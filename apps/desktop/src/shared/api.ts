@@ -4,5 +4,6 @@
  * interface over HTTP.
  */
 export interface Api {
-  ping(): Promise<string>;
+  /** The app version, from `package.json`. */
+  getVersion(): Promise<string>;
 }

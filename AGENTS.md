@@ -220,10 +220,13 @@ Distribution target, once cockpit is published: an npm package launched with `np
 
 ## Tests and validation
 
+- **CI** (`.github/workflows/ci.yml`): on every pull request and every push to `main`, one macOS job runs `bun turbo run build typecheck lint test`. macOS because the desktop app is packaged for macOS and its tests open windows. The repository is public, so GitHub-hosted runners cost nothing.
+- **`main` is protected** by a ruleset: changes go through a pull request, the CI `check` job must pass on a branch up to date with `main`, and force pushes and deletion are blocked. The rule applies to administrators too.
+
 - `packages/memory` (vitest): CRUD, search, scope filtering, concurrent writes from 2 processes.
 - `packages/mcp-server` (vitest): context resolution; a git worktree and a subdirectory resolve to the same `projectId` as the main checkout, and a directory outside git gets its own.
 - `apps/mcp`: the binary responds over stdio (test with MCP Inspector).
-- `apps/desktop` (vitest + Playwright): the `dev` script, the built app and the packaged `Cockpit.app` each start, show the main process reply (`pong`), keep Node out of the renderer, follow the system color scheme, reload, and log no error.
+- `apps/desktop` (vitest + Playwright): the `dev` script, the built app and the packaged `Cockpit.app` each start, show the home page and the app version returned by the main process, keep Node out of the renderer, follow the system color scheme, reload, and log no error.
 - End to end, after `install-claude`, with the stock `claude` in a real repository:
   - "Remember that X" → Claude calls `memory_write` (scope `project`);
   - new session in the same repository, then in one of its worktrees → asked about X, Claude calls `memory_search` and finds X;

@@ -1,7 +1,7 @@
 import { Link } from '@tanstack/react-router';
 import { HouseIcon } from 'lucide-react';
 
-export function AppSidebar() {
+export function AppSidebar({ version }: { version: string }) {
   return (
     <aside className="flex w-64 shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground select-none">
       {/* Draggable strip; on macOS it holds the window controls. */}
@@ -15,6 +15,7 @@ export function AppSidebar() {
           Home
         </Link>
       </nav>
+      <footer className="mt-auto px-4 py-3 text-xs text-muted-foreground">Cockpit {version}</footer>
     </aside>
   );
 }

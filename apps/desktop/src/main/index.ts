@@ -83,7 +83,7 @@ app.on('window-all-closed', () => {
 // ES module has finished evaluating, so the app would wait forever.
 void app.whenReady().then(() => {
   protocol.handle('app', serveRenderer);
-  ipcMain.handle('ping', () => 'pong');
+  ipcMain.handle('get-version', () => app.getVersion());
 
   createWindow();
 

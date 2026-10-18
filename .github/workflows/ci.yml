@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A newer push to the same branch cancels the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Required by the `main` ruleset: keep the job id in sync with it.
+  check:
+    # macOS: the desktop app is packaged for macOS, and the runner has a
+    # desktop session for the Electron tests.
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # The oldest Node line the repository supports.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      # Installs the Bun version pinned in `packageManager`.
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.bun/install/cache
+            ~/Library/Caches/electron
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bun.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-
+
+      - run: bun install --frozen-lockfile
+
+      # `test` launches the desktop app: the dev script, the built app and the
+      # packaged app.
+      - run: bun turbo run build typecheck lint test
