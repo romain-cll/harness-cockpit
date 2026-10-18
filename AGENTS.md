@@ -1,10 +1,14 @@
 # AGENTS.md — cockpit
 
-**cockpit** is a provisional working name. It appears in the binary name (`cockpit-mcp`) and in the data directory (`~/.cockpit`).
+**cockpit** is a provisional working name. It appears in the binary name (`cockpit-mcp`), in the data directory (`~/.cockpit`) and in the desktop app (`Cockpit`, `com.cockpit.desktop`).
 
 ## Rule #1: no over-engineering
 
 Do not add any abstraction, package or app beyond what this file describes. When in doubt, do the simplest thing.
+
+## Technical choices: long-term viability first
+
+When choosing a tool, library or framework, the criterion is long-term viability: who maintains it (an organization or a single person), release activity, real adoption, compatibility with the rest of the stack, and the cost of leaving it. Setup speed and amount of configuration are not arguments. Back the choice with verified facts.
 
 ## Language
 
@@ -20,9 +24,13 @@ Differentiators:
 - artifacts on storage you own;
 - usage statistics.
 
-Today the repository covers **only the cross-harness memory**, as a regular local MCP server usable with the stock `claude`. Daemon, Electron, pty, UI, artifacts, stats, real cloud backend, embeddings, mobile: create none of these without an explicit request.
+The repository is built in steps. In scope so far:
+- the **cross-harness memory**, as a regular local MCP server usable with the stock `claude`;
+- the **desktop app shell** (`apps/desktop`): a window, a router and a typed bridge to the main process, nothing more yet.
 
-## Architecture
+Daemon, pty, product UI, artifacts, stats, real cloud backend, embeddings, web app, mobile: create none of these without an explicit request.
+
+## Memory architecture
 
 ```
 Claude Code / OpenCode / Codex ──stdio──▶ cockpit-mcp (MCP server) ──▶ MemoryService ──▶ LocalStore (~/.cockpit: md + SQLite FTS)
@@ -38,12 +46,12 @@ Claude Code / OpenCode / Codex ──stdio──▶ cockpit-mcp (MCP server) ─
 
 1. **MCP tools independent of the transport.** `packages/mcp-server` exports `createMcpServer(service, options)`. `apps/mcp` mounts it over stdio; the same server must be mountable over HTTP without a rewrite, so no stdio-specific code in `packages/mcp-server`.
 2. **Storage behind a single interface** (`MemoryStore`). The local / cloud choice is made **only** in `apps/mcp/src/main.ts`, from the config.
-3. **No business logic in `apps/`.** Everything lives in `packages/`; apps only wire things together.
 
 ## Monorepo
 
+- **No business logic in `apps/`.** Everything lives in `packages/`; apps only wire things together.
 - **Bun** (package manager, workspaces, script runner) + **Turborepo**, TypeScript.
-- Binary runtime: **Node 22+**. `better-sqlite3` is a native Node module.
+- Runtime: **Node 22+** for `cockpit-mcp`; the desktop app runs on the Node bundled with Electron (24 in Electron 44). A native module (`better-sqlite3`, later `node-pty`) must be built for the runtime that loads it.
 - Set up by hand, without the `create-turbo` template:
   - root `package.json`: `apps/*` and `packages/*` workspaces, scripts that delegate to Turbo;
   - `turbo.json`: `build`, `dev`, `test`, `typecheck`, `lint` tasks;
@@ -52,6 +60,7 @@ Claude Code / OpenCode / Codex ──stdio──▶ cockpit-mcp (MCP server) ─
 
 ```
 apps/
+  desktop/           # Electron app: main process, preload, React renderer
   mcp/               # `cockpit-mcp` bin: stdio MCP server
 packages/
   memory/            # types, scopes, MemoryStore interface, MemoryService, LocalStore, CloudStore (stub)
@@ -60,7 +69,7 @@ scripts/
   install-claude.ts  # global install for Claude Code (+ uninstall)
 ```
 
-- No other app (daemon, desktop, cloud) without an explicit request.
+- No other app (daemon, web, cloud) without an explicit request.
 - **Internal packages consumed as TS source**, with no separate per-package build.
 - **`apps/mcp`** is bundled with `tsup` into a single binary. `better-sqlite3` stays an external dependency because it is a native module.
 - **Tests** with `vitest`, **validation** with `zod`.
@@ -75,7 +84,35 @@ bun run test        # turbo run test
 bun run typecheck   # turbo run typecheck
 bun run lint        # turbo run lint
 bun turbo run build test typecheck   # several tasks in one pass
+
+bun run --filter @cockpit/desktop dev       # desktop app with hot reload
+bun run --filter @cockpit/desktop package   # Cockpit.app in apps/desktop/release/
 ```
+
+## Desktop app (`apps/desktop`)
+
+- **Stack**: Electron 44, electron-vite (dev server and build), electron-builder (packaging), React 19, TanStack Router with file-based routes.
+  - electron-builder rather than Electron Forge: Forge does not support Bun, and its Vite plugin leaves `node_modules` out of the package, which breaks native modules such as node-pty.
+  - electron-vite has a single maintainer. It is a thin layer over Vite: if it is abandoned, replace it with Vite and a dev script. Packaging does not depend on it.
+
+```
+src/
+  main/       # main process: window, `app://` protocol, IPC handlers
+  preload/    # exposes `window.api`, nothing else
+  shared/     # the `Api` contract, types only
+  renderer/   # React app; routes in `routes/`
+```
+
+- **Renderer boundary.** The renderer never imports `electron` or Node modules. It reaches the main process only through `window.api`, typed by `Api` in `src/shared/api.ts`. A future web app (TanStack Start) implements the same `Api` over HTTP and reuses the routes.
+- **No web app or shared UI package** until a web target exists. When it does, move the renderer into a package consumed by both apps.
+- **Security**:
+  - `contextIsolation` and `sandbox` on, `nodeIntegration` off. A sandboxed preload cannot be an ES module, so it is bundled as CommonJS (`index.cjs`).
+  - The built renderer is served from the `app://renderer` protocol, never `file://`, with a CSP in `index.html`. The router therefore uses real URLs, as on the web.
+  - New windows are denied (`https` links open in the system browser), and navigation away from the app origin is blocked.
+- **Dependencies**: everything the bundles import goes in `devDependencies`, and electron-vite bundles it. Only modules that cannot be bundled (native modules such as node-pty) go in `dependencies`, so electron-builder ships them and rebuilds them for Electron.
+- **Generated route tree**: `src/renderer/routeTree.gen.ts` is generated by the router plugin on `dev` and `build`, and committed so `typecheck` works on a fresh checkout.
+- **Output**: electron-vite builds to `dist/` (the Turbo `build` output), electron-builder packages to `release/`.
+- **Packaging**: `package` builds an ad-hoc signed `Cockpit.app` for the current platform. Developer ID signing, notarization, installers and auto-update come later, on request.
 
 ## Storage
 
@@ -161,6 +198,7 @@ MCP servers the user has already configured must keep working.
 - `packages/memory` (vitest): CRUD, FTS, scope filtering, rebuilding the index from the files, concurrent writes from 2 processes.
 - `packages/mcp-server` (vitest): context resolution; a git worktree and a subdirectory resolve to the same `projectId` as the main checkout, and a directory outside git gets its own.
 - `apps/mcp`: the binary responds over stdio (test with MCP Inspector).
+- `apps/desktop`: `build` and `typecheck` pass; `dev` opens the window and it shows the main process reply (`pong`); the packaged `Cockpit.app` launches and shows the same.
 - End to end, after `install-claude`, with the stock `claude` in a real repository:
   - "Remember that X" → Claude calls `memory_write` (scope `project`);
   - new session in the same repository, then in one of its worktrees → asked about X, Claude calls `memory_search` and finds X;

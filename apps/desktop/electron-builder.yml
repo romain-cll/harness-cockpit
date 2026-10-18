@@ -1,0 +1,10 @@
+appId: com.cockpit.desktop
+productName: Cockpit
+directories:
+  output: release
+files:
+  - dist/**
+mac:
+  # Ad-hoc signed until a Developer ID certificate is set up for distribution.
+  identity: '-'
+  hardenedRuntime: false
