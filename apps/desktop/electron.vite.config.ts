@@ -1,4 +1,5 @@
 import { resolve } from 'node:path';
+import tailwindcss from '@tailwindcss/vite';
 import { tanstackRouter } from '@tanstack/router-plugin/vite';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'electron-vite';
@@ -18,6 +19,7 @@ export default defineConfig({
     // Absolute asset paths, so nested routes resolve them under the `app://` protocol.
     base: '/',
     build: { outDir: 'dist/renderer' },
+    resolve: { alias: { '@': resolve('src/renderer') } },
     plugins: [
       tanstackRouter({
         target: 'react',
@@ -26,6 +28,7 @@ export default defineConfig({
         generatedRouteTree: resolve('src/renderer/routeTree.gen.ts'),
       }),
       react(),
+      tailwindcss(),
     ],
   },
 });
