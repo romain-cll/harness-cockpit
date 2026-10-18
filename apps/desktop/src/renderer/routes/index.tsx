@@ -1,4 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router';
+import { PageHeader } from '@/components/page-header';
 
 export const Route = createFileRoute('/')({
   loader: () => window.api.ping(),
@@ -8,9 +9,11 @@ export const Route = createFileRoute('/')({
 function Home() {
   const reply = Route.useLoaderData();
   return (
-    <main>
-      <h1>Cockpit</h1>
-      <p>Main process: {reply}</p>
-    </main>
+    <>
+      <PageHeader title="Home" />
+      <div className="flex-1 overflow-auto p-4 text-xs text-muted-foreground">
+        Main process: {reply}
+      </div>
+    </>
   );
 }

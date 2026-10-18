@@ -33,7 +33,15 @@ function createWindow(): void {
   const window = new BrowserWindow({
     width: 1200,
     height: 800,
+    minWidth: 800,
+    minHeight: 500,
     show: false,
+    // On macOS the page extends under the title bar and the window controls sit
+    // in the sidebar's top strip. Other platforms keep the native frame.
+    ...(process.platform === 'darwin' && {
+      titleBarStyle: 'hidden',
+      trafficLightPosition: { x: 16, y: 16 },
+    }),
     webPreferences: {
       preload: join(import.meta.dirname, '../preload/index.cjs'),
       contextIsolation: true,
