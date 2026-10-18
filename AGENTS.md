@@ -109,12 +109,13 @@ interface MemoryStore {
 
 ## Context resolution (`packages/mcp-server`)
 
-The agent never passes the project, the session or the harness itself: the server resolves them, after the MCP `initialize` handshake.
+The agent never passes the project, the session or the harness itself: the server resolves them.
 
-- **Project directory**: the first root returned by the MCP `roots/list` request; if the client does not support roots, `process.cwd()`. Re-resolve on `notifications/roots/list_changed`.
+- **Project directory**: passed by the app to `createMcpServer`. `apps/mcp` passes `process.cwd()`: Claude Code, OpenCode and Codex all start a stdio server in the project (or launch) directory.
+  - Do not use MCP roots: they are deprecated since protocol version 2026-07-28, and Codex does not support them.
   - Do not rely on harness environment variables such as `CLAUDE_PROJECT_DIR`: they leak into child processes. An OpenCode started from a Claude Code terminal passes the parent Claude session's variables to its MCP servers.
 - **`projectId`**: hash of the `realpath` of `git rev-parse --path-format=absolute --git-common-dir`, run from the project directory. Every worktree and subdirectory of a repository therefore shares one `projectId`, like Claude Code's own auto memory. Without git, hash of the project directory, which covers sessions outside any project.
-- **`source`**: `clientInfo.name` from `initialize` (`claude-code`, `opencode`…).
+- **`source`**: the client name the harness sends when it connects (`claude-code`, `opencode`…).
 - **`sessionId`**: `CLAUDE_CODE_SESSION_ID` when the client is Claude Code; otherwise an id generated when the MCP process starts. Session resume (`--resume`) is not handled.
 
 ### Harness behavior
@@ -159,7 +160,7 @@ MCP servers the user has already configured must keep working.
 ## Tests and validation
 
 - `packages/memory` (vitest): CRUD, FTS, scope filtering, rebuilding the index from the files, concurrent writes from 2 processes.
-- `packages/mcp-server` (vitest): context resolution from roots and from the cwd fallback; a git worktree and a subdirectory resolve to the same `projectId` as the main checkout.
+- `packages/mcp-server` (vitest): context resolution; a git worktree and a subdirectory resolve to the same `projectId` as the main checkout, and a directory outside git gets its own.
 - `apps/mcp`: the binary responds over stdio (test with MCP Inspector).
 - End to end, after `install-claude`, with the stock `claude` in a real repository:
   - "Remember that X" → Claude calls `memory_write` (scope `project`);
