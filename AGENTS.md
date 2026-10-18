@@ -64,6 +64,7 @@ scripts/
 - **Internal packages consumed as TS source**, with no separate per-package build.
 - **`apps/mcp`** is bundled with `tsup` into a single binary. `better-sqlite3` stays an external dependency because it is a native module.
 - **Tests** with `vitest`, **validation** with `zod`.
+- **MCP** with `@modelcontextprotocol/sdk` 1.32 (protocol 2025-11-25; Claude Code falls back to it automatically).
 
 ### Commands
 
@@ -90,7 +91,7 @@ interface MemoryStore {
 ```
 
 - **`LocalStore`**:
-  - markdown files with frontmatter in `~/.cockpit/memory/{global,projects/<projectId>,sessions/<sessionId>}/<id>.md`;
+  - markdown files with frontmatter in `~/.cockpit/memory/{global,projects/<projectId>}/<id>.md`;
   - SQLite FTS5 index in `~/.cockpit/index.db`, WAL mode;
   - **the files are the source of truth**; the index can be rebuilt from them.
 - **`CloudStore`**: stub that throws "not implemented".
@@ -103,20 +104,19 @@ interface MemoryStore {
 
 ## Data model
 
-- **Scopes**: `global`, `project`, `session`.
-- **Entry**: `id`, `scope`, `projectId?`, `sessionId?`, `content` (markdown), `tags[]`, `source` (harness), `createdAt`, `updatedAt`.
+- **Scopes**: `global`, `project`.
+- **Entry**: `id`, `scope`, `projectId?`, `content` (markdown), `tags[]`, `source` (harness), `createdAt`, `updatedAt`.
 - Visibility: a `project` memory only appears in its project; a `global` memory appears everywhere.
 
 ## Context resolution (`packages/mcp-server`)
 
-The agent never passes the project, the session or the harness itself: the server resolves them.
+The agent never passes the project or the harness itself: the server resolves them.
 
 - **Project directory**: passed by the app to `createMcpServer`. `apps/mcp` passes `process.cwd()`: Claude Code, OpenCode and Codex all start a stdio server in the project (or launch) directory.
   - Do not use MCP roots: they are deprecated since protocol version 2026-07-28, and Codex does not support them.
   - Do not rely on harness environment variables such as `CLAUDE_PROJECT_DIR`: they leak into child processes. An OpenCode started from a Claude Code terminal passes the parent Claude session's variables to its MCP servers.
 - **`projectId`**: hash of the `realpath` of `git rev-parse --path-format=absolute --git-common-dir`, run from the project directory. Every worktree and subdirectory of a repository therefore shares one `projectId`, like Claude Code's own auto memory. Without git, hash of the project directory, which covers sessions outside any project.
 - **`source`**: the client name the harness sends when it connects (`claude-code`, `opencode`…).
-- **`sessionId`**: `CLAUDE_CODE_SESSION_ID` when the client is Claude Code; otherwise an id generated when the MCP process starts. Session resume (`--resume`) is not handled.
 
 ### Harness behavior
 
@@ -129,7 +129,6 @@ Claude Code 2.1.302 and OpenCode 2.0.31 verified in practice; Codex from its doc
 | Environment | full parent env, plus `CLAUDE_PROJECT_DIR` and `CLAUDE_CODE_SESSION_ID` | full parent env, including `CLAUDE_*` variables leaked from a parent Claude session | allowlist only (`HOME`, `PATH`, `USER`…) plus `env` / `env_vars` |
 | MCP process lifetime | one per session | long-lived, shared across sessions by the resident `opencode serve` service | not documented |
 | Server `instructions` injected | yes, cut at 4,096 characters | yes, only when the server exposes at least one tool | yes, no documented cap; keep the first 512 characters self-contained |
-| Session id available | `CLAUDE_CODE_SESSION_ID` | no | no |
 
 ## MCP tools and instructions (`packages/mcp-server`)
 
