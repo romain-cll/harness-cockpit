@@ -32,7 +32,7 @@ Claude Code / OpenCode / Codex ──stdio──▶ cockpit-mcp (MCP server) ─
 - `cockpit-mcp` is a standard **stdio** MCP server, **launched automatically by the harness**. The user never starts anything by hand.
 - **Nothing is injected at session start** apart from the MCP server instructions. The agent fetches what it needs with `memory_search` as the conversation goes. What an agent must always know belongs in the user's own `AGENTS.md` / `CLAUDE.md`, not in this server.
 - **No daemon.** The MCP process embeds `packages/memory` directly. Several MCP processes may run at once on the same files, which SQLite in WAL mode handles.
-- **Do not assume one MCP process per session.** Claude Code starts one per session, but OpenCode keeps a single long-lived process per project in its resident service.
+- **Do not assume one MCP process per session.** Claude Code starts one per session, but OpenCode keeps long-lived MCP processes in its resident service and shares them across sessions.
 
 ### Principles to follow
 
@@ -117,15 +117,18 @@ The agent never passes the project, the session or the harness itself: the serve
 - **`source`**: `clientInfo.name` from `initialize` (`claude-code`, `opencode`…).
 - **`sessionId`**: `CLAUDE_CODE_SESSION_ID` when the client is Claude Code; otherwise an id generated when the MCP process starts. Session resume (`--resume`) is not handled.
 
-### Harness behavior (verified with Claude Code 2.1.302 and OpenCode 2.0.31)
+### Harness behavior
 
-| | Claude Code | OpenCode |
-|---|---|---|
-| `roots/list` | launch directory (even a subdirectory) | project directory |
-| `process.cwd()` | launch directory | directory of the first session that started the service |
-| MCP process lifetime | one per session | one per project, owned by the resident `opencode serve` service |
-| server `instructions` injected into context | yes, cut at 4,096 characters | no |
-| session id available | `CLAUDE_CODE_SESSION_ID` env variable | no |
+Claude Code 2.1.302 and OpenCode 2.0.31 verified in practice; Codex from its docs and source only, not tested.
+
+| | Claude Code | OpenCode | Codex |
+|---|---|---|---|
+| `roots/list` | launch directory (even a subdirectory) | project directory | not supported |
+| `process.cwd()` | launch directory | project directory | Codex process cwd, unless `cwd` is set |
+| Environment | full parent env, plus `CLAUDE_PROJECT_DIR` and `CLAUDE_CODE_SESSION_ID` | full parent env, including `CLAUDE_*` variables leaked from a parent Claude session | allowlist only (`HOME`, `PATH`, `USER`…) plus `env` / `env_vars` |
+| MCP process lifetime | one per session | long-lived, shared across sessions by the resident `opencode serve` service | not documented |
+| Server `instructions` injected | yes, cut at 4,096 characters | yes, only when the server exposes at least one tool | yes, no documented cap; keep the first 512 characters self-contained |
+| Session id available | `CLAUDE_CODE_SESSION_ID` | no | no |
 
 ## MCP tools and instructions (`packages/mcp-server`)
 
@@ -137,7 +140,6 @@ The agent never passes the project, the session or the harness itself: the serve
 | `memory_delete` | `id` | |
 
 - **Server instructions** (returned by `initialize`): short, under 500 characters, written as factual statements. They say when to call `memory_search` and `memory_write`.
-- **Tool descriptions must stand on their own**, because some harnesses (OpenCode) do not inject the server instructions.
 - Keep tool results small: return only the matching entries, within `limit`.
 
 ## Installation (`scripts/install-claude.ts`)
