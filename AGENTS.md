@@ -191,6 +191,8 @@ Idempotent:
 
 MCP servers the user has already configured must keep working.
 
+Distribution target, once cockpit is published: an npm package launched with `npx -y <package>@latest`, as Playwright MCP and Chrome DevTools MCP do, so the user needs Node and nothing else. The package name waits for the final product name. Until then, the script registers the local build.
+
 ## Other harnesses
 
 - **Codex**: same binary, declared in `~/.codex/config.toml` (`mcp_servers`).
