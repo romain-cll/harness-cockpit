@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createServer, type AddressInfo } from 'node:net';
 import { join } from 'node:path';
@@ -10,6 +11,10 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 // the packaged app, and checks each one starts, renders and logs no error.
 
 const appDir = join(import.meta.dirname, '..');
+const { version } = JSON.parse(readFileSync(join(appDir, 'package.json'), 'utf8')) as { version: string };
+// Shown in the sidebar from `window.api.getVersion()`, so it proves the
+// renderer reaches the main process.
+const versionLabel = `Cockpit ${version}`;
 
 // Signs of an uncaught error in the main process.
 const MAIN_PROCESS_ERROR = /\bUncaught\b|\bUnhandled\b|App threw an error/;
@@ -122,9 +127,10 @@ describe.each([
     await session?.close();
   });
 
-  test('shows the home page with the main process reply', async () => {
+  test('shows the home page and the version from the main process', async () => {
     const { page } = session;
-    await page.getByText('Main process: pong').waitFor();
+    await page.getByText(versionLabel).waitFor();
+    await page.getByRole('heading', { name: 'Home' }).waitFor();
     expect(await page.title()).toBe('Cockpit');
     expect(await page.getByRole('link', { name: 'Home' }).getAttribute('aria-current')).toBe('page');
   });
@@ -151,7 +157,7 @@ describe.each([
   test('reloads to the same page', async () => {
     const { page } = session;
     await page.reload();
-    await page.getByText('Main process: pong').waitFor();
+    await page.getByText(versionLabel).waitFor();
   });
 
   test('logs no error and keeps running', async () => {
