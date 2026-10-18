@@ -33,13 +33,13 @@ Daemon, pty, product UI, artifacts, stats, real cloud backend, embeddings, web a
 ## Memory architecture
 
 ```
-Claude Code / OpenCode / Codex ──stdio──▶ cockpit-mcp (MCP server) ──▶ MemoryService ──▶ LocalStore (~/.cockpit: md + SQLite FTS)
+Claude Code / OpenCode / Codex ──stdio──▶ cockpit-mcp (MCP server) ──▶ MemoryService ──▶ LocalStore (~/.cockpit: markdown files)
                                                                                     └─▶ CloudStore (stub)
 ```
 
 - `cockpit-mcp` is a standard **stdio** MCP server, **launched automatically by the harness**. The user never starts anything by hand.
 - **Nothing is injected at session start** apart from the MCP server instructions. The agent fetches what it needs with `memory_search` as the conversation goes. What an agent must always know belongs in the user's own `AGENTS.md` / `CLAUDE.md`, not in this server.
-- **No daemon.** The MCP process embeds `packages/memory` directly. Several MCP processes may run at once on the same files, which SQLite in WAL mode handles.
+- **No daemon.** The MCP process embeds `packages/memory` directly. Several MCP processes may run at once on the same files, which atomic per-file writes handle.
 - **Do not assume one MCP process per session.** Claude Code starts one per session, but OpenCode keeps long-lived MCP processes in its resident service and shares them across sessions.
 
 ### Principles to follow
@@ -51,7 +51,7 @@ Claude Code / OpenCode / Codex ──stdio──▶ cockpit-mcp (MCP server) ─
 
 - **No business logic in `apps/`.** Everything lives in `packages/`; apps only wire things together.
 - **Bun** (package manager, workspaces, script runner) + **Turborepo**, TypeScript.
-- Runtime: **Node 22+** for `cockpit-mcp`; the desktop app runs on the Node bundled with Electron (24 in Electron 44). A native module (`better-sqlite3`, later `node-pty`) must be built for the runtime that loads it.
+- Runtime: **Node 22+** for `cockpit-mcp`, the oldest supported LTS line; the desktop app runs on the Node bundled with Electron (24 in Electron 44). `cockpit-mcp` has no native module; a native module (later `node-pty`) must be built for the runtime that loads it.
 - Set up by hand, without the `create-turbo` template:
   - root `package.json`: `apps/*` and `packages/*` workspaces, scripts that delegate to Turbo;
   - `turbo.json`: `build`, `dev`, `test`, `typecheck`, `lint` tasks;
@@ -71,9 +71,9 @@ scripts/
 
 - No other app (daemon, web, cloud) without an explicit request.
 - **Internal packages consumed as TS source**, with no separate per-package build.
-- **`apps/mcp`** is bundled with `tsup` into a single binary. `better-sqlite3` stays an external dependency because it is a native module.
-- **Tests** with `vitest`, **validation** with `zod`.
-- **MCP** with `@modelcontextprotocol/sdk` 1.32 (protocol 2025-11-25; Claude Code falls back to it automatically).
+- **`apps/mcp`** is bundled with `rolldown` 1.x into a single ESM file with a shebang, workspace packages included; the build script sets the exec bit. Rolldown has a stable semver API and a full-time team.
+- **Tests** with `vitest`, **validation** with `zod` 4 (`^4.2`, required by the MCP SDK).
+- **MCP** with `@modelcontextprotocol/server` 2.x, served with `serveStdio` from `@modelcontextprotocol/server/stdio`, which accepts both 2025-era clients (up to 2025-11-25) and 2026-07-28 clients. The v1 SDK is the maintenance line and will not get 2026-07-28.
 
 ### Commands
 
@@ -129,8 +129,12 @@ interface MemoryStore {
 
 - **`LocalStore`**:
   - markdown files with frontmatter in `~/.cockpit/memory/{global,projects/<projectId>}/<id>.md`;
-  - SQLite FTS5 index in `~/.cockpit/index.db`, WAL mode;
-  - **the files are the source of truth**; the index can be rebuilt from them.
+  - one file per memory, written to a temporary file then renamed, so concurrent processes never see a partial file;
+  - **no index, no database**: `search` reads the files at each call. 10,000 memories scan in about 125 ms; an index is added only once a real need is measured.
+- **Keep the storage replaceable** (an index, embeddings or the cloud can come later without migrating data):
+  - the frontmatter format is stable and carries every field of the entry;
+  - `memory_search` takes free text, with no query operator syntax;
+  - ranking is "most relevant first", never a guaranteed order.
 - **`CloudStore`**: stub that throws "not implemented".
 - **Config** in `~/.cockpit/config.json`:
   ```json
@@ -171,7 +175,7 @@ Claude Code 2.1.302 and OpenCode 2.0.31 verified in practice; Codex from its doc
 
 | Tool | Input | Notes |
 |---|---|---|
-| `memory_search` | `query`, `scope?` (defaults to `all`), `limit?` | FTS, sorted by relevance then recency |
+| `memory_search` | `query`, `scope?` (defaults to `all`), `limit?` | scan of the files, sorted by relevance then recency |
 | `memory_write` | `content`, `scope`, `tags?` | returns the `id` |
 | `memory_update` | `id`, `content?`, `tags?` | |
 | `memory_delete` | `id` | |
@@ -195,7 +199,7 @@ MCP servers the user has already configured must keep working.
 
 ## Tests and validation
 
-- `packages/memory` (vitest): CRUD, FTS, scope filtering, rebuilding the index from the files, concurrent writes from 2 processes.
+- `packages/memory` (vitest): CRUD, search, scope filtering, concurrent writes from 2 processes.
 - `packages/mcp-server` (vitest): context resolution; a git worktree and a subdirectory resolve to the same `projectId` as the main checkout, and a directory outside git gets its own.
 - `apps/mcp`: the binary responds over stdio (test with MCP Inspector).
 - `apps/desktop`: `build` and `typecheck` pass; `dev` opens the window and it shows the main process reply (`pong`); the packaged `Cockpit.app` launches and shows the same.
