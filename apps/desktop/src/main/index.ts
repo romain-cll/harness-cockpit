@@ -9,6 +9,18 @@ import { app, BrowserWindow, ipcMain, net, protocol, shell } from 'electron';
 const RENDERER_ORIGIN = 'app://renderer';
 const rendererDir = join(import.meta.dirname, '../renderer');
 
+// Test switches, read before `ready`. Unlike `ELECTRON_RENDERER_URL`, which is
+// ignored once packaged because it would change the code the app runs, they are
+// honoured in the packaged app too: the packaged-app test needs them, and they
+// only change where the data lives and whether windows are shown.
+// - COCKPIT_USER_DATA_DIR: the app keeps its data in that folder.
+// - COCKPIT_TEST_BACKGROUND=1: no Dock icon, windows never shown, so a test
+//   launch does not take the user's focus.
+const background = process.env.COCKPIT_TEST_BACKGROUND === '1';
+const userDataDir = process.env.COCKPIT_USER_DATA_DIR;
+if (userDataDir) app.setPath('userData', userDataDir);
+if (background && process.platform === 'darwin') app.setActivationPolicy('accessory');
+
 protocol.registerSchemesAsPrivileged([
   { scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true } },
 ]);
@@ -47,10 +59,13 @@ function createWindow(): void {
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
+      // A window that is never shown would otherwise count as hidden: the page
+      // would report `hidden` and throttle its timers and animation frames.
+      ...(background && { backgroundThrottling: false }),
     },
   });
 
-  window.once('ready-to-show', () => window.show());
+  if (!background) window.once('ready-to-show', () => window.show());
 
   // Links that open a new window go to the system browser, never to a new app window.
   window.webContents.setWindowOpenHandler(({ url }) => {
