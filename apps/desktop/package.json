@@ -13,7 +13,11 @@
     "test": "bun run package && vitest run",
     "typecheck": "tsc -p tsconfig.json && tsc -p src/renderer/tsconfig.json && tsc -p test/tsconfig.json"
   },
+  "dependencies": {
+    "node-pty": "1.2.0-beta.15"
+  },
   "devDependencies": {
+    "@cockpit/pty": "workspace:*",
     "@tailwindcss/vite": "^4.3.3",
     "@tanstack/react-router": "^1.170.45",
     "@tanstack/router-plugin": "^1.168.47",
