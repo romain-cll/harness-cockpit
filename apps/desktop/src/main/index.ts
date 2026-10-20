@@ -81,6 +81,8 @@ function createWindow(): void {
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
+      // A dropped file must not navigate the window; drops are a no-op until a feature handles them.
+      navigateOnDragDrop: false,
       // A window that is never shown would otherwise count as hidden: the page
       // would report `hidden` and throttle its timers and animation frames.
       ...(background && { backgroundThrottling: false }),
@@ -166,16 +168,15 @@ function startPty(): void {
     if (owner && !owner.isDestroyed()) owner.send('pty:exit', id, exit);
   });
 
-  // A page's shells end with it: when its main frame loads another document
-  // (a reload included) or the page is destroyed. Route changes inside the app
-  // are same-document navigations and kill nothing.
+  // A page's shells end with it: when its main frame commits another document
+  // (a reload included) or the page is destroyed. `did-navigate` fires only for a
+  // committed main-frame document, so a navigation that `will-navigate` cancels,
+  // and route changes inside the app (same-document), kill nothing.
   const killSessionsOf = (contents: WebContents) => {
     for (const [id, owner] of owners) if (owner === contents) pty.kill(id);
   };
   app.on('web-contents-created', (_event, contents) => {
-    contents.on('did-start-navigation', (details) => {
-      if (details.isMainFrame && !details.isSameDocument) killSessionsOf(contents);
-    });
+    contents.on('did-navigate', () => killSessionsOf(contents));
     contents.on('destroyed', () => killSessionsOf(contents));
   });
 }
@@ -230,7 +231,7 @@ function startProjects(userData: string, loaded: State): void {
 // The app never navigates away from its own page.
 app.on('web-contents-created', (_event, contents) => {
   contents.on('will-navigate', (event, url) => {
-    if (new URL(url).origin !== new URL(contents.getURL()).origin) event.preventDefault();
+    if (originOf(url) !== originOf(contents.getURL())) event.preventDefault();
   });
 });
 
