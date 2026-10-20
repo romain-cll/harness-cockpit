@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { WorkspaceError } from '../src/git';
 import { createWorktree, findRepositoryRoot, listWorktrees, removeWorktree } from '../src/index';
@@ -242,8 +242,56 @@ describe('createWorktree', () => {
   });
 });
 
+describe('createWorktree arguments', () => {
+  test('AC19 — rejects a relative root with a TypeError and creates nothing anywhere', async () => {
+    const repo = await makeRepo();
+    const listBefore = git(repo, 'worktree', 'list', '--porcelain');
+    // A relative root may resolve against the process cwd: never leave a stray folder in the real
+    // repository, even when the implementation is wrong.
+    const strayInCwd = join(process.cwd(), 'worktrees');
+    const strayExisted = existsSync(strayInCwd);
+
+    try {
+      for (const base of ['main', undefined]) {
+        const outcome = await createWorktree({ repo, root: 'worktrees', branch: 'topic', base, env: testEnv }).then(
+          (value) => ({ resolved: true as const, value }),
+          (error: unknown) => ({ resolved: false as const, error }),
+        );
+        expect(outcome.resolved, 'a relative root must be rejected').toBe(false);
+        if (outcome.resolved) continue;
+        expect(outcome.error).toBeInstanceOf(TypeError);
+        expect(outcome.error).not.toBeInstanceOf(WorkspaceError);
+      }
+
+      expect(existsSync(join(repo, 'worktrees'))).toBe(false);
+      expect(git(repo, 'status', '--porcelain')).toBe('');
+      expect(git(repo, 'worktree', 'list', '--porcelain')).toBe(listBefore);
+      expect(existsSync(strayInCwd)).toBe(strayExisted);
+      expect(readdirSync(dirname(repo))).toEqual(['my-repo']);
+    } finally {
+      if (!strayExisted) await rm(strayInCwd, { recursive: true, force: true });
+    }
+  });
+
+  test('AC20 — rejects GIT_FAILED for @{-1}, with or without a base, creating nothing', async () => {
+    const repo = await makeRepo();
+    const root = await tempDir();
+    git(repo, 'checkout', '-b', 'other');
+    git(repo, 'checkout', 'main');
+    const listBefore = git(repo, 'worktree', 'list', '--porcelain');
+
+    for (const base of ['main', undefined]) {
+      const error = await rejection(createWorktree({ repo, root, branch: '@{-1}', base, env: testEnv }));
+      expect(error.code, `base: ${String(base)}`).toBe('GIT_FAILED');
+    }
+
+    expect(readdirSync(root)).toEqual([]);
+    expect(git(repo, 'worktree', 'list', '--porcelain')).toBe(listBefore);
+  });
+});
+
 describe('removeWorktree', () => {
-  test('AC8 — removes a clean worktree and keeps its branch', async () => {
+  test('AC8— removes a clean worktree and keeps its branch', async () => {
     const repo = await makeRepo();
     const path = await addWorktree(repo, 'clean', 'clean');
 
