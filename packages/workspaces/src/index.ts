@@ -122,12 +122,15 @@ export async function removeWorktree({
   const worktree = await linkedWorktree(worktrees, path);
   const main = worktrees[0]!.path;
 
-  if ((await git(['status', '--porcelain'], { cwd: worktree.path, env })).trim() !== '') {
+  if ((await git(['status', '--porcelain', '--untracked-files=normal'], { cwd: worktree.path, env })).trim() !== '') {
     throw new WorkspaceError('DIRTY_WORKTREE', `worktree has uncommitted changes: ${worktree.path}`);
   }
   await git(['worktree', 'remove', '--', worktree.path], { cwd: main, env });
 
-  if (deleteBranch && worktree.branch !== null && !(await succeeds(['branch', '-d', '--', worktree.branch], { cwd: main, env }))) {
+  if (!deleteBranch || worktree.branch === null) return;
+  // A branch deleted by hand while checked out is still reported by the worktree: nothing to delete.
+  if (!(await succeeds(['rev-parse', '--verify', '--quiet', `refs/heads/${worktree.branch}`], { cwd: main, env }))) return;
+  if (!(await succeeds(['branch', '-d', '--', worktree.branch], { cwd: main, env }))) {
     throw new WorkspaceError('BRANCH_NOT_MERGED', `branch is not merged: ${worktree.branch}`);
   }
 }

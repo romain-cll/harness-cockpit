@@ -19,8 +19,8 @@ export type WorkspaceErrorCode =
 export class WorkspaceError extends Error {
   readonly code: WorkspaceErrorCode;
 
-  constructor(code: WorkspaceErrorCode, message: string) {
-    super(message);
+  constructor(code: WorkspaceErrorCode, message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = 'WorkspaceError';
     this.code = code;
   }
@@ -31,15 +31,21 @@ export interface GitOptions {
   env?: NodeJS.ProcessEnv;
 }
 
-/** Runs git without a shell and resolves to its stdout. */
+/**
+ * Runs git without a shell and resolves to its stdout. Every failure is `GIT_FAILED`, a missing
+ * executable included: with a `cwd`, ENOENT also means the folder is missing.
+ */
 export async function git(args: string[], { cwd, env }: GitOptions = {}): Promise<string> {
   try {
     const { stdout } = await execFileAsync('git', args, { cwd, env });
     return stdout;
   } catch (error) {
     const failure = error as NodeJS.ErrnoException & { stderr?: string };
-    if (failure.code === 'ENOENT') throw new WorkspaceError('GIT_MISSING', 'git is not installed');
-    throw new WorkspaceError('GIT_FAILED', `git ${args.join(' ')} failed: ${failure.stderr?.trim() || failure.message}`);
+    throw new WorkspaceError(
+      'GIT_FAILED',
+      `git ${args.join(' ')} failed: ${failure.stderr?.trim() || failure.message}`,
+      { cause: failure },
+    );
   }
 }
 
@@ -56,7 +62,15 @@ export async function succeeds(args: string[], options: GitOptions = {}): Promis
 
 /** Rejects with `GIT_MISSING` or `GIT_TOO_OLD` unless the git on `PATH` is 2.36 or later. */
 export async function checkGit(env?: NodeJS.ProcessEnv): Promise<void> {
-  const output = await git(['--version'], { env });
+  let output: string;
+  try {
+    output = await git(['--version'], { env });
+  } catch (error) {
+    // Without a `cwd`, ENOENT can only be the missing executable.
+    const cause = (error as WorkspaceError).cause as NodeJS.ErrnoException;
+    if (cause.code === 'ENOENT') throw new WorkspaceError('GIT_MISSING', 'git is not installed', { cause });
+    throw error;
+  }
   const match = /(\d+)\.(\d+)/.exec(output);
   if (!match) throw new WorkspaceError('GIT_FAILED', `unrecognised git version: ${output.trim()}`);
   const major = Number(match[1]);
