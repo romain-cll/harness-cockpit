@@ -18,6 +18,11 @@ const api: Api = {
     onData: (listener) => subscribe('pty:data', listener),
     onExit: (listener) => subscribe('pty:exit', listener),
   },
+  projects: {
+    list: () => ipcRenderer.invoke('projects:list'),
+    add: () => ipcRenderer.invoke('projects:add'),
+    remove: (path) => ipcRenderer.invoke('projects:remove', path),
+  },
   getShellPath: () => ipcRenderer.invoke('get-shell-path'),
 };
 

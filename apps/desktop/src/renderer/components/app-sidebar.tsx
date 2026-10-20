@@ -1,7 +1,9 @@
 import { Link } from '@tanstack/react-router';
 import { HouseIcon, SquareTerminalIcon } from 'lucide-react';
+import type { Project } from '../../shared/api';
+import { Projects } from '@/components/projects';
 
-export function AppSidebar({ version }: { version: string }) {
+export function AppSidebar({ version, projects }: { version: string; projects: Project[] }) {
   return (
     <aside className="flex w-64 shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground select-none">
       {/* Draggable strip; on macOS it holds the window controls. */}
@@ -22,6 +24,7 @@ export function AppSidebar({ version }: { version: string }) {
           Terminal
         </Link>
       </nav>
+      <Projects projects={projects} />
       <footer className="mt-auto px-4 py-3 text-xs text-muted-foreground">Cockpit {version}</footer>
     </aside>
   );

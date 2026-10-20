@@ -10,6 +10,18 @@ export type { PtyExit };
  */
 export type PtySpawnRequest = Pick<PtySpawnOptions, 'cols' | 'rows'> & Partial<PtySpawnOptions>;
 
+/** A git repository the user added; `path` is its root, `name` its basename. */
+export interface Project {
+  path: string;
+  name: string;
+}
+
+/** What adding a project came to; `refused` carries the message to show the user. */
+export type AddProjectResult =
+  | { status: 'added'; project: Project }
+  | { status: 'cancelled' }
+  | { status: 'refused'; message: string };
+
 /**
  * The only surface the renderer may use to reach the main process, exposed by
  * the preload script on `window.api`. A web build would implement the same
@@ -28,6 +40,14 @@ export interface Api {
     /** Each listener registration returns its unsubscribe function. */
     onData(listener: (id: number, data: string) => void): () => void;
     onExit(listener: (id: number, exit: PtyExit) => void): () => void;
+  };
+  /** Git repositories the user works in, kept in the app state. */
+  projects: {
+    list(): Promise<Project[]>;
+    /** Opens the folder picker, then adds the repository that holds the folder. */
+    add(): Promise<AddProjectResult>;
+    /** Forgets the project; its files stay on disk. */
+    remove(path: string): Promise<void>;
   };
   /** The `PATH` of the user's login shell, the only part of its environment the renderer sees. */
   getShellPath(): Promise<string>;
