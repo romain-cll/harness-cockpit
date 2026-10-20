@@ -1,4 +1,5 @@
 import { statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { extname, isAbsolute, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createPtyClient, type PtySpawnOptions } from '@cockpit/pty';
@@ -15,6 +16,7 @@ import {
   type IpcMainEvent,
   type WebContents,
 } from 'electron';
+import type { PtySpawnRequest } from '../shared/api';
 import ptyHostPath from './pty-host?modulePath';
 import { shellEnv } from './shell-env';
 
@@ -117,15 +119,29 @@ function isFromApp({ senderFrame }: Pick<IpcMainEvent, 'senderFrame'>): boolean 
   return senderFrame !== null && originOf(senderFrame.url) === appOrigin;
 }
 
+// Fills in what a spawn request leaves out: the user's login-shell environment
+// and the shell it names, run as a login shell as Terminal.app does, in the home
+// directory. Options the renderer passes win.
+async function withSpawnDefaults(request: PtySpawnRequest): Promise<PtySpawnOptions> {
+  const env = await shellEnv;
+  return {
+    command: env.SHELL ?? '/bin/zsh',
+    args: ['-l'],
+    cwd: homedir(),
+    env: { ...env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
+    ...request,
+  };
+}
+
 // Terminals live in a utility process, so a pty crash does not take the app down.
 function startPty(): void {
   const pty = createPtyClient(utilityProcess.fork(ptyHostPath, [], { serviceName: 'Cockpit Pty Host' }));
   // The window that spawned a session is the one that receives its output.
   const owners = new Map<number, WebContents>();
 
-  ipcMain.handle('pty:spawn', async (event, options: PtySpawnOptions) => {
+  ipcMain.handle('pty:spawn', async (event, request: PtySpawnRequest) => {
     if (!isFromApp(event)) throw new Error('pty:spawn refused: unexpected origin');
-    const id = await pty.spawn(options);
+    const id = await pty.spawn(await withSpawnDefaults(request));
     owners.set(id, event.sender);
     return id;
   });
@@ -147,6 +163,19 @@ function startPty(): void {
     const owner = owners.get(id);
     owners.delete(id);
     if (owner && !owner.isDestroyed()) owner.send('pty:exit', id, exit);
+  });
+
+  // A page's shells end with it: when its main frame loads another document
+  // (a reload included) or the page is destroyed. Route changes inside the app
+  // are same-document navigations and kill nothing.
+  const killSessionsOf = (contents: WebContents) => {
+    for (const [id, owner] of owners) if (owner === contents) pty.kill(id);
+  };
+  app.on('web-contents-created', (_event, contents) => {
+    contents.on('did-start-navigation', (details) => {
+      if (details.isMainFrame && !details.isSameDocument) killSessionsOf(contents);
+    });
+    contents.on('destroyed', () => killSessionsOf(contents));
   });
 }
 
