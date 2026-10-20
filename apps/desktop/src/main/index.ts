@@ -164,13 +164,18 @@ app.on('window-all-closed', () => {
 // Never `await` this at the top level: Electron emits `ready` only once this
 // ES module has finished evaluating, so the app would wait forever.
 void app.whenReady().then(() => {
+  const userData = app.getPath('userData');
   try {
-    loadState(app.getPath('userData'));
+    loadState(userData);
   } catch (error) {
-    if (!(error instanceof NewerStateError)) throw error;
-    // The file is left as it is: quit without opening a window.
-    console.error(error.message);
-    if (!background) dialog.showErrorBox('Cockpit cannot start', error.message);
+    // The file is left as it is: quit without opening a window. A file that
+    // cannot be read (a folder, no permission) quits the same way.
+    const message =
+      error instanceof NewerStateError
+        ? error.message
+        : `Cockpit cannot read its data (${join(userData, 'state.json')}): ${error instanceof Error ? error.message : String(error)}`;
+    console.error(message);
+    if (!background) dialog.showErrorBox('Cockpit cannot start', message);
     app.exit(1);
     return;
   }
