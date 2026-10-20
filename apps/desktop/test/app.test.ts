@@ -2,7 +2,7 @@ import { execFile, execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createServer, type AddressInfo } from 'node:net';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
@@ -90,10 +90,14 @@ function launchBuilt(): Promise<Session> {
   return launchElectron({ executablePath, args: ['.'], cwd: appDir }, true);
 }
 
-function launchPackaged({ background = true } = {}): Promise<ElectronSession> {
+function packagedAppDir(): string {
   if (process.platform !== 'darwin') throw new Error(`No packaged app path for ${process.platform}`);
   const releaseDir = process.arch === 'arm64' ? 'mac-arm64' : 'mac';
-  const executablePath = join(appDir, 'release', releaseDir, 'Cockpit.app/Contents/MacOS/Cockpit');
+  return join(appDir, 'release', releaseDir, 'Cockpit.app');
+}
+
+function launchPackaged({ background = true } = {}): Promise<ElectronSession> {
+  const executablePath = join(packagedAppDir(), 'Contents/MacOS/Cockpit');
   return launchElectron({ executablePath }, background);
 }
 
@@ -212,11 +216,101 @@ async function poll<T>(read: () => T | Promise<T>, done: (value: T) => boolean, 
   }
 }
 
+// What `window.api.pty` must look like. Declared here, not imported, because
+// the test project does not include the app sources.
+interface PtySpawnOptions {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+  cols: number;
+  rows: number;
+}
+interface PtyExit {
+  exitCode: number | null;
+  signal: number | null;
+}
+interface PtyApi {
+  spawn(options: PtySpawnOptions): Promise<number>;
+  write(id: number, data: string): void;
+  resize(id: number, cols: number, rows: number): void;
+  kill(id: number): void;
+  onData(listener: (id: number, data: string) => void): () => void;
+  onExit(listener: (id: number, exit: PtyExit) => void): () => void;
+}
+/** What the renderer collected from `onData` and `onExit`, per session id. */
+interface PtyLog {
+  data: Record<number, string>;
+  exits: Record<number, PtyExit[]>;
+}
+type PtyWindow = Window & { api: { pty: PtyApi }; __ptyLog?: PtyLog };
+
+const shellOptions: PtySpawnOptions = {
+  command: '/bin/sh',
+  args: [],
+  cwd: homedir(),
+  env: { PATH: '/usr/bin:/bin', TERM: 'xterm-256color' },
+  cols: 80,
+  rows: 24,
+};
+
+// Spawns a shell through `window.api.pty` from the renderer. The listeners are
+// registered before the spawn, once per page load, so no output is missed.
+function spawnShell(page: Page): Promise<number> {
+  return page.evaluate((options) => {
+    const w = window as unknown as PtyWindow;
+    if (!w.api.pty) throw new Error('window.api.pty is not exposed');
+    if (!w.__ptyLog) {
+      const log: PtyLog = { data: {}, exits: {} };
+      w.api.pty.onData((id, data) => {
+        log.data[id] = (log.data[id] ?? '') + data;
+      });
+      w.api.pty.onExit((id, exit) => {
+        (log.exits[id] ??= []).push(exit);
+      });
+      w.__ptyLog = log;
+    }
+    return w.api.pty.spawn(options);
+  }, shellOptions);
+}
+
+const ptyWrite = (page: Page, id: number, data: string) =>
+  page.evaluate(([id, data]) => (window as unknown as PtyWindow).api.pty.write(id, data), [id, data] as const);
+
+const ptyResize = (page: Page, id: number, cols: number, rows: number) =>
+  page.evaluate(([id, cols, rows]) => (window as unknown as PtyWindow).api.pty.resize(id, cols, rows), [id, cols, rows] as const);
+
+const ptyKill = (page: Page, id: number) =>
+  page.evaluate((id) => (window as unknown as PtyWindow).api.pty.kill(id), id);
+
+// Waits until the output of the session contains `text`, or matches it when it
+// is a regular expression.
+const waitForOutput = (page: Page, id: number, text: string | RegExp) =>
+  page.waitForFunction(
+    ([id, source]) => new RegExp(source).test((window as unknown as PtyWindow).__ptyLog?.data[id] ?? ''),
+    [id, typeof text === 'string' ? text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : text.source] as const,
+    { timeout: 15_000 },
+  );
+
+const waitForExit = (page: Page, id: number) =>
+  page.waitForFunction((id) => ((window as unknown as PtyWindow).__ptyLog?.exits[id]?.length ?? 0) > 0, id, {
+    timeout: 15_000,
+  });
+
+const exitsOf = (page: Page, id: number) =>
+  page.evaluate((id) => (window as unknown as PtyWindow).__ptyLog?.exits[id] ?? [], id);
+
+const outputOf = (page: Page, id: number) =>
+  page.evaluate((id) => (window as unknown as PtyWindow).__ptyLog?.data[id] ?? '', id);
+
+const consoleErrorsOf = async (page: Page) =>
+  (await page.consoleMessages()).filter((m) => m.type() === 'error').map((m) => m.text());
+
 describe.each([
   ['dev server', launchDev],
   ['built app', launchBuilt],
   ['packaged app', launchPackaged],
-])('%s', (_name, launch) => {
+])('%s', (mode, launch) => {
   let session: Session;
   let front: ReturnType<typeof watchFrontmost>;
 
@@ -288,15 +382,113 @@ describe.each([
     expect(files).not.toEqual([]);
   });
 
+  test('AC1 — spawns a shell through window.api.pty and receives its output', async () => {
+    const { page } = session;
+    const id = await spawnShell(page);
+    expect(typeof id).toBe('number');
+
+    await ptyWrite(page, id, 'echo cockpit-$((6*7))\n');
+    await waitForOutput(page, id, 'cockpit-42');
+
+    await ptyKill(page, id);
+  });
+
+  test('AC2 — resizes the pty', async () => {
+    const { page } = session;
+    const id = await spawnShell(page);
+
+    await ptyResize(page, id, 100, 30);
+    await ptyWrite(page, id, 'stty size\n');
+    await waitForOutput(page, id, '30 100');
+
+    await ptyKill(page, id);
+  });
+
+  test('AC3 — kill ends the session with a single exit, and later calls on it do nothing', async () => {
+    const { page } = session;
+    const id = await spawnShell(page);
+
+    await ptyKill(page, id);
+    await waitForExit(page, id);
+
+    const thrown = await page.evaluate((id) => {
+      try {
+        const { pty } = (window as unknown as PtyWindow).api;
+        pty.write(id, 'echo late\n');
+        pty.resize(id, 120, 40);
+        pty.kill(id);
+        return null;
+      } catch (error) {
+        return String(error);
+      }
+    }, id);
+    expect(thrown).toBeNull();
+
+    await sleep(500);
+    expect(await exitsOf(page, id)).toHaveLength(1);
+    expect(await consoleErrorsOf(page)).toEqual([]);
+  });
+
+  // node-pty is N-API: electron-builder must ship its prebuilds as they are
+  // (`npmRebuild: false`), not compile it in place.
+  test.runIf(mode === 'packaged app')('ships the node-pty prebuilds, not a rebuilt copy', () => {
+    const nodePty = join(packagedAppDir(), 'Contents/Resources/app.asar.unpacked/node_modules/node-pty');
+    expect(existsSync(join(nodePty, 'prebuilds'))).toBe(true);
+    expect(existsSync(join(nodePty, 'build'))).toBe(false);
+  });
+
   test('logs no error and keeps running', async () => {
     const { page } = session;
-    const consoleErrors = (await page.consoleMessages()).filter((m) => m.type() === 'error').map((m) => m.text());
-    expect(consoleErrors).toEqual([]);
+    expect(await consoleErrorsOf(page)).toEqual([]);
     expect(await page.pageErrors()).toEqual([]);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
     expect(session.isRunning()).toBe(true);
     // Still never the frontmost app, after every check above.
     expect(front.pids.has(session.pid)).toBe(false);
+  });
+
+  // Kills the pty host, so it stays the last test that needs a working one.
+  test('AC4 — survives the pty host being killed, and reports the open session as exited', async () => {
+    const { page } = session;
+    const id = await spawnShell(page);
+    await ptyWrite(page, id, 'echo ppid-$PPID\n');
+    await waitForOutput(page, id, /ppid-\d+/);
+    const hostPid = Number(/ppid-(\d+)/.exec(await outputOf(page, id))![1]);
+
+    // The host is a process of its own, not the main process.
+    expect(hostPid).not.toBe(session.pid);
+
+    process.kill(hostPid, 'SIGKILL');
+
+    await waitForExit(page, id);
+    expect(await exitsOf(page, id)).toEqual([{ exitCode: null, signal: null }]);
+    await page.getByText(versionLabel).waitFor();
+    await page.getByRole('heading', { name: 'Home' }).waitFor();
+    expect(session.isRunning()).toBe(true);
+    expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+    expect(await page.pageErrors()).toEqual([]);
+    expect(await consoleErrorsOf(page)).toEqual([]);
+  });
+
+  test('AC5 — spawn rejects once the pty host is dead, and the host is not restarted', async () => {
+    const { page } = session;
+    const attempt = () =>
+      page.evaluate(async (options) => {
+        try {
+          await (window as unknown as PtyWindow).api.pty.spawn(options);
+          return null;
+        } catch (error) {
+          return error instanceof Error ? error.message : String(error);
+        }
+      }, shellOptions);
+
+    expect(await attempt()).toContain('pty host is not running');
+    // Still rejected after a while: nothing restarted the host.
+    await sleep(2_000);
+    expect(await attempt()).toContain('pty host is not running');
+    expect(session.isRunning()).toBe(true);
+    expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+    expect(await consoleErrorsOf(page)).toEqual([]);
   });
 });
 
