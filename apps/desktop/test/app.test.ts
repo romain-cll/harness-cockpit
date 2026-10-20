@@ -381,6 +381,14 @@ const outputOf = (page: Page, id: number) =>
 const consoleErrorsOf = async (page: Page) =>
   (await page.consoleMessages()).filter((m) => m.type() === 'error').map((m) => m.text());
 
+// By default Playwright returns only what came after the last new-document
+// navigation (a reload included). These read everything since the page was
+// attached (or since the last clear), so a message logged before a reload counts.
+const allConsoleErrorsOf = async (page: Page) =>
+  (await page.consoleMessages({ filter: 'all' })).filter((m) => m.type() === 'error').map((m) => m.text());
+
+const allPageErrorsOf = (page: Page) => page.pageErrors({ filter: 'all' });
+
 // --- Terminal page helpers ---------------------------------------------------
 
 const UI_TIMEOUT = 10_000;
@@ -902,8 +910,8 @@ describe.each([
 
   test('logs no error and keeps running', async () => {
     const { page } = session;
-    expect(await consoleErrorsOf(page)).toEqual([]);
-    expect(await page.pageErrors()).toEqual([]);
+    expect(await allConsoleErrorsOf(page)).toEqual([]);
+    expect(await allPageErrorsOf(page)).toEqual([]);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
     expect(session.isRunning()).toBe(true);
     // Still never the frontmost app, after every check above.
@@ -980,9 +988,9 @@ describe.each([
 
     test('navigation AC5 — those attempts log no console error but Chromium refusing the file:// URL, no page error and no main-process error', async () => {
       const { page } = session;
-      const errors = await consoleErrorsOf(page);
+      const errors = await allConsoleErrorsOf(page);
       expect(errors.filter((text) => !CHROMIUM_LOCAL_RESOURCE.test(text))).toEqual([]);
-      expect(await page.pageErrors()).toEqual([]);
+      expect(await allPageErrorsOf(page)).toEqual([]);
       expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
       expect(session.isRunning()).toBe(true);
     });
