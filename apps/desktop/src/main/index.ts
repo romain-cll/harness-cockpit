@@ -2,9 +2,11 @@ import { statSync } from 'node:fs';
 import { extname, isAbsolute, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createPtyClient, type PtySpawnOptions } from '@cockpit/pty';
+import { loadState, NewerStateError } from '@cockpit/state';
 import {
   app,
   BrowserWindow,
+  dialog,
   ipcMain,
   net,
   protocol,
@@ -162,6 +164,17 @@ app.on('window-all-closed', () => {
 // Never `await` this at the top level: Electron emits `ready` only once this
 // ES module has finished evaluating, so the app would wait forever.
 void app.whenReady().then(() => {
+  try {
+    loadState(app.getPath('userData'));
+  } catch (error) {
+    if (!(error instanceof NewerStateError)) throw error;
+    // The file is left as it is: quit without opening a window.
+    console.error(error.message);
+    if (!background) dialog.showErrorBox('Cockpit cannot start', error.message);
+    app.exit(1);
+    return;
+  }
+
   protocol.handle('app', serveRenderer);
   ipcMain.handle('get-version', () => app.getVersion());
   // The renderer gets the PATH only: the environment may hold tokens.
