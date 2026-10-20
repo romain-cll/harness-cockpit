@@ -1,5 +1,5 @@
 import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createServer, type AddressInfo } from 'node:net';
 import { homedir, tmpdir, userInfo } from 'node:os';
@@ -1527,6 +1527,63 @@ describe('packaged app state file', () => {
     expect(readdirSync(file)).toEqual([]);
     expect(readdirSync(dataDir).filter((name) => name.startsWith('state.json'))).toEqual(['state.json']);
     expect(windowTracesIn(dataDir)).toEqual([]);
+  });
+});
+
+// A login shell that prints an environment whose PATH holds no git. A real
+// `/bin/sh -l` would source `/etc/profile`, whose `path_helper` puts `/usr/bin`
+// back, so the fake shell sets the PATH of the shell that prints the environment
+// itself (`$2` is the command `resolveShellEnv` asks for: `env -0`, by absolute
+// path, between two printf markers).
+function makeShellWithoutGit(dir: string): string {
+  const empty = join(dir, 'empty-bin');
+  mkdirSync(empty);
+  const shell = join(dir, 'shell-without-git');
+  writeFileSync(shell, `#!/bin/sh\n[ "$1" = --warmup ] && exit 0\nPATH='${empty}' /bin/sh -c "$2"\n`);
+  chmodSync(shell, 0o755);
+  // macOS scans a new executable the first time it runs.
+  execFileSync(shell, ['--warmup']);
+  // The premise of the test: no git on the PATH this shell prints.
+  const printed = execFileSync(shell, ['-ilc', 'printf %s "$PATH"'], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
+  expect(printed).toBe(empty);
+  return shell;
+}
+
+describe('built app with no git on the login shell PATH', () => {
+  let folder: string;
+  let repo: TempRepo;
+  let session: Session;
+
+  beforeAll(async () => {
+    folder = mkdtempSync(join(tmpdir(), 'cockpit-fake-shell-'));
+    repo = makeRepo('no-git-project');
+    const executablePath: string = createRequire(import.meta.url)('electron');
+    session = await launchSpawned(executablePath, ['.'], true, undefined, {
+      ...process.env,
+      SHELL: makeShellWithoutGit(folder),
+    });
+  });
+
+  afterAll(async () => {
+    await session?.close();
+    rmSync(folder, { recursive: true, force: true });
+    if (repo) rmSync(repo.parent, { recursive: true, force: true });
+  });
+
+  test('AC12 — adding a repository is refused with "git is not installed", no entry, and state.json untouched', async () => {
+    const { page } = session;
+    await page.getByText(versionLabel).waitFor();
+    const before = stateSnapshot(session.dataDir);
+
+    await addProject(session, repo.root);
+    await waitForLine(page, 'git is not installed');
+    await sleep(300);
+
+    expect(await entryTitles(page)).toEqual([]);
+    expect(await isBelowProjectsHeader(page, { text: 'git is not installed' })).toBe(true);
+    expect(stateSnapshot(session.dataDir)).toEqual(before);
+    expect(projectsInState(session.dataDir) ?? []).toEqual([]);
+    expect(existsSync(join(session.dataDir, 'state.json.tmp'))).toBe(false);
   });
 });
 
