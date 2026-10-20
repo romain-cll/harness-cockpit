@@ -2,17 +2,19 @@ import { execFile, execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createServer, type AddressInfo } from 'node:net';
-import { homedir, tmpdir } from 'node:os';
+import { homedir, tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { _electron, chromium, type ElectronApplication, type Page } from 'playwright-core';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 
-// Launches the app the three ways it runs: the dev server, the built app and
-// the packaged app, and checks each one starts, renders, logs no error, stays
-// in the background and writes its data in its own folder. In CI only, it also
-// launches the packaged app without the background switch.
+// Launches the app the four ways it runs: the dev server, the built app, the
+// packaged app and the packaged app with the minimal environment launchd gives
+// an app opened from the Finder or the Dock, and checks each one starts,
+// renders, logs no error, stays in the background and writes its data in its
+// own folder. In CI only, it also launches the packaged app without the
+// background switch.
 
 const appDir = join(import.meta.dirname, '..');
 const { version } = JSON.parse(readFileSync(join(appDir, 'package.json'), 'utf8')) as { version: string };
@@ -42,10 +44,11 @@ interface ElectronSession extends Session {
 // Every launch gets a fresh data folder, so no launch touches the data of
 // another one or of the Cockpit the developer has open. The background switch
 // keeps the app out of the Dock and out of the way: it never shows a window nor
-// takes the focus. Playwright's `env` replaces the environment, hence the spread.
-function launchEnv(background: boolean) {
+// takes the focus. Playwright's `env` replaces the environment, hence the spread
+// of `base`, the test runner's environment unless the launch gives another one.
+function launchEnv(background: boolean, base: NodeJS.ProcessEnv = process.env) {
   const dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
-  const env = { ...process.env, COCKPIT_USER_DATA_DIR: dataDir } as Record<string, string>;
+  const env = { ...base, COCKPIT_USER_DATA_DIR: dataDir } as Record<string, string>;
   if (background) env.COCKPIT_TEST_BACKGROUND = '1';
   else delete env.COCKPIT_TEST_BACKGROUND;
   return { dataDir, env };
@@ -73,8 +76,9 @@ async function fromElectronApp(app: ElectronApplication, dataDir: string): Promi
 async function launchElectron(
   options: Parameters<typeof _electron.launch>[0],
   background: boolean,
+  base?: NodeJS.ProcessEnv,
 ): Promise<ElectronSession> {
-  const { dataDir, env } = launchEnv(background);
+  const { dataDir, env } = launchEnv(background, base);
   try {
     return await fromElectronApp(await _electron.launch({ ...options, env }), dataDir);
   } catch (error) {
@@ -96,10 +100,37 @@ function packagedAppDir(): string {
   return join(appDir, 'release', releaseDir, 'Cockpit.app');
 }
 
-function launchPackaged({ background = true } = {}): Promise<ElectronSession> {
+function launchPackaged({ background = true, env }: { background?: boolean; env?: NodeJS.ProcessEnv } = {}): Promise<ElectronSession> {
   const executablePath = join(packagedAppDir(), 'Contents/MacOS/Cockpit');
-  return launchElectron({ executablePath }, background);
+  return launchElectron({ executablePath }, background, env);
 }
+
+// What the page sees of the main process's `Api.getShellPath`.
+const getShellPath = (page: Page) =>
+  page.evaluate(() => (globalThis as unknown as { api: { getShellPath(): Promise<string> } }).api.getShellPath());
+
+// The PATH launchd gives an app started from the Finder or the Dock.
+const LAUNCHD_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+
+// The environment launchd gives an app started from the Finder or the Dock,
+// minus the few variables it adds that no startup file is expected to need.
+const LAUNCHD_ENV: Record<string, string> = (() => {
+  const { shell, username } = userInfo();
+  if (!shell) throw new Error('The current user has no login shell');
+  return {
+    HOME: homedir(),
+    USER: username,
+    LOGNAME: username,
+    SHELL: shell,
+    TMPDIR: process.env.TMPDIR ?? '/tmp',
+    PATH: LAUNCHD_PATH,
+  };
+})();
+
+// Every shell gets its own `fnm_multishells/<id>` directory in its PATH.
+const normalizeFnm = (path: string) => path.replace(/fnm_multishells\/[^/:]+/g, 'fnm_multishells/<id>');
+
+const launchLaunchd = () => launchPackaged({ env: LAUNCHD_ENV });
 
 function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -310,6 +341,7 @@ describe.each([
   ['dev server', launchDev],
   ['built app', launchBuilt],
   ['packaged app', launchPackaged],
+  ['packaged app with the launchd environment', launchLaunchd],
 ])('%s', (mode, launch) => {
   let session: Session;
   let front: ReturnType<typeof watchFrontmost>;
@@ -436,6 +468,38 @@ describe.each([
     expect(existsSync(join(nodePty, 'prebuilds'))).toBe(true);
     expect(existsSync(join(nodePty, 'build'))).toBe(false);
   });
+
+  test('login shell: AC3 — gets the PATH of the login shell from the main process', async () => {
+    const { page } = session;
+    await page.getByText(versionLabel).waitFor();
+    const path = await getShellPath(page);
+    expect(typeof path).toBe('string');
+    expect(path).not.toBe('');
+  });
+
+  // The app is given the environment launchd gives an app opened from the
+  // Finder, so the same environment can be given to the login shell.
+  test.runIf(launch === launchLaunchd)(
+    'login shell: AC1 — gets exactly the PATH printed by the login shell, not the launchd PATH',
+    async () => {
+      const { page } = session;
+      await page.getByText(versionLabel).waitFor();
+      const expected = execFileSync(LAUNCHD_ENV.SHELL!, ['-ilc', 'printf %s "$PATH"'], {
+        cwd: homedir(),
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        // The same environment as the app's shell: launchd's plus the two test variables.
+        env: {
+          ...LAUNCHD_ENV,
+          COCKPIT_TEST_BACKGROUND: '1',
+          COCKPIT_USER_DATA_DIR: session.dataDir,
+        },
+      });
+      const path = await getShellPath(page);
+      expect(normalizeFnm(path)).toBe(normalizeFnm(expected));
+      expect(path).not.toBe(LAUNCHD_PATH);
+    },
+  );
 
   test('logs no error and keeps running', async () => {
     const { page } = session;

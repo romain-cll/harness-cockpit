@@ -19,4 +19,6 @@ export interface Api {
     onData(listener: (id: number, data: string) => void): () => void;
     onExit(listener: (id: number, exit: PtyExit) => void): () => void;
   };
+  /** The `PATH` of the user's login shell, the only part of its environment the renderer sees. */
+  getShellPath(): Promise<string>;
 }

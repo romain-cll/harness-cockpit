@@ -14,6 +14,7 @@ import {
   type WebContents,
 } from 'electron';
 import ptyHostPath from './pty-host?modulePath';
+import { shellEnv } from './shell-env';
 
 // The built renderer is served from a custom protocol rather than `file://`,
 // as the Electron security checklist recommends. It also gives the router
@@ -108,7 +109,7 @@ function originOf(url: string): string | undefined {
   }
 }
 
-// Only the app's own page may drive terminals.
+// Only the app's own page may drive terminals or read the shell PATH.
 function isFromApp({ senderFrame }: Pick<IpcMainEvent, 'senderFrame'>): boolean {
   const appOrigin = devServerUrl ? originOf(devServerUrl) : RENDERER_ORIGIN;
   return senderFrame !== null && originOf(senderFrame.url) === appOrigin;
@@ -163,6 +164,11 @@ app.on('window-all-closed', () => {
 void app.whenReady().then(() => {
   protocol.handle('app', serveRenderer);
   ipcMain.handle('get-version', () => app.getVersion());
+  // The renderer gets the PATH only: the environment may hold tokens.
+  ipcMain.handle('get-shell-path', async (event) => {
+    if (!isFromApp(event)) throw new Error('get-shell-path refused: unexpected origin');
+    return (await shellEnv).PATH ?? '';
+  });
   startPty();
 
   createWindow();

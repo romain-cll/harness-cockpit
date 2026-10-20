@@ -18,6 +18,7 @@
   },
   "devDependencies": {
     "@cockpit/pty": "workspace:*",
+    "@cockpit/shell-env": "workspace:*",
     "@tailwindcss/vite": "^4.3.3",
     "@tanstack/react-router": "^1.170.45",
     "@tanstack/router-plugin": "^1.168.47",
