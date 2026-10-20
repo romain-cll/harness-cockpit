@@ -23,7 +23,7 @@ Differentiators:
 - artifacts on storage you own;
 - usage statistics.
 
-The repository is built in steps. So far, the parts in scope are the **desktop app shell** (`apps/desktop`): a window, a router, a typed bridge to the main process, and the UI foundation (styling, light and dark themes, sidebar layout); and the **pty host** (`packages/pty`), which runs node-pty in a utility process and exposes it as `window.api.pty`; the **login-shell environment** (`packages/shell-env`), which the main process resolves at startup for the child processes it will spawn; the **state store** (`packages/state`), which keeps the app state in a JSON file; and the **workspaces package** (`packages/workspaces`), which creates, lists and removes git worktrees. The only product UI is the **terminal page** (`/terminal`): xterm.js connected to a shell through `window.api.pty`.
+The repository is built in steps. So far, the parts in scope are the **desktop app shell** (`apps/desktop`): a window, a router, a typed bridge to the main process, and the UI foundation (styling, light and dark themes, sidebar layout); and the **pty host** (`packages/pty`), which runs node-pty in a utility process and exposes it as `window.api.pty`; the **login-shell environment** (`packages/shell-env`), which the main process resolves at startup for the child processes it will spawn; the **state store** (`packages/state`), which keeps the app state in a JSON file; the **workspaces package** (`packages/workspaces`), which creates, lists and removes git worktrees; and the **harnesses package** (`packages/harnesses`), which catalogues the agent CLIs and detects which are installed. The only product UI is the **terminal page** (`/terminal`): xterm.js connected to a shell through `window.api.pty`.
 
 Daemon, artifacts, stats, cloud backend, web app, mobile: create none of these without an explicit request.
 
@@ -46,6 +46,7 @@ packages/
   shell-env/         # resolves the environment of the user's login shell
   state/             # app state kept in a JSON file in userData
   workspaces/        # git worktrees: find a repository's root, create, list, remove
+  harnesses/         # agent CLIs: catalogue (start, resume, session stores) and detection
 ```
 
 - No other app (daemon, web, cloud) without an explicit request.
@@ -146,6 +147,26 @@ Pure Node, consumed as TS source like `packages/pty`, with no `electron` import 
 - **Layout**: `<root>/<project>-<hash>/<branch>`, where `<project>` is the basename of the main working tree and `<hash>` the first 8 hex characters of the SHA-256 of its path (deterministic, stateless, no collision between two repositories with the same name). A branch with a slash nests (`feature/login`). The root is a parameter: choosing the real one is the app's job.
 - **No force option on removal.** A dirty worktree is refused (`DIRTY_WORKTREE`), and a branch is deleted only with `git branch -d`: unmerged, squash-merged included, gives `BRANCH_NOT_MERGED`, with the worktree removed and the branch kept. Forcing comes with a caller that asks the user to confirm. `createWorktree` does use `git worktree remove --force` and `git branch -D`, but only to roll back what the call itself created, so a failed creation leaves nothing behind (all-or-nothing).
 
+## Harnesses (`packages/harnesses`)
+
+Pure Node, consumed as TS source like `packages/workspaces`, with no `electron` import (a test checks it) and no runtime dependency. Nothing is wired into `apps/desktop` yet (sessions come with COCKPIT-25).
+
+- **API**:
+  - `harnesses`: the catalogue, three `Harness` entries in this order: `claude-code`, `codex`, `opencode`. Each has `id`, `name`, `binary`, `start(prompt?)` (interactive, in the spawn's cwd), `continueLast`, `resume(sessionId)` (argv arrays) and `sessions(env)`, which gives the location and format (`jsonl` or `sqlite`) of the harness's session store, honouring `HOME` and the relocation variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`; an empty one counts as unset). It reads nothing.
+  - `detectHarnesses(env, { timeoutMs })` (default 10 000 ms): serializable `{ id, path, version }` records, in catalogue order, so they can cross IPC.
+- **Only verified harnesses are listed.** Verified means official docs, the CLI's own `--help` or output, or the official open source code at a release tag. Each fact carries its source as a comment in `src/catalogue.ts`. Checked on 2026-10-20 against Claude Code 2.1.304, Codex 0.163.0 and OpenCode 2.0.31. These CLIs release weekly and the tests use stubs, so nothing catches a renamed flag: re-check the sources when updating an entry.
+  - Codex's session path comes from its source, not its docs.
+  - OpenCode's docs still describe the 1.x storage; the 2.x path rests on `opencode debug paths`.
+- **Left out (COCKPIT-43)**, for what was missing:
+  - **Cursor CLI**: session storage is not documented and the CLI is closed source; the path was only found in the shipped binary. Its binary is now `agent`, with `cursor-agent` kept as a legacy alias.
+  - **Kimi**: the legacy `kimi-cli` is archived and its `kimi` no longer runs an agent. Its successor Kimi Code CLI installs the same `kimi` binary but cannot take an initial prompt in interactive mode; detection would also have to tell the two apart.
+  - **Mistral Vibe**: left out by decision. 3.0 (Rust rewrite) shipped on 2026-10-19 and its session store layout is only in the source.
+- **Detection rules**:
+  - The package walks `env.PATH` itself: the first executable regular file named after the binary wins (symlinks followed). Empty and relative entries are skipped, as are directories and non-executable files.
+  - It runs `<path> --version` with the given `env`, in its own process group, all harnesses in parallel. Exit 0 means installed, with the first `x.y.z` (optionally with a pre-release suffix) of stdout as `version`, or `null` when there is none.
+  - A non-zero exit, a signal, a spawn failure or a timeout means not detected. On timeout the whole group gets `SIGKILL` and detection settles without waiting for `close`, as a background child can hold stdout open. It never rejects.
+- Out of scope: combining an initial prompt with a resume, prompts that start with `-` (passed as is, not verified), minimum versions, `--version` caching, non-macOS paths.
+
 ## Tests and validation
 
 - **CI** (`.github/workflows/ci.yml`): on every pull request and every push to `main`, one macOS job runs `bun turbo run build typecheck lint test`. macOS because the desktop app is packaged for macOS and its tests open windows. The repository is public, so GitHub-hosted runners cost nothing.
@@ -155,3 +176,4 @@ Pure Node, consumed as TS source like `packages/pty`, with no `electron` import 
 - `packages/shell-env` (vitest, plain Node): `resolveShellEnv` against fake shells (startup noise, multi-line values, timeout, missing or failing shell, no passwd entry and no shell found, an unreadable home directory, a background process holding stdout, injected and removed variables).
 - `packages/state` (vitest, plain Node): `loadState` on a fresh folder per case: missing file and folder, read back without a rewrite, each corrupted shape set aside, newer version, unreadable file (`EISDIR` for a folder, `EACCES` for a file without read permission, nothing renamed, created or removed), leftover `.tmp`.
 - `packages/workspaces` (vitest, plain Node): the four functions against the real git, on temporary repositories and roots under `os.tmpdir()`, with an env that ignores the user's git config.
+- `packages/harnesses` (vitest, plain Node): the catalogue's exact values (ids, argv, session stores with and without the relocation variables), and `detectHarnesses` against `#!/bin/sh` stubs in temporary folders (versions, `PATH` lookup rules, a failing `--version`, a stub that never exits with a background child holding stdout, no version printed, the env passed to the stub, an unrunnable file). No real CLI is run.
