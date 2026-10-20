@@ -613,47 +613,24 @@ interface QuickRun {
   exit: { code: number | null; signal: NodeJS.Signals | null } | 'timeout';
   /** Everything the app wrote to stderr. */
   stderr: string;
-  /** Ids of the `page` targets Chromium reported, whenever they were created. */
-  pageTargets: string[];
 }
 
 // Starts the packaged app on a data folder it must refuse, and waits for it to
-// exit. The app quits before any window, so there is no page to attach to:
-// instead the run watches the browser's targets over CDP, to prove that no
-// window was opened. The debugging port is read from Chromium's first stderr
-// line and the watch starts on that very chunk, as early as the test can, since
-// the app may exit a few milliseconds later. A refused connection or a closed
-// socket means the app is already gone, not an error. Targets that already exist
-// when the watch starts are reported too (`Target.setDiscoverTargets`).
+// exit. The app quits before any window, so there is no page to attach to, and
+// no debugging port either: "opens no window" is proven by the traces a window
+// leaves in the data folder (`windowTracesIn`), not by watching the browser,
+// which the app can outrun (it creates a window and exits within one task).
 async function runUntilExit(dataDir: string): Promise<QuickRun> {
   const { env } = launchEnv(true, dataDir);
   // Its own process group, so a hung run leaves no Electron helper behind.
-  const child = spawn(join(packagedAppDir(), 'Contents/MacOS/Cockpit'), ['--remote-debugging-port=0'], {
+  const child = spawn(join(packagedAppDir(), 'Contents/MacOS/Cockpit'), [], {
     env,
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stderr = '';
-  const pageTargets: string[] = [];
-  let socket: WebSocket | undefined;
   child.stdout.on('data', () => {});
-  child.stderr.on('data', (chunk) => {
-    stderr += chunk;
-    const endpoint = !socket && /DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/\S+)/.exec(stderr)?.[1];
-    if (!endpoint) return;
-    socket = new WebSocket(endpoint);
-    socket.onopen = () =>
-      socket!.send(JSON.stringify({ id: 1, method: 'Target.setDiscoverTargets', params: { discover: true } }));
-    socket.onmessage = ({ data }) => {
-      const message = JSON.parse(String(data)) as {
-        method?: string;
-        params?: { targetInfo?: { targetId: string; type: string } };
-      };
-      const info = message.params?.targetInfo;
-      if (message.method === 'Target.targetCreated' && info?.type === 'page') pageTargets.push(info.targetId);
-    };
-    socket.onerror = () => {};
-  });
+  child.stderr.on('data', (chunk) => (stderr += chunk));
 
   const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
     child.once('exit', (code, signal) => resolve({ code, signal })),
@@ -663,15 +640,15 @@ async function runUntilExit(dataDir: string): Promise<QuickRun> {
   if (exit === 'timeout') await stopGroup(child);
   // Lets the last stderr chunks arrive after the exit.
   await sleep(200);
-  socket?.close();
-  return { exit, stderr, pageTargets };
+  return { exit, stderr };
 }
 
 // What Chromium writes into the data folder only once a window exists (its
 // profile: preferences, storage, caches). The app that quits before opening one
-// leaves none of it. The CDP watch above is a race, since the main process can
-// create a window and exit within one task, before any client is served; this
-// is the trace such a window leaves for certain.
+// leaves none of it. AC4 and AC8 check they are absent after the exit; the
+// guard in the restart test checks a normal start does create them, so an
+// Electron that stops writing them fails the guard instead of passing the
+// check silently.
 const WINDOW_TRACES = ['Preferences', 'Local Storage', 'Session Storage', 'Cache'];
 const windowTracesIn = (dir: string) => readdirSync(dir).filter((name) => WINDOW_TRACES.includes(name));
 
@@ -702,6 +679,11 @@ describe('packaged app state file', () => {
   test('AC2 — a second start leaves state.json unchanged and sets nothing aside', async () => {
     const first = await launchPackaged({ dataDir });
     await expectHomePageWithoutError(first);
+    // Guard for AC4 and AC8: a normal start leaves window traces (Chromium may
+    // write them shortly after the page shows), so their absence there means
+    // something.
+    const traces = await poll(() => windowTracesIn(dataDir), (found) => found.length > 0, 5_000);
+    expect(traces, 'a normal start leaves window traces in the data folder').not.toEqual([]);
     await first.close();
 
     const file = stateFileIn(dataDir);
@@ -751,7 +733,6 @@ describe('packaged app state file', () => {
     expect(readFileSync(file, 'utf8')).toBe(newer);
     expect(statSync(file).mtimeMs).toBe(mtimeMs);
     expect(readdirSync(dataDir).filter((name) => name.startsWith('state.json.'))).toEqual([]);
-    expect(run.pageTargets).toEqual([]);
     expect(windowTracesIn(dataDir)).toEqual([]);
   });
 
@@ -769,7 +750,6 @@ describe('packaged app state file', () => {
     expect(statSync(file).isDirectory()).toBe(true);
     expect(readdirSync(file)).toEqual([]);
     expect(readdirSync(dataDir).filter((name) => name.startsWith('state.json'))).toEqual(['state.json']);
-    expect(run.pageTargets).toEqual([]);
     expect(windowTracesIn(dataDir)).toEqual([]);
   });
 });
