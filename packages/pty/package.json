@@ -1,0 +1,22 @@
+{
+  "name": "@cockpit/pty",
+  "version": "0.0.0",
+  "private": true,
+  "description": "node-pty host (utility process side) and client (main process side)",
+  "type": "module",
+  "exports": {
+    ".": "./src/client.ts",
+    "./host": "./src/host.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "node-pty": "1.2.0-beta.15"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "vitest": "^5.0.5"
+  }
+}

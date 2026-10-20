@@ -1,13 +1,29 @@
 import { statSync } from 'node:fs';
 import { extname, isAbsolute, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { app, BrowserWindow, ipcMain, net, protocol, shell } from 'electron';
+import { createPtyClient, type PtySpawnOptions } from '@cockpit/pty';
+import {
+  app,
+  BrowserWindow,
+  ipcMain,
+  net,
+  protocol,
+  shell,
+  utilityProcess,
+  type IpcMainEvent,
+  type WebContents,
+} from 'electron';
+import ptyHostPath from './pty-host?modulePath';
 
 // The built renderer is served from a custom protocol rather than `file://`,
 // as the Electron security checklist recommends. It also gives the router
 // real URLs, as on the web.
 const RENDERER_ORIGIN = 'app://renderer';
 const rendererDir = join(import.meta.dirname, '../renderer');
+
+// Set by `electron-vite dev`. Ignored once packaged, so the environment cannot
+// point the app at another page.
+const devServerUrl = app.isPackaged ? undefined : process.env.ELECTRON_RENDERER_URL;
 
 // Test switches, read before `ready`. Unlike `ELECTRON_RENDERER_URL`, which is
 // ignored once packaged because it would change the code the app runs, they are
@@ -73,14 +89,62 @@ function createWindow(): void {
     return { action: 'deny' };
   });
 
-  // Set by `electron-vite dev`. Ignored once packaged, so the environment cannot
-  // point the app at another page.
-  const devServerUrl = process.env.ELECTRON_RENDERER_URL;
-  if (!app.isPackaged && devServerUrl) {
+  if (devServerUrl) {
     void window.loadURL(devServerUrl);
   } else {
     void window.loadURL(`${RENDERER_ORIGIN}/`);
   }
+}
+
+// `URL.origin` is "null" for a scheme Node does not know, such as `app:`, so the
+// origin is rebuilt from the protocol and host. An unparsable URL (empty while a
+// frame navigates) has none.
+function originOf(url: string): string | undefined {
+  try {
+    const { protocol, host } = new URL(url);
+    return `${protocol}//${host}`;
+  } catch {
+    return undefined;
+  }
+}
+
+// Only the app's own page may drive terminals.
+function isFromApp({ senderFrame }: Pick<IpcMainEvent, 'senderFrame'>): boolean {
+  const appOrigin = devServerUrl ? originOf(devServerUrl) : RENDERER_ORIGIN;
+  return senderFrame !== null && originOf(senderFrame.url) === appOrigin;
+}
+
+// Terminals live in a utility process, so a pty crash does not take the app down.
+function startPty(): void {
+  const pty = createPtyClient(utilityProcess.fork(ptyHostPath, [], { serviceName: 'Cockpit Pty Host' }));
+  // The window that spawned a session is the one that receives its output.
+  const owners = new Map<number, WebContents>();
+
+  ipcMain.handle('pty:spawn', async (event, options: PtySpawnOptions) => {
+    if (!isFromApp(event)) throw new Error('pty:spawn refused: unexpected origin');
+    const id = await pty.spawn(options);
+    owners.set(id, event.sender);
+    return id;
+  });
+  ipcMain.on('pty:write', (event, id: number, data: string) => {
+    if (isFromApp(event)) pty.write(id, data);
+  });
+  ipcMain.on('pty:resize', (event, id: number, cols: number, rows: number) => {
+    if (isFromApp(event)) pty.resize(id, cols, rows);
+  });
+  ipcMain.on('pty:kill', (event, id: number) => {
+    if (isFromApp(event)) pty.kill(id);
+  });
+
+  pty.onData((id, data) => {
+    const owner = owners.get(id);
+    if (owner && !owner.isDestroyed()) owner.send('pty:data', id, data);
+  });
+  pty.onExit((id, exit) => {
+    const owner = owners.get(id);
+    owners.delete(id);
+    if (owner && !owner.isDestroyed()) owner.send('pty:exit', id, exit);
+  });
 }
 
 // The app never navigates away from its own page.
@@ -99,6 +163,7 @@ app.on('window-all-closed', () => {
 void app.whenReady().then(() => {
   protocol.handle('app', serveRenderer);
   ipcMain.handle('get-version', () => app.getVersion());
+  startPty();
 
   createWindow();
 

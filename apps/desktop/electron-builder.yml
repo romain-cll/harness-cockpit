@@ -4,6 +4,12 @@ directories:
   output: release
 files:
   - dist/**
+# node-pty is N-API: its prebuilds load under Electron as they are. A rebuild
+# would compile it in place in the shared Bun store.
+npmRebuild: false
+# node-pty's `pty.node` and `spawn-helper` must sit outside the asar to run.
+asarUnpack:
+  - node_modules/node-pty/**
 mac:
   # Ad-hoc signed until a Developer ID certificate is set up for distribution.
   identity: '-'

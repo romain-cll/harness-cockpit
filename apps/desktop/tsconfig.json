@@ -1,7 +1,7 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "types": ["node"],
+    "types": ["node", "electron-vite/node"],
     // Read by the shadcn CLI to place components. The renderer has its own
     // tsconfig, and the main and preload builds do not resolve this alias.
     "paths": { "@/*": ["./src/renderer/*"] }
