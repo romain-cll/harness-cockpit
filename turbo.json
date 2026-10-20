@@ -11,7 +11,8 @@
     },
     "test": {
       "dependsOn": ["build"],
-      "env": ["CI"]
+      "env": ["CI"],
+      "cache": false
     },
     "typecheck": {},
     "lint": {}
