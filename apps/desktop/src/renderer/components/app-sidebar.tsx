@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router';
-import { HouseIcon } from 'lucide-react';
+import { HouseIcon, SquareTerminalIcon } from 'lucide-react';
 
 export function AppSidebar({ version }: { version: string }) {
   return (
@@ -13,6 +13,13 @@ export function AppSidebar({ version }: { version: string }) {
         >
           <HouseIcon />
           Home
+        </Link>
+        <Link
+          to="/terminal"
+          className="app-drag h-12 shrink-0"
+        >
+          <SquareTerminalIcon />
+          Terminal
         </Link>
       </nav>
       <footer className="mt-auto px-4 py-3 text-xs text-muted-foreground">Cockpit {version}</footer>
