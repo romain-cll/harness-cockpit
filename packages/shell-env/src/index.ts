@@ -45,56 +45,65 @@ export function resolveShellEnv({
       console.warn(`Could not read the environment of ${shell}: ${reason}. Using the app's environment.`);
       resolve({ ...baseEnv });
     };
-    if (!shell) return fallback('no shell found');
+    if (!shell) {
+      console.warn("Could not find a login shell. Using the app's environment.");
+      resolve({ ...baseEnv });
+      return;
+    }
 
-    // A process group of its own, so a timeout can kill the shell and its children.
-    const child = spawn(
-      shell,
-      ['-ilc', `printf '%s' "${MARK}"; command /usr/bin/env -0; printf '%s' "${MARK}"`],
-      {
-        cwd: homedir(),
-        detached: true,
-        stdio: ['ignore', 'pipe', 'ignore'],
-        env: { ...baseEnv, ...INJECTED },
-      },
-    );
+    // `spawn` and `homedir` can throw: the promise must still resolve.
+    try {
+      // A process group of its own, so a timeout can kill the shell and its children.
+      const child = spawn(
+        shell,
+        ['-ilc', `printf '%s' "${MARK}"; command /usr/bin/env -0; printf '%s' "${MARK}"`],
+        {
+          cwd: homedir(),
+          detached: true,
+          stdio: ['ignore', 'pipe', 'ignore'],
+          env: { ...baseEnv, ...INJECTED },
+        },
+      );
 
-    let settled = false;
-    const settle = (finish: () => void) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      finish();
-    };
+      let settled = false;
+      const settle = (finish: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        finish();
+      };
 
-    const timer = setTimeout(() => {
-      settle(() => {
-        try {
-          process.kill(-child.pid!, 'SIGKILL');
-        } catch {
-          // The group is already gone.
-        }
-        fallback(`no answer after ${timeoutMs} ms`);
+      const timer = setTimeout(() => {
+        settle(() => {
+          try {
+            process.kill(-child.pid!, 'SIGKILL');
+          } catch {
+            // The group is already gone.
+          }
+          fallback(`no answer after ${timeoutMs} ms`);
+        });
+      }, timeoutMs);
+
+      // A background process started by a startup file can hold stdout open long
+      // after the shell is done, which delays `close`: settle once both markers
+      // have arrived, and stop reading.
+      const chunks: Buffer[] = [];
+      child.stdout.on('data', (chunk: Buffer) => {
+        chunks.push(chunk);
+        const output = Buffer.concat(chunks).toString('utf8').split(MARK);
+        if (output.length < 3) return;
+        settle(() => {
+          child.stdout.destroy();
+          resolve(parseEnv(output[1]!, baseEnv));
+        });
       });
-    }, timeoutMs);
-
-    // A background process started by a startup file can hold stdout open long
-    // after the shell is done, which delays `close`: settle once both markers
-    // have arrived, and stop reading.
-    const chunks: Buffer[] = [];
-    child.stdout.on('data', (chunk: Buffer) => {
-      chunks.push(chunk);
-      const output = Buffer.concat(chunks).toString('utf8').split(MARK);
-      if (output.length < 3) return;
-      settle(() => {
-        child.stdout.destroy();
-        resolve(parseEnv(output[1]!, baseEnv));
-      });
-    });
-    child.on('error', (error) => settle(() => fallback(error.message)));
-    child.on('close', (code) =>
-      settle(() => fallback(`it printed no environment (exit code ${code})`)),
-    );
+      child.on('error', (error) => settle(() => fallback(error.message)));
+      child.on('close', (code) =>
+        settle(() => fallback(`it printed no environment (exit code ${code})`)),
+      );
+    } catch (error) {
+      fallback(error instanceof Error ? error.message : String(error));
+    }
   });
 }
 
