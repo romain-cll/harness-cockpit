@@ -523,6 +523,10 @@ describe.each([
 ])('%s', (mode, launch) => {
   let session: Session;
   let front: ReturnType<typeof watchFrontmost>;
+  // The terminal tests run the shell the tests chose (`SHELL=/bin/sh`). The
+  // launchd-environment mode runs the developer's real shell and its
+  // configuration, so it only gets the PATH check (terminal AC12).
+  const inIsolatedShell = launch !== launchLaunchd;
 
   beforeAll(async () => {
     front = watchFrontmost();
@@ -691,8 +695,7 @@ describe.each([
     },
   );
 
-
-  test('terminal AC1 — the Terminal link opens a page with a heading and an xterm.js terminal under the header', async () => {
+  test.runIf(inIsolatedShell)('terminal AC1 — the Terminal link opens a page with a heading and an xterm.js terminal under the header', async () => {
     const { page } = session;
     await page.getByRole('link', { name: 'Home', exact: true }).click({ timeout: UI_TIMEOUT });
     await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
@@ -718,7 +721,7 @@ describe.each([
     expect(boxes.terminal.width).toBeGreaterThan(boxes.main.width - 40);
   });
 
-  test('terminal AC2 — typing a command shows its output', async () => {
+  test.runIf(inIsolatedShell)('terminal AC2 — typing a command shows its output', async () => {
     const { page } = session;
     await openTerminal(page);
 
@@ -728,7 +731,7 @@ describe.each([
     await waitForRow(page, 'cockpit-42');
   });
 
-  test('terminal AC3 — resizing the viewport resizes the pty to the terminal columns and rows', async () => {
+  test.runIf(inIsolatedShell)('terminal AC3 — resizing the viewport resizes the pty to the terminal columns and rows', async () => {
     const { page } = session;
     await openTerminal(page);
     const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
@@ -755,7 +758,7 @@ describe.each([
     }
   });
 
-  test('terminal AC4 — exit shows the exit code, and later keys do nothing', async () => {
+  test.runIf(inIsolatedShell)('terminal AC4 — exit shows the exit code, and later keys do nothing', async () => {
     const { page } = session;
     await openTerminal(page);
 
@@ -771,19 +774,20 @@ describe.each([
     expect(await consoleErrorsOf(page)).toEqual([]);
   });
 
-  test('terminal AC5 — copy puts the selected word in the clipboard data as text/plain', async () => {
+  test.runIf(inIsolatedShell)('terminal AC5 — copy puts the selected word in the clipboard data as text/plain', async () => {
     const { page } = session;
     await openTerminal(page);
     await typeLine(page, 'echo copy-me-123');
     await waitForRow(page, 'copy-me-123');
 
     // The echoed command line holds the word too: double-click the output line.
-    const rows = page.locator('.xterm-rows > div');
+    // xterm.js sets `pointer-events: none` on `.xterm-rows`, so Playwright refuses
+    // a locator `dblclick` on a row: the mouse goes to the word's position, where
+    // the event lands on `.xterm-screen`, which handles the selection.
     const index = (await terminalRows(page)).indexOf('copy-me-123');
     expect(index).toBeGreaterThanOrEqual(0);
-    const row = rows.nth(index);
-    const box = (await row.boundingBox())!;
-    await row.dblclick({ position: { x: 5, y: box.height / 2 }, timeout: UI_TIMEOUT });
+    const box = (await page.locator('.xterm-rows > div').nth(index).boundingBox())!;
+    await page.mouse.dblclick(box.x + 5, box.y + box.height / 2);
 
     const copied = () =>
       page.evaluate(() => {
@@ -794,7 +798,7 @@ describe.each([
     expect(await poll(copied, (text) => text !== '', 5_000)).toBe('copy-me-123');
   });
 
-  test('terminal AC6 — pasting text then pressing Enter runs it', async () => {
+  test.runIf(inIsolatedShell)('terminal AC6 — pasting text then pressing Enter runs it', async () => {
     const { page } = session;
     await openTerminal(page);
 
@@ -808,7 +812,7 @@ describe.each([
     await waitForRow(page, 'pasted-42');
   });
 
-  test('terminal AC7 — text, background and ANSI red follow the tokens as the color scheme changes', async () => {
+  test.runIf(inIsolatedShell)('terminal AC7 — text, background and ANSI red follow the tokens as the color scheme changes', async () => {
     const { page } = session;
     await openTerminal(page);
     await page.emulateMedia({ colorScheme: 'dark' });
@@ -831,7 +835,7 @@ describe.each([
     expect(light.expected.red).not.toBe(light.expected.text);
   });
 
-  test('terminal AC8 — leaving the terminal page ends its shell', async () => {
+  test.runIf(inIsolatedShell)('terminal AC8 — leaving the terminal page ends its shell', async () => {
     const { page } = session;
     await openTerminal(page);
     await typeLine(page, 'echo pid-$$');
@@ -844,7 +848,7 @@ describe.each([
     expect(await poll(() => isAlive(pid!), (alive) => !alive, 5_000)).toBe(false);
   });
 
-  test('terminal AC9 — reloading the page ends its shell and opens a new one', async () => {
+  test.runIf(inIsolatedShell)('terminal AC9 — reloading the page ends its shell and opens a new one', async () => {
     const { page } = session;
     await openTerminal(page);
     await typeLine(page, 'echo pid-$$');
@@ -860,6 +864,30 @@ describe.each([
     await waitForRow(page, 'cockpit-42');
   });
 
+  // The app is given launchd's environment: the terminal's shell must get the
+  // login shell's PATH (`await shellEnv`), not launchd's.
+  test.runIf(launch === launchLaunchd)('terminal AC12 — the terminal shell gets the login shell PATH, not the launchd PATH', async () => {
+    const { page } = session;
+    await openTerminal(page);
+    const expected = normalizeFnm(await getShellPath(page));
+    expect(expected).not.toBe(LAUNCHD_PATH);
+
+    await typeLine(page, 'printf %s "$PATH"');
+
+    // A long PATH wraps over several rows: the rows after the typed command are
+    // joined (a wrapped row is full, so no padding comes between its parts), and
+    // the shell's prompt, if any, follows the PATH.
+    const printed = () =>
+      page.evaluate(() => {
+        const rows = [...document.querySelectorAll('.xterm-rows > div')].map((row) => (row.textContent ?? '').replace(/ /g, ' '));
+        const command = rows.findLastIndex((row) => /printf %s "\$PATH"\s*$/.test(row));
+        return command < 0 ? '' : rows.slice(command + 1).join('');
+      });
+    const output = await poll(printed, (text) => normalizeFnm(text).startsWith(expected), 20_000);
+    expect(normalizeFnm(output).startsWith(expected)).toBe(true);
+    expect(output.startsWith(LAUNCHD_PATH)).toBe(false);
+  });
+
   test('logs no error and keeps running', async () => {
     const { page } = session;
     expect(await consoleErrorsOf(page)).toEqual([]);
@@ -873,10 +901,13 @@ describe.each([
   // Kills the pty host, so it stays the last test that needs a working one.
   test('AC4 — survives the pty host being killed, and reports the open session as exited (terminal AC10: the terminal shows [Process ended])', async () => {
     const { page } = session;
-    // The terminal page is open, with a running shell.
-    await openTerminal(page);
-    await typeLine(page, 'echo up-$((1+1))');
-    await waitForRow(page, 'up-2');
+    // The terminal page is open, with a running shell (not in the launchd mode,
+    // which keeps the developer's shell out of the tests).
+    if (inIsolatedShell) {
+      await openTerminal(page);
+      await typeLine(page, 'echo up-$((1+1))');
+      await waitForRow(page, 'up-2');
+    }
 
     const id = await spawnShell(page);
     await ptyWrite(page, id, 'echo ppid-$PPID\n');
@@ -890,9 +921,11 @@ describe.each([
 
     await waitForExit(page, id);
     expect(await exitsOf(page, id)).toEqual([{ exitCode: null, signal: null }]);
-    await waitForRow(page, '[Process ended]');
+    if (inIsolatedShell) {
+      await waitForRow(page, '[Process ended]');
+      await page.getByRole('heading', { name: 'Terminal' }).waitFor();
+    }
     await page.getByText(versionLabel).waitFor();
-    await page.getByRole('heading', { name: 'Terminal' }).waitFor();
     expect(session.isRunning()).toBe(true);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
     expect(await page.pageErrors()).toEqual([]);
