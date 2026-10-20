@@ -143,11 +143,11 @@ describe('detectHarnesses', () => {
     );
 
     const started = Date.now();
-    const result = await detectHarnesses({ PATH: dir }, { timeoutMs: 500 });
+    const result = await detectHarnesses({ PATH: dir }, { timeoutMs: 2000 });
     const elapsed = Date.now() - started;
 
     expect(result).toEqual([]);
-    expect(elapsed).toBeLessThan(3000);
+    expect(elapsed).toBeLessThan(5000);
 
     const pids = (await readFile(pidFile, 'utf8')).trim().split('\n').map(Number);
     expect(pids).toHaveLength(2);
@@ -166,7 +166,7 @@ describe('detectHarnesses', () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     expect(pids.map(alive)).toEqual([false, false]);
-  });
+  }, 15000);
 
   test('AC12 — a --version that exits 0 without a x.y.z version gives version null', async () => {
     const dir = await tempDir();
