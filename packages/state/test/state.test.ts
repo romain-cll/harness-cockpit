@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
@@ -174,5 +174,57 @@ describe('AC5 — atomic write', () => {
 
     expect(existsSync(join(dir, 'state.json.tmp'))).toBe(false);
     expect(readdirSync(dir).sort()).toEqual([...backups(), 'state.json'].sort());
+  });
+});
+
+// What `loadState` throws, or undefined when it returns.
+const thrownBy = (run: () => unknown): unknown => {
+  try {
+    run();
+  } catch (caught) {
+    return caught;
+  }
+  return undefined;
+};
+
+describe('AC8 — file that cannot be read', () => {
+  test('AC8 — a folder named state.json throws EISDIR and nothing is renamed or created', () => {
+    mkdirSync(file, { recursive: true });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const error = thrownBy(() => loadState(dir));
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(NewerStateError);
+    expect((error as NodeJS.ErrnoException).code).toBe('EISDIR');
+    expect(statSync(file).isDirectory()).toBe(true);
+    expect(readdirSync(dir)).toEqual(['state.json']);
+    expect(readdirSync(file)).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  // A file without read permission cannot be told from a corrupted one by its
+  // content, which is unreadable: it must not be set aside nor replaced.
+  test.skipIf(process.getuid?.() === 0)('AC8 — a file without read permission throws EACCES and is left untouched', () => {
+    seed('{"version":1,"extra":"kept"}');
+    const before = snapshot();
+    chmodSync(file, 0o000);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      const error = thrownBy(() => loadState(dir));
+
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(NewerStateError);
+      expect((error as NodeJS.ErrnoException).code).toBe('EACCES');
+      expect(readdirSync(dir)).toEqual(['state.json']);
+      expect(statSync(file).mode & 0o777).toBe(0o000);
+      expect(statSync(file).mtimeMs).toBe(before.mtimeMs);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      // Restored so the folder can be removed and the content checked.
+      chmodSync(file, 0o644);
+    }
+    expect(snapshot()).toEqual(before);
   });
 });

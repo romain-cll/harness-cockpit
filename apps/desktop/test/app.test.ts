@@ -1,5 +1,5 @@
 import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createServer, type AddressInfo } from 'node:net';
 import { homedir, tmpdir, userInfo } from 'node:os';
@@ -609,6 +609,72 @@ describe.each([
   });
 });
 
+interface QuickRun {
+  exit: { code: number | null; signal: NodeJS.Signals | null } | 'timeout';
+  /** Everything the app wrote to stderr. */
+  stderr: string;
+  /** Ids of the `page` targets Chromium reported, whenever they were created. */
+  pageTargets: string[];
+}
+
+// Starts the packaged app on a data folder it must refuse, and waits for it to
+// exit. The app quits before any window, so there is no page to attach to:
+// instead the run watches the browser's targets over CDP, to prove that no
+// window was opened. The debugging port is read from Chromium's first stderr
+// line and the watch starts on that very chunk, as early as the test can, since
+// the app may exit a few milliseconds later. A refused connection or a closed
+// socket means the app is already gone, not an error. Targets that already exist
+// when the watch starts are reported too (`Target.setDiscoverTargets`).
+async function runUntilExit(dataDir: string): Promise<QuickRun> {
+  const { env } = launchEnv(true, dataDir);
+  // Its own process group, so a hung run leaves no Electron helper behind.
+  const child = spawn(join(packagedAppDir(), 'Contents/MacOS/Cockpit'), ['--remote-debugging-port=0'], {
+    env,
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  const pageTargets: string[] = [];
+  let socket: WebSocket | undefined;
+  child.stdout.on('data', () => {});
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk;
+    const endpoint = !socket && /DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/\S+)/.exec(stderr)?.[1];
+    if (!endpoint) return;
+    socket = new WebSocket(endpoint);
+    socket.onopen = () =>
+      socket!.send(JSON.stringify({ id: 1, method: 'Target.setDiscoverTargets', params: { discover: true } }));
+    socket.onmessage = ({ data }) => {
+      const message = JSON.parse(String(data)) as {
+        method?: string;
+        params?: { targetInfo?: { targetId: string; type: string } };
+      };
+      const info = message.params?.targetInfo;
+      if (message.method === 'Target.targetCreated' && info?.type === 'page') pageTargets.push(info.targetId);
+    };
+    socket.onerror = () => {};
+  });
+
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
+    child.once('exit', (code, signal) => resolve({ code, signal })),
+  );
+  const timedOut = sleep(20_000).then(() => 'timeout' as const);
+  const exit = await Promise.race([exited, timedOut]);
+  if (exit === 'timeout') await stopGroup(child);
+  // Lets the last stderr chunks arrive after the exit.
+  await sleep(200);
+  socket?.close();
+  return { exit, stderr, pageTargets };
+}
+
+// What Chromium writes into the data folder only once a window exists (its
+// profile: preferences, storage, caches). The app that quits before opening one
+// leaves none of it. The CDP watch above is a race, since the main process can
+// create a window and exit within one task, before any client is served; this
+// is the trace such a window leaves for certain.
+const WINDOW_TRACES = ['Preferences', 'Local Storage', 'Session Storage', 'Cache'];
+const windowTracesIn = (dir: string) => readdirSync(dir).filter((name) => WINDOW_TRACES.includes(name));
+
 const stateFileIn = (dir: string) => join(dir, 'state.json');
 const backupsIn = (dir: string) => readdirSync(dir).filter((name) => name.startsWith('state.json.corrupt-'));
 
@@ -678,27 +744,33 @@ describe('packaged app state file', () => {
     writeFileSync(file, newer);
     const mtimeMs = statSync(file).mtimeMs;
 
-    // Spawned directly: the app quits before any window opens, so there is no
-    // page for Playwright to attach to.
-    const { env } = launchEnv(true, dataDir);
-    const child = spawn(join(packagedAppDir(), 'Contents/MacOS/Cockpit'), [], { env, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stderr = '';
-    child.stderr.on('data', (chunk) => (stderr += chunk));
-    const exit = await Promise.race([
-      new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
-        child.once('exit', (code, signal) => resolve({ code, signal })),
-      ),
-      sleep(15_000).then(() => {
-        child.kill('SIGKILL');
-        return 'timeout' as const;
-      }),
-    ]);
+    const run = await runUntilExit(dataDir);
 
-    expect(exit).toEqual({ code: 1, signal: null });
-    expect(stderr).toContain('written by a newer version of Cockpit');
+    expect(run.exit).toEqual({ code: 1, signal: null });
+    expect(run.stderr).toContain('written by a newer version of Cockpit');
     expect(readFileSync(file, 'utf8')).toBe(newer);
     expect(statSync(file).mtimeMs).toBe(mtimeMs);
     expect(readdirSync(dataDir).filter((name) => name.startsWith('state.json.'))).toEqual([]);
+    expect(run.pageTargets).toEqual([]);
+    expect(windowTracesIn(dataDir)).toEqual([]);
+  });
+
+  test('AC8 — a state.json that cannot be read opens no window, exits with code 1 and is left alone', async () => {
+    const file = stateFileIn(dataDir);
+    // Reading a folder fails with EISDIR, whatever the user's permissions.
+    mkdirSync(file);
+
+    const run = await runUntilExit(dataDir);
+
+    expect(run.exit).toEqual({ code: 1, signal: null });
+    expect(run.stderr).toContain('Cockpit cannot read its data');
+    expect(run.stderr).toContain(file);
+    expect(run.stderr).toContain('EISDIR');
+    expect(statSync(file).isDirectory()).toBe(true);
+    expect(readdirSync(file)).toEqual([]);
+    expect(readdirSync(dataDir).filter((name) => name.startsWith('state.json'))).toEqual(['state.json']);
+    expect(run.pageTargets).toEqual([]);
+    expect(windowTracesIn(dataDir)).toEqual([]);
   });
 });
 
