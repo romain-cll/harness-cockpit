@@ -1,13 +1,13 @@
-import { execFile, execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createServer, type AddressInfo } from 'node:net';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
-import { _electron, chromium, type ElectronApplication, type Page } from 'playwright-core';
-import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { chromium, type Browser, type Page } from 'playwright-core';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 
 // Launches the app the four ways it runs: the dev server, the built app, the
 // packaged app and the packaged app with the minimal environment launchd gives
@@ -37,52 +37,97 @@ interface Session {
   close(): Promise<void>;
 }
 
-interface ElectronSession extends Session {
-  app: ElectronApplication;
-}
-
 // Every launch gets a fresh data folder, so no launch touches the data of
 // another one or of the Cockpit the developer has open. The background switch
 // keeps the app out of the Dock and out of the way: it never shows a window nor
-// takes the focus. Playwright's `env` replaces the environment, hence the spread
-// of `base`, the test runner's environment unless the launch gives another one.
-function launchEnv(background: boolean, base: NodeJS.ProcessEnv = process.env) {
-  const dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+// takes the focus. The spawned app's `env` replaces the environment, hence the spread
+// of `base`, the test runner's environment unless the launch gives another one
+// (the launchd launch gives its own minimal one).
+// A test that must start the app twice on the same data folder creates the
+// folder itself, passes it in and removes it afterwards: sessions leave a folder
+// they were given in place.
+function launchEnv(
+  background: boolean,
+  dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-')),
+  base: NodeJS.ProcessEnv = process.env,
+) {
   const env = { ...base, COCKPIT_USER_DATA_DIR: dataDir } as Record<string, string>;
   if (background) env.COCKPIT_TEST_BACKGROUND = '1';
   else delete env.COCKPIT_TEST_BACKGROUND;
   return { dataDir, env };
 }
 
-async function fromElectronApp(app: ElectronApplication, dataDir: string): Promise<ElectronSession> {
-  let output = '';
-  app.process().stdout?.on('data', (chunk) => (output += chunk));
-  app.process().stderr?.on('data', (chunk) => (output += chunk));
-  const page = await app.firstWindow();
-  return {
-    app,
-    page,
-    pid: app.process().pid!,
-    dataDir,
-    output: () => output,
-    isRunning: () => app.process().exitCode === null,
-    close: async () => {
-      await app.close();
-      rmSync(dataDir, { recursive: true, force: true });
-    },
-  };
+// Attaches to a running Electron over the Chrome DevTools Protocol and returns
+// its first window. Reloads it so the page's console output is captured from the
+// start.
+async function attach(endpoint: string): Promise<{ browser: Browser; page: Page }> {
+  const browser = await chromium.connectOverCDP(endpoint);
+  const context = browser.contexts()[0]!;
+  const page = context.pages()[0] ?? (await context.waitForEvent('page'));
+  await page.reload();
+  return { browser, page };
 }
 
-async function launchElectron(
-  options: Parameters<typeof _electron.launch>[0],
+// Stops a process started with `detached: true` and everything in its process
+// group, and waits for it to exit.
+async function stopGroup(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise((resolve) => child.once('exit', resolve));
+  process.kill(-child.pid!, 'SIGTERM');
+  const killer = setTimeout(() => process.kill(-child.pid!, 'SIGKILL'), 10_000);
+  await exited;
+  clearTimeout(killer);
+}
+
+// Spawns the Electron binary itself, with its output piped from the first line,
+// and attaches over CDP. Chromium prints the port it picked on stderr
+// (`--remote-debugging-port=0`).
+async function launchSpawned(
+  executablePath: string,
+  args: string[],
   background: boolean,
+  givenDataDir?: string,
   base?: NodeJS.ProcessEnv,
-): Promise<ElectronSession> {
-  const { dataDir, env } = launchEnv(background, base);
+): Promise<Session> {
+  const { dataDir, env } = launchEnv(background, givenDataDir, base);
+  // Its own process group, so closing stops Electron and its helpers together.
+  const child = spawn(executablePath, ['--remote-debugging-port=0', ...args], {
+    cwd: appDir,
+    env,
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => (output += chunk));
+  child.stderr.on('data', (chunk) => (output += chunk));
+  const removeDataDir = () => {
+    if (givenDataDir === undefined) rmSync(dataDir, { recursive: true, force: true });
+  };
+
   try {
-    return await fromElectronApp(await _electron.launch({ ...options, env }), dataDir);
+    const deadline = Date.now() + 30_000;
+    let port: string | undefined;
+    while (!(port = /DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)/.exec(output)?.[1])) {
+      if (child.exitCode !== null) throw new Error(`the app exited with code ${child.exitCode}:\n${output}`);
+      if (Date.now() > deadline) throw new Error(`the app did not open a debugging port:\n${output}`);
+      await sleep(50);
+    }
+    const { browser, page } = await attach(`http://127.0.0.1:${port}`);
+    return {
+      page,
+      pid: child.pid!,
+      dataDir,
+      output: () => output,
+      isRunning: () => child.exitCode === null,
+      close: async () => {
+        await browser.close();
+        await stopGroup(child);
+        removeDataDir();
+      },
+    };
   } catch (error) {
-    rmSync(dataDir, { recursive: true, force: true });
+    await stopGroup(child);
+    removeDataDir();
     throw error;
   }
 }
@@ -91,7 +136,7 @@ function launchBuilt(): Promise<Session> {
   // The `electron` package exports the path to its binary, downloading it if
   // missing. Resolved here, not at import, so the dev test runs first without it.
   const executablePath: string = createRequire(import.meta.url)('electron');
-  return launchElectron({ executablePath, args: ['.'], cwd: appDir }, true);
+  return launchSpawned(executablePath, ['.'], true);
 }
 
 function packagedAppDir(): string {
@@ -100,9 +145,13 @@ function packagedAppDir(): string {
   return join(appDir, 'release', releaseDir, 'Cockpit.app');
 }
 
-function launchPackaged({ background = true, env }: { background?: boolean; env?: NodeJS.ProcessEnv } = {}): Promise<ElectronSession> {
+function launchPackaged({
+  background = true,
+  dataDir,
+  env,
+}: { background?: boolean; dataDir?: string; env?: NodeJS.ProcessEnv } = {}): Promise<Session> {
   const executablePath = join(packagedAppDir(), 'Contents/MacOS/Cockpit');
-  return launchElectron({ executablePath }, background, env);
+  return launchSpawned(executablePath, [], background, dataDir, env);
 }
 
 // What the page sees of the main process's `Api.getShellPath`.
@@ -158,11 +207,7 @@ async function launchDev(): Promise<Session> {
   let output = '';
   dev.stdout.on('data', (chunk) => (output += chunk));
   dev.stderr.on('data', (chunk) => (output += chunk));
-  const stop = async () => {
-    if (dev.exitCode !== null) return;
-    process.kill(-dev.pid!, 'SIGTERM');
-    await new Promise((resolve) => dev.once('exit', resolve));
-  };
+  const stop = () => stopGroup(dev);
   const removeDataDir = () => rmSync(dataDir, { recursive: true, force: true });
 
   try {
@@ -173,11 +218,7 @@ async function launchDev(): Promise<Session> {
       if (Date.now() > deadline) throw new Error(`dev did not open a window:\n${output}`);
       await sleep(250);
     }
-    const browser = await chromium.connectOverCDP(endpoint);
-    const context = browser.contexts()[0]!;
-    const page = context.pages()[0] ?? (await context.waitForEvent('page'));
-    // Reload so the page's console output is captured from the start.
-    await page.reload();
+    const { browser, page } = await attach(endpoint);
     // The dev script runs Electron in the process group of `dev`; the helpers
     // are named `Electron Helper ...`, so `-x` matches the main process only.
     const pid = Number(execFileSync('pgrep', ['-g', String(dev.pid), '-x', 'Electron'], { encoding: 'utf8' }).split('\n')[0]);
@@ -414,6 +455,18 @@ describe.each([
     expect(files).not.toEqual([]);
   });
 
+  test('AC7 — the output holds what the app wrote from its first line', async () => {
+    // Chromium prints this line during startup, before the test attaches to the window.
+    expect(session.output()).toContain('DevTools listening on');
+  });
+
+  test('AC1 (state) — the data folder holds state.json with version 1', async () => {
+    const file = join(session.dataDir, 'state.json');
+    await poll(() => existsSync(file), Boolean, 5_000);
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1 });
+    expect(existsSync(join(session.dataDir, 'state.json.tmp'))).toBe(false);
+  });
+
   test('AC1 — spawns a shell through window.api.pty and receives its output', async () => {
     const { page } = session;
     const id = await spawnShell(page);
@@ -556,10 +609,155 @@ describe.each([
   });
 });
 
+interface QuickRun {
+  exit: { code: number | null; signal: NodeJS.Signals | null } | 'timeout';
+  /** Everything the app wrote to stderr. */
+  stderr: string;
+}
+
+// Starts the packaged app on a data folder it must refuse, and waits for it to
+// exit. The app quits before any window, so there is no page to attach to, and
+// no debugging port either: "opens no window" is proven by the traces a window
+// leaves in the data folder (`windowTracesIn`), not by watching the browser,
+// which the app can outrun (it creates a window and exits within one task).
+async function runUntilExit(dataDir: string): Promise<QuickRun> {
+  const { env } = launchEnv(true, dataDir);
+  // Its own process group, so a hung run leaves no Electron helper behind.
+  const child = spawn(join(packagedAppDir(), 'Contents/MacOS/Cockpit'), [], {
+    env,
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  child.stdout.on('data', () => {});
+  child.stderr.on('data', (chunk) => (stderr += chunk));
+
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
+    child.once('exit', (code, signal) => resolve({ code, signal })),
+  );
+  const timedOut = sleep(20_000).then(() => 'timeout' as const);
+  const exit = await Promise.race([exited, timedOut]);
+  if (exit === 'timeout') await stopGroup(child);
+  // Lets the last stderr chunks arrive after the exit.
+  await sleep(200);
+  return { exit, stderr };
+}
+
+// What Chromium writes into the data folder only once a window exists (its
+// profile: preferences, storage, caches). The app that quits before opening one
+// leaves none of it. AC4 and AC8 check they are absent after the exit; the
+// guard in the restart test checks a normal start does create them, so an
+// Electron that stops writing them fails the guard instead of passing the
+// check silently.
+const WINDOW_TRACES = ['Preferences', 'Local Storage', 'Session Storage', 'Cache'];
+const windowTracesIn = (dir: string) => readdirSync(dir).filter((name) => WINDOW_TRACES.includes(name));
+
+const stateFileIn = (dir: string) => join(dir, 'state.json');
+const backupsIn = (dir: string) => readdirSync(dir).filter((name) => name.startsWith('state.json.corrupt-'));
+
+// The state file across restarts of the packaged app, always on a data folder
+// the test creates and removes.
+describe('packaged app state file', () => {
+  let dataDir: string;
+
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+  });
+
+  afterEach(() => {
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  async function expectHomePageWithoutError(session: Session) {
+    await session.page.getByText(versionLabel).waitFor();
+    await session.page.getByRole('heading', { name: 'Home' }).waitFor();
+    expect(await consoleErrorsOf(session.page)).toEqual([]);
+    expect(await session.page.pageErrors()).toEqual([]);
+    expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+  }
+
+  test('AC2 — a second start leaves state.json unchanged and sets nothing aside', async () => {
+    const first = await launchPackaged({ dataDir });
+    await expectHomePageWithoutError(first);
+    // Guard for AC4 and AC8: a normal start leaves window traces (Chromium may
+    // write them shortly after the page shows), so their absence there means
+    // something.
+    const traces = await poll(() => windowTracesIn(dataDir), (found) => found.length > 0, 5_000);
+    expect(traces, 'a normal start leaves window traces in the data folder').not.toEqual([]);
+    await first.close();
+
+    const file = stateFileIn(dataDir);
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1 });
+    const before = { content: readFileSync(file, 'utf8'), mtimeMs: statSync(file).mtimeMs };
+
+    const second = await launchPackaged({ dataDir });
+    try {
+      await expectHomePageWithoutError(second);
+    } finally {
+      await second.close();
+    }
+
+    expect(readFileSync(file, 'utf8')).toBe(before.content);
+    expect(statSync(file).mtimeMs).toBe(before.mtimeMs);
+    expect(backupsIn(dataDir)).toEqual([]);
+    expect(existsSync(join(dataDir, 'state.json.tmp'))).toBe(false);
+  });
+
+  test('AC3 — a corrupted state.json is set aside and replaced, and the app starts', async () => {
+    const corrupt = '{not json';
+    writeFileSync(stateFileIn(dataDir), corrupt);
+
+    const session = await launchPackaged({ dataDir });
+    try {
+      await expectHomePageWithoutError(session);
+      const backups = backupsIn(dataDir);
+      expect(backups).toHaveLength(1);
+      expect(readFileSync(join(dataDir, backups[0]!), 'utf8')).toBe(corrupt);
+      expect(JSON.parse(readFileSync(stateFileIn(dataDir), 'utf8'))).toEqual({ version: 1 });
+      expect(session.output()).toContain(backups[0]!);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test('AC4 — a state.json from a newer version opens no window, exits with code 1 and is left untouched', async () => {
+    const newer = '{"version":2}';
+    const file = stateFileIn(dataDir);
+    writeFileSync(file, newer);
+    const mtimeMs = statSync(file).mtimeMs;
+
+    const run = await runUntilExit(dataDir);
+
+    expect(run.exit).toEqual({ code: 1, signal: null });
+    expect(run.stderr).toContain('written by a newer version of Cockpit');
+    expect(readFileSync(file, 'utf8')).toBe(newer);
+    expect(statSync(file).mtimeMs).toBe(mtimeMs);
+    expect(readdirSync(dataDir).filter((name) => name.startsWith('state.json.'))).toEqual([]);
+    expect(windowTracesIn(dataDir)).toEqual([]);
+  });
+
+  test('AC8 — a state.json that cannot be read opens no window, exits with code 1 and is left alone', async () => {
+    const file = stateFileIn(dataDir);
+    // Reading a folder fails with EISDIR, whatever the user's permissions.
+    mkdirSync(file);
+
+    const run = await runUntilExit(dataDir);
+
+    expect(run.exit).toEqual({ code: 1, signal: null });
+    expect(run.stderr).toContain('Cockpit cannot read its data');
+    expect(run.stderr).toContain(file);
+    expect(run.stderr).toContain('EISDIR');
+    expect(statSync(file).isDirectory()).toBe(true);
+    expect(readdirSync(file)).toEqual([]);
+    expect(readdirSync(dataDir).filter((name) => name.startsWith('state.json'))).toEqual(['state.json']);
+    expect(windowTracesIn(dataDir)).toEqual([]);
+  });
+});
+
 // The real launch, as a user starts the app. It opens a visible window, so it
 // runs in CI only, never on a developer's machine.
 describe.runIf(process.env.CI)('packaged app without the background switch', () => {
-  let session: ElectronSession;
+  let session: Session;
 
   beforeAll(async () => {
     session = await launchPackaged({ background: false });
@@ -571,12 +769,17 @@ describe.runIf(process.env.CI)('packaged app without the background switch', () 
   });
 
   test('opens a visible window as a regular app', async () => {
-    const visible = await poll(
-      () => session.app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.isVisible() ?? false),
-      Boolean,
+    // A window that was never shown reports `hidden`.
+    const visibility = await poll(
+      () => session.page.evaluate(() => document.visibilityState),
+      (state) => state === 'visible',
       5_000,
     );
-    expect(visible).toBe(true);
+    expect(visibility).toBe('visible');
     expect(await applicationType(session.pid)).toContain('"Foreground"');
+  });
+
+  test('AC7 — the output holds what the app wrote from its first line', () => {
+    expect(session.output()).toContain('DevTools listening on');
   });
 });
