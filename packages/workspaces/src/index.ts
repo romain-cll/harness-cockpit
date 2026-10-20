@@ -72,7 +72,8 @@ export async function listWorktrees(repo: string, { env }: GitEnv = {}): Promise
 
 /**
  * Creates the worktree at `<root>/<project>-<hash>/<branch>`. With `base` it creates `branch` from
- * it; without, it checks out the existing local `branch`.
+ * it, and deletes it again if the creation fails; without, it checks out the existing local
+ * `branch`, and refuses a name that is not a local branch (a tag, a SHA, a remote-only name).
  */
 export async function createWorktree({
   repo,
@@ -95,13 +96,19 @@ export async function createWorktree({
   const project = `${basename(main)}-${createHash('sha256').update(main).digest('hex').slice(0, 8)}`;
   const path = join(root, project, branch);
 
+  const exists = await succeeds(['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: main, env });
   if (base === undefined) {
+    if (!exists) throw new WorkspaceError('GIT_FAILED', `no local branch to check out: ${branch}`);
     await git(['worktree', 'add', '--', path, branch], { cwd: main, env });
   } else {
-    if (await succeeds(['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: main, env })) {
-      throw new WorkspaceError('BRANCH_EXISTS', `branch already exists: ${branch}`);
+    if (exists) throw new WorkspaceError('BRANCH_EXISTS', `branch already exists: ${branch}`);
+    try {
+      await git(['worktree', 'add', '-b', branch, '--', path, base], { cwd: main, env });
+    } catch (error) {
+      // The branch is this call's own, at `base`, with no commit: leave none behind.
+      await succeeds(['branch', '-D', '--', branch], { cwd: main, env });
+      throw error;
     }
-    await git(['worktree', 'add', '-b', branch, '--', path, base], { cwd: main, env });
   }
   return linkedWorktree(await list(main, env), path);
 }
