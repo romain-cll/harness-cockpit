@@ -1,16 +1,21 @@
 import { execFileSync } from 'node:child_process';
 import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import * as os from 'node:os';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
 import { resolveShellEnv } from '../src/index';
 
-// `userInfo` is a spy that calls the real one, so AC9 can make it throw.
+// `userInfo` and `homedir` are spies that call the real ones, so AC9 and AC10
+// can make them throw.
 vi.mock('node:os', async (importOriginal) => {
   const os = await importOriginal<typeof import('node:os')>();
-  return { ...os, default: os, userInfo: vi.fn(os.userInfo) };
+  return { ...os, default: os, userInfo: vi.fn(os.userInfo), homedir: vi.fn(os.homedir) };
 });
+
+// The real functions, to put the spies back after a test that made them throw.
+const real = await vi.importActual<typeof import('node:os')>('node:os');
 
 // Every test runs `resolveShellEnv` against a fake shell: a small `#!/bin/sh`
 // script. Like a real shell it receives `-ilc` as `$1` and the command to run
@@ -51,6 +56,8 @@ beforeEach(() => {
 
 afterEach(() => {
   warn.mockRestore();
+  vi.mocked(userInfo).mockImplementation(real.userInfo);
+  vi.mocked(os.homedir).mockImplementation(real.homedir);
 });
 
 function isAlive(pid: number): boolean {
@@ -106,7 +113,7 @@ describe('resolveShellEnv', () => {
     expect(pids.map(isAlive)).toEqual([false, false]);
   });
 
-  test('AC6 — resolves to the base environment and warns once when the shell does not exist', async () => {
+  test('AC6 — resolves to the base environment and warns once, with the spawn error, when the shell does not exist', async () => {
     const shell = join(dir, 'does-not-exist');
 
     const env = await resolveShellEnv({ shell, baseEnv });
@@ -114,22 +121,30 @@ describe('resolveShellEnv', () => {
     expect(env).toEqual(baseEnv);
     expect(env).not.toBe(baseEnv);
     expect(warn).toHaveBeenCalledTimes(1);
-    expect(String(warn.mock.calls[0]![0])).toContain(shell);
+    const message = String(warn.mock.calls[0]![0]);
+    expect(message).toContain(shell);
+    expect(message).toContain('ENOENT');
   });
 
   test.each([
-    ['exits with an error', 'exit 1'],
-    ['exits without printing the environment', 'echo nothing useful; exit 0'],
-  ])('AC6 — resolves to the base environment and warns once when the shell %s', async (_name, body) => {
-    const shell = fakeShell(body);
+    ['exits with an error', 'exit 1', 1],
+    ['exits without printing the environment', 'echo nothing useful; exit 0', 0],
+    ['exits with another code without printing the environment', 'exit 7', 7],
+  ])(
+    'AC6 — resolves to the base environment and warns once, with the exit code, when the shell %s',
+    async (_name, body, code) => {
+      const shell = fakeShell(body);
 
-    const env = await resolveShellEnv({ shell, baseEnv });
+      const env = await resolveShellEnv({ shell, baseEnv });
 
-    expect(env).toEqual(baseEnv);
-    expect(env).not.toBe(baseEnv);
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(String(warn.mock.calls[0]![0])).toContain(shell);
-  });
+      expect(env).toEqual(baseEnv);
+      expect(env).not.toBe(baseEnv);
+      expect(warn).toHaveBeenCalledTimes(1);
+      const message = String(warn.mock.calls[0]![0]);
+      expect(message).toContain(shell);
+      expect(message).toContain(`it printed no environment (exit code ${code})`);
+    },
+  );
 
   describe('AC7 — injected variables, removed keys and working directory', () => {
     const injected = {
@@ -225,26 +240,47 @@ describe('resolveShellEnv', () => {
   });
 
   describe('AC9 — no shell found and no passwd entry', () => {
-    test('resolves to the base environment, warns once, and neither throws nor rejects', async () => {
-      const { userInfo: realUserInfo } = await vi.importActual<typeof import('node:os')>('node:os');
+    test('resolves to the base environment, warns once with the exact text, and neither throws nor rejects', async () => {
       vi.mocked(userInfo).mockImplementation(() => {
         throw new Error('ENOENT: no matching entry in passwd file');
       });
-      try {
-        const { SHELL: _shell, ...withoutShell } = baseEnv;
-        let promise!: Promise<NodeJS.ProcessEnv>;
-        expect(() => {
-          promise = resolveShellEnv({ baseEnv: withoutShell });
-        }).not.toThrow();
+      const { SHELL: _shell, ...withoutShell } = baseEnv;
+      let promise!: Promise<NodeJS.ProcessEnv>;
+      expect(() => {
+        promise = resolveShellEnv({ baseEnv: withoutShell });
+      }).not.toThrow();
 
-        const env = await promise;
+      const env = await promise;
 
-        expect(env).toEqual(withoutShell);
-        expect(env).not.toBe(withoutShell);
-        expect(warn).toHaveBeenCalledTimes(1);
-      } finally {
-        vi.mocked(userInfo).mockImplementation(realUserInfo);
-      }
+      expect(env).toEqual(withoutShell);
+      expect(env).not.toBe(withoutShell);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith("Could not find a login shell. Using the app's environment.");
+      expect(String(warn.mock.calls[0]![0])).not.toContain('undefined');
+    });
+  });
+
+  describe('AC10 — a shell is set but the home directory cannot be found', () => {
+    test('resolves to the base environment, warns once naming the shell and the error, and neither throws nor rejects', async () => {
+      const shell = fakeShell(`FROM_SHELL=yes /bin/sh -c "$2"`);
+      vi.mocked(os.homedir).mockImplementation(() => {
+        throw new Error('no HOME and no passwd entry');
+      });
+      const withShell = { ...baseEnv, SHELL: shell };
+      let promise!: Promise<NodeJS.ProcessEnv>;
+      expect(() => {
+        promise = resolveShellEnv({ baseEnv: withShell });
+      }).not.toThrow();
+
+      const env = await promise;
+
+      expect(env).toEqual(withShell);
+      expect(env).not.toBe(withShell);
+      expect(env).not.toHaveProperty('FROM_SHELL');
+      expect(warn).toHaveBeenCalledTimes(1);
+      const message = String(warn.mock.calls[0]![0]);
+      expect(message).toContain(shell);
+      expect(message).toContain('no HOME and no passwd entry');
     });
   });
 });
