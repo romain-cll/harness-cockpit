@@ -2,13 +2,46 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
-import { loadState, NewerStateError } from '../src/index';
+import { addProject, loadState, NewerStateError, ProjectExistsError, removeProject, saveState } from '../src/index';
+
+// Records the calls `saveState` and `loadState` make on the file system, in
+// order, while still running them for real (AC10). `fds` maps an open
+// descriptor to the path it was opened on.
+const calls = vi.hoisted(() => ({ log: [] as string[], fds: new Map<number, string>() }));
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  const pathOf = (fd: number) => calls.fds.get(fd) ?? `fd ${fd}`;
+  return {
+    ...actual,
+    openSync: ((path: string, ...rest: unknown[]) => {
+      const fd = (actual.openSync as (...args: unknown[]) => number)(path, ...rest);
+      calls.fds.set(fd, String(path));
+      calls.log.push(`open ${String(path)}`);
+      return fd;
+    }) as typeof actual.openSync,
+    writeSync: ((fd: number, ...rest: unknown[]) => {
+      calls.log.push(`write ${pathOf(fd)}`);
+      return (actual.writeSync as (...args: unknown[]) => number)(fd, ...rest);
+    }) as typeof actual.writeSync,
+    fsyncSync: ((fd: number) => {
+      calls.log.push(`fsync ${pathOf(fd)}`);
+      return actual.fsyncSync(fd);
+    }) as typeof actual.fsyncSync,
+    renameSync: ((from: string, to: string) => {
+      calls.log.push(`rename ${String(from)} -> ${String(to)}`);
+      return actual.renameSync(from, to);
+    }) as typeof actual.renameSync,
+  };
+});
 
 let root: string;
 let dir: string;
 let file: string;
 
 beforeEach(() => {
+  calls.log.length = 0;
+  calls.fds.clear();
   root = mkdtempSync(join(tmpdir(), 'cockpit-state-test-'));
   dir = join(root, 'data');
   file = join(dir, 'state.json');
@@ -35,7 +68,7 @@ describe('AC1 — missing file', () => {
   test('AC1 — returns { version: 1 } and writes it when the folder has no state.json', () => {
     mkdirSync(dir, { recursive: true });
 
-    expect(loadState(dir)).toEqual({ version: 1 });
+    expect(loadState(dir)).toEqual({ version: 1, projects: [] });
     expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1 });
     expect(existsSync(join(dir, 'state.json.tmp'))).toBe(false);
     expect(readdirSync(dir)).toEqual(['state.json']);
@@ -45,7 +78,7 @@ describe('AC1 — missing file', () => {
     dir = join(root, 'a', 'b', 'data');
     file = join(dir, 'state.json');
 
-    expect(loadState(dir)).toEqual({ version: 1 });
+    expect(loadState(dir)).toEqual({ version: 1, projects: [] });
     expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1 });
     expect(readdirSync(dir)).toEqual(['state.json']);
   });
@@ -68,7 +101,7 @@ describe('AC2 — read back', () => {
     seed('{ "version": 1, "extra": ["kept"] }\n');
     const before = snapshot();
 
-    expect(loadState(dir)).toEqual({ version: 1, extra: ['kept'] });
+    expect(loadState(dir)).toEqual({ version: 1, extra: ['kept'], projects: [] });
     expect(snapshot()).toEqual(before);
     expect(backups()).toEqual([]);
   });
@@ -89,7 +122,7 @@ describe('AC3 — corrupted file', () => {
     seed(content);
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    expect(loadState(dir)).toEqual({ version: 1 });
+    expect(loadState(dir)).toEqual({ version: 1, projects: [] });
 
     const found = backups();
     expect(found).toHaveLength(1);
@@ -115,7 +148,7 @@ describe('AC3 — corrupted file', () => {
     loadState(dir);
     const before = snapshot();
 
-    expect(loadState(dir)).toEqual({ version: 1 });
+    expect(loadState(dir)).toEqual({ version: 1, projects: [] });
     expect(snapshot()).toEqual(before);
     expect(backups()).toHaveLength(1);
   });
@@ -152,7 +185,7 @@ describe('AC5 — atomic write', () => {
     writeFileSync(join(dir, 'state.json.tmp'), '{half written');
     const before = snapshot();
 
-    expect(loadState(dir)).toEqual({ version: 1, extra: 1 });
+    expect(loadState(dir)).toEqual({ version: 1, extra: 1, projects: [] });
     expect(snapshot()).toEqual(before);
     expect(backups()).toEqual([]);
   });
@@ -161,7 +194,7 @@ describe('AC5 — atomic write', () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'state.json.tmp'), '{half written');
 
-    expect(loadState(dir)).toEqual({ version: 1 });
+    expect(loadState(dir)).toEqual({ version: 1, projects: [] });
     expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1 });
     expect(existsSync(join(dir, 'state.json.tmp'))).toBe(false);
   });
@@ -226,5 +259,183 @@ describe('AC8 — file that cannot be read', () => {
       chmodSync(file, 0o644);
     }
     expect(snapshot()).toEqual(before);
+  });
+});
+
+describe('AC8, AC9 — projects field absent or valid', () => {
+  test('AC8 — a version 1 file without projects reads as projects: [] and is not rewritten', () => {
+    seed('{ "version": 1 }\n');
+    const before = snapshot();
+
+    expect(loadState(dir)).toEqual({ version: 1, projects: [] });
+    expect(snapshot()).toEqual(before);
+    expect(backups()).toEqual([]);
+    expect(readdirSync(dir)).toEqual(['state.json']);
+  });
+
+  test('AC9 — a valid list is returned as written, in order, without rewriting the file', () => {
+    seed('{ "version": 1, "projects": [{ "path": "/b" }, { "path": "/a" }] }\n');
+    const before = snapshot();
+
+    expect(loadState(dir)).toEqual({ version: 1, projects: [{ path: '/b' }, { path: '/a' }] });
+    expect(snapshot()).toEqual(before);
+    expect(backups()).toEqual([]);
+  });
+
+  test('AC9 — an empty list is valid', () => {
+    seed('{ "version": 1, "projects": [] }\n');
+    const before = snapshot();
+
+    expect(loadState(dir)).toEqual({ version: 1, projects: [] });
+    expect(snapshot()).toEqual(before);
+    expect(backups()).toEqual([]);
+  });
+});
+
+describe('AC9 — malformed projects', () => {
+  test.each([
+    ['a string', '"x"'],
+    ['null', 'null'],
+    ['an object', '{}'],
+    ['a number', '3'],
+    ['an array of numbers', '[1]'],
+    ['an array holding null', '[null]'],
+    ['an object without path', '[{}]'],
+    ['a numeric path', '[{ "path": 3 }]'],
+    ['a valid project followed by an invalid one', '[{ "path": "/a" }, { "path": null }]'],
+  ])('AC9 — projects as %s is set aside with its original bytes and replaced', (_name, projects) => {
+    const content = `{ "version": 1, "projects": ${projects} }\n`;
+    seed(content);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    expect(loadState(dir)).toEqual({ version: 1, projects: [] });
+
+    const found = backups();
+    expect(found).toHaveLength(1);
+    expect(readFileSync(join(dir, found[0]!), 'utf8')).toBe(content);
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1 });
+    expect(existsSync(join(dir, 'state.json.tmp'))).toBe(false);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]!.join(' ')).toContain(found[0]!);
+  });
+});
+
+describe('AC10 — durable write', () => {
+  const tmp = () => join(dir, 'state.json.tmp');
+
+  // The calls that matter, in order; the open of the temporary file is left out.
+  const durableSteps = () => calls.log.filter((entry) => entry !== `open ${tmp()}`);
+
+  const expected = () => [
+    `write ${tmp()}`,
+    `fsync ${tmp()}`,
+    `rename ${tmp()} -> ${file}`,
+    `open ${dir}`,
+    `fsync ${dir}`,
+  ];
+
+  test('AC10 — saveState writes the temp file, fsyncs it, renames it, then opens the folder and fsyncs it', () => {
+    mkdirSync(dir, { recursive: true });
+    calls.log.length = 0;
+
+    saveState(dir, { version: 1, projects: [{ path: '/a' }] });
+
+    expect(durableSteps()).toEqual(expected());
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1, projects: [{ path: '/a' }] });
+    expect(existsSync(tmp())).toBe(false);
+  });
+
+  test('AC10 — the first write of loadState goes through the same steps', () => {
+    loadState(dir);
+
+    expect(durableSteps()).toEqual(expected());
+  });
+
+  test('AC10 — the write that replaces a corrupted file goes through the same steps', () => {
+    seed('[]');
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    calls.log.length = 0;
+
+    loadState(dir);
+
+    expect(durableSteps()).toEqual(expected());
+  });
+
+  test('AC10 — a leftover state.json.tmp is overwritten, and none remains', () => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(tmp(), '{half written, much longer than the state that replaces it'.repeat(20));
+
+    saveState(dir, { version: 1, projects: [] });
+
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1, projects: [] });
+    expect(existsSync(tmp())).toBe(false);
+    expect(readdirSync(dir)).toEqual(['state.json']);
+  });
+
+  test('AC10 — what saveState wrote loads back as the same state, without a rewrite', () => {
+    mkdirSync(dir, { recursive: true });
+    const state = { version: 1, projects: [{ path: '/b' }, { path: '/a' }] };
+    saveState(dir, state);
+    const before = snapshot();
+
+    expect(loadState(dir)).toEqual(state);
+    expect(snapshot()).toEqual(before);
+    expect(backups()).toEqual([]);
+  });
+});
+
+describe('AC11 — addProject and removeProject', () => {
+  test('AC11 — addProject appends the project and leaves the given state alone', () => {
+    const state = { version: 1, projects: [{ path: '/a' }] };
+
+    const next = addProject(state, '/b');
+
+    expect(next).toEqual({ version: 1, projects: [{ path: '/a' }, { path: '/b' }] });
+    expect(state).toEqual({ version: 1, projects: [{ path: '/a' }] });
+  });
+
+  test('AC11 — addProject keeps the other fields of the state', () => {
+    const state = { version: 1, extra: 'kept', projects: [] };
+
+    const next = addProject(state, '/a');
+
+    expect(next).toEqual({ version: 1, extra: 'kept', projects: [{ path: '/a' }] });
+  });
+
+  test('AC11 — addProject throws ProjectExistsError for a path already in the state, and returns nothing', () => {
+    const state = { version: 1, projects: [{ path: '/a' }, { path: '/b' }] };
+    let result: unknown;
+
+    const error = (() => {
+      try {
+        result = addProject(state, '/a');
+      } catch (caught) {
+        return caught;
+      }
+      return undefined;
+    })();
+
+    expect(error).toBeInstanceOf(ProjectExistsError);
+    expect(error).toBeInstanceOf(Error);
+    expect(result).toBeUndefined();
+    expect(state).toEqual({ version: 1, projects: [{ path: '/a' }, { path: '/b' }] });
+  });
+
+  test('AC11 — removeProject removes the project and keeps the order of the others', () => {
+    const state = { version: 1, projects: [{ path: '/a' }, { path: '/b' }, { path: '/c' }] };
+
+    const next = removeProject(state, '/b');
+
+    expect(next).toEqual({ version: 1, projects: [{ path: '/a' }, { path: '/c' }] });
+    expect(state.projects).toHaveLength(3);
+  });
+
+  test('AC11 — removeProject with an unknown path returns a state with the same projects', () => {
+    const state = { version: 1, projects: [{ path: '/a' }, { path: '/b' }] };
+
+    const next = removeProject(state, '/unknown');
+
+    expect(next.projects).toEqual([{ path: '/a' }, { path: '/b' }]);
+    expect(next.version).toBe(1);
   });
 });
