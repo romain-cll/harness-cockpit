@@ -469,7 +469,7 @@ describe.each([
     expect(existsSync(join(nodePty, 'build'))).toBe(false);
   });
 
-  test('AC3 — gets the PATH of the login shell from the main process', async () => {
+  test('login shell: AC3 — gets the PATH of the login shell from the main process', async () => {
     const { page } = session;
     await page.getByText(versionLabel).waitFor();
     const path = await getShellPath(page);
@@ -480,7 +480,7 @@ describe.each([
   // The app is given the environment launchd gives an app opened from the
   // Finder, so the same environment can be given to the login shell.
   test.runIf(launch === launchLaunchd)(
-    'AC1 — gets exactly the PATH printed by the login shell, not the launchd PATH',
+    'login shell: AC1 — gets exactly the PATH printed by the login shell, not the launchd PATH',
     async () => {
       const { page } = session;
       await page.getByText(versionLabel).waitFor();

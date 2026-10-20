@@ -1,10 +1,16 @@
 import { execFileSync } from 'node:child_process';
 import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { homedir, tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
 import { resolveShellEnv } from '../src/index';
+
+// `userInfo` is a spy that calls the real one, so AC9 can make it throw.
+vi.mock('node:os', async (importOriginal) => {
+  const os = await importOriginal<typeof import('node:os')>();
+  return { ...os, default: os, userInfo: vi.fn(os.userInfo) };
+});
 
 // Every test runs `resolveShellEnv` against a fake shell: a small `#!/bin/sh`
 // script. Like a real shell it receives `-ilc` as `$1` and the command to run
@@ -178,6 +184,67 @@ describe('resolveShellEnv', () => {
       expect(env.ZSH_TMUX_AUTOSTARTED).toBe('base-3');
       expect(env.ZSH_TMUX_AUTOSTART).toBe('base-4');
       for (const key of ['_', 'SHLVL', 'PWD', 'OLDPWD']) expect(env).not.toHaveProperty(key);
+    });
+  });
+
+  describe('AC8 — a background process that holds stdout open', () => {
+    const pidFiles: string[] = [];
+
+    afterEach(() => {
+      // The startup leaves `sleep 30` running on purpose; the test cleans up.
+      for (const file of pidFiles.splice(0)) {
+        try {
+          process.kill(Number(readFileSync(file, 'utf8').trim()), 'SIGKILL');
+        } catch {
+          // Never started, or already gone.
+        }
+      }
+    });
+
+    test('resolves to the shell environment, in time, without a warning', async () => {
+      const pidFile = join(dir, `background-pid-${counter++}`);
+      pidFiles.push(pidFile);
+      const shell = fakeShell(
+        // `sleep` inherits the shell's stdout and is not redirected.
+        ['sleep 30 &', `echo $! > "${pidFile}"`, `FROM_SHELL=yes /bin/sh -c "$2"`].join('\n'),
+      );
+
+      const started = Date.now();
+      // Gives up waiting after 2.5 s, so a regression fails here instead of after 30 s.
+      const env = await Promise.race([
+        resolveShellEnv({ shell, baseEnv, timeoutMs: 5000 }),
+        sleep(2500).then(() => undefined),
+      ]);
+      const elapsed = Date.now() - started;
+
+      expect(env).toBeDefined();
+      expect(elapsed).toBeLessThan(2000);
+      expect(env!.FROM_SHELL).toBe('yes');
+      expect(warn).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('AC9 — no shell found and no passwd entry', () => {
+    test('resolves to the base environment, warns once, and neither throws nor rejects', async () => {
+      const { userInfo: realUserInfo } = await vi.importActual<typeof import('node:os')>('node:os');
+      vi.mocked(userInfo).mockImplementation(() => {
+        throw new Error('ENOENT: no matching entry in passwd file');
+      });
+      try {
+        const { SHELL: _shell, ...withoutShell } = baseEnv;
+        let promise!: Promise<NodeJS.ProcessEnv>;
+        expect(() => {
+          promise = resolveShellEnv({ baseEnv: withoutShell });
+        }).not.toThrow();
+
+        const env = await promise;
+
+        expect(env).toEqual(withoutShell);
+        expect(env).not.toBe(withoutShell);
+        expect(warn).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.mocked(userInfo).mockImplementation(realUserInfo);
+      }
     });
   });
 });
