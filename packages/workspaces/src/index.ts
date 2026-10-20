@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { realpath } from 'node:fs/promises';
+import { mkdir, realpath } from 'node:fs/promises';
 import { basename, isAbsolute, join } from 'node:path';
 import { checkGit, git, succeeds, WorkspaceError } from './git';
 
@@ -77,14 +77,15 @@ export async function listWorktrees(repo: string, { env }: GitEnv = {}): Promise
 }
 
 /**
- * Creates the worktree at `<root>/<project>-<hash>/<branch>`. With `base` it creates `branch` from
- * it; without, it checks out the existing local `branch`, and refuses a name that is not a local
- * branch (a tag, a SHA, a remote-only name). All or nothing: if git fails, the worktree and the
- * branch this call created are removed, and the original `GIT_FAILED` is rethrown.
+ * Creates the worktree at `<root>/<project>-<hash>/<branch>`, creating `root` if needed. With `base`
+ * it creates `branch` from it; without, it checks out the existing local `branch`, and refuses a
+ * name that is not a local branch (a tag, a SHA, a remote-only name). All or nothing: if git fails,
+ * the worktree and the branch this call created are removed, and the original `GIT_FAILED` is
+ * rethrown.
  */
 export async function createWorktree({
   repo,
-  root,
+  root: requestedRoot,
   branch,
   base,
   env,
@@ -94,7 +95,10 @@ export async function createWorktree({
   branch: string;
   base?: string;
 } & GitEnv): Promise<Worktree> {
-  if (!isAbsolute(root)) throw new TypeError(`root must be an absolute path: ${root}`);
+  if (!isAbsolute(requestedRoot)) throw new TypeError(`root must be an absolute path: ${requestedRoot}`);
+  // Canonical, so the paths built from it match the ones git reports (symbolic links, macOS `/var`).
+  await mkdir(requestedRoot, { recursive: true });
+  const root = await realpath(requestedRoot);
   await checkGit(env);
   const main = await repositoryRoot(repo, env);
   // `--branch` expands shorthands such as `@{-1}`: a name it rewrites is not a branch name.
