@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { afterEach, describe, expect, test, vi } from 'vitest';
@@ -383,6 +383,36 @@ describe('createWorktree arguments', () => {
     );
     expect(git(repo, 'worktree', 'list', '--porcelain')).toBe(listBefore);
     expect(branchExists(repo, 'topic')).toBe(true);
+  });
+
+  test('AC25 — a root reached through a symbolic link does not let the rollback drop a prunable registration', async () => {
+    const repo = await makeRepo();
+    const realRoot = await tempDir();
+    const link = join(await tempDir(), 'link');
+    await symlink(realRoot, link);
+    git(repo, 'branch', 'topic');
+    const target = join(realRoot, projectDir(repo), 'topic');
+    await createWorktree({ repo, root: realRoot, branch: 'topic', env: testEnv });
+    await rm(target, { recursive: true, force: true });
+    expect(git(repo, 'worktree', 'list', '--porcelain')).toContain(`worktree ${target}\n`);
+
+    const error = await rejection(createWorktree({ repo, root: link, branch: 'topic', env: testEnv }));
+
+    expect(error.code).toBe('GIT_FAILED');
+    expect(git(repo, 'worktree', 'list', '--porcelain')).toContain(`worktree ${target}\n`);
+    expect(branchExists(repo, 'topic')).toBe(true);
+  });
+
+  test('AC25 — a root that does not exist yet is created and the worktree is under it', async () => {
+    const repo = await makeRepo();
+    const root = join(await tempDir(), 'not', 'yet', 'there');
+    expect(existsSync(root)).toBe(false);
+
+    const worktree = await createWorktree({ repo, root, branch: 'topic', base: 'main', env: testEnv });
+
+    expect(worktree.path).toBe(join(root, projectDir(repo), 'topic'));
+    expect(existsSync(worktree.path)).toBe(true);
+    expect((await listWorktrees(repo, { env: testEnv })).some((w) => w.path === worktree.path)).toBe(true);
   });
 });
 
