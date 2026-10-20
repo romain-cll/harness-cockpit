@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
-import { basename, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
 import { checkGit, git, succeeds, WorkspaceError } from './git';
 
 export { WorkspaceError } from './git';
@@ -86,9 +86,12 @@ export async function createWorktree({
   branch: string;
   base?: string;
 } & GitEnv): Promise<Worktree> {
+  if (!isAbsolute(root)) throw new TypeError(`root must be an absolute path: ${root}`);
   await checkGit(env);
   const main = await repositoryRoot(repo, env);
-  await git(['check-ref-format', '--branch', branch], { cwd: main, env });
+  // `--branch` expands shorthands such as `@{-1}`: a name it rewrites is not a branch name.
+  const checked = await git(['check-ref-format', '--branch', branch], { cwd: main, env });
+  if (checked.trim() !== branch) throw new WorkspaceError('GIT_FAILED', `invalid branch name: ${branch}`);
   const project = `${basename(main)}-${createHash('sha256').update(main).digest('hex').slice(0, 8)}`;
   const path = join(root, project, branch);
 
