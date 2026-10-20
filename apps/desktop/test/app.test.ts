@@ -46,10 +46,12 @@ interface Session {
 // A test that must start the app twice on the same data folder creates the
 // folder itself, passes it in and removes it afterwards: sessions leave a folder
 // they were given in place.
+// The terminal page runs whatever `$SHELL` says: by default `/bin/sh`, which keeps
+// the developer's shell configuration from slowing or breaking the tests.
 function launchEnv(
   background: boolean,
   dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-')),
-  base: NodeJS.ProcessEnv = process.env,
+  base: NodeJS.ProcessEnv = { ...process.env, SHELL: '/bin/sh' },
 ) {
   const env = { ...base, COCKPIT_USER_DATA_DIR: dataDir } as Record<string, string>;
   if (background) env.COCKPIT_TEST_BACKGROUND = '1';
@@ -378,6 +380,141 @@ const outputOf = (page: Page, id: number) =>
 const consoleErrorsOf = async (page: Page) =>
   (await page.consoleMessages()).filter((m) => m.type() === 'error').map((m) => m.text());
 
+// --- Terminal page helpers ---------------------------------------------------
+
+const UI_TIMEOUT = 10_000;
+
+// Goes Home, then to the terminal page through the sidebar, so each call opens
+// a new shell, and focuses the terminal.
+async function openTerminal(page: Page) {
+  await page.getByRole('link', { name: 'Home', exact: true }).click({ timeout: UI_TIMEOUT });
+  await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
+  await page.getByRole('link', { name: 'Terminal', exact: true }).click({ timeout: UI_TIMEOUT });
+  await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
+  await focusTerminal(page);
+}
+
+async function focusTerminal(page: Page) {
+  const terminal = page.locator('.xterm');
+  await terminal.waitFor({ state: 'visible', timeout: UI_TIMEOUT });
+  await terminal.click({ timeout: UI_TIMEOUT });
+  await page.locator('.xterm-helper-textarea').focus({ timeout: UI_TIMEOUT });
+}
+
+// Types on the keyboard, as a user does.
+async function typeLine(page: Page, text: string) {
+  await page.keyboard.type(text);
+  await page.keyboard.press('Enter');
+}
+
+// The text of each row xterm.js renders (its DOM renderer), cell padding removed.
+const terminalRows = (page: Page) =>
+  page.evaluate(() =>
+    [...document.querySelectorAll('.xterm-rows > div')].map((row) => (row.textContent ?? '').replace(/ /g, ' ').trimEnd()),
+  );
+
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Waits until a row is exactly `text`, or matches it when it is a regular
+// expression. Output reaches the DOM on animation frames, so it is polled.
+const waitForRow = (page: Page, text: string | RegExp) =>
+  page.waitForFunction(
+    (source) => {
+      const pattern = new RegExp(source);
+      return [...document.querySelectorAll('.xterm-rows > div')].some((row) =>
+        pattern.test((row.textContent ?? '').replace(/ /g, ' ').trimEnd()),
+      );
+    },
+    typeof text === 'string' ? `^${escapeRegExp(text)}$` : text.source,
+    { timeout: 15_000 },
+  );
+
+// Waits for a row matching `pattern` and returns its capture groups.
+async function captureRow(page: Page, pattern: RegExp): Promise<string[]> {
+  await waitForRow(page, pattern);
+  for (const row of await terminalRows(page)) {
+    const match = pattern.exec(row);
+    if (match) return match.slice(1);
+  }
+  throw new Error(`No terminal row matches ${pattern}`);
+}
+
+// Types `stty size` and returns the `[rows, cols]` of its answer.
+async function terminalSize(page: Page): Promise<[number, number]> {
+  const answers = () => page.evaluate(() =>
+    [...document.querySelectorAll('.xterm-rows > div')].filter((row) => /^\d+\s\d+\s*$/.test(row.textContent ?? '')).length,
+  );
+  const before = await answers();
+  await typeLine(page, 'stty size');
+  await page.waitForFunction(
+    (before) =>
+      [...document.querySelectorAll('.xterm-rows > div')].filter((row) => /^\d+\s\d+\s*$/.test(row.textContent ?? '')).length > before,
+    before,
+    { timeout: 15_000 },
+  );
+  const rows = await terminalRows(page);
+  const last = rows.filter((row) => /^\d+ \d+$/.test(row)).at(-1)!;
+  const [r, c] = last.split(' ').map(Number);
+  return [r!, c!];
+}
+
+// `process.kill(pid, 0)` throws ESRCH once the process is gone.
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+// What the terminal paints against what the tokens say, in `rgb()` form: a
+// token is normalised through a 1x1 canvas, whatever notation it is written in.
+interface TerminalColors {
+  actual: { text: string; background: string; red: string };
+  expected: { text: string; background: string; red: string };
+}
+const readTerminalColors = (page: Page): Promise<TerminalColors> =>
+  page.evaluate(() => {
+    const context = document.createElement('canvas').getContext('2d')!;
+    const rgba = (css: string) => {
+      context.clearRect(0, 0, 1, 1);
+      context.fillStyle = '#000000';
+      context.fillStyle = css;
+      context.clearRect(0, 0, 1, 1);
+      context.fillRect(0, 0, 1, 1);
+      const [r, g, b, a] = context.getImageData(0, 0, 1, 1).data;
+      return { css: `rgb(${r}, ${g}, ${b})`, a: a! };
+    };
+    const token = (name: string) => {
+      const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      return value ? rgba(value).css : `missing ${name}`;
+    };
+    const rows = document.querySelector('.xterm-rows') as HTMLElement | null;
+    // The terminal background is the first painted one going up from the rows.
+    let background = 'none';
+    for (let element = rows; element; element = element.parentElement) {
+      const painted = rgba(getComputedStyle(element).backgroundColor);
+      if (painted.a > 0) {
+        background = painted.css;
+        break;
+      }
+    }
+    const red = [...document.querySelectorAll<HTMLElement>('.xterm-rows span.xterm-fg-1')].find((span) => span.textContent === 'red');
+    return {
+      actual: {
+        text: rows ? rgba(getComputedStyle(rows).color).css : 'no rows',
+        background,
+        red: red ? rgba(getComputedStyle(red).color).css : 'no red text',
+      },
+      expected: {
+        text: token('--foreground'),
+        background: token('--background'),
+        red: token('--terminal-red'),
+      },
+    };
+  });
+
 describe.each([
   ['dev server', launchDev],
   ['built app', launchBuilt],
@@ -554,6 +691,175 @@ describe.each([
     },
   );
 
+
+  test('terminal AC1 — the Terminal link opens a page with a heading and an xterm.js terminal under the header', async () => {
+    const { page } = session;
+    await page.getByRole('link', { name: 'Home', exact: true }).click({ timeout: UI_TIMEOUT });
+    await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
+    await page.getByRole('link', { name: 'Terminal', exact: true }).click({ timeout: UI_TIMEOUT });
+
+    await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
+    expect(await page.getByRole('link', { name: 'Terminal', exact: true }).getAttribute('aria-current')).toBe('page');
+    await page.locator('.xterm').waitFor({ state: 'visible', timeout: UI_TIMEOUT });
+
+    // It fills the page: right under the header, down to the window bottom and
+    // across the main area, give or take one cell and the scrollbar.
+    const boxes = await page.evaluate(() => {
+      const box = (selector: string) => {
+        const { top, bottom, width } = document.querySelector(selector)!.getBoundingClientRect();
+        return { top, bottom, width };
+      };
+      return { header: box('main header'), main: box('main'), terminal: box('.xterm') };
+    });
+    expect(boxes.terminal.width).toBeGreaterThan(0);
+    expect(boxes.terminal.top).toBeGreaterThanOrEqual(boxes.header.bottom - 1);
+    expect(boxes.terminal.top).toBeLessThan(boxes.header.bottom + 20);
+    expect(boxes.terminal.bottom).toBeGreaterThan(boxes.main.bottom - 40);
+    expect(boxes.terminal.width).toBeGreaterThan(boxes.main.width - 40);
+  });
+
+  test('terminal AC2 — typing a command shows its output', async () => {
+    const { page } = session;
+    await openTerminal(page);
+
+    await typeLine(page, 'echo cockpit-$((6*7))');
+
+    // The echoed command line shows `$((6*7))`: only the shell prints `cockpit-42`.
+    await waitForRow(page, 'cockpit-42');
+  });
+
+  test('terminal AC3 — resizing the viewport resizes the pty to the terminal columns and rows', async () => {
+    const { page } = session;
+    await openTerminal(page);
+    const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+    const screenWidth = () => page.evaluate(() => document.querySelector('.xterm-screen')!.getBoundingClientRect().width);
+    const renderedRows = async () => (await terminalRows(page)).length;
+
+    const [rowsBefore, colsBefore] = await terminalSize(page);
+    expect(rowsBefore).toBe(await renderedRows());
+    const widthBefore = await screenWidth();
+
+    try {
+      await page.setViewportSize({ width: viewport.width - 300, height: viewport.height - 150 });
+      await page.waitForFunction(
+        (before) => document.querySelector('.xterm-screen')!.getBoundingClientRect().width !== before,
+        widthBefore,
+        { timeout: UI_TIMEOUT },
+      );
+
+      const [rowsAfter, colsAfter] = await terminalSize(page);
+      expect(colsAfter).not.toBe(colsBefore);
+      expect(rowsAfter).toBe(await renderedRows());
+    } finally {
+      await page.setViewportSize(viewport);
+    }
+  });
+
+  test('terminal AC4 — exit shows the exit code, and later keys do nothing', async () => {
+    const { page } = session;
+    await openTerminal(page);
+
+    await typeLine(page, 'exit 3');
+    await waitForRow(page, '[Process exited with code 3]');
+
+    const before = await terminalRows(page);
+    await page.keyboard.type('still-typing');
+    await page.keyboard.press('Enter');
+    await sleep(500);
+    expect(await terminalRows(page)).toEqual(before);
+    expect(await page.pageErrors()).toEqual([]);
+    expect(await consoleErrorsOf(page)).toEqual([]);
+  });
+
+  test('terminal AC5 — copy puts the selected word in the clipboard data as text/plain', async () => {
+    const { page } = session;
+    await openTerminal(page);
+    await typeLine(page, 'echo copy-me-123');
+    await waitForRow(page, 'copy-me-123');
+
+    // The echoed command line holds the word too: double-click the output line.
+    const rows = page.locator('.xterm-rows > div');
+    const index = (await terminalRows(page)).indexOf('copy-me-123');
+    expect(index).toBeGreaterThanOrEqual(0);
+    const row = rows.nth(index);
+    const box = (await row.boundingBox())!;
+    await row.dblclick({ position: { x: 5, y: box.height / 2 }, timeout: UI_TIMEOUT });
+
+    const copied = () =>
+      page.evaluate(() => {
+        const clipboardData = new DataTransfer();
+        document.querySelector('.xterm')!.dispatchEvent(new ClipboardEvent('copy', { clipboardData, bubbles: true, cancelable: true }));
+        return clipboardData.getData('text/plain');
+      });
+    expect(await poll(copied, (text) => text !== '', 5_000)).toBe('copy-me-123');
+  });
+
+  test('terminal AC6 — pasting text then pressing Enter runs it', async () => {
+    const { page } = session;
+    await openTerminal(page);
+
+    await page.evaluate(() => {
+      const clipboardData = new DataTransfer();
+      clipboardData.setData('text/plain', 'echo pasted-$((2*21))');
+      document.querySelector('.xterm')!.dispatchEvent(new ClipboardEvent('paste', { clipboardData, bubbles: true, cancelable: true }));
+    });
+    await page.keyboard.press('Enter');
+
+    await waitForRow(page, 'pasted-42');
+  });
+
+  test('terminal AC7 — text, background and ANSI red follow the tokens as the color scheme changes', async () => {
+    const { page } = session;
+    await openTerminal(page);
+    await page.emulateMedia({ colorScheme: 'dark' });
+    await typeLine(page, "printf '\\033[31mred\\033[0m\\n'");
+    await page.locator('.xterm-rows span.xterm-fg-1', { hasText: 'red' }).first().waitFor({ timeout: 15_000 });
+
+    const settled = (colors: TerminalColors) => JSON.stringify(colors.actual) === JSON.stringify(colors.expected);
+
+    const dark = await poll(() => readTerminalColors(page), settled, 5_000);
+    expect(dark.actual).toEqual(dark.expected);
+
+    // Without reloading.
+    await page.emulateMedia({ colorScheme: 'light' });
+    const light = await poll(() => readTerminalColors(page), settled, 5_000);
+    expect(light.actual).toEqual(light.expected);
+
+    // The two schemes really differ, so the checks above are not vacuous.
+    expect(light.expected.text).not.toBe(dark.expected.text);
+    expect(light.expected.background).not.toBe(dark.expected.background);
+    expect(light.expected.red).not.toBe(light.expected.text);
+  });
+
+  test('terminal AC8 — leaving the terminal page ends its shell', async () => {
+    const { page } = session;
+    await openTerminal(page);
+    await typeLine(page, 'echo pid-$$');
+    const [pid] = (await captureRow(page, /^pid-(\d+)$/)).map(Number);
+    expect(isAlive(pid!)).toBe(true);
+
+    await page.getByRole('link', { name: 'Home', exact: true }).click({ timeout: UI_TIMEOUT });
+    await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
+
+    expect(await poll(() => isAlive(pid!), (alive) => !alive, 5_000)).toBe(false);
+  });
+
+  test('terminal AC9 — reloading the page ends its shell and opens a new one', async () => {
+    const { page } = session;
+    await openTerminal(page);
+    await typeLine(page, 'echo pid-$$');
+    const [pid] = (await captureRow(page, /^pid-(\d+)$/)).map(Number);
+    expect(isAlive(pid!)).toBe(true);
+
+    await page.reload();
+    await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
+    expect(await poll(() => isAlive(pid!), (alive) => !alive, 5_000)).toBe(false);
+
+    await focusTerminal(page);
+    await typeLine(page, 'echo cockpit-$((6*7))');
+    await waitForRow(page, 'cockpit-42');
+  });
+
   test('logs no error and keeps running', async () => {
     const { page } = session;
     expect(await consoleErrorsOf(page)).toEqual([]);
@@ -565,8 +871,13 @@ describe.each([
   });
 
   // Kills the pty host, so it stays the last test that needs a working one.
-  test('AC4 — survives the pty host being killed, and reports the open session as exited', async () => {
+  test('AC4 — survives the pty host being killed, and reports the open session as exited (terminal AC10: the terminal shows [Process ended])', async () => {
     const { page } = session;
+    // The terminal page is open, with a running shell.
+    await openTerminal(page);
+    await typeLine(page, 'echo up-$((1+1))');
+    await waitForRow(page, 'up-2');
+
     const id = await spawnShell(page);
     await ptyWrite(page, id, 'echo ppid-$PPID\n');
     await waitForOutput(page, id, /ppid-\d+/);
@@ -579,8 +890,9 @@ describe.each([
 
     await waitForExit(page, id);
     expect(await exitsOf(page, id)).toEqual([{ exitCode: null, signal: null }]);
+    await waitForRow(page, '[Process ended]');
     await page.getByText(versionLabel).waitFor();
-    await page.getByRole('heading', { name: 'Home' }).waitFor();
+    await page.getByRole('heading', { name: 'Terminal' }).waitFor();
     expect(session.isRunning()).toBe(true);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
     expect(await page.pageErrors()).toEqual([]);
