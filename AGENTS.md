@@ -96,7 +96,7 @@ src/
   - `contextIsolation` and `sandbox` on, `nodeIntegration` off. A sandboxed preload cannot be an ES module, so it is bundled as CommonJS (`index.cjs`).
   - The built renderer is served from the `app://renderer` protocol, never `file://`, with a CSP in `index.html`. The router therefore uses real URLs, as on the web.
   - New windows are denied (`https` links open in the system browser), and navigation away from the app origin is blocked.
-  - Every privileged IPC handler in the main process (`pty:*`, `get-shell-path`) ignores a message whose sender frame is not the app's own page (`app://renderer`, or the dev server origin in dev); an invoke handler rejects.
+  - Every privileged IPC handler in the main process (`pty:*`, `projects:*`, `get-shell-path`) ignores a message whose sender frame is not the app's own page (`app://renderer`, or the dev server origin in dev); an invoke handler rejects.
 - **Dependencies**: everything the bundles import goes in `devDependencies`, and electron-vite bundles it. Only modules that cannot be bundled (native modules such as node-pty) go in `dependencies`, so electron-builder ships them and rebuilds them for Electron.
 - **Styling**:
   - Tailwind utilities with the semantic tokens defined in `styles.css` (`bg-background`, `text-muted-foreground`, `bg-sidebar`…), never raw colors or `dark:` color overrides.

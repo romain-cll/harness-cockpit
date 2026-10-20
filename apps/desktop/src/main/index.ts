@@ -114,7 +114,7 @@ function originOf(url: string): string | undefined {
   }
 }
 
-// Only the app's own page may drive terminals or read the shell PATH.
+// Only the app's own page may drive terminals, manage projects or read the shell PATH.
 function isFromApp({ senderFrame }: Pick<IpcMainEvent, 'senderFrame'>): boolean {
   const appOrigin = devServerUrl ? originOf(devServerUrl) : RENDERER_ORIGIN;
   return senderFrame !== null && originOf(senderFrame.url) === appOrigin;
