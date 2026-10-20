@@ -5,6 +5,7 @@ import { createServer, type AddressInfo } from 'node:net';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { chromium, type Browser, type Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest';
@@ -379,6 +380,14 @@ const outputOf = (page: Page, id: number) =>
 
 const consoleErrorsOf = async (page: Page) =>
   (await page.consoleMessages()).filter((m) => m.type() === 'error').map((m) => m.text());
+
+// By default Playwright returns only what came after the last new-document
+// navigation (a reload included). These read everything since the page was
+// attached (or since the last clear), so a message logged before a reload counts.
+const allConsoleErrorsOf = async (page: Page) =>
+  (await page.consoleMessages({ filter: 'all' })).filter((m) => m.type() === 'error').map((m) => m.text());
+
+const allPageErrorsOf = (page: Page) => page.pageErrors({ filter: 'all' });
 
 // --- Terminal page helpers ---------------------------------------------------
 
@@ -901,12 +910,90 @@ describe.each([
 
   test('logs no error and keeps running', async () => {
     const { page } = session;
-    expect(await consoleErrorsOf(page)).toEqual([]);
-    expect(await page.pageErrors()).toEqual([]);
+    expect(await allConsoleErrorsOf(page)).toEqual([]);
+    expect(await allPageErrorsOf(page)).toEqual([]);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
     expect(session.isRunning()).toBe(true);
     // Still never the frontmost app, after every check above.
     expect(front.pids.has(session.pid)).toBe(false);
+  });
+
+  // A navigation away from the app, scripted from the page (a real Finder drop
+  // cannot be produced over CDP), must change nothing: same URL, same page, same
+  // shell. Not run in the launchd-environment mode (it runs the developer's real shell).
+  describe.runIf(inIsolatedShell)('navigations away from the app', () => {
+    // The file:// URL of a file that exists.
+    const existingFileUrl = pathToFileURL(import.meta.filename).href;
+    const CHROMIUM_LOCAL_RESOURCE = /Not allowed to load local resource/;
+
+    // The console messages and page errors of earlier tests are not this
+    // suite's business, and its own (Chromium's refusal of the file:// URL) must
+    // not reach the tests that follow.
+    beforeAll(async () => {
+      await session.page.clearConsoleMessages();
+      await session.page.clearPageErrors();
+    });
+    afterAll(async () => {
+      await session.page.clearConsoleMessages();
+      await session.page.clearPageErrors();
+    });
+
+    // After a navigation attempt Playwright keeps a pending navigation that never
+    // commits, and locator waits (`waitFor`, `click`) hang on it: from the attempt
+    // on, the page is read and driven through `page.evaluate` and the keyboard only.
+    async function attemptNavigation(target: string) {
+      const { page } = session;
+      await openTerminal(page);
+      const appUrl = await page.evaluate(() => location.href);
+      await typeLine(page, 'echo pid-$$');
+      const [pid] = (await captureRow(page, /^pid-(\d+)$/)).map(Number);
+      expect(isAlive(pid!)).toBe(true);
+
+      try {
+        await page.evaluate((url) => {
+          location.href = url;
+        }, target);
+        await sleep(2_000);
+
+        expect(await page.evaluate(() => location.href)).toBe(appUrl);
+        expect(
+          await page.evaluate(() =>
+            [...document.querySelectorAll('h1, h2, h3, [role="heading"]')].some((heading) => heading.textContent?.trim() === 'Terminal'),
+          ),
+        ).toBe(true);
+        expect(isAlive(pid!)).toBe(true);
+
+        await page.evaluate(() => (document.querySelector('.xterm-helper-textarea') as HTMLElement | null)?.focus());
+        await typeLine(page, 'echo cockpit-$((6*7))');
+        await waitForRow(page, 'cockpit-42');
+      } finally {
+        // Load the app page again, whether or not the page left it, so the pending
+        // navigation is gone and the next test can click.
+        await page.goto(appUrl);
+        await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
+      }
+    }
+
+    test('navigation AC2 — app://other/ leaves the page, its shell and its terminal as they were', async () => {
+      await attemptNavigation('app://other/');
+    });
+
+    test('navigation AC3 — https://example.com/ leaves the page, its shell and its terminal as they were', async () => {
+      await attemptNavigation('https://example.com/');
+    });
+
+    test('navigation AC4 — the file:// URL of an existing file leaves the page, its shell and its terminal as they were', async () => {
+      await attemptNavigation(existingFileUrl);
+    });
+
+    test('navigation AC5 — those attempts log no console error but Chromium refusing the file:// URL, no page error and no main-process error', async () => {
+      const { page } = session;
+      const errors = await allConsoleErrorsOf(page);
+      expect(errors.filter((text) => !CHROMIUM_LOCAL_RESOURCE.test(text))).toEqual([]);
+      expect(await allPageErrorsOf(page)).toEqual([]);
+      expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+      expect(session.isRunning()).toBe(true);
+    });
   });
 
   // Kills the pty host, so it stays the last test that needs a working one.
