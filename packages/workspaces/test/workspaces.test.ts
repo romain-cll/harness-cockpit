@@ -288,6 +288,38 @@ describe('createWorktree arguments', () => {
     expect(readdirSync(root)).toEqual([]);
     expect(git(repo, 'worktree', 'list', '--porcelain')).toBe(listBefore);
   });
+
+  test('AC21 — a failed creation in a non-empty folder leaves no new branch behind', async () => {
+    const repo = await makeRepo();
+    const root = await tempDir();
+    const target = join(root, projectDir(repo), 'topic');
+    await mkdir(target, { recursive: true });
+    await writeFile(join(target, 'keep.txt'), 'keep me\n');
+    const listBefore = git(repo, 'worktree', 'list', '--porcelain');
+
+    const error = await rejection(
+      createWorktree({ repo, root, branch: 'topic', base: 'main', env: testEnv }),
+    );
+
+    expect(error.code).toBe('GIT_FAILED');
+    expect(branchExists(repo, 'topic')).toBe(false);
+    expect(readdirSync(target)).toEqual(['keep.txt']);
+    expect(await readFile(join(target, 'keep.txt'), 'utf8')).toBe('keep me\n');
+    expect(git(repo, 'worktree', 'list', '--porcelain')).toBe(listBefore);
+  });
+
+  test('AC22 — rejects GIT_FAILED for a tag without a base, creating nothing', async () => {
+    const repo = await makeRepo();
+    const root = await tempDir();
+    git(repo, 'tag', 'v1');
+    const listBefore = git(repo, 'worktree', 'list', '--porcelain');
+
+    const error = await rejection(createWorktree({ repo, root, branch: 'v1', env: testEnv }));
+
+    expect(error.code).toBe('GIT_FAILED');
+    expect(readdirSync(root)).toEqual([]);
+    expect(git(repo, 'worktree', 'list', '--porcelain')).toBe(listBefore);
+  });
 });
 
 describe('removeWorktree', () => {
