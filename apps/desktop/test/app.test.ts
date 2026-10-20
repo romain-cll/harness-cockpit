@@ -488,7 +488,12 @@ describe.each([
         cwd: homedir(),
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
-        env: LAUNCHD_ENV,
+        // The same environment as the app's shell: launchd's plus the two test variables.
+        env: {
+          ...LAUNCHD_ENV,
+          COCKPIT_TEST_BACKGROUND: '1',
+          COCKPIT_USER_DATA_DIR: session.dataDir,
+        },
       });
       const path = await getShellPath(page);
       expect(normalizeFnm(path)).toBe(normalizeFnm(expected));
