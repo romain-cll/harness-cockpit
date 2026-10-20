@@ -865,13 +865,23 @@ describe.each([
   });
 
   // The app is given launchd's environment: the terminal's shell must get the
-  // login shell's PATH (`await shellEnv`), not launchd's.
+  // login shell's PATH (`await shellEnv`), not launchd's. The shell is a login
+  // shell and re-reads the user's startup files, so its PATH may be reordered or
+  // extended: every directory of the login-shell PATH must appear in it.
   test.runIf(launch === launchLaunchd)('terminal AC12 — the terminal shell gets the login shell PATH, not the launchd PATH', async () => {
     const { page } = session;
     await openTerminal(page);
     const expected = normalizeFnm(await getShellPath(page));
     expect(expected).not.toBe(LAUNCHD_PATH);
+    const directories = expected.split(':').filter(Boolean);
 
+    // The developer's login shell starts slowly and drops what is typed before
+    // its prompt: wait for the prompt.
+    await page.waitForFunction(
+      () => [...document.querySelectorAll('.xterm-rows > div')].some((row) => (row.textContent ?? '').trim() !== ''),
+      undefined,
+      { timeout: 20_000 },
+    );
     await typeLine(page, 'printf %s "$PATH"');
 
     // A long PATH wraps over several rows: the rows after the typed command are
@@ -879,12 +889,13 @@ describe.each([
     // the shell's prompt, if any, follows the PATH.
     const printed = () =>
       page.evaluate(() => {
-        const rows = [...document.querySelectorAll('.xterm-rows > div')].map((row) => (row.textContent ?? '').replace(/ /g, ' '));
+        const rows = [...document.querySelectorAll('.xterm-rows > div')].map((row) => (row.textContent ?? '').replace(/\u00a0/g, ' '));
         const command = rows.findLastIndex((row) => /printf %s "\$PATH"\s*$/.test(row));
         return command < 0 ? '' : rows.slice(command + 1).join('');
       });
-    const output = await poll(printed, (text) => normalizeFnm(text).startsWith(expected), 20_000);
-    expect(normalizeFnm(output).startsWith(expected)).toBe(true);
+    const missingFrom = (text: string) => directories.filter((directory) => !normalizeFnm(text).includes(directory));
+    const output = await poll(printed, (text) => missingFrom(text).length === 0, 20_000);
+    expect(missingFrom(output)).toEqual([]);
     expect(output.startsWith(LAUNCHD_PATH)).toBe(false);
   });
 
