@@ -38,7 +38,7 @@ export function resolveShellEnv({
   baseEnv = process.env,
 }: ResolveShellEnvOptions = {}): Promise<NodeJS.ProcessEnv> {
   if (process.platform === 'win32') return Promise.resolve({ ...baseEnv });
-  shell ??= baseEnv.SHELL ?? (userInfo().shell || undefined);
+  shell ??= baseEnv.SHELL ?? loginShell();
 
   return new Promise((resolve) => {
     const fallback = (reason: string) => {
@@ -78,17 +78,33 @@ export function resolveShellEnv({
       });
     }, timeoutMs);
 
+    // A background process started by a startup file can hold stdout open long
+    // after the shell is done, which delays `close`: settle once both markers
+    // have arrived, and stop reading.
     const chunks: Buffer[] = [];
-    child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+    child.stdout.on('data', (chunk: Buffer) => {
+      chunks.push(chunk);
+      const output = Buffer.concat(chunks).toString('utf8').split(MARK);
+      if (output.length < 3) return;
+      settle(() => {
+        child.stdout.destroy();
+        resolve(parseEnv(output[1]!, baseEnv));
+      });
+    });
     child.on('error', (error) => settle(() => fallback(error.message)));
     child.on('close', (code) =>
-      settle(() => {
-        const output = Buffer.concat(chunks).toString('utf8').split(MARK);
-        if (output.length < 3) return fallback(`it printed no environment (exit code ${code})`);
-        resolve(parseEnv(output[1]!, baseEnv));
-      }),
+      settle(() => fallback(`it printed no environment (exit code ${code})`)),
     );
   });
+}
+
+// `userInfo()` throws when the user has no passwd entry.
+function loginShell(): string | undefined {
+  try {
+    return userInfo().shell || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function parseEnv(text: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
