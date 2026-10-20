@@ -119,14 +119,13 @@ function isFromApp({ senderFrame }: Pick<IpcMainEvent, 'senderFrame'>): boolean 
   return senderFrame !== null && originOf(senderFrame.url) === appOrigin;
 }
 
-// Fills in what a spawn request leaves out: the user's shell as a login shell, as
-// Terminal.app runs it, in the home directory. Options the renderer passes win.
-function withSpawnDefaults(request: PtySpawnRequest): PtySpawnOptions {
-  const env = Object.fromEntries(
-    Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
-  );
+// Fills in what a spawn request leaves out: the user's login-shell environment
+// and the shell it names, run as a login shell as Terminal.app does, in the home
+// directory. Options the renderer passes win.
+async function withSpawnDefaults(request: PtySpawnRequest): Promise<PtySpawnOptions> {
+  const env = await shellEnv;
   return {
-    command: process.env.SHELL ?? '/bin/zsh',
+    command: env.SHELL ?? '/bin/zsh',
     args: ['-l'],
     cwd: homedir(),
     env: { ...env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
@@ -142,7 +141,7 @@ function startPty(): void {
 
   ipcMain.handle('pty:spawn', async (event, request: PtySpawnRequest) => {
     if (!isFromApp(event)) throw new Error('pty:spawn refused: unexpected origin');
-    const id = await pty.spawn(withSpawnDefaults(request));
+    const id = await pty.spawn(await withSpawnDefaults(request));
     owners.set(id, event.sender);
     return id;
   });
