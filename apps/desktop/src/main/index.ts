@@ -14,6 +14,7 @@ import {
   type WebContents,
 } from 'electron';
 import ptyHostPath from './pty-host?modulePath';
+import { shellEnv } from './shell-env';
 
 // The built renderer is served from a custom protocol rather than `file://`,
 // as the Electron security checklist recommends. It also gives the router
@@ -163,6 +164,8 @@ app.on('window-all-closed', () => {
 void app.whenReady().then(() => {
   protocol.handle('app', serveRenderer);
   ipcMain.handle('get-version', () => app.getVersion());
+  // The renderer gets the PATH only: the environment may hold tokens.
+  ipcMain.handle('get-shell-path', async () => (await shellEnv).PATH ?? '');
   startPty();
 
   createWindow();

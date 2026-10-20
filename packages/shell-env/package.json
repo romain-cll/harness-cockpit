@@ -1,0 +1,16 @@
+{
+  "name": "@cockpit/shell-env",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Resolves the environment of the user's login shell",
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "vitest": "^5.0.5"
+  }
+}

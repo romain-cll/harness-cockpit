@@ -18,6 +18,7 @@ const api: Api = {
     onData: (listener) => subscribe('pty:data', listener),
     onExit: (listener) => subscribe('pty:exit', listener),
   },
+  getShellPath: () => ipcRenderer.invoke('get-shell-path'),
 };
 
 contextBridge.exposeInMainWorld('api', api);
