@@ -320,10 +320,74 @@ describe('createWorktree arguments', () => {
     expect(readdirSync(root)).toEqual([]);
     expect(git(repo, 'worktree', 'list', '--porcelain')).toBe(listBefore);
   });
+
+  /** A `post-checkout` hook that always fails; linked worktrees share the repository's hooks. */
+  async function failingPostCheckoutHook(repo: string): Promise<void> {
+    const hook = join(repo, '.git', 'hooks', 'post-checkout');
+    await mkdir(dirname(hook), { recursive: true });
+    await writeFile(hook, '#!/bin/sh\nexit 1\n');
+    await chmod(hook, 0o755);
+  }
+
+  test('AC23 (a) — a failing post-checkout hook rolls back the worktree and the new branch', async () => {
+    const repo = await makeRepo();
+    const root = await tempDir();
+    const target = join(root, projectDir(repo), 'topic');
+    const listBefore = git(repo, 'worktree', 'list', '--porcelain');
+    await failingPostCheckoutHook(repo);
+
+    const error = await rejection(
+      createWorktree({ repo, root, branch: 'topic', base: 'main', env: testEnv }),
+    );
+
+    expect(error.code).toBe('GIT_FAILED');
+    expect(existsSync(target)).toBe(false);
+    expect(git(repo, 'worktree', 'list', '--porcelain')).toBe(listBefore);
+    expect(branchExists(repo, 'topic')).toBe(false);
+  });
+
+  test('AC23 (b) — a failing post-checkout hook rolls back the worktree and keeps the existing branch', async () => {
+    const repo = await makeRepo();
+    const root = await tempDir();
+    git(repo, 'branch', 'existing');
+    const existingHead = git(repo, 'rev-parse', 'existing');
+    const target = join(root, projectDir(repo), 'existing');
+    const listBefore = git(repo, 'worktree', 'list', '--porcelain');
+    await failingPostCheckoutHook(repo);
+
+    const error = await rejection(createWorktree({ repo, root, branch: 'existing', env: testEnv }));
+
+    expect(error.code).toBe('GIT_FAILED');
+    expect(existsSync(target)).toBe(false);
+    expect(git(repo, 'worktree', 'list', '--porcelain')).toBe(listBefore);
+    expect(branchExists(repo, 'existing')).toBe(true);
+    expect(git(repo, 'rev-parse', 'existing')).toBe(existingHead);
+  });
+
+  test('AC24 — a failed creation on an already registered path leaves the existing worktree intact', async () => {
+    const repo = await makeRepo();
+    const root = await tempDir();
+    const target = join(root, projectDir(repo), 'topic');
+    await mkdir(dirname(target), { recursive: true });
+    git(repo, 'worktree', 'add', '-b', 'topic', '--', target, 'main');
+    await writeFile(join(target, 'notes.txt'), 'keep me\n');
+    const listBefore = git(repo, 'worktree', 'list', '--porcelain');
+
+    const error = await rejection(createWorktree({ repo, root, branch: 'topic', env: testEnv }));
+
+    expect(error.code).toBe('GIT_FAILED');
+    expect(existsSync(target)).toBe(true);
+    expect(await readFile(join(target, 'notes.txt'), 'utf8')).toBe('keep me\n');
+    expect((await listWorktrees(repo, { env: testEnv })).some((w) => w.path === target && w.branch === 'topic')).toBe(
+      true,
+    );
+    expect(git(repo, 'worktree', 'list', '--porcelain')).toBe(listBefore);
+    expect(branchExists(repo, 'topic')).toBe(true);
+  });
 });
 
 describe('removeWorktree', () => {
-  test('AC8— removes a clean worktree and keeps its branch', async () => {
+  test('AC8 — removes a clean worktree and keeps its branch', async () => {
     const repo = await makeRepo();
     const path = await addWorktree(repo, 'clean', 'clean');
 
