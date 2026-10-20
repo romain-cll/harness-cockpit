@@ -1,0 +1,133 @@
+import { createHash } from 'node:crypto';
+import { realpath } from 'node:fs/promises';
+import { basename, join } from 'node:path';
+import { checkGit, git, succeeds, WorkspaceError } from './git';
+
+export { WorkspaceError } from './git';
+export type { WorkspaceErrorCode } from './git';
+
+export type GitEnv = { env?: NodeJS.ProcessEnv };
+
+export interface Worktree {
+  path: string;
+  /** The checked out commit. */
+  head: string | null;
+  /** The short branch name, `null` on a detached HEAD. */
+  branch: string | null;
+  /** Whether this is the main working tree. */
+  main: boolean;
+}
+
+/** The main working tree comes first. */
+async function list(repo: string, env?: NodeJS.ProcessEnv): Promise<Worktree[]> {
+  if (!(await succeeds(['rev-parse', '--show-toplevel'], { cwd: repo, env }))) {
+    throw new WorkspaceError('NOT_A_REPOSITORY', `not a git repository: ${repo}`);
+  }
+  const output = await git(['worktree', 'list', '--porcelain', '-z'], { cwd: repo, env });
+  const worktrees: Worktree[] = [];
+  let current: Worktree | undefined;
+  // Fields end with NUL, and an empty field ends a record.
+  for (const field of output.split('\0')) {
+    if (field === '') {
+      current = undefined;
+    } else if (field.startsWith('worktree ')) {
+      current = { path: field.slice('worktree '.length), head: null, branch: null, main: worktrees.length === 0 };
+      worktrees.push(current);
+    } else if (current && field.startsWith('HEAD ')) {
+      current.head = field.slice('HEAD '.length);
+    } else if (current && field.startsWith('branch ')) {
+      current.branch = field.slice('branch '.length).replace(/^refs\/heads\//, '');
+    }
+  }
+  return worktrees;
+}
+
+async function repositoryRoot(path: string, env?: NodeJS.ProcessEnv): Promise<string> {
+  const [main] = await list(path, env);
+  if (!main) throw new WorkspaceError('GIT_FAILED', `git worktree list found no worktree in ${path}`);
+  return main.path;
+}
+
+const realPath = (path: string) => realpath(path).catch(() => path);
+
+/** The linked worktree at `path`, compared by real path (macOS `/var` is `/private/var`). */
+async function linkedWorktree(worktrees: Worktree[], path: string): Promise<Worktree> {
+  const wanted = await realPath(path);
+  for (const worktree of worktrees) {
+    if (!worktree.main && (await realPath(worktree.path)) === wanted) return worktree;
+  }
+  throw new WorkspaceError('GIT_FAILED', `not a linked worktree: ${path}`);
+}
+
+/** The main working tree of the repository containing `path`, which may be inside a linked worktree. */
+export async function findRepositoryRoot(path: string, { env }: GitEnv = {}): Promise<string> {
+  await checkGit(env);
+  return repositoryRoot(path, env);
+}
+
+export async function listWorktrees(repo: string, { env }: GitEnv = {}): Promise<Worktree[]> {
+  await checkGit(env);
+  return list(repo, env);
+}
+
+/**
+ * Creates the worktree at `<root>/<project>-<hash>/<branch>`. With `base` it creates `branch` from
+ * it; without, it checks out the existing local `branch`.
+ */
+export async function createWorktree({
+  repo,
+  root,
+  branch,
+  base,
+  env,
+}: {
+  repo: string;
+  root: string;
+  branch: string;
+  base?: string;
+} & GitEnv): Promise<Worktree> {
+  await checkGit(env);
+  const main = await repositoryRoot(repo, env);
+  await git(['check-ref-format', '--branch', branch], { cwd: main, env });
+  const project = `${basename(main)}-${createHash('sha256').update(main).digest('hex').slice(0, 8)}`;
+  const path = join(root, project, branch);
+
+  if (base === undefined) {
+    await git(['worktree', 'add', '--', path, branch], { cwd: main, env });
+  } else {
+    if (await succeeds(['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: main, env })) {
+      throw new WorkspaceError('BRANCH_EXISTS', `branch already exists: ${branch}`);
+    }
+    await git(['worktree', 'add', '-b', branch, '--', path, base], { cwd: main, env });
+  }
+  return linkedWorktree(await list(main, env), path);
+}
+
+/**
+ * Removes a clean linked worktree. With `deleteBranch`, also deletes its branch if merged: when it
+ * is not, the worktree is still removed and the call rejects with `BRANCH_NOT_MERGED`.
+ */
+export async function removeWorktree({
+  repo,
+  path,
+  deleteBranch,
+  env,
+}: {
+  repo: string;
+  path: string;
+  deleteBranch?: boolean;
+} & GitEnv): Promise<void> {
+  await checkGit(env);
+  const worktrees = await list(repo, env);
+  const worktree = await linkedWorktree(worktrees, path);
+  const main = worktrees[0]!.path;
+
+  if ((await git(['status', '--porcelain'], { cwd: worktree.path, env })).trim() !== '') {
+    throw new WorkspaceError('DIRTY_WORKTREE', `worktree has uncommitted changes: ${worktree.path}`);
+  }
+  await git(['worktree', 'remove', '--', worktree.path], { cwd: main, env });
+
+  if (deleteBranch && worktree.branch !== null && !(await succeeds(['branch', '-d', '--', worktree.branch], { cwd: main, env }))) {
+    throw new WorkspaceError('BRANCH_NOT_MERGED', `branch is not merged: ${worktree.branch}`);
+  }
+}

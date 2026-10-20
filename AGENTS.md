@@ -23,7 +23,7 @@ Differentiators:
 - artifacts on storage you own;
 - usage statistics.
 
-The repository is built in steps. So far, the parts in scope are the **desktop app shell** (`apps/desktop`): a window, a router, a typed bridge to the main process, and the UI foundation (styling, light and dark themes, sidebar layout); and the **pty host** (`packages/pty`), which runs node-pty in a utility process and exposes it as `window.api.pty`; the **login-shell environment** (`packages/shell-env`), which the main process resolves at startup for the child processes it will spawn; and the **state store** (`packages/state`), which keeps the app state in a JSON file. No product UI yet.
+The repository is built in steps. So far, the parts in scope are the **desktop app shell** (`apps/desktop`): a window, a router, a typed bridge to the main process, and the UI foundation (styling, light and dark themes, sidebar layout); and the **pty host** (`packages/pty`), which runs node-pty in a utility process and exposes it as `window.api.pty`; the **login-shell environment** (`packages/shell-env`), which the main process resolves at startup for the child processes it will spawn; the **state store** (`packages/state`), which keeps the app state in a JSON file; and the **workspaces package** (`packages/workspaces`), which creates, lists and removes git worktrees. No product UI yet.
 
 Daemon, terminal UI, artifacts, stats, cloud backend, web app, mobile: create none of these without an explicit request.
 
@@ -45,6 +45,7 @@ packages/
   pty/               # node-pty host (utility process side) and client (main process side)
   shell-env/         # resolves the environment of the user's login shell
   state/             # app state kept in a JSON file in userData
+  workspaces/        # git worktrees: find a repository's root, create, list, remove
 ```
 
 - No other app (daemon, web, cloud) without an explicit request.
@@ -130,6 +131,16 @@ src/
   - The launch without the switch (visible window, `Foreground` app) runs only in CI, where no one's focus is at stake: `CI` reaches the tests through `turbo.json`. Do not set `CI` locally to run it.
   - Playwright is maintained by Microsoft and widely adopted. The tests do not use its Electron launcher (`_electron.launch()`, labelled experimental): it runs the app's main script before it returns, so output written during startup never reaches the test. They spawn the app themselves with `--remote-debugging-port=0`, attach the output listeners at once, read the port from Chromium's `DevTools listening on ws://127.0.0.1:<port>` line on stderr, and attach with `chromium.connectOverCDP`. The session's `output()` therefore holds everything the app wrote from its first line. The attach goes through Chromium's remote debugging port, so never disable it in test builds.
 
+## Workspaces (`packages/workspaces`)
+
+Pure Node, consumed as TS source like `packages/pty`, with no `electron` import (a test checks it). Four functions: `findRepositoryRoot`, `listWorktrees`, `createWorktree`, `removeWorktree`. Each takes an optional `env` used to run git, so the caller can pass the login-shell environment.
+
+- **A package called by the main process, not a CLI.** Checked on 2026-10-19 against the source of Superset, Orca, Emdash, Vibe Kanban and Claude Squad: none of them has its app call its own CLI. Errors are typed (`WorkspaceError` with a string `code`, which survives IPC). Nothing is wired into `apps/desktop` yet.
+- **`execFile('git', …)` on the user's git, no git library.** Never through a shell. The git manual guarantees that the output of `git worktree list --porcelain` stays stable. Against the libraries: simple-git has no worktree API and one de facto maintainer; dugite ships its own git binary, which would have to be signed; isomorphic-git has no worktrees; nodegit's last stable release is from 2020. Typed errors come from pre-checks and exit codes, never from git's localized messages.
+- **git 2.36 or later**, checked at runtime by every public function (`GIT_MISSING`, `GIT_TOO_OLD`): `listWorktrees` parses `git worktree list --porcelain -z`.
+- **Layout**: `<root>/<project>-<hash>/<branch>`, where `<project>` is the basename of the main working tree and `<hash>` the first 8 hex characters of the SHA-256 of its path (deterministic, stateless, no collision between two repositories with the same name). A branch with a slash nests (`feature/login`). The root is a parameter: choosing the real one is the app's job.
+- **No force option on removal.** A dirty worktree is refused (`DIRTY_WORKTREE`), and a branch is deleted only with `git branch -d`: unmerged, squash-merged included, gives `BRANCH_NOT_MERGED`, with the worktree removed and the branch kept. Forcing comes with a caller that asks the user to confirm.
+
 ## Tests and validation
 
 - **CI** (`.github/workflows/ci.yml`): on every pull request and every push to `main`, one macOS job runs `bun turbo run build typecheck lint test`. macOS because the desktop app is packaged for macOS and its tests open windows. The repository is public, so GitHub-hosted runners cost nothing.
@@ -138,3 +149,4 @@ src/
 - `packages/pty` (vitest, plain Node): the host and the client wired through in-memory ports, with the real node-pty.
 - `packages/shell-env` (vitest, plain Node): `resolveShellEnv` against fake shells (startup noise, multi-line values, timeout, missing or failing shell, no passwd entry and no shell found, an unreadable home directory, a background process holding stdout, injected and removed variables).
 - `packages/state` (vitest, plain Node): `loadState` on a fresh folder per case: missing file and folder, read back without a rewrite, each corrupted shape set aside, newer version, unreadable file (`EISDIR` for a folder, `EACCES` for a file without read permission, nothing renamed, created or removed), leftover `.tmp`.
+- `packages/workspaces` (vitest, plain Node): the four functions against the real git, on temporary repositories and roots under `os.tmpdir()`, with an env that ignores the user's git config.
