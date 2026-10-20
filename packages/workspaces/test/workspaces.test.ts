@@ -306,6 +306,81 @@ describe('removeWorktree', () => {
   });
 });
 
+describe('missing folders', () => {
+  test('AC16 — a path that does not exist is NOT_A_REPOSITORY, never GIT_MISSING', async () => {
+    const missing = join(await tempDir(), 'never-created');
+    const root = await tempDir();
+
+    const calls: Record<string, () => Promise<unknown>> = {
+      findRepositoryRoot: () => findRepositoryRoot(missing, { env: testEnv }),
+      listWorktrees: () => listWorktrees(missing, { env: testEnv }),
+      createWorktree: () =>
+        createWorktree({ repo: missing, root, branch: 'topic', base: 'main', env: testEnv }),
+    };
+    for (const [name, call] of Object.entries(calls)) {
+      const error = await rejection(call());
+      expect(error.code, name).toBe('NOT_A_REPOSITORY');
+    }
+    expect(readdirSync(root)).toEqual([]);
+  });
+
+  test('AC16 — a linked worktree whose folder was deleted by hand is GIT_FAILED, never GIT_MISSING', async () => {
+    const repo = await makeRepo();
+    const path = await addWorktree(repo, 'gone', 'gone');
+    await rm(path, { recursive: true, force: true });
+
+    const error = await rejection(removeWorktree({ repo, path, env: testEnv }));
+
+    expect(error.code).toBe('GIT_FAILED');
+  });
+});
+
+describe('removeWorktree dirty check and vanished branches', () => {
+  test('AC17 — an untracked file is DIRTY_WORKTREE even with status.showUntrackedFiles=no', async () => {
+    const repo = await makeRepo();
+    git(repo, 'config', 'status.showUntrackedFiles', 'no');
+    const path = await addWorktree(repo, 'quiet', 'quiet');
+    await writeFile(join(path, 'notes.txt'), 'keep me\n');
+
+    const error = await rejection(removeWorktree({ repo, path, env: testEnv }));
+
+    expect(error.code).toBe('DIRTY_WORKTREE');
+    expect(existsSync(path)).toBe(true);
+    expect(await readFile(join(path, 'notes.txt'), 'utf8')).toBe('keep me\n');
+  });
+
+  test('AC18 (a) — resolves when the worktree is detached and its branch was deleted by hand', async () => {
+    const repo = await makeRepo();
+    const path = await addWorktree(repo, 'detached-gone', 'detached-gone');
+    git(path, 'checkout', '--detach');
+    git(repo, 'branch', '-D', 'detached-gone');
+
+    await removeWorktree({ repo, path, deleteBranch: true, env: testEnv });
+
+    expect(existsSync(path)).toBe(false);
+    expect((await listWorktrees(repo, { env: testEnv })).some((w) => w.path === path)).toBe(false);
+    expect(branchExists(repo, 'detached-gone')).toBe(false);
+  });
+
+  test('AC18 (b) — resolves when the branch ref was deleted while checked out and the worktree is clean', async () => {
+    const repo = await makeRepo();
+    const path = await addWorktree(repo, 'ref-gone', 'ref-gone');
+    git(repo, 'update-ref', '-d', 'refs/heads/ref-gone');
+    git(path, 'rm', '-r', '-q', '--cached', '.');
+    await rm(join(path, 'README.md'), { force: true });
+    expect(git(path, 'status', '--porcelain')).toBe('');
+    // Git still reports the checked out branch name.
+    const listed = await listWorktrees(repo, { env: testEnv });
+    expect(listed.find((w) => w.path === path)?.branch).toBe('ref-gone');
+
+    await removeWorktree({ repo, path, deleteBranch: true, env: testEnv });
+
+    expect(existsSync(path)).toBe(false);
+    expect((await listWorktrees(repo, { env: testEnv })).some((w) => w.path === path)).toBe(false);
+    expect(branchExists(repo, 'ref-gone')).toBe(false);
+  });
+});
+
 describe('git availability', () => {
   /** A folder to use as the whole `PATH`, optionally holding a `git` script. */
   async function pathWith(gitScript?: string): Promise<string> {
