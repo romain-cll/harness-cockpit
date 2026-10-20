@@ -16,7 +16,7 @@ export function AppSidebar({ version }: { version: string }) {
         </Link>
         <Link
           to="/terminal"
-          className="app-drag h-12 shrink-0"
+          className="flex h-8 cursor-default items-center gap-2 rounded-[calc(var(--radius-sm)+2px)] p-2 text-xs hover:bg-sidebar-accent hover:text-sidebar-accent-foreground aria-[current=page]:bg-sidebar-accent aria-[current=page]:font-medium aria-[current=page]:text-sidebar-accent-foreground [&_svg]:size-4 [&_svg]:shrink-0"
         >
           <SquareTerminalIcon />
           Terminal
