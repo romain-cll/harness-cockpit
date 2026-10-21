@@ -17,9 +17,11 @@
     "node-pty": "1.2.0-beta.15"
   },
   "devDependencies": {
+    "@base-ui/react": "^1.9.0",
     "@cockpit/pty": "workspace:*",
     "@cockpit/shell-env": "workspace:*",
     "@cockpit/state": "workspace:*",
+    "@cockpit/workspaces": "workspace:*",
     "@tailwindcss/vite": "^4.3.3",
     "@tanstack/react-router": "^1.170.45",
     "@tanstack/router-plugin": "^1.168.47",
@@ -29,6 +31,8 @@
     "@vitejs/plugin-react": "^6.1.2",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
+    "class-variance-authority": "^0.7.1",
+    "cn": "^0.5.0",
     "electron": "^44.9.0",
     "electron-builder": "^26.15.3",
     "electron-vite": "^6.0.0",

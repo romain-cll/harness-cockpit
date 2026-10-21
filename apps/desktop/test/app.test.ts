@@ -1,9 +1,9 @@
 import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createServer, type AddressInfo } from 'node:net';
 import { homedir, tmpdir, userInfo } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
@@ -34,6 +34,13 @@ interface Session {
   dataDir: string;
   /** Everything the app wrote to stdout and stderr. */
   output(): string;
+  /**
+   * Evaluates an expression in the app's main process, through the Node
+   * inspector, and returns its value. `require` is available in it (the
+   * inspector's command-line API). The app has no test hook: this is how a test
+   * replaces the folder picker.
+   */
+  evaluateInMain<T = unknown>(expression: string): Promise<T>;
   isRunning(): boolean;
   close(): Promise<void>;
 }
@@ -82,6 +89,63 @@ async function stopGroup(child: ChildProcess): Promise<void> {
   clearTimeout(killer);
 }
 
+// Connects to the main process's Node inspector (`--inspect=0` prints
+// `Debugger listening on ws://...` on stderr) with Node's own WebSocket, and
+// evaluates expressions in it. The connection opens on the first evaluation.
+// `Runtime.evaluate` with `includeCommandLineAPI` exposes `require`, which is
+// what `electronApp.evaluate` of Playwright's Electron launcher does too.
+function mainInspector(output: () => string) {
+  let socket: Promise<WebSocket> | undefined;
+  let lastId = 0;
+  const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();
+
+  const connect = async () => {
+    const url = await poll(() => /Debugger listening on (ws:\/\/\S+)/.exec(output())?.[1], Boolean, 15_000);
+    if (!url) throw new Error(`the app did not open an inspector:\n${output()}`);
+    const ws = new WebSocket(url);
+    await new Promise<void>((resolve, reject) => {
+      ws.addEventListener('open', () => resolve(), { once: true });
+      ws.addEventListener('error', () => reject(new Error(`cannot connect to the inspector at ${url}`)), { once: true });
+    });
+    ws.addEventListener('message', (event) => {
+      const message = JSON.parse(String(event.data)) as {
+        id?: number;
+        result?: { result?: { value?: unknown }; exceptionDetails?: { text: string; exception?: { description?: string } } };
+        error?: { message: string };
+      };
+      const waiting = message.id === undefined ? undefined : pending.get(message.id);
+      if (!waiting) return;
+      pending.delete(message.id!);
+      const failure = message.result?.exceptionDetails;
+      if (message.error) waiting.reject(new Error(message.error.message));
+      else if (failure) waiting.reject(new Error(failure.exception?.description ?? failure.text));
+      else waiting.resolve(message.result?.result?.value);
+    });
+    return ws;
+  };
+
+  return {
+    async evaluate<T>(expression: string): Promise<T> {
+      const ws = await (socket ??= connect());
+      const id = ++lastId;
+      const answer = new Promise<unknown>((resolve, reject) => pending.set(id, { resolve, reject }));
+      ws.send(
+        JSON.stringify({
+          id,
+          method: 'Runtime.evaluate',
+          params: { expression, includeCommandLineAPI: true, awaitPromise: true, returnByValue: true },
+        }),
+      );
+      return (await answer) as T;
+    },
+    // An inspector left connected can hold the process at exit.
+    async close() {
+      const ws = await socket?.catch(() => undefined);
+      ws?.close();
+    },
+  };
+}
+
 // Spawns the Electron binary itself, with its output piped from the first line,
 // and attaches over CDP. Chromium prints the port it picked on stderr
 // (`--remote-debugging-port=0`).
@@ -94,7 +158,7 @@ async function launchSpawned(
 ): Promise<Session> {
   const { dataDir, env } = launchEnv(background, givenDataDir, base);
   // Its own process group, so closing stops Electron and its helpers together.
-  const child = spawn(executablePath, ['--remote-debugging-port=0', ...args], {
+  const child = spawn(executablePath, ['--remote-debugging-port=0', '--inspect=0', ...args], {
     cwd: appDir,
     env,
     detached: true,
@@ -116,13 +180,16 @@ async function launchSpawned(
       await sleep(50);
     }
     const { browser, page } = await attach(`http://127.0.0.1:${port}`);
+    const inspector = mainInspector(() => output);
     return {
       page,
       pid: child.pid!,
       dataDir,
       output: () => output,
+      evaluateInMain: inspector.evaluate,
       isRunning: () => child.exitCode === null,
       close: async () => {
+        await inspector.close();
         await browser.close();
         await stopGroup(child);
         removeDataDir();
@@ -199,9 +266,11 @@ function freePort(): Promise<number> {
 // DevTools Protocol.
 async function launchDev(): Promise<Session> {
   const port = await freePort();
+  const inspectPort = await freePort();
   const { dataDir, env } = launchEnv(true);
   // Its own process group, so closing stops the dev server and Electron with it.
-  const dev = spawn('bun', ['run', 'dev', '--remoteDebuggingPort', String(port)], {
+  // electron-vite ignores `--inspect 0` (0 is falsy for it): a free port instead.
+  const dev = spawn('bun', ['run', 'dev', '--remoteDebuggingPort', String(port), '--inspect', String(inspectPort)], {
     cwd: appDir,
     env,
     detached: true,
@@ -225,13 +294,16 @@ async function launchDev(): Promise<Session> {
     // The dev script runs Electron in the process group of `dev`; the helpers
     // are named `Electron Helper ...`, so `-x` matches the main process only.
     const pid = Number(execFileSync('pgrep', ['-g', String(dev.pid), '-x', 'Electron'], { encoding: 'utf8' }).split('\n')[0]);
+    const inspector = mainInspector(() => output);
     return {
       page,
       pid,
       dataDir,
       output: () => output,
+      evaluateInMain: inspector.evaluate,
       isRunning: () => dev.exitCode === null,
       close: async () => {
+        await inspector.close();
         await browser.close();
         await stop();
         removeDataDir();
@@ -523,6 +595,174 @@ const readTerminalColors = (page: Page): Promise<TerminalColors> =>
       },
     };
   });
+
+// --- Projects helpers --------------------------------------------------------
+
+// A git that ignores the user's configuration, for the repositories the tests
+// create.
+const gitTestEnv: NodeJS.ProcessEnv = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: '/dev/null',
+  GIT_CONFIG_NOSYSTEM: '1',
+  GIT_AUTHOR_NAME: 'Test',
+  GIT_AUTHOR_EMAIL: 'test@example.com',
+  GIT_COMMITTER_NAME: 'Test',
+  GIT_COMMITTER_EMAIL: 'test@example.com',
+};
+
+const gitIn = (cwd: string, ...args: string[]) =>
+  execFileSync('git', args, { cwd, env: gitTestEnv, encoding: 'utf8' }).trim();
+
+interface TempRepo {
+  /** The temporary folder that holds the repository, to remove afterwards. */
+  parent: string;
+  /** The repository root, as git reports it (macOS `/var` is `/private/var`). */
+  root: string;
+  /** The name the sidebar shows: the root's basename. */
+  name: string;
+}
+
+// `<tmp>/<name>` with one commit (`README.md`, `src/main.ts`).
+function makeRepo(name: string): TempRepo {
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-project-test-')));
+  const root = join(parent, name);
+  mkdirSync(join(root, 'src'), { recursive: true });
+  writeFileSync(join(root, 'README.md'), 'hello\n');
+  writeFileSync(join(root, 'src', 'main.ts'), 'export {};\n');
+  gitIn(root, 'init', '-b', 'main');
+  gitIn(root, 'add', '.');
+  gitIn(root, 'commit', '-m', 'initial');
+  expect(gitIn(root, 'rev-parse', '--show-toplevel')).toBe(root);
+  return { parent, root, name };
+}
+
+// A folder that is not inside any git repository.
+function makePlainFolder(name: string): TempRepo {
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-project-test-')));
+  const root = join(parent, name);
+  mkdirSync(root);
+  return { parent, root, name };
+}
+
+// What a removal from Cockpit must leave alone.
+const snapshotRepo = (repo: TempRepo) => ({
+  head: gitIn(repo.root, 'rev-parse', 'HEAD'),
+  status: gitIn(repo.root, 'status', '--porcelain'),
+  readme: readFileSync(join(repo.root, 'README.md'), 'utf8'),
+  source: readFileSync(join(repo.root, 'src', 'main.ts'), 'utf8'),
+  hasGit: existsSync(join(repo.root, '.git')),
+});
+
+const projectsInState = (dataDir: string): unknown =>
+  (JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')) as { projects?: unknown }).projects;
+
+const stateSnapshot = (dataDir: string) => {
+  const file = join(dataDir, 'state.json');
+  return { content: readFileSync(file, 'utf8'), mtimeMs: statSync(file).mtimeMs };
+};
+
+// Replaces `dialog.showOpenDialog` in the main process with a function that
+// answers the folder `pick` (or a cancellation for `null`) and counts its calls.
+const stubPicker = (session: Session, pick: string | null) =>
+  session.evaluateInMain(`(() => {
+    const { dialog } = require('electron');
+    const picker = (globalThis.__pickerCalls ??= { count: 0 });
+    const answer = ${JSON.stringify(pick === null ? { canceled: true, filePaths: [] } : { canceled: false, filePaths: [pick] })};
+    const stub = async () => {
+      picker.count++;
+      return answer;
+    };
+    dialog.showOpenDialog = stub;
+    if (dialog.showOpenDialog !== stub) throw new Error('dialog.showOpenDialog cannot be replaced');
+    return picker.count;
+  })()`);
+
+const pickerCalls = (session: Session) => session.evaluateInMain<number>('globalThis.__pickerCalls?.count ?? 0');
+
+// Clicks "Add project" with the picker answering `pick`, and waits until the
+// app has opened the picker. What the app does with the answer is the caller's
+// to wait for.
+async function addProject(session: Session, pick: string | null) {
+  await stubPicker(session, pick);
+  const before = await pickerCalls(session);
+  await session.page.getByRole('button', { name: 'Add project', exact: true }).click({ timeout: UI_TIMEOUT });
+  const after = await poll(() => pickerCalls(session), (calls) => calls > before, UI_TIMEOUT);
+  expect(after, 'clicking "Add project" opens the folder picker').toBeGreaterThan(before);
+}
+
+interface SidebarEntry {
+  title: string;
+  text: string;
+}
+
+// The sidebar elements that carry a `title`: the project entries (the outermost
+// one when the title is repeated on nested elements).
+const sidebarEntries = (page: Page): Promise<SidebarEntry[]> =>
+  page.evaluate(() => {
+    const titled = [...document.querySelectorAll('aside [title]')] as HTMLElement[];
+    return titled
+      .filter((element) => !titled.some((other) => other !== element && other.contains(element) && other.title === element.title))
+      .map((element) => ({ title: element.title, text: (element.textContent ?? '').trim() }));
+  });
+
+const entryTitles = async (page: Page) => (await sidebarEntries(page)).map((entry) => entry.title);
+
+const waitForEntries = (page: Page, expected: string[]) =>
+  poll(() => entryTitles(page), (titles) => JSON.stringify(titles) === JSON.stringify(expected), UI_TIMEOUT);
+
+// The text lines of the sidebar.
+const sidebarLines = async (page: Page) =>
+  (await page.locator('aside').innerText()).split('\n').map((line) => line.trim()).filter(Boolean);
+
+const REFUSAL = /is already in Cockpit\.$|is not in a git repository\.$/;
+const refusalsShown = async (page: Page) => (await sidebarLines(page)).filter((line) => REFUSAL.test(line));
+
+const waitForLine = (page: Page, line: string) =>
+  poll(() => sidebarLines(page), (lines) => lines.includes(line), UI_TIMEOUT);
+
+// Whether the deepest element that shows `text` (or carries `title`) sits
+// below the "Projects" header in the sidebar.
+const isBelowProjectsHeader = (page: Page, target: { text: string } | { title: string }) =>
+  page.evaluate((target) => {
+    const all = [...document.querySelectorAll('aside *')] as HTMLElement[];
+    const deepest = (matches: (element: HTMLElement) => boolean) =>
+      all.filter(matches).filter((element) => !all.some((other) => other !== element && element.contains(other) && matches(other)))[0];
+    const header = deepest((element) => (element.textContent ?? '').trim() === 'Projects');
+    const found =
+      'title' in target
+        ? deepest((element) => element.getAttribute('title') === target.title)
+        : deepest((element) => (element.textContent ?? '').trim() === target.text);
+    if (!header || !found) return false;
+    return found.getBoundingClientRect().top >= header.getBoundingClientRect().bottom - 1;
+  }, target);
+
+// Opens the "…" menu of the project entry titled `root`, checks it, and picks
+// "Remove from Cockpit".
+async function removeThroughMenu(page: Page, root: string) {
+  const entry = page.getByTitle(root, { exact: true }).first();
+  await entry.hover({ timeout: UI_TIMEOUT });
+  // The "…" button sits in the same row as the entry; Base UI marks a menu trigger with aria-haspopup.
+  await entry
+    .locator('xpath=ancestor-or-self::*[.//button[@aria-haspopup="menu"]][1]')
+    .locator('button[aria-haspopup="menu"]')
+    .click({ timeout: UI_TIMEOUT });
+
+  const items = page.getByRole('menuitem');
+  await items.first().waitFor({ timeout: UI_TIMEOUT });
+  expect(await items.count()).toBe(1);
+  const lines = (await items.first().innerText()).split('\n').map((line) => line.trim()).filter(Boolean);
+  expect(lines).toEqual(['Remove from Cockpit', 'Files stay on disk']);
+  // The second line is muted: not painted like the item itself.
+  const colors = await page.evaluate(() => {
+    const item = document.querySelector('[role="menuitem"]') as HTMLElement;
+    const note = [...item.querySelectorAll('*')].find((element) => element.textContent?.trim() === 'Files stay on disk');
+    return { item: getComputedStyle(item).color, note: note ? getComputedStyle(note).color : 'no element of its own' };
+  });
+  expect(colors.note).not.toBe('no element of its own');
+  expect(colors.note).not.toBe(colors.item);
+
+  await items.first().click({ timeout: UI_TIMEOUT });
+}
 
 describe.each([
   ['dev server', launchDev],
@@ -908,6 +1148,129 @@ describe.each([
     expect(output.startsWith(LAUNCHD_PATH)).toBe(false);
   });
 
+  // The picker is stubbed in the main process (`session.evaluateInMain`). The
+  // tests share the session and run in order: the repository added by AC1 is
+  // the one AC2 adds again, and AC6 removes what AC1 and AC4 added.
+  describe('projects', () => {
+    let alpha: TempRepo;
+    let bravo: TempRepo;
+    let plain: TempRepo;
+    const folders: TempRepo[] = [];
+
+    beforeAll(() => {
+      alpha = makeRepo('alpha-project');
+      bravo = makeRepo('bravo-project');
+      plain = makePlainFolder('not-a-repository');
+      folders.push(alpha, bravo, plain);
+    });
+
+    afterAll(() => {
+      for (const folder of folders) rmSync(folder.parent, { recursive: true, force: true });
+    });
+
+    test('AC1 — adding a subfolder of a repository lists the repository by name, titled with its root, and stores its root', async () => {
+      const { page } = session;
+      await page.getByText(versionLabel).waitFor();
+      expect(await sidebarLines(page)).toContain('Projects');
+      expect(await entryTitles(page)).toEqual([]);
+
+      await addProject(session, join(alpha.root, 'src'));
+      await waitForEntries(page, [alpha.root]);
+
+      const entries = await sidebarEntries(page);
+      expect(entries).toHaveLength(1);
+      expect(entries[0]!.title).toBe(alpha.root);
+      expect(entries[0]!.text).toContain(alpha.name);
+      expect(await isBelowProjectsHeader(page, { title: alpha.root })).toBe(true);
+
+      await poll(() => projectsInState(session.dataDir), (projects) => Array.isArray(projects) && projects.length > 0, UI_TIMEOUT);
+      expect(projectsInState(session.dataDir)).toEqual([{ path: alpha.root }]);
+      expect(existsSync(join(session.dataDir, 'state.json.tmp'))).toBe(false);
+    });
+
+    test('AC2 — adding the same repository again, by its root or a subfolder, keeps one entry, shows a message and leaves state.json alone', async () => {
+      const { page } = session;
+      const message = `${alpha.name} is already in Cockpit.`;
+      const before = stateSnapshot(session.dataDir);
+
+      for (const pick of [alpha.root, join(alpha.root, 'src')]) {
+        await addProject(session, pick);
+        await waitForLine(page, message);
+        await sleep(300);
+
+        expect(await entryTitles(page)).toEqual([alpha.root]);
+        expect(await refusalsShown(page)).toEqual([message]);
+        expect(await isBelowProjectsHeader(page, { text: message })).toBe(true);
+        expect(stateSnapshot(session.dataDir)).toEqual(before);
+      }
+    });
+
+    test('AC3 — a folder outside any git repository is refused with a message, no entry and state.json untouched', async () => {
+      const { page } = session;
+      const message = `${plain.root} is not in a git repository.`;
+      const before = stateSnapshot(session.dataDir);
+
+      await addProject(session, plain.root);
+      await waitForLine(page, message);
+      await sleep(300);
+
+      expect(await entryTitles(page)).toEqual([alpha.root]);
+      expect(await refusalsShown(page)).toEqual([message]);
+      expect(await isBelowProjectsHeader(page, { text: message })).toBe(true);
+      expect(stateSnapshot(session.dataDir)).toEqual(before);
+    });
+
+    test('AC4 — a message goes away when a valid repository is added, and the project appears', async () => {
+      const { page } = session;
+      expect(await refusalsShown(page), 'a message is shown before the add').not.toEqual([]);
+
+      await addProject(session, bravo.root);
+      await waitForEntries(page, [alpha.root, bravo.root]);
+
+      expect(await refusalsShown(page)).toEqual([]);
+      await poll(() => projectsInState(session.dataDir), (projects) => Array.isArray(projects) && projects.length > 1, UI_TIMEOUT);
+      expect(projectsInState(session.dataDir)).toEqual([{ path: alpha.root }, { path: bravo.root }]);
+    });
+
+    test('AC5 — cancelling the picker changes neither the list, nor state.json, and shows no message', async () => {
+      const { page } = session;
+      expect(await refusalsShown(page)).toEqual([]);
+      const before = stateSnapshot(session.dataDir);
+
+      await addProject(session, null);
+      await sleep(500);
+
+      expect(await entryTitles(page)).toEqual([alpha.root, bravo.root]);
+      expect(await refusalsShown(page)).toEqual([]);
+      expect(stateSnapshot(session.dataDir)).toEqual(before);
+    });
+
+    test('AC6 — the "…" menu offers "Remove from Cockpit" (Files stay on disk); picking it removes the entry at once and leaves the repository on disk', async () => {
+      const { page } = session;
+      const alphaOnDisk = snapshotRepo(alpha);
+      const bravoOnDisk = snapshotRepo(bravo);
+
+      await removeThroughMenu(page, bravo.root);
+      await waitForEntries(page, [alpha.root]);
+      // No confirmation to answer.
+      expect(await page.getByRole('dialog').count()).toBe(0);
+      expect(await page.getByRole('alertdialog').count()).toBe(0);
+      await poll(() => projectsInState(session.dataDir), (projects) => Array.isArray(projects) && projects.length === 1, UI_TIMEOUT);
+      expect(projectsInState(session.dataDir)).toEqual([{ path: alpha.root }]);
+      expect(snapshotRepo(bravo)).toEqual(bravoOnDisk);
+
+      await removeThroughMenu(page, alpha.root);
+      await waitForEntries(page, []);
+      expect(await page.getByRole('dialog').count()).toBe(0);
+      expect(await page.getByRole('alertdialog').count()).toBe(0);
+      await poll(() => projectsInState(session.dataDir), (projects) => Array.isArray(projects) && projects.length === 0, UI_TIMEOUT);
+      expect(projectsInState(session.dataDir)).toEqual([]);
+      expect(snapshotRepo(alpha)).toEqual(alphaOnDisk);
+      expect(alphaOnDisk.hasGit).toBe(true);
+      expect(basename(alpha.root)).toBe(alpha.name);
+    });
+  });
+
   test('logs no error and keeps running', async () => {
     const { page } = session;
     expect(await allConsoleErrorsOf(page)).toEqual([]);
@@ -1146,6 +1509,63 @@ describe('packaged app state file', () => {
     expect(existsSync(join(dataDir, 'state.json.tmp'))).toBe(false);
   });
 
+  test('AC7 — a project survives a restart on the same data folder, and removing it leaves the repository on disk', async () => {
+    const repo = makeRepo('persistent-project');
+    try {
+      const first = await launchPackaged({ dataDir });
+      try {
+        await first.page.getByText(versionLabel).waitFor();
+        await addProject(first, repo.root);
+        await waitForEntries(first.page, [repo.root]);
+        await poll(() => projectsInState(dataDir), (projects) => Array.isArray(projects) && projects.length > 0, UI_TIMEOUT);
+        expect(projectsInState(dataDir)).toEqual([{ path: repo.root }]);
+      } finally {
+        await first.close();
+      }
+
+      const repoOnDisk = snapshotRepo(repo);
+      const second = await launchPackaged({ dataDir });
+      try {
+        await second.page.getByText(versionLabel).waitFor();
+        await waitForEntries(second.page, [repo.root]);
+        expect((await sidebarEntries(second.page))[0]!.text).toContain(repo.name);
+        expect(projectsInState(dataDir)).toEqual([{ path: repo.root }]);
+
+        await removeThroughMenu(second.page, repo.root);
+        await waitForEntries(second.page, []);
+        await poll(() => projectsInState(dataDir), (projects) => Array.isArray(projects) && projects.length === 0, UI_TIMEOUT);
+        expect(projectsInState(dataDir)).toEqual([]);
+        expect(backupsIn(dataDir)).toEqual([]);
+        expect(snapshotRepo(repo)).toEqual(repoOnDisk);
+      } finally {
+        await second.close();
+      }
+    } finally {
+      rmSync(repo.parent, { recursive: true, force: true });
+    }
+  });
+
+  test('AC8 — a state.json from an earlier build, without projects, shows no project and is left unchanged', async () => {
+    const file = stateFileIn(dataDir);
+    writeFileSync(file, '{ "version": 1 }\n');
+    const before = stateSnapshot(dataDir);
+
+    const session = await launchPackaged({ dataDir });
+    try {
+      await expectHomePageWithoutError(session);
+      // The Projects section is there, empty.
+      await session.page.getByRole('button', { name: 'Add project', exact: true }).waitFor({ timeout: UI_TIMEOUT });
+      expect(await sidebarLines(session.page)).toContain('Projects');
+      expect(await entryTitles(session.page)).toEqual([]);
+    } finally {
+      await session.close();
+    }
+
+    expect(stateSnapshot(dataDir)).toEqual(before);
+    expect(backupsIn(dataDir)).toEqual([]);
+    expect(existsSync(join(dataDir, 'state.json.tmp'))).toBe(false);
+  });
+
   test('AC3 — a corrupted state.json is set aside and replaced, and the app starts', async () => {
     const corrupt = '{not json';
     writeFileSync(stateFileIn(dataDir), corrupt);
@@ -1194,6 +1614,63 @@ describe('packaged app state file', () => {
     expect(readdirSync(file)).toEqual([]);
     expect(readdirSync(dataDir).filter((name) => name.startsWith('state.json'))).toEqual(['state.json']);
     expect(windowTracesIn(dataDir)).toEqual([]);
+  });
+});
+
+// A login shell that prints an environment whose PATH holds no git. A real
+// `/bin/sh -l` would source `/etc/profile`, whose `path_helper` puts `/usr/bin`
+// back, so the fake shell sets the PATH of the shell that prints the environment
+// itself (`$2` is the command `resolveShellEnv` asks for: `env -0`, by absolute
+// path, between two printf markers).
+function makeShellWithoutGit(dir: string): string {
+  const empty = join(dir, 'empty-bin');
+  mkdirSync(empty);
+  const shell = join(dir, 'shell-without-git');
+  writeFileSync(shell, `#!/bin/sh\n[ "$1" = --warmup ] && exit 0\nPATH='${empty}' /bin/sh -c "$2"\n`);
+  chmodSync(shell, 0o755);
+  // macOS scans a new executable the first time it runs.
+  execFileSync(shell, ['--warmup']);
+  // The premise of the test: no git on the PATH this shell prints.
+  const printed = execFileSync(shell, ['-ilc', 'printf %s "$PATH"'], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
+  expect(printed).toBe(empty);
+  return shell;
+}
+
+describe('built app with no git on the login shell PATH', () => {
+  let folder: string;
+  let repo: TempRepo;
+  let session: Session;
+
+  beforeAll(async () => {
+    folder = mkdtempSync(join(tmpdir(), 'cockpit-fake-shell-'));
+    repo = makeRepo('no-git-project');
+    const executablePath: string = createRequire(import.meta.url)('electron');
+    session = await launchSpawned(executablePath, ['.'], true, undefined, {
+      ...process.env,
+      SHELL: makeShellWithoutGit(folder),
+    });
+  });
+
+  afterAll(async () => {
+    await session?.close();
+    rmSync(folder, { recursive: true, force: true });
+    if (repo) rmSync(repo.parent, { recursive: true, force: true });
+  });
+
+  test('AC12 — adding a repository is refused with "git is not installed", no entry, and state.json untouched', async () => {
+    const { page } = session;
+    await page.getByText(versionLabel).waitFor();
+    const before = stateSnapshot(session.dataDir);
+
+    await addProject(session, repo.root);
+    await waitForLine(page, 'git is not installed');
+    await sleep(300);
+
+    expect(await entryTitles(page)).toEqual([]);
+    expect(await isBelowProjectsHeader(page, { text: 'git is not installed' })).toBe(true);
+    expect(stateSnapshot(session.dataDir)).toEqual(before);
+    expect(projectsInState(session.dataDir) ?? []).toEqual([]);
+    expect(existsSync(join(session.dataDir, 'state.json.tmp'))).toBe(false);
   });
 });
 

@@ -1,9 +1,10 @@
 import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { extname, isAbsolute, join, relative } from 'node:path';
+import { basename, extname, isAbsolute, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createPtyClient, type PtySpawnOptions } from '@cockpit/pty';
-import { loadState, NewerStateError } from '@cockpit/state';
+import { addProject, loadState, NewerStateError, ProjectExistsError, removeProject, saveState, type State } from '@cockpit/state';
+import { findRepositoryRoot, WorkspaceError } from '@cockpit/workspaces';
 import {
   app,
   BrowserWindow,
@@ -16,7 +17,7 @@ import {
   type IpcMainEvent,
   type WebContents,
 } from 'electron';
-import type { PtySpawnRequest } from '../shared/api';
+import type { AddProjectResult, PtySpawnRequest, Project } from '../shared/api';
 import ptyHostPath from './pty-host?modulePath';
 import { shellEnv } from './shell-env';
 
@@ -115,7 +116,7 @@ function originOf(url: string): string | undefined {
   }
 }
 
-// Only the app's own page may drive terminals or read the shell PATH.
+// Only the app's own page may drive terminals, manage projects or read the shell PATH.
 function isFromApp({ senderFrame }: Pick<IpcMainEvent, 'senderFrame'>): boolean {
   const appOrigin = devServerUrl ? originOf(devServerUrl) : RENDERER_ORIGIN;
   return senderFrame !== null && originOf(senderFrame.url) === appOrigin;
@@ -180,6 +181,53 @@ function startPty(): void {
   });
 }
 
+const toProject = ({ path }: { path: string }): Project => ({ path, name: basename(path) });
+
+// The projects the user added, kept in `state.json`. `state` is the loaded state,
+// replaced by a new one (and saved) on every change.
+function startProjects(userData: string, loaded: State): void {
+  let state = loaded;
+
+  ipcMain.handle('projects:list', (event) => {
+    if (!isFromApp(event)) throw new Error('projects:list refused: unexpected origin');
+    return state.projects.map(toProject);
+  });
+
+  ipcMain.handle('projects:add', async (event): Promise<AddProjectResult> => {
+    if (!isFromApp(event)) throw new Error('projects:add refused: unexpected origin');
+    const window = BrowserWindow.fromWebContents(event.sender);
+    const options = { properties: ['openDirectory' as const] };
+    const picked = await (window ? dialog.showOpenDialog(window, options) : dialog.showOpenDialog(options));
+    const folder = picked.filePaths[0];
+    if (picked.canceled || folder === undefined) return { status: 'cancelled' };
+
+    try {
+      const root = await findRepositoryRoot(folder, { env: await shellEnv });
+      const next = addProject(state, root);
+      saveState(userData, next);
+      state = next;
+      return { status: 'added', project: toProject({ path: root }) };
+    } catch (error) {
+      if (error instanceof ProjectExistsError) {
+        return { status: 'refused', message: `${basename(error.path)} is already in Cockpit.` };
+      }
+      if (error instanceof WorkspaceError) {
+        const message = error.code === 'NOT_A_REPOSITORY' ? `${folder} is not in a git repository.` : error.message;
+        return { status: 'refused', message };
+      }
+      throw error;
+    }
+  });
+
+  ipcMain.handle('projects:remove', (event, path: string) => {
+    if (!isFromApp(event)) throw new Error('projects:remove refused: unexpected origin');
+    const next = removeProject(state, path);
+    if (next.projects.length === state.projects.length) return;
+    saveState(userData, next);
+    state = next;
+  });
+}
+
 // The app never navigates away from its own page.
 app.on('web-contents-created', (_event, contents) => {
   contents.on('will-navigate', (event, url) => {
@@ -195,8 +243,9 @@ app.on('window-all-closed', () => {
 // ES module has finished evaluating, so the app would wait forever.
 void app.whenReady().then(() => {
   const userData = app.getPath('userData');
+  let state: State;
   try {
-    loadState(userData);
+    state = loadState(userData);
   } catch (error) {
     // The file is left as it is: quit without opening a window. A file that
     // cannot be read (a folder, no permission) quits the same way.
@@ -217,6 +266,7 @@ void app.whenReady().then(() => {
     if (!isFromApp(event)) throw new Error('get-shell-path refused: unexpected origin');
     return (await shellEnv).PATH ?? '';
   });
+  startProjects(userData, state);
   startPty();
 
   createWindow();
