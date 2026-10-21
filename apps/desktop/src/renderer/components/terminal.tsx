@@ -8,7 +8,7 @@ const ANSI_COLORS = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan
 
 // The terminal colors are the page's tokens, read when the scheme changes: the
 // computed value of a custom property is the one of the current scheme.
-function readTheme(): ITheme {
+export function readTheme(): ITheme {
   const style = getComputedStyle(document.documentElement);
   const token = (name: string) => style.getPropertyValue(`--${name}`).trim();
   const [black, red, green, yellow, blue, magenta, cyan, white] = ANSI_COLORS.map((name) => token(`terminal-${name}`));
@@ -39,7 +39,7 @@ function readTheme(): ITheme {
   };
 }
 
-function exitMessage({ exitCode, signal }: PtyExit): string {
+export function exitMessage({ exitCode, signal }: PtyExit): string {
   if (exitCode !== null) return `[Process exited with code ${exitCode}]`;
   if (signal !== null) return `[Process exited with signal ${signal}]`;
   return '[Process ended]';

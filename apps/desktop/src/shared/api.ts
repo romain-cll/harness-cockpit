@@ -49,6 +49,25 @@ export type CreateWorkspaceResult = { status: 'created'; workspace: Workspace } 
 /** `dirty`: the workspace has uncommitted changes and was not removed. `branchKept`: its branch is not merged. */
 export type RemoveWorkspaceResult = { status: 'removed'; branchKept: boolean } | { status: 'dirty' } | Refused;
 
+/** A run of an agent CLI in a folder of its own; `harness` is its id in the catalogue. */
+export interface Session {
+  id: string;
+  name: string;
+  harness: string;
+  directory: string;
+  /** ISO 8601. */
+  createdAt: string;
+}
+
+/** A detected agent CLI the user can start a session with. */
+export interface AvailableHarness {
+  id: string;
+  name: string;
+}
+
+/** What starting a session came to; `started` carries the id of its pty, `refused` the message to show. */
+export type StartSessionResult = { status: 'started'; session: Session; ptyId: number } | Refused;
+
 /**
  * The only surface the renderer may use to reach the main process, exposed by
  * the preload script on `window.api`. A web build would implement the same
@@ -84,6 +103,15 @@ export interface Api {
     create(project: string, name: string, base: string): Promise<CreateWorkspaceResult>;
     /** Removes the worktree, and its branch when merged; `force` removes it with its uncommitted changes. */
     remove(project: string, path: string, options?: { force?: boolean }): Promise<RemoveWorkspaceResult>;
+  };
+  /** Agent CLIs run outside any project, in a folder of their own. */
+  sessions: {
+    /** The detected agent CLIs, in catalogue order. */
+    harnesses(): Promise<AvailableHarness[]>;
+    /** The stored sessions, newest first. */
+    list(): Promise<Session[]>;
+    /** Runs the harness in a new folder, in a pty owned by the calling window. */
+    start(harness: string, size: { cols: number; rows: number }): Promise<StartSessionResult>;
   };
   /** The `PATH` of the user's login shell, the only part of its environment the renderer sees. */
   getShellPath(): Promise<string>;

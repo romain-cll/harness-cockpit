@@ -9,9 +9,23 @@ export interface Project {
   path: string;
 }
 
+// A run of an agent CLI in a folder of its own, outside any project.
+export interface Session {
+  id: string;
+  // `<harness name> <n>`, from `sessionName`.
+  name: string;
+  // The harness's id in `@cockpit/harnesses`.
+  harness: string;
+  // Absolute path of the session's folder.
+  directory: string;
+  // ISO 8601.
+  createdAt: string;
+}
+
 export interface State {
   version: number;
   projects: Project[];
+  sessions: Session[];
 }
 
 // `state.json` was written by a newer version of the app: it is left untouched.
@@ -39,11 +53,18 @@ function isProject(value: unknown): value is Project {
   return typeof value === 'object' && value !== null && typeof (value as { path?: unknown }).path === 'string';
 }
 
-// A file written before projects existed has no `projects`: it reads as empty.
-function isState(value: unknown): value is Omit<State, 'projects'> & { projects?: unknown } {
+function isSession(value: unknown): value is Session {
+  if (typeof value !== 'object' || value === null) return false;
+  const { id, name, harness, directory, createdAt } = value as Record<string, unknown>;
+  return [id, name, harness, directory, createdAt].every((field) => typeof field === 'string');
+}
+
+// A file written before projects or sessions existed lacks them: they read as empty.
+function isState(value: unknown): value is Omit<State, 'projects' | 'sessions'> & { projects?: unknown; sessions?: unknown } {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-  const { version, projects } = value as { version?: unknown; projects?: unknown };
+  const { version, projects, sessions } = value as { version?: unknown; projects?: unknown; sessions?: unknown };
   if (projects !== undefined && !(Array.isArray(projects) && projects.every(isProject))) return false;
+  if (sessions !== undefined && !(Array.isArray(sessions) && sessions.every(isSession))) return false;
   return typeof version === 'number' && Number.isInteger(version) && version > 0;
 }
 
@@ -81,6 +102,15 @@ export function removeProject(state: State, path: string): State {
   return { ...state, projects: state.projects.filter((project) => project.path !== path) };
 }
 
+export function addSession(state: State, session: Session): State {
+  return { ...state, sessions: [...state.sessions, session] };
+}
+
+// `<harness name> <n>`, n being one more than the sessions of that harness so far.
+export function sessionName(state: State, harness: { id: string; name: string }): string {
+  return `${harness.name} ${1 + state.sessions.filter((session) => session.harness === harness.id).length}`;
+}
+
 function readState(file: string): string | undefined {
   try {
     return readFileSync(file, 'utf8');
@@ -93,7 +123,12 @@ function readState(file: string): string | undefined {
 function parseState(content: string): State | undefined {
   try {
     const parsed: unknown = JSON.parse(content);
-    return isState(parsed) ? { ...parsed, projects: (parsed.projects as Project[] | undefined) ?? [] } : undefined;
+    if (!isState(parsed)) return undefined;
+    return {
+      ...parsed,
+      projects: (parsed.projects as Project[] | undefined) ?? [],
+      sessions: (parsed.sessions as Session[] | undefined) ?? [],
+    };
   } catch {
     return undefined;
   }
@@ -143,7 +178,7 @@ export function loadState(dir: string): State {
     console.warn(`${file} is not a valid state file, kept as ${backup} and replaced.`);
   }
 
-  // A fresh file holds the version only; `projects` is written with the first one.
+  // A fresh file holds the version only; `projects` and `sessions` are written with the first one.
   writeFile(dir, { version: STATE_VERSION });
-  return { version: STATE_VERSION, projects: [] };
+  return { version: STATE_VERSION, projects: [], sessions: [] };
 }
