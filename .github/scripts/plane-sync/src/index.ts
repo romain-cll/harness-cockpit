@@ -52,7 +52,7 @@ export async function syncMergedPullRequest(options: SyncOptions): Promise<void>
     const response = await fetch(`${baseUrl}/api/v1/workspaces/${workspace}${path}`, {
       method,
       headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
     if (!response.ok) throw new Error(`${method} ${path} answered ${response.status}`);
     return (await response.json()) as T;
