@@ -7,7 +7,7 @@ import { addProject, loadState, NewerStateError, ProjectExistsError, removeProje
 // Records the calls `saveState` and `loadState` make on the file system, in
 // order, while still running them for real (AC10). `fds` maps an open
 // descriptor to the path it was opened on.
-const calls = vi.hoisted(() => ({ log: [] as string[], fds: new Map<number, string>() }));
+const calls = vi.hoisted(() => ({ log: [] as string[], fds: new Map<number, string>(), failLink: false }));
 
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
@@ -32,6 +32,11 @@ vi.mock('node:fs', async (importOriginal) => {
       calls.log.push(`rename ${String(from)} -> ${String(to)}`);
       return actual.renameSync(from, to);
     }) as typeof actual.renameSync,
+    // Fails like a volume without hard links when a test asks for it (AC21).
+    linkSync: ((existing: string, created: string) => {
+      if (calls.failLink) throw Object.assign(new Error(`EPERM: operation not permitted, link '${existing}' -> '${created}'`), { code: 'EPERM' });
+      return actual.linkSync(existing, created);
+    }) as typeof actual.linkSync,
   };
 });
 
@@ -42,6 +47,7 @@ let file: string;
 beforeEach(() => {
   calls.log.length = 0;
   calls.fds.clear();
+  calls.failLink = false;
   root = mkdtempSync(join(tmpdir(), 'cockpit-state-test-'));
   dir = join(root, 'data');
   file = join(dir, 'state.json');
@@ -49,6 +55,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -151,6 +158,91 @@ describe('AC3 — corrupted file', () => {
     expect(loadState(dir)).toEqual({ version: 1, projects: [] });
     expect(snapshot()).toEqual(before);
     expect(backups()).toHaveLength(1);
+  });
+});
+
+// The name `loadState` gives the backup for a clock set to `at`.
+const backupNameAt = (at: Date) => `state.json.corrupt-${at.toISOString().replace(/[:.]/g, '-')}`;
+
+describe('AC21 — backup when the hard link fails', () => {
+  test.each(['{not json', '', '[]'])(
+    'AC21 — %j is kept as a copy with its original bytes, a fresh state.json is written and the app starts',
+    (content) => {
+      seed(content);
+      calls.failLink = true;
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      expect(loadState(dir)).toEqual({ version: 1, projects: [] });
+
+      const found = backups();
+      expect(found).toHaveLength(1);
+      expect(found[0]).toMatch(/^state\.json\.corrupt-[0-9TZ-]+$/);
+      expect(readFileSync(join(dir, found[0]!), 'utf8')).toBe(content);
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1 });
+      expect(existsSync(join(dir, 'state.json.tmp'))).toBe(false);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]!.join(' ')).toContain(found[0]!);
+    },
+  );
+
+  test('AC21 — a replaced file reads back as valid on the next load', () => {
+    seed('{not json');
+    calls.failLink = true;
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    loadState(dir);
+    const before = snapshot();
+
+    expect(loadState(dir)).toEqual({ version: 1, projects: [] });
+    expect(snapshot()).toEqual(before);
+    expect(backups()).toHaveLength(1);
+  });
+});
+
+describe('AC22 — backup name already taken', () => {
+  const at = new Date('2026-10-21T10:20:30.456Z');
+
+  test('AC22 — the backup goes to the first free -<n> from 2 and the existing backup is left byte for byte', () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: at });
+    const taken = join(dir, backupNameAt(at));
+    seed('{not json');
+    writeFileSync(taken, 'an older backup');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    expect(loadState(dir)).toEqual({ version: 1, projects: [] });
+
+    expect(readFileSync(taken, 'utf8')).toBe('an older backup');
+    expect(backups().sort()).toEqual([backupNameAt(at), `${backupNameAt(at)}-2`]);
+    expect(readFileSync(join(dir, `${backupNameAt(at)}-2`), 'utf8')).toBe('{not json');
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1 });
+    expect(warn.mock.calls[0]!.join(' ')).toContain(`${backupNameAt(at)}-2`);
+  });
+
+  test('AC22 — with -2 taken too, the backup goes to -3', () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: at });
+    seed('{not json');
+    writeFileSync(join(dir, backupNameAt(at)), 'first');
+    writeFileSync(join(dir, `${backupNameAt(at)}-2`), 'second');
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    expect(loadState(dir)).toEqual({ version: 1, projects: [] });
+
+    expect(readFileSync(join(dir, backupNameAt(at)), 'utf8')).toBe('first');
+    expect(readFileSync(join(dir, `${backupNameAt(at)}-2`), 'utf8')).toBe('second');
+    expect(readFileSync(join(dir, `${backupNameAt(at)}-3`), 'utf8')).toBe('{not json');
+  });
+
+  test('AC22 — the same holds when the hard link fails and the backup is a copy', () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: at });
+    seed('{not json');
+    writeFileSync(join(dir, backupNameAt(at)), 'first');
+    calls.failLink = true;
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    expect(loadState(dir)).toEqual({ version: 1, projects: [] });
+
+    expect(readFileSync(join(dir, backupNameAt(at)), 'utf8')).toBe('first');
+    expect(readFileSync(join(dir, `${backupNameAt(at)}-2`), 'utf8')).toBe('{not json');
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1 });
   });
 });
 

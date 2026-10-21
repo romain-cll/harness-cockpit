@@ -1,9 +1,10 @@
 import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createServer, type AddressInfo } from 'node:net';
 import { homedir, tmpdir, userInfo } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
@@ -32,6 +33,8 @@ interface Session {
   pid: number;
   /** The folder the app was told to keep its data in, removed on close. */
   dataDir: string;
+  /** `COCKPIT_HOME` the app was launched with: inside `dataDir`, so it goes away with it. */
+  cockpitHome: string;
   /** Everything the app wrote to stdout and stderr. */
   output(): string;
   /**
@@ -54,6 +57,9 @@ interface Session {
 // A test that must start the app twice on the same data folder creates the
 // folder itself, passes it in and removes it afterwards: sessions leave a folder
 // they were given in place.
+// `COCKPIT_HOME` is a folder inside the data folder: the worktrees the app
+// creates live under it and are removed with it, and no test touches the
+// developer's `~/.cockpit`.
 // The terminal page runs whatever `$SHELL` says: by default `/bin/sh`, which keeps
 // the developer's shell configuration from slowing or breaking the tests.
 function launchEnv(
@@ -61,10 +67,11 @@ function launchEnv(
   dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-')),
   base: NodeJS.ProcessEnv = { ...process.env, SHELL: '/bin/sh' },
 ) {
-  const env = { ...base, COCKPIT_USER_DATA_DIR: dataDir } as Record<string, string>;
+  const cockpitHome = join(dataDir, 'cockpit-home');
+  const env = { ...base, COCKPIT_USER_DATA_DIR: dataDir, COCKPIT_HOME: cockpitHome } as Record<string, string>;
   if (background) env.COCKPIT_TEST_BACKGROUND = '1';
   else delete env.COCKPIT_TEST_BACKGROUND;
-  return { dataDir, env };
+  return { dataDir, cockpitHome, env };
 }
 
 // Attaches to a running Electron over the Chrome DevTools Protocol and returns
@@ -156,7 +163,7 @@ async function launchSpawned(
   givenDataDir?: string,
   base?: NodeJS.ProcessEnv,
 ): Promise<Session> {
-  const { dataDir, env } = launchEnv(background, givenDataDir, base);
+  const { dataDir, cockpitHome, env } = launchEnv(background, givenDataDir, base);
   // Its own process group, so closing stops Electron and its helpers together.
   const child = spawn(executablePath, ['--remote-debugging-port=0', '--inspect=0', ...args], {
     cwd: appDir,
@@ -185,6 +192,7 @@ async function launchSpawned(
       page,
       pid: child.pid!,
       dataDir,
+      cockpitHome,
       output: () => output,
       evaluateInMain: inspector.evaluate,
       isRunning: () => child.exitCode === null,
@@ -267,7 +275,7 @@ function freePort(): Promise<number> {
 async function launchDev(): Promise<Session> {
   const port = await freePort();
   const inspectPort = await freePort();
-  const { dataDir, env } = launchEnv(true);
+  const { dataDir, cockpitHome, env } = launchEnv(true);
   // Its own process group, so closing stops the dev server and Electron with it.
   // electron-vite ignores `--inspect 0` (0 is falsy for it): a free port instead.
   const dev = spawn('bun', ['run', 'dev', '--remoteDebuggingPort', String(port), '--inspect', String(inspectPort)], {
@@ -299,6 +307,7 @@ async function launchDev(): Promise<Session> {
       page,
       pid,
       dataDir,
+      cockpitHome,
       output: () => output,
       evaluateInMain: inspector.evaluate,
       isRunning: () => dev.exitCode === null,
@@ -736,33 +745,234 @@ const isBelowProjectsHeader = (page: Page, target: { text: string } | { title: s
     return found.getBoundingClientRect().top >= header.getBoundingClientRect().bottom - 1;
   }, target);
 
-// Opens the "…" menu of the project entry titled `root`, checks it, and picks
-// "Remove from Cockpit".
+// The "…" menu trigger of the sidebar entry titled `title` (a project root or a
+// workspace path): the nearest ancestor of the entry that holds a menu trigger
+// of its own, not counting the triggers of entries nested in it (a project
+// holds its workspaces).
+async function menuTriggerOf(page: Page, title: string) {
+  const handle = await page.evaluateHandle((title) => {
+    const entry = [...document.querySelectorAll('aside [title]')].find((element) => element.getAttribute('title') === title);
+    for (let node: Element | null = entry ?? null; node && node.tagName !== 'ASIDE'; node = node.parentElement) {
+      const here: Element = node;
+      const triggers = [...here.querySelectorAll('button[aria-haspopup="menu"]')].filter((button) => {
+        const titled = button.closest('[title]');
+        return !titled || titled === here || !here.contains(titled) || titled.getAttribute('title') === title;
+      });
+      if (triggers.length === 1) return triggers[0]!;
+      if (triggers.length > 1) return null;
+    }
+    return null;
+  }, title);
+  const trigger = handle.asElement();
+  if (!trigger) throw new Error(`no single "…" menu trigger for the sidebar entry titled ${title}`);
+  return trigger;
+}
+
+// Opens the "…" menu of the sidebar entry titled `title` and waits for its items.
+async function openMenu(page: Page, title: string) {
+  await page.getByTitle(title, { exact: true }).first().hover({ timeout: UI_TIMEOUT });
+  const trigger = await menuTriggerOf(page, title);
+  await trigger.click({ timeout: UI_TIMEOUT });
+  await page.getByRole('menuitem').first().waitFor({ timeout: UI_TIMEOUT });
+}
+
+// Opens the "…" menu of the project entry titled `root`, checks the removal
+// item, and picks "Remove from Cockpit".
 async function removeThroughMenu(page: Page, root: string) {
-  const entry = page.getByTitle(root, { exact: true }).first();
-  await entry.hover({ timeout: UI_TIMEOUT });
-  // The "…" button sits in the same row as the entry; Base UI marks a menu trigger with aria-haspopup.
-  await entry
-    .locator('xpath=ancestor-or-self::*[.//button[@aria-haspopup="menu"]][1]')
-    .locator('button[aria-haspopup="menu"]')
-    .click({ timeout: UI_TIMEOUT });
+  await openMenu(page, root);
 
   const items = page.getByRole('menuitem');
-  await items.first().waitFor({ timeout: UI_TIMEOUT });
-  expect(await items.count()).toBe(1);
-  const lines = (await items.first().innerText()).split('\n').map((line) => line.trim()).filter(Boolean);
+  const remove = items.filter({ hasText: 'Remove from Cockpit' });
+  expect(await remove.count()).toBe(1);
+  const lines = (await remove.first().innerText()).split('\n').map((line) => line.trim()).filter(Boolean);
   expect(lines).toEqual(['Remove from Cockpit', 'Files stay on disk']);
   // The second line is muted: not painted like the item itself.
-  const colors = await page.evaluate(() => {
-    const item = document.querySelector('[role="menuitem"]') as HTMLElement;
+  const colors = await remove.first().evaluate((item) => {
     const note = [...item.querySelectorAll('*')].find((element) => element.textContent?.trim() === 'Files stay on disk');
     return { item: getComputedStyle(item).color, note: note ? getComputedStyle(note).color : 'no element of its own' };
   });
   expect(colors.note).not.toBe('no element of its own');
   expect(colors.note).not.toBe(colors.item);
 
-  await items.first().click({ timeout: UI_TIMEOUT });
+  await remove.first().click({ timeout: UI_TIMEOUT });
 }
+
+// --- Workspaces helpers ------------------------------------------------------
+
+const sha8 = (root: string) => createHash('sha256').update(root).digest('hex').slice(0, 8);
+
+// Where the app must create the worktree of `branch` for `repo`:
+// `$COCKPIT_HOME/worktrees/<repo basename>-<8 hex>/<branch>`, compared by real
+// path (macOS `/var` is `/private/var`; the data folder exists, the rest does not yet).
+const worktreePath = (session: Session, repo: TempRepo, branch: string) =>
+  join(realpathSync(session.dataDir), 'cockpit-home', 'worktrees', `${repo.name}-${sha8(repo.root)}`, branch);
+
+// A repository with `origin` (a clone of `upstream`, which has `develop`,
+// `feature/x` and `release/1.0` besides `main`), a local commit on `main` that
+// `origin/main` lacks, and the local branches `local-topic` and `topic/nested`.
+interface TempClone extends TempRepo {
+  upstream: TempRepo;
+}
+function makeClone(name: string): TempClone {
+  const upstream = makeRepo(`${name}-upstream`);
+  for (const branch of ['develop', 'feature/x', 'release/1.0']) gitIn(upstream.root, 'branch', branch);
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-project-test-')));
+  const root = join(parent, name);
+  gitIn(parent, 'clone', '--quiet', upstream.root, root);
+  gitIn(root, 'commit', '--allow-empty', '-m', 'local only');
+  gitIn(root, 'branch', 'local-topic');
+  gitIn(root, 'branch', 'topic/nested');
+  expect(gitIn(root, 'rev-parse', '--show-toplevel')).toBe(root);
+  return { parent, root, name, upstream };
+}
+
+// A repository whose only content is an empty commit.
+function makeLightRepo(name: string): TempRepo {
+  const parent = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-project-test-')));
+  const root = join(parent, name);
+  mkdirSync(root);
+  gitIn(root, 'init', '--quiet', '-b', 'main');
+  gitIn(root, 'commit', '--quiet', '--allow-empty', '-m', 'initial');
+  return { parent, root, name };
+}
+
+// The linked worktrees of `repo`, in `git worktree list` order.
+function linkedWorktrees(repo: TempRepo): { path: string; branch: string | null }[] {
+  const records = gitIn(repo.root, 'worktree', 'list', '--porcelain').split('\n\n').filter(Boolean);
+  return records.slice(1).map((record) => {
+    const lines = record.split('\n');
+    return {
+      path: lines.find((line) => line.startsWith('worktree '))!.slice('worktree '.length),
+      branch: lines.find((line) => line.startsWith('branch '))?.slice('branch refs/heads/'.length) ?? null,
+    };
+  });
+}
+
+const localBranches = (repo: TempRepo) =>
+  gitIn(repo.root, 'for-each-ref', '--format=%(refname:short)', 'refs/heads').split('\n').filter(Boolean).sort();
+
+// What a cancelled or refused action must leave alone.
+const gitState = (repo: TempRepo) => ({
+  worktrees: gitIn(repo.root, 'worktree', 'list', '--porcelain'),
+  branches: localBranches(repo),
+  refs: gitIn(repo.root, 'for-each-ref', '--format=%(refname) %(objectname)'),
+});
+
+// Adds a repository through the stubbed picker and waits until it is listed.
+async function addRepository(session: Session, repo: TempRepo) {
+  await addProject(session, repo.root);
+  await poll(() => entryTitles(session.page), (titles) => titles.includes(repo.root), UI_TIMEOUT);
+  expect(await entryTitles(session.page)).toContain(repo.root);
+}
+
+// Asks the main process to look again, as it does when the window gains focus.
+const dispatchFocus = (page: Page) => page.evaluate(() => window.dispatchEvent(new Event('focus')));
+
+const openDialogs = (page: Page) => page.locator('[role="dialog"], [role="alertdialog"]');
+
+// Escape until no dialog is left (a Select popup takes one Escape of its own).
+async function dismissDialogs(page: Page) {
+  for (let attempt = 0; attempt < 4 && (await openDialogs(page).count()) > 0; attempt++) {
+    await page.keyboard.press('Escape');
+    await sleep(250);
+  }
+  expect(await openDialogs(page).count()).toBe(0);
+}
+
+const linesOf = async (locator: ReturnType<Page['locator']>) =>
+  (await locator.innerText()).split('\n').map((line) => line.trim()).filter(Boolean);
+
+const waitForDialogLine = (dialog: ReturnType<Page['locator']>, matches: (line: string) => boolean) =>
+  poll(
+    async () => (await linesOf(dialog)).filter(matches),
+    (found) => found.length > 0,
+    UI_TIMEOUT,
+  );
+
+// Marks where the console and the main process output stood, so a test can check that
+// what it did logged no error (the shared session may hold earlier ones).
+const errorMark = async (session: Session) => ({
+  errors: (await allConsoleErrorsOf(session.page)).length,
+  output: session.output().length,
+});
+const expectNoNewErrors = async (session: Session, mark: { errors: number; output: number }) => {
+  expect(await allConsoleErrorsOf(session.page)).toHaveLength(mark.errors);
+  expect(await allPageErrorsOf(session.page)).toEqual([]);
+  const written = session.output().slice(mark.output);
+  expect(written).not.toMatch(MAIN_PROCESS_ERROR);
+  expect(written).not.toContain('Error occurred in handler');
+};
+
+// --- New workspace dialog
+
+const newWorkspaceDialog = (page: Page, project: TempRepo) =>
+  page.getByRole('dialog', { name: `New workspace in ${project.name}` });
+const nameField = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('textbox', { name: 'Name', exact: true });
+const baseSelect = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('combobox');
+const createButton = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('button', { name: 'Create', exact: true });
+
+async function openNewWorkspaceDialog(page: Page, project: TempRepo) {
+  await openMenu(page, project.root);
+  await page.getByRole('menuitem', { name: 'New workspace…' }).click({ timeout: UI_TIMEOUT });
+  const dialog = newWorkspaceDialog(page, project);
+  await dialog.waitFor({ timeout: UI_TIMEOUT });
+  return dialog;
+}
+
+// What the Base select shows as its value.
+const selectedBase = async (dialog: ReturnType<Page['locator']>) => (await baseSelect(dialog).innerText()).trim();
+
+// Opens the Base select, reads its options per group ("Local", "Remote"), closes it.
+async function readBaseOptions(page: Page, dialog: ReturnType<Page['locator']>) {
+  await baseSelect(dialog).click({ timeout: UI_TIMEOUT });
+  const listbox = page.getByRole('listbox');
+  await listbox.waitFor({ timeout: UI_TIMEOUT });
+  const groups: Record<string, string[]> = {};
+  let current: string | undefined;
+  for (const line of await linesOf(listbox)) {
+    if (line === 'Local' || line === 'Remote') groups[(current = line)] = [];
+    else if (current) groups[current]!.push(line);
+  }
+  await page.keyboard.press('Escape');
+  await listbox.waitFor({ state: 'hidden', timeout: UI_TIMEOUT });
+  expect(await dialog.isVisible(), 'closing the Base select keeps the dialog open').toBe(true);
+  return groups;
+}
+
+async function chooseBase(page: Page, dialog: ReturnType<Page['locator']>, base: string) {
+  await baseSelect(dialog).click({ timeout: UI_TIMEOUT });
+  await page.getByRole('option', { name: base, exact: true }).click({ timeout: UI_TIMEOUT });
+  await poll(() => selectedBase(dialog), (value) => value === base, UI_TIMEOUT);
+}
+
+// --- Delete workspace dialog
+
+const deleteDialog = (page: Page, text: string) => openDialogs(page).filter({ hasText: text });
+
+async function startDeletion(page: Page, path: string) {
+  await openMenu(page, path);
+  await page.getByRole('menuitem', { name: 'Delete workspace…' }).click({ timeout: UI_TIMEOUT });
+}
+
+// The color the `muted-foreground` token resolves to, for "muted" lines.
+const mutedColor = (page: Page) =>
+  page.evaluate(() => {
+    const probe = document.createElement('span');
+    probe.style.color = 'var(--muted-foreground)';
+    document.body.append(probe);
+    const color = getComputedStyle(probe).color;
+    probe.remove();
+    return color;
+  });
+
+// The computed color of the deepest sidebar element that shows `text`.
+const colorOfLine = (page: Page, text: string) =>
+  page.evaluate((text) => {
+    const all = [...document.querySelectorAll('aside *')] as HTMLElement[];
+    const matches = all.filter((element) => (element.textContent ?? '').trim() === text);
+    const deepest = matches.find((element) => !matches.some((other) => other !== element && element.contains(other)));
+    return deepest ? getComputedStyle(deepest).color : null;
+  }, text);
 
 describe.each([
   ['dev server', launchDev],
@@ -1271,6 +1481,588 @@ describe.each([
     });
   });
 
+  // Workspaces: the picker is stubbed as in `projects`, and the tests share the
+  // session and run in order. `ws-clone` stays in the list from the first test
+  // to the "delete" tests, and the workspaces `feature/login` and
+  // `second-by-enter`, created by the AC5 test, are the ones the delete tests
+  // delete. Worktrees the app creates land under the launch's COCKPIT_HOME.
+  describe('workspaces', () => {
+    let clone: TempClone;
+    let noDefault: TempRepo;
+    const folders: TempRepo[] = [];
+    const loginBranch = 'feature/login';
+    const enterBranch = 'second-by-enter';
+
+    beforeAll(() => {
+      clone = makeClone('ws-clone');
+      noDefault = makeRepo('ws-no-default');
+      gitIn(noDefault.root, 'checkout', '--detach');
+      folders.push(clone, clone.upstream, noDefault);
+    });
+
+    // A failing test must not leave a menu or a dialog that blocks the tests after it.
+    afterEach(async () => {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        await session.page.keyboard.press('Escape');
+        await sleep(150);
+      }
+    });
+
+    afterAll(async () => {
+      try {
+        await clearProjects();
+      } finally {
+        for (const folder of folders) rmSync(folder.parent, { recursive: true, force: true });
+      }
+    });
+
+    const projectWorktrees = (repo: TempRepo) => dirname(worktreePath(session, repo, 'x'));
+    // Everything under the worktrees folder of `repo`, so "nothing was created" is checkable.
+    const worktreeListing = (repo: TempRepo) => {
+      const dir = projectWorktrees(repo);
+      return existsSync(dir) ? readdirSync(dir, { recursive: true }).map(String).sort() : [];
+    };
+    const isListed = async (path: string) => (await entryTitles(session.page)).includes(path);
+    const waitListed = (path: string) => poll(() => isListed(path), Boolean, UI_TIMEOUT);
+    const waitUnlisted = (path: string) => poll(() => isListed(path), (listed) => !listed, UI_TIMEOUT);
+
+    test('AC1 — the project menu holds "New workspace…" above "Remove from Cockpit", and opens a dialog titled "New workspace in <project>" with an empty, focused Name and a Base select', async () => {
+      const { page } = session;
+      await page.getByText(versionLabel).waitFor();
+      await addRepository(session, clone);
+
+      await openMenu(page, clone.root);
+      const items = await page.getByRole('menuitem').allInnerTexts();
+      expect(items).toHaveLength(2);
+      expect(items[0]!.trim()).toBe('New workspace…');
+      expect(items[1]!.split('\n')[0]!.trim()).toBe('Remove from Cockpit');
+      await page.getByRole('menuitem', { name: 'New workspace…' }).click({ timeout: UI_TIMEOUT });
+
+      const dialog = newWorkspaceDialog(page, clone);
+      await dialog.waitFor({ timeout: UI_TIMEOUT });
+      const lines = await linesOf(dialog);
+      expect(lines).toContain(`New workspace in ${clone.name}`);
+      expect(lines).toContain('Name');
+      expect(lines).toContain('Base');
+      expect(await nameField(dialog).inputValue()).toBe('');
+      const focused = await poll(
+        () => nameField(dialog).evaluate((element) => element === document.activeElement),
+        Boolean,
+        UI_TIMEOUT,
+      );
+      expect(focused, 'the Name field has the focus').toBe(true);
+      expect(await baseSelect(dialog).count()).toBe(1);
+      await dismissDialogs(page);
+    });
+
+    test('AC2 — the Base select lists local branches under "Local" and origin/* branches under "Remote" (no origin/HEAD), preselects origin/main and runs no fetch', async () => {
+      const { page } = session;
+      // A commit only a fetch would bring in.
+      gitIn(clone.upstream.root, 'commit', '--allow-empty', '-m', 'newer on origin');
+      const originMain = gitIn(clone.root, 'rev-parse', 'refs/remotes/origin/main');
+      const fetchHead = join(clone.root, '.git', 'FETCH_HEAD');
+      const fetchHeadBefore = existsSync(fetchHead);
+
+      const dialog = await openNewWorkspaceDialog(page, clone);
+      expect(await poll(() => selectedBase(dialog), (value) => value === 'origin/main', UI_TIMEOUT)).toBe('origin/main');
+      const groups = await readBaseOptions(page, dialog);
+
+      expect(Object.keys(groups)).toEqual(['Local', 'Remote']);
+      expect([...groups.Local!].sort()).toEqual(['local-topic', 'main', 'topic/nested']);
+      expect([...groups.Remote!].sort()).toEqual(['origin/develop', 'origin/feature/x', 'origin/main', 'origin/release/1.0']);
+      expect(await selectedBase(dialog)).toBe('origin/main');
+      expect(gitIn(clone.root, 'rev-parse', 'refs/remotes/origin/main')).toBe(originMain);
+      expect(existsSync(fetchHead)).toBe(fetchHeadBefore);
+      await dismissDialogs(page);
+    });
+
+    test('AC4 — "Create" is disabled while Name is empty or only whitespace', async () => {
+      const { page } = session;
+      const dialog = await openNewWorkspaceDialog(page, clone);
+      await poll(() => selectedBase(dialog), (value) => value === 'origin/main', UI_TIMEOUT);
+
+      expect(await createButton(dialog).isDisabled()).toBe(true);
+      await nameField(dialog).fill('   ');
+      expect(await createButton(dialog).isDisabled()).toBe(true);
+      await nameField(dialog).fill('\t  \t');
+      expect(await createButton(dialog).isDisabled()).toBe(true);
+      await nameField(dialog).fill('something');
+      expect(await createButton(dialog).isDisabled()).toBe(false);
+      await nameField(dialog).fill('');
+      expect(await createButton(dialog).isDisabled()).toBe(true);
+      await dismissDialogs(page);
+    });
+
+    test('AC3 — without a default base nothing is preselected and "Create" stays disabled until a base is chosen', async () => {
+      const { page } = session;
+      await addRepository(session, noDefault);
+
+      const dialog = await openNewWorkspaceDialog(page, noDefault);
+      const groups = await readBaseOptions(page, dialog);
+      expect(groups.Local).toContain('main');
+      expect(await selectedBase(dialog), 'no base is preselected').not.toBe('main');
+      expect(await selectedBase(dialog)).not.toBe('');
+      await nameField(dialog).fill('some-work');
+      expect(await createButton(dialog).isDisabled()).toBe(true);
+
+      await chooseBase(page, dialog, 'main');
+      expect(await createButton(dialog).isDisabled()).toBe(false);
+      await dismissDialogs(page);
+
+      await removeThroughMenu(page, noDefault.root);
+      await waitForEntries(page, [clone.root]);
+    });
+
+    test('AC5 — "Create" (or Enter in Name) creates the branch from origin/main and the worktree under $COCKPIT_HOME, closes the dialog and lists the workspace; the name is trimmed', async () => {
+      const { page } = session;
+      const originMain = gitIn(clone.root, 'rev-parse', 'origin/main');
+      expect(gitIn(clone.root, 'rev-parse', 'main'), 'local main differs from origin/main').not.toBe(originMain);
+      // The launch's COCKPIT_HOME is inside its temporary folder.
+      expect(await session.evaluateInMain<string>('process.env.COCKPIT_HOME')).toBe(session.cockpitHome);
+      expect(session.cockpitHome.startsWith(`${session.dataDir}/`)).toBe(true);
+
+      const dialog = await openNewWorkspaceDialog(page, clone);
+      await poll(() => selectedBase(dialog), (value) => value === 'origin/main', UI_TIMEOUT);
+      await nameField(dialog).fill(`  ${loginBranch}  `);
+      await createButton(dialog).click({ timeout: UI_TIMEOUT });
+      await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
+
+      const path = worktreePath(session, clone, loginBranch);
+      expect(existsSync(join(path, 'README.md'))).toBe(true);
+      expect(linkedWorktrees(clone)).toContainEqual({ path, branch: loginBranch });
+      expect(gitIn(clone.root, 'rev-parse', loginBranch)).toBe(originMain);
+      expect(localBranches(clone)).toContain(loginBranch);
+      expect(existsSync(join(homedir(), '.cockpit', 'worktrees', `${clone.name}-${sha8(clone.root)}`))).toBe(false);
+      await waitListed(path);
+      const row = (await sidebarEntries(page)).find((entry) => entry.title === path);
+      expect(row!.text).toContain(loginBranch);
+      expect(await isBelowProjectsHeader(page, { title: path })).toBe(true);
+
+      // Enter in the Name field does the same.
+      const second = await openNewWorkspaceDialog(page, clone);
+      await poll(() => selectedBase(second), (value) => value === 'origin/main', UI_TIMEOUT);
+      await nameField(second).fill(enterBranch);
+      await nameField(second).press('Enter');
+      await second.waitFor({ state: 'hidden', timeout: 15_000 });
+
+      const secondPath = worktreePath(session, clone, enterBranch);
+      expect(existsSync(join(secondPath, 'README.md'))).toBe(true);
+      expect(linkedWorktrees(clone)).toContainEqual({ path: secondPath, branch: enterBranch });
+      expect(gitIn(clone.root, 'rev-parse', enterBranch)).toBe(originMain);
+      await waitListed(secondPath);
+      // Under their project, in `git worktree list` order.
+      expect(linkedWorktrees(clone).map((worktree) => worktree.path).sort()).toEqual([path, secondPath].sort());
+      await waitForEntries(page, [clone.root, ...linkedWorktrees(clone).map((worktree) => worktree.path)]);
+    });
+
+    test('AC6 — a name that is already a local branch keeps the dialog open with "A branch named <name> already exists." and creates nothing', async () => {
+      const { page } = session;
+      const before = { git: gitState(clone), listing: worktreeListing(clone) };
+
+      const dialog = await openNewWorkspaceDialog(page, clone);
+      await poll(() => selectedBase(dialog), (value) => value === 'origin/main', UI_TIMEOUT);
+      await nameField(dialog).fill(loginBranch);
+      await createButton(dialog).click({ timeout: UI_TIMEOUT });
+      await waitForDialogLine(dialog, (line) => line === `A branch named ${loginBranch} already exists.`);
+      await sleep(300);
+
+      expect(await dialog.isVisible()).toBe(true);
+      expect(gitState(clone)).toEqual(before.git);
+      expect(worktreeListing(clone)).toEqual(before.listing);
+      await dismissDialogs(page);
+    });
+
+    test('AC7 — a name git refuses keeps the dialog open with "<name> is not a valid branch name." and creates nothing', async () => {
+      const { page } = session;
+      const before = { git: gitState(clone), listing: worktreeListing(clone) };
+
+      const dialog = await openNewWorkspaceDialog(page, clone);
+      await poll(() => selectedBase(dialog), (value) => value === 'origin/main', UI_TIMEOUT);
+      for (const name of ['my feature', 'a..b']) {
+        await nameField(dialog).fill(name);
+        await createButton(dialog).click({ timeout: UI_TIMEOUT });
+        await waitForDialogLine(dialog, (line) => line === `${name} is not a valid branch name.`);
+        await sleep(300);
+
+        expect(await dialog.isVisible()).toBe(true);
+        expect(gitState(clone)).toEqual(before.git);
+        expect(worktreeListing(clone)).toEqual(before.listing);
+      }
+      await dismissDialogs(page);
+    });
+
+    test('AC8 — a base deleted after the dialog opened keeps it open with the error message and creates nothing', async () => {
+      const { page } = session;
+      const develop = gitIn(clone.root, 'rev-parse', 'refs/remotes/origin/develop');
+      const before = { git: gitState(clone), listing: worktreeListing(clone) };
+
+      const dialog = await openNewWorkspaceDialog(page, clone);
+      await chooseBase(page, dialog, 'origin/develop');
+      await nameField(dialog).fill('orphan-base');
+      const linesBefore = await linesOf(dialog);
+      gitIn(clone.root, 'update-ref', '-d', 'refs/remotes/origin/develop');
+      try {
+        await createButton(dialog).click({ timeout: UI_TIMEOUT });
+        // A new line that names the base git could not find.
+        const message = await waitForDialogLine(dialog, (line) => !linesBefore.includes(line) && line.includes('origin/develop'));
+        expect(message.length).toBeGreaterThan(0);
+        await sleep(300);
+
+        expect(await dialog.isVisible()).toBe(true);
+        expect(localBranches(clone)).not.toContain('orphan-base');
+        expect(worktreeListing(clone)).toEqual(before.listing);
+      } finally {
+        gitIn(clone.root, 'update-ref', 'refs/remotes/origin/develop', develop);
+      }
+      expect(gitState(clone)).toEqual(before.git);
+      await dismissDialogs(page);
+    });
+
+    // A workspace added with git itself (on a new branch from origin/main), listed after a reload.
+    async function addExternalWorkspace(name: string): Promise<string> {
+      const path = join(clone.parent, `wt-${name}`);
+      gitIn(clone.root, 'worktree', 'add', '--quiet', '-b', name, path, 'origin/main');
+      await session.page.reload();
+      await session.page.getByText(versionLabel).waitFor();
+      await waitListed(path);
+      return path;
+    }
+
+    // Leaves the session with no project.
+    async function clearProjects() {
+      const { page } = session;
+      await page.evaluate(async () => {
+        const { projects } = (globalThis as unknown as { api: { projects: { list(): Promise<{ path: string }[]>; remove(path: string): Promise<void> } } }).api;
+        for (const project of await projects.list()) await projects.remove(project.path);
+      });
+      await page.reload();
+      await page.getByText(versionLabel).waitFor();
+      await waitForEntries(page, []);
+    }
+
+    test('AC14, AC15 — the workspace menu holds "Delete workspace…", which opens "Delete <name>?" naming the folder; Cancel and Escape change nothing', async () => {
+      const { page } = session;
+      const path = await addExternalWorkspace('review-ws');
+      const before = { git: gitState(clone), listing: worktreeListing(clone) };
+
+      await openMenu(page, path);
+      const items = await page.getByRole('menuitem').allInnerTexts();
+      expect(items.map((item) => item.trim())).toContain('Delete workspace…');
+      await page.keyboard.press('Escape');
+      await page.getByRole('menuitem').first().waitFor({ state: 'hidden', timeout: UI_TIMEOUT });
+
+      for (const dismiss of ['Cancel', 'Escape'] as const) {
+        await startDeletion(page, path);
+        const dialog = deleteDialog(page, 'Delete review-ws?');
+        await dialog.waitFor({ timeout: UI_TIMEOUT });
+        const text = await dialog.innerText();
+        expect(text).toContain(path);
+        expect(text).toMatch(/deleted/);
+        expect(text).toMatch(/merged/);
+        expect(await dialog.getByRole('button', { name: 'Cancel', exact: true }).count()).toBe(1);
+        expect(await dialog.getByRole('button', { name: 'Delete', exact: true }).count()).toBe(1);
+
+        if (dismiss === 'Cancel') await dialog.getByRole('button', { name: 'Cancel', exact: true }).click({ timeout: UI_TIMEOUT });
+        else await page.keyboard.press('Escape');
+        await dialog.waitFor({ state: 'hidden', timeout: UI_TIMEOUT });
+        await sleep(300);
+
+        expect(existsSync(join(path, 'README.md'))).toBe(true);
+        expect(gitState(clone)).toEqual(before.git);
+        expect(worktreeListing(clone)).toEqual(before.listing);
+        expect(await isListed(path)).toBe(true);
+      }
+    });
+
+    test('AC16 — confirming the deletion of a clean workspace with no new commit removes the folder, the worktree, the branch and the row', async () => {
+      const { page } = session;
+      const path = worktreePath(session, clone, loginBranch);
+
+      await startDeletion(page, path);
+      const dialog = deleteDialog(page, `Delete ${loginBranch}?`);
+      await dialog.waitFor({ timeout: UI_TIMEOUT });
+      await dialog.getByRole('button', { name: 'Delete', exact: true }).click({ timeout: UI_TIMEOUT });
+      await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
+      await waitUnlisted(path);
+
+      expect(existsSync(path)).toBe(false);
+      expect(linkedWorktrees(clone).map((worktree) => worktree.path)).not.toContain(path);
+      expect(localBranches(clone)).not.toContain(loginBranch);
+      expect((await sidebarLines(page)).filter((line) => line.startsWith('Branch '))).toEqual([]);
+    });
+
+    test('AC17 — an unmerged branch is kept: the worktree is removed and "Branch <branch> was kept: it is not merged." shows under the Projects header', async () => {
+      const { page } = session;
+      const path = await addExternalWorkspace('unmerged-ws');
+      gitIn(path, 'commit', '--allow-empty', '-m', 'work in progress');
+      const commit = gitIn(path, 'rev-parse', 'HEAD');
+
+      await startDeletion(page, path);
+      const dialog = deleteDialog(page, 'Delete unmerged-ws?');
+      await dialog.waitFor({ timeout: UI_TIMEOUT });
+      await dialog.getByRole('button', { name: 'Delete', exact: true }).click({ timeout: UI_TIMEOUT });
+      await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
+      const message = 'Branch unmerged-ws was kept: it is not merged.';
+      await waitForLine(page, message);
+      await waitUnlisted(path);
+
+      expect(await isBelowProjectsHeader(page, { text: message })).toBe(true);
+      expect(existsSync(path)).toBe(false);
+      expect(linkedWorktrees(clone).map((worktree) => worktree.path)).not.toContain(path);
+      expect(localBranches(clone)).toContain('unmerged-ws');
+      expect(gitIn(clone.root, 'rev-parse', 'unmerged-ws')).toBe(commit);
+    });
+
+    test('AC18 — a workspace with uncommitted changes shows a warning first; Cancel keeps everything; "Delete anyway" removes it, changes included, and applies the branch rule', async () => {
+      const { page } = session;
+      const path = await addExternalWorkspace('dirty-ws');
+      writeFileSync(join(path, 'README.md'), 'changed\n');
+      writeFileSync(join(path, 'notes.txt'), 'untracked\n');
+      const before = gitState(clone);
+
+      await startDeletion(page, path);
+      const dialog = deleteDialog(page, 'Delete dirty-ws?');
+      await dialog.waitFor({ timeout: UI_TIMEOUT });
+      await dialog.getByRole('button', { name: 'Delete', exact: true }).click({ timeout: UI_TIMEOUT });
+      const warning = deleteDialog(page, 'dirty-ws has uncommitted changes');
+      await warning.waitFor({ timeout: UI_TIMEOUT });
+      expect(await warning.innerText()).toMatch(/lost/i);
+      expect(await warning.getByRole('button', { name: 'Cancel', exact: true }).count()).toBe(1);
+      expect(await warning.getByRole('button', { name: 'Delete anyway', exact: true }).count()).toBe(1);
+      await sleep(300);
+      // Nothing is deleted yet.
+      expect(existsSync(path)).toBe(true);
+      expect(gitState(clone)).toEqual(before);
+
+      await warning.getByRole('button', { name: 'Cancel', exact: true }).click({ timeout: UI_TIMEOUT });
+      await warning.waitFor({ state: 'hidden', timeout: UI_TIMEOUT });
+      expect(readFileSync(join(path, 'README.md'), 'utf8')).toBe('changed\n');
+      expect(readFileSync(join(path, 'notes.txt'), 'utf8')).toBe('untracked\n');
+      expect(gitState(clone)).toEqual(before);
+      expect(await isListed(path)).toBe(true);
+
+      await startDeletion(page, path);
+      await deleteDialog(page, 'Delete dirty-ws?').getByRole('button', { name: 'Delete', exact: true }).click({ timeout: UI_TIMEOUT });
+      const again = deleteDialog(page, 'dirty-ws has uncommitted changes');
+      await again.waitFor({ timeout: UI_TIMEOUT });
+      await again.getByRole('button', { name: 'Delete anyway', exact: true }).click({ timeout: UI_TIMEOUT });
+      await again.waitFor({ state: 'hidden', timeout: 15_000 });
+      await waitUnlisted(path);
+
+      expect(existsSync(path)).toBe(false);
+      expect(linkedWorktrees(clone).map((worktree) => worktree.path)).not.toContain(path);
+      // No commit outside its base: the branch goes too (AC16).
+      expect(localBranches(clone)).not.toContain('dirty-ws');
+    });
+
+    test('AC18 — "Delete anyway" on a workspace whose branch has unmerged commits removes the worktree, keeps the branch and says so (AC17)', async () => {
+      const { page } = session;
+      const path = await addExternalWorkspace('dirty-kept');
+      gitIn(path, 'commit', '--allow-empty', '-m', 'unmerged work');
+      writeFileSync(join(path, 'notes.txt'), 'untracked\n');
+      const commit = gitIn(path, 'rev-parse', 'HEAD');
+
+      await startDeletion(page, path);
+      await deleteDialog(page, 'Delete dirty-kept?').getByRole('button', { name: 'Delete', exact: true }).click({ timeout: UI_TIMEOUT });
+      const warning = deleteDialog(page, 'dirty-kept has uncommitted changes');
+      await warning.waitFor({ timeout: UI_TIMEOUT });
+      await warning.getByRole('button', { name: 'Delete anyway', exact: true }).click({ timeout: UI_TIMEOUT });
+      await warning.waitFor({ state: 'hidden', timeout: 15_000 });
+      const message = 'Branch dirty-kept was kept: it is not merged.';
+      await waitForLine(page, message);
+      await waitUnlisted(path);
+
+      expect(await isBelowProjectsHeader(page, { text: message })).toBe(true);
+      expect(existsSync(path)).toBe(false);
+      expect(localBranches(clone)).toContain('dirty-kept');
+      expect(gitIn(clone.root, 'rev-parse', 'dirty-kept')).toBe(commit);
+    });
+
+    test('AC19 — a deletion git refuses (locked worktree) keeps the dialog open with the error message and the workspace listed', async () => {
+      const { page } = session;
+      const path = await addExternalWorkspace('locked-ws');
+      gitIn(clone.root, 'worktree', 'lock', '--reason', 'kept for a test', path);
+      const before = gitState(clone);
+
+      try {
+        await startDeletion(page, path);
+        const dialog = deleteDialog(page, 'Delete locked-ws?');
+        await dialog.waitFor({ timeout: UI_TIMEOUT });
+        const linesBefore = await linesOf(dialog);
+        await dialog.getByRole('button', { name: 'Delete', exact: true }).click({ timeout: UI_TIMEOUT });
+        const message = await waitForDialogLine(dialog, (line) => !linesBefore.includes(line) && /lock/i.test(line));
+        expect(message.length).toBeGreaterThan(0);
+        await sleep(300);
+
+        expect(await dialog.isVisible()).toBe(true);
+        expect(await dialog.innerText()).toContain('Delete locked-ws?');
+        expect(existsSync(path)).toBe(true);
+        expect(gitState(clone)).toEqual(before);
+        expect(await isListed(path)).toBe(true);
+        await dismissDialogs(page);
+      } finally {
+        gitIn(clone.root, 'worktree', 'unlock', path);
+      }
+    });
+
+    test('AC10, AC11 — workspaces added outside the app are listed under their project in git order, by branch or folder name, titled with their path; a focus event or a reload lists new ones', async () => {
+      const { page } = session;
+      await clearProjects();
+
+      const external = makeLightRepo('ws-external');
+      folders.push(external);
+      const add = (...args: string[]) => gitIn(external.root, 'worktree', 'add', '--quiet', ...args);
+      add('-b', 'topic-a', join(external.parent, 'wt-a'));
+      add('--detach', join(external.parent, 'detached-folder'));
+      add('-b', 'topic/b', join(external.parent, 'wt-b'));
+      const expectedRows = () => linkedWorktrees(external).map((worktree) => ({ title: worktree.path, name: worktree.branch ?? basename(worktree.path) }));
+      expect(expectedRows()).toHaveLength(3);
+      expect(expectedRows().map((row) => row.name).sort()).toEqual(['detached-folder', 'topic-a', 'topic/b']);
+
+      await addRepository(session, external);
+      await waitForEntries(page, [external.root, ...expectedRows().map((row) => row.title)]);
+      const entries = await sidebarEntries(page);
+      expect(entries[0]!.text).toContain(external.name);
+      expectedRows().forEach((row, index) => {
+        expect(entries[index + 1]!.title).toBe(row.title);
+        expect(entries[index + 1]!.text).toContain(row.name);
+      });
+      expect(await isBelowProjectsHeader(page, { title: expectedRows()[0]!.title })).toBe(true);
+
+      // AC11: the focus event.
+      const lateFocus = join(external.parent, 'late-focus');
+      add('-b', 'late-focus', lateFocus);
+      await sleep(500);
+      expect(await isListed(lateFocus), 'the list does not refresh by itself').toBe(false);
+      await dispatchFocus(page);
+      await waitForEntries(page, [external.root, ...expectedRows().map((row) => row.title)]);
+      expect(await isListed(lateFocus)).toBe(true);
+
+      // AC11: a reload.
+      const lateReload = join(external.parent, 'late-reload');
+      add('-b', 'late-reload', lateReload);
+      await page.reload();
+      await page.getByText(versionLabel).waitFor();
+      await waitForEntries(page, [external.root, ...expectedRows().map((row) => row.title)]);
+      expect(await isListed(lateReload)).toBe(true);
+
+      await removeThroughMenu(page, external.root);
+      await waitForEntries(page, []);
+      expect(existsSync(lateReload), 'removing a project deletes no worktree').toBe(true);
+    });
+
+    test('AC12, AC8 — a project whose folder is gone stays listed with a muted "<path> is not a git repository." and no workspace, logs no error, offers an unusable New workspace dialog and can be removed', async () => {
+      const { page } = session;
+      await clearProjects();
+      const vanishing = makeLightRepo('ws-vanishing');
+      folders.push(vanishing);
+      await addRepository(session, vanishing);
+      const mark = await errorMark(session);
+
+      rmSync(vanishing.parent, { recursive: true, force: true });
+      await page.reload();
+      await page.getByText(versionLabel).waitFor();
+      const line = `${vanishing.root} is not a git repository.`;
+      await waitForLine(page, line);
+
+      expect(await entryTitles(page)).toEqual([vanishing.root]);
+      expect((await sidebarEntries(page))[0]!.text).toContain(vanishing.name);
+      expect(await isBelowProjectsHeader(page, { text: line })).toBe(true);
+      expect(await colorOfLine(page, line), 'the line is muted').toBe(await mutedColor(page));
+      expect(projectsInState(session.dataDir)).toContainEqual({ path: vanishing.root });
+
+      // AC8: listing the branches fails, the dialog says so and "Create" stays disabled.
+      const dialog = await openNewWorkspaceDialog(page, vanishing);
+      const linesNow = await waitForDialogLine(dialog, (found) => found.includes(vanishing.root));
+      expect(linesNow.length).toBeGreaterThan(0);
+      await nameField(dialog).fill('anything');
+      expect(await createButton(dialog).isDisabled()).toBe(true);
+      await dismissDialogs(page);
+
+      await removeThroughMenu(page, vanishing.root);
+      await waitForEntries(page, []);
+      await poll(() => projectsInState(session.dataDir), (projects) => Array.isArray(projects) && projects.length === 0, UI_TIMEOUT);
+      expect(projectsInState(session.dataDir)).toEqual([]);
+      await expectNoNewErrors(session, mark);
+    });
+
+    test.runIf(mode === 'built app')('AC13 — with 30 projects the Projects header and the footer stay in the window and the list scrolls to its last entry', async () => {
+      const { page } = session;
+      await clearProjects();
+      const repos = Array.from({ length: 30 }, (_, index) => makeLightRepo(`crowded-${String(index).padStart(2, '0')}`));
+      folders.push(...repos);
+      const last = repos[29]!;
+      // A workspace under the last project: the list ends with its row once workspaces are listed.
+      gitIn(last.root, 'worktree', 'add', '--quiet', '-b', 'last-workspace', join(last.parent, 'last-workspace'));
+      const addApi = () =>
+        page.evaluate(() => (globalThis as unknown as { api: { projects: { add(): Promise<unknown> } } }).api.projects.add());
+      for (const repo of repos) {
+        await stubPicker(session, repo.root);
+        await addApi();
+      }
+      await page.reload();
+      await page.getByText(versionLabel).waitFor();
+      await poll(() => entryTitles(page), (titles) => titles.includes(last.root), UI_TIMEOUT);
+      expect((await entryTitles(page)).filter((title) => repos.some((repo) => repo.root === title))).toHaveLength(30);
+
+      const layout = await page.evaluate(
+        ({ footerText }) => {
+          const all = [...document.querySelectorAll('aside *')] as HTMLElement[];
+          const deepest = (matches: (element: HTMLElement) => boolean) =>
+            all.filter(matches).filter((element) => !all.some((other) => other !== element && element.contains(other) && matches(other)))[0];
+          const header = deepest((element) => (element.textContent ?? '').trim() === 'Projects');
+          const footer = deepest((element) => (element.textContent ?? '').trim() === footerText);
+          // The last entry of the list, a workspace row when there is one.
+          const lastEntry = all.filter((element) => element.hasAttribute('title')).at(-1);
+          if (!header || !footer || !lastEntry) return null;
+          let scroller: HTMLElement | null = lastEntry.parentElement;
+          while (scroller && !(scroller.scrollHeight > scroller.clientHeight && /auto|scroll/.test(getComputedStyle(scroller).overflowY))) {
+            scroller = scroller.parentElement;
+          }
+          const rect = (element: Element) => {
+            const { top, bottom } = element.getBoundingClientRect();
+            return { top, bottom };
+          };
+          const before = { header: rect(header), footer: rect(footer), last: rect(lastEntry) };
+          lastEntry.scrollIntoView({ block: 'end' });
+          const after = { header: rect(header), footer: rect(footer), last: rect(lastEntry) };
+          return {
+            innerHeight: window.innerHeight,
+            scrollable: scroller ? { scrollHeight: scroller.scrollHeight, clientHeight: scroller.clientHeight, scrollTop: scroller.scrollTop } : null,
+            before,
+            after,
+          };
+        },
+        { footerText: versionLabel },
+      );
+
+      expect(layout, 'the header, the footer and the last entry are in the sidebar').not.toBeNull();
+      const { innerHeight, scrollable, before, after } = layout!;
+      for (const [name, rects] of Object.entries({ before, after })) {
+        expect(rects.header.top, `${name}: header top`).toBeGreaterThanOrEqual(0);
+        expect(rects.header.bottom, `${name}: header bottom`).toBeLessThanOrEqual(innerHeight);
+        expect(rects.footer.top, `${name}: footer top`).toBeGreaterThanOrEqual(0);
+        expect(rects.footer.bottom, `${name}: footer bottom`).toBeLessThanOrEqual(innerHeight);
+      }
+      expect(scrollable, 'a scrollable container holds the list').not.toBeNull();
+      expect(scrollable!.scrollHeight).toBeGreaterThan(scrollable!.clientHeight);
+      expect(scrollable!.scrollTop, 'the list scrolled to its last entry').toBeGreaterThan(0);
+      expect(after.last.bottom).toBeLessThanOrEqual(after.footer.top + 1);
+      expect(after.last.top).toBeGreaterThanOrEqual(after.header.bottom - 1);
+
+      // Leaves the session as it was.
+      for (const repo of repos) {
+        await page.evaluate(
+          (path) => (globalThis as unknown as { api: { projects: { remove(path: string): Promise<void> } } }).api.projects.remove(path),
+          repo.root,
+        );
+      }
+      await page.reload();
+      await page.getByText(versionLabel).waitFor();
+      await waitForEntries(page, []);
+    }, 120_000);
+  });
+
   test('logs no error and keeps running', async () => {
     const { page } = session;
     expect(await allConsoleErrorsOf(page)).toEqual([]);
@@ -1412,6 +2204,52 @@ describe.each([
     expect(session.isRunning()).toBe(true);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
     expect(await consoleErrorsOf(page)).toEqual([]);
+  });
+
+  // Last of the session on purpose: the refusal must come without any error, and
+  // an app that lets the failure through would log one that the "logs no error"
+  // checks of the tests above would then report in their place.
+  test('workspaces AC20 — a failing save refuses the add with "Cockpit could not save its data: <error>", lists nothing, leaves state.json as it was and logs no error', async () => {
+    const { page } = session;
+    const repo = makeLightRepo('ws-save');
+    try {
+      await page.getByText(versionLabel).waitFor();
+      expect(await entryTitles(page)).toEqual([]);
+      const mark = await errorMark(session);
+      const before = stateSnapshot(session.dataDir);
+      const blocker = join(session.dataDir, 'state.json.tmp');
+      mkdirSync(blocker);
+
+      try {
+        await addProject(session, repo.root);
+        const [message] = await poll(
+          async () => (await sidebarLines(page)).filter((line) => line.startsWith('Cockpit could not save its data: ')),
+          (found) => found.length > 0,
+          UI_TIMEOUT,
+        );
+        await sleep(300);
+
+        expect(message).toBeDefined();
+        expect(message!.length).toBeGreaterThan('Cockpit could not save its data: '.length);
+        expect(message).toContain('EISDIR');
+        expect(await isBelowProjectsHeader(page, { text: message! })).toBe(true);
+        expect(await entryTitles(page)).toEqual([]);
+        expect(stateSnapshot(session.dataDir)).toEqual(before);
+        await expectNoNewErrors(session, mark);
+      } finally {
+        rmSync(blocker, { recursive: true, force: true });
+      }
+
+      // Nothing was kept in memory either: the same add works once the folder is gone.
+      await addProject(session, repo.root);
+      await waitForEntries(page, [repo.root]);
+      expect(projectsInState(session.dataDir)).toEqual([{ path: repo.root }]);
+      expect((await sidebarLines(page)).filter((line) => line.startsWith('Cockpit could not save'))).toEqual([]);
+      await removeThroughMenu(page, repo.root);
+      await waitForEntries(page, []);
+    } finally {
+      rmSync(repo.parent, { recursive: true, force: true });
+    }
   });
 });
 
