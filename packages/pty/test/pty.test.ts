@@ -18,36 +18,53 @@ const shell: PtySpawnOptions = {
 
 type Listener = (...args: any[]) => void;
 
-/** Connects `createPtyClient` to `runPtyHost` and lets a test kill the "child". */
+/**
+ * Connects `createPtyClient` to `runPtyHost` and lets a test kill the "child".
+ * The client gets a fork function (as in the app): each call starts a new fake
+ * host, and the test sees how many were started.
+ */
 function connect() {
-  const hostListeners: Listener[] = [];
-  const childMessageListeners: Listener[] = [];
-  const childExitListeners: Listener[] = [];
+  interface FakeHost {
+    /** What the host sends to the client, as if the utility process posted it. */
+    emit(message: unknown): void;
+    /** This host's utility process exits. */
+    exit(code?: number): void;
+  }
+  const hosts: FakeHost[] = [];
 
   // An error escaping a host listener is an uncaught exception in the utility
   // process: it dies, as it would for real.
   const hostErrors: unknown[] = [];
-  const dieNow = (code = 1) => childExitListeners.forEach((l) => l(code));
 
-  runPtyHost({
-    on: (_event: 'message', listener: Listener) =>
-      void hostListeners.push((...args: unknown[]) => {
-        try {
-          listener(...args);
-        } catch (error) {
-          hostErrors.push(error);
-          dieNow();
-        }
-      }),
-    postMessage: (message: unknown) => queueMicrotask(() => childMessageListeners.forEach((l) => l(message))),
-  });
+  const fork = () => {
+    const hostListeners: Listener[] = [];
+    const childMessageListeners: Listener[] = [];
+    const childExitListeners: Listener[] = [];
+    const exit = (code = 1) => childExitListeners.forEach((l) => l(code));
 
-  const client = createPtyClient({
-    postMessage: (message: unknown) => queueMicrotask(() => hostListeners.forEach((l) => l({ data: message }))),
-    on: (event: 'message' | 'exit', listener: Listener) => {
-      (event === 'message' ? childMessageListeners : childExitListeners).push(listener);
-    },
-  });
+    runPtyHost({
+      on: (_event: 'message', listener: Listener) =>
+        void hostListeners.push((...args: unknown[]) => {
+          try {
+            listener(...args);
+          } catch (error) {
+            hostErrors.push(error);
+            exit();
+          }
+        }),
+      postMessage: (message: unknown) => queueMicrotask(() => childMessageListeners.forEach((l) => l(message))),
+    });
+
+    hosts.push({ emit: (message) => childMessageListeners.forEach((l) => l(message)), exit });
+    return {
+      postMessage: (message: unknown) => queueMicrotask(() => hostListeners.forEach((l) => l({ data: message }))),
+      on: (event: 'message' | 'exit', listener: Listener) => {
+        (event === 'message' ? childMessageListeners : childExitListeners).push(listener);
+      },
+    };
+  };
+
+  const client = createPtyClient(fork);
 
   const data = new Map<number, string>();
   const exits = new Map<number, PtyExit[]>();
@@ -58,8 +75,10 @@ function connect() {
     client,
     output: (id: number) => data.get(id) ?? '',
     exitsOf: (id: number) => exits.get(id) ?? [],
-    /** The utility process dies. */
-    die: dieNow,
+    /** The current utility process dies. */
+    die: () => hosts.at(-1)!.exit(),
+    /** Every host the client started, oldest first. */
+    hosts,
     /** Errors that escaped the host's message listener (each one kills the host). */
     hostErrors,
   };
@@ -171,43 +190,141 @@ describe('pty host and client', () => {
     expect(c.exitsOf(id)).toHaveLength(1);
   });
 
-  test('AC5 — after the host died, spawn rejects with "pty host is not running"', async () => {
+  test('COCKPIT-24 AC9 — the client forks the host at creation, once, and not again while it runs', async () => {
+    const c = connect();
+    expect(c.hosts).toHaveLength(1);
+
+    const first = await c.client.spawn(shell);
+    const second = await c.client.spawn(shell);
+    expect(c.hosts).toHaveLength(1);
+
+    c.client.kill(first);
+    c.client.kill(second);
+  });
+
+  test('COCKPIT-24 AC9 — after the host died, spawn forks a new host and resolves with an id no earlier session used', async () => {
+    const c = connect();
+    const first = await c.client.spawn(shell);
+    const second = await c.client.spawn(shell);
+    c.die();
+    await until(() => c.exitsOf(first).length > 0 && c.exitsOf(second).length > 0, 'both sessions to exit');
+
+    const third = await c.client.spawn(shell);
+    expect(c.hosts).toHaveLength(2);
+    expect([first, second]).not.toContain(third);
+    expect(third).toBeGreaterThan(Math.max(first, second));
+
+    c.client.write(third, 'echo cockpit-$((6*7))\n');
+    await waitForOutput(c, third, 'cockpit-42');
+
+    // Ids keep counting across hosts, more than once.
+    c.die();
+    await until(() => c.exitsOf(third).length > 0, `the exit of session ${third}`);
+    const fourth = await c.client.spawn(shell);
+    expect(fourth).toBeGreaterThan(third);
+    expect(c.hosts).toHaveLength(3);
+
+    c.client.kill(fourth);
+  });
+
+  test('COCKPIT-24 AC8 — spawns issued together after the host died share one new host', async () => {
     const c = connect();
     c.die();
 
-    await expect(c.client.spawn(shell)).rejects.toThrow('pty host is not running');
-    await expect(c.client.spawn(shell)).rejects.toThrow('pty host is not running');
+    const ids = await Promise.all([c.client.spawn(shell), c.client.spawn(shell)]);
+
+    expect(new Set(ids).size).toBe(2);
+    expect(c.hosts).toHaveLength(2);
+    ids.forEach((id) => c.client.kill(id));
   });
 
-  test('AC5 — a spawn still waiting for the host rejects when the host dies', async () => {
+  test('COCKPIT-24 AC9 — write, resize and kill on an id of the dead host do nothing to the new sessions', async () => {
+    const c = connect();
+    const old = await c.client.spawn(shell);
+    c.die();
+    await until(() => c.exitsOf(old).length > 0, `the exit of session ${old}`);
+    const fresh = await c.client.spawn(shell);
+
+    expect(() => {
+      c.client.write(old, 'echo from-old-id\n');
+      c.client.resize(old, 100, 30);
+      c.client.kill(old);
+    }).not.toThrow();
+    await sleep(300);
+
+    expect(c.exitsOf(fresh)).toEqual([]);
+    expect(c.output(fresh)).not.toContain('from-old-id');
+    expect(c.exitsOf(old)).toHaveLength(1);
+
+    // The new session still has its own size and still answers.
+    c.client.write(fresh, 'stty size\n');
+    await waitForOutput(c, fresh, '24 80');
+
+    c.client.kill(fresh);
+  });
+
+  test('COCKPIT-24 AC9 — what the dead host still sends, or a second exit of it, is ignored once a new host runs', async () => {
+    const c = connect();
+    const old = await c.client.spawn(shell);
+    c.die();
+    await until(() => c.exitsOf(old).length > 0, `the exit of session ${old}`);
+    const fresh = await c.client.spawn(shell);
+    expect(c.hosts).toHaveLength(2);
+
+    // The old process says something late, and exits again.
+    c.hosts[0]!.emit({ type: 'data', id: old, data: 'late-from-old-host' });
+    c.hosts[0]!.emit({ type: 'exit', id: old, exitCode: 0, signal: null });
+    c.hosts[0]!.exit();
+    await sleep(300);
+
+    expect(c.output(old)).not.toContain('late-from-old-host');
+    expect(c.exitsOf(old)).toHaveLength(1);
+    // The new host is not taken for dead: its session lives and spawn does not fork a third host.
+    expect(c.exitsOf(fresh)).toEqual([]);
+    const another = await c.client.spawn(shell);
+    expect(c.hosts).toHaveLength(2);
+    c.client.write(another, 'echo still-$((3*3))\n');
+    await waitForOutput(c, another, 'still-9');
+
+    c.client.kill(fresh);
+    c.client.kill(another);
+  });
+
+  test('COCKPIT-24 AC8 — a session that ended stays ended when the new host dies in turn', async () => {
+    const c = connect();
+    const old = await c.client.spawn(shell);
+    c.die();
+    await until(() => c.exitsOf(old).length > 0, `the exit of session ${old}`);
+    const fresh = await c.client.spawn(shell);
+
+    c.die();
+    await until(() => c.exitsOf(fresh).length > 0, `the exit of session ${fresh}`);
+    await sleep(200);
+
+    expect(c.exitsOf(old)).toEqual([{ exitCode: null, signal: null }]);
+    expect(c.exitsOf(fresh)).toEqual([{ exitCode: null, signal: null }]);
+  });
+
+  test('COCKPIT-24 AC9 — a spawn still waiting for the host rejects when the host dies, and the next spawn gets a new host', async () => {
     const childExitListeners: Listener[] = [];
+    let forks = 0;
     // A child that never answers.
-    const client = createPtyClient({
-      postMessage: () => {},
-      on: (event: 'message' | 'exit', listener: Listener) => {
-        if (event === 'exit') childExitListeners.push(listener);
-      },
+    const client = createPtyClient(() => {
+      forks++;
+      return {
+        postMessage: () => {},
+        on: (event: 'message' | 'exit', listener: Listener) => {
+          if (event === 'exit') childExitListeners.push(listener);
+        },
+      };
     });
 
     const pending = client.spawn(shell);
     childExitListeners.forEach((l) => l(1));
-
     await expect(pending).rejects.toThrow();
-  });
 
-  test('AC5 — after the host died, write, resize and kill do nothing', async () => {
-    const c = connect();
-    const id = await c.client.spawn(shell);
-    c.die();
-    await until(() => c.exitsOf(id).length > 0, `the exit of session ${id}`);
-
-    expect(() => {
-      c.client.write(id, 'echo x\n');
-      c.client.resize(id, 100, 30);
-      c.client.kill(id);
-    }).not.toThrow();
-    await sleep(200);
-    expect(c.exitsOf(id)).toHaveLength(1);
+    void client.spawn(shell).catch(() => {});
+    expect(forks).toBe(2);
   });
 
   test('AC3b — resize with a zero or NaN size is ignored and the host keeps running', async () => {
