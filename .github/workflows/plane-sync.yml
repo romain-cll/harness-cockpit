@@ -1,0 +1,31 @@
+name: Plane sync
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    # A pull request closed without a merge moves nothing.
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      # Installs the Bun version pinned in `packageManager`. The script has no
+      # dependency, so there is no `bun install`.
+      - uses: oven-sh/setup-bun@v2
+
+      # The title and the branch are user input: they reach the script through
+      # `env`, never through an expression inside `run`.
+      - name: Sync the Plane tickets
+        run: bun .github/scripts/plane-sync/src/main.ts
+        env:
+          PLANE_API_KEY: ${{ secrets.PLANE_API_KEY }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
