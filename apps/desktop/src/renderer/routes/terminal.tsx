@@ -1,16 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { PageHeader } from '@/components/page-header';
-import { Terminal } from '@/components/terminal';
+import { TerminalTabs } from '@/components/terminal-tabs';
 
 export const Route = createFileRoute('/terminal')({
-  component: TerminalPage,
+  component: TerminalTabs,
 });
-
-function TerminalPage() {
-  return (
-    <>
-      <PageHeader title="Terminal" />
-      <Terminal />
-    </>
-  );
-}

@@ -45,19 +45,25 @@ export function exitMessage({ exitCode, signal }: PtyExit): string {
   return '[Process ended]';
 }
 
-// An xterm.js terminal running a shell through `window.api.pty`. The shell lives
-// as long as the component: unmounting kills it.
-export function Terminal() {
+// An xterm.js terminal running a shell through `window.api.pty`, filling its
+// parent. The shell lives as long as the component: unmounting kills it. The
+// keyboard goes to the terminal whenever `focused` becomes true.
+export function Terminal({ focused }: { focused: boolean }) {
   const container = useRef<HTMLDivElement>(null);
+  const xterm = useRef<XTerm>(null);
 
   useEffect(() => {
     const { pty } = window.api;
     const term = new XTerm({ fontFamily: 'ui-monospace, Menlo, monospace', fontSize: 12, theme: readTheme() });
     const fit = new FitAddon();
     term.loadAddon(fit);
+    xterm.current = term;
     term.open(container.current!);
-    fit.fit();
-    term.focus();
+    // A terminal in a hidden area has no size to fit to.
+    const fitToArea = () => {
+      if (container.current!.clientWidth > 0 && container.current!.clientHeight > 0) fit.fit();
+    };
+    fitToArea();
 
     let sessionId: number | undefined;
     let exited = false;
@@ -78,14 +84,18 @@ export function Terminal() {
       }),
     );
 
+    const requested = { cols: term.cols, rows: term.rows };
     pty
-      .spawn({ cols: term.cols, rows: term.rows })
+      .spawn(requested)
       .then((id) => {
         if (disposed) {
           pty.kill(id);
           return;
         }
         sessionId = id;
+        // The terminal may have been resized while the shell was starting, when
+        // there was no session to resize yet.
+        if (term.cols !== requested.cols || term.rows !== requested.rows) pty.resize(id, term.cols, term.rows);
         for (const event of early) if (event.id === id) event.apply();
         early.length = 0;
       })
@@ -99,7 +109,7 @@ export function Terminal() {
     const resize = term.onResize(({ cols, rows }) => {
       if (sessionId !== undefined && !exited) pty.resize(sessionId, cols, rows);
     });
-    const observer = new ResizeObserver(() => fit.fit());
+    const observer = new ResizeObserver(fitToArea);
     observer.observe(container.current!);
 
     const scheme = matchMedia('(prefers-color-scheme: dark)');
@@ -121,5 +131,9 @@ export function Terminal() {
     };
   }, []);
 
-  return <div ref={container} className="min-h-0 flex-1 overflow-hidden bg-background px-2 py-1" />;
+  useEffect(() => {
+    if (focused) xterm.current?.focus();
+  }, [focused]);
+
+  return <div ref={container} className="size-full overflow-hidden bg-background px-2 py-1" />;
 }
