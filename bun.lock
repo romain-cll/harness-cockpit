@@ -9,6 +9,14 @@
         "typescript": "^7.0.2",
       },
     },
+    ".github/scripts/plane-sync": {
+      "name": "@cockpit/plane-sync",
+      "version": "0.0.0",
+      "devDependencies": {
+        "@types/node": "^24.19.2",
+        "vitest": "^5.0.5",
+      },
+    },
     "apps/desktop": {
       "name": "@cockpit/desktop",
       "version": "0.0.0",
@@ -158,6 +166,8 @@
     "@cockpit/desktop": ["@cockpit/desktop@workspace:apps/desktop"],
 
     "@cockpit/harnesses": ["@cockpit/harnesses@workspace:packages/harnesses"],
+
+    "@cockpit/plane-sync": ["@cockpit/plane-sync@workspace:.github/scripts/plane-sync"],
 
     "@cockpit/pty": ["@cockpit/pty@workspace:packages/pty"],
 
