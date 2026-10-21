@@ -42,10 +42,13 @@ export function NewWorkspaceDialog({
     event.preventDefault();
     if (!canCreate) return;
     setBusy(true);
-    const result = await window.api.workspaces.create(project.path, name.trim(), base);
-    setBusy(false);
-    if (result.status === 'refused') setMessage(result.message);
-    else await onCreated();
+    try {
+      const result = await window.api.workspaces.create(project.path, name.trim(), base);
+      if (result.status === 'refused') setMessage(result.message);
+      else await onCreated();
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (

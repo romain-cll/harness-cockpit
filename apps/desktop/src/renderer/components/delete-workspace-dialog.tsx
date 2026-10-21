@@ -31,11 +31,14 @@ export function DeleteWorkspaceDialog({
   async function remove() {
     setBusy(true);
     setMessage(undefined);
-    const result = await window.api.workspaces.remove(project.path, workspace.path, { force: dirty });
-    setBusy(false);
-    if (result.status === 'dirty') setDirty(true);
-    else if (result.status === 'refused') setMessage(result.message);
-    else await onRemoved(result.branchKept);
+    try {
+      const result = await window.api.workspaces.remove(project.path, workspace.path, { force: dirty });
+      if (result.status === 'dirty') setDirty(true);
+      else if (result.status === 'refused') setMessage(result.message);
+      else await onRemoved(result.branchKept);
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (

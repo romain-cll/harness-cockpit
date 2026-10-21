@@ -142,7 +142,7 @@ function serialised<T>(key: string, task: () => Promise<T>): Promise<T> {
  * it creates `branch` from it; without, it checks out the existing local `branch`, and refuses a
  * name that is not a local branch (a tag, a SHA, a remote-only name). All or nothing: if git fails,
  * the worktree and the branch this call created are removed, and the original `GIT_FAILED` is
- * rethrown. A name git refuses is `INVALID_BRANCH_NAME`. Calls for one repository run one at a time,
+ * rethrown; a root that cannot be created is `GIT_FAILED` too. A name git refuses is `INVALID_BRANCH_NAME`. Calls for one repository run one at a time,
  * so of two creating the same branch, the second gets `BRANCH_EXISTS`.
  */
 export async function createWorktree({
@@ -159,8 +159,14 @@ export async function createWorktree({
 } & GitEnv): Promise<Worktree> {
   if (!isAbsolute(requestedRoot)) throw new TypeError(`root must be an absolute path: ${requestedRoot}`);
   // Canonical, so the paths built from it match the ones git reports (symbolic links, macOS `/var`).
-  await mkdir(requestedRoot, { recursive: true });
-  const root = await realpath(requestedRoot);
+  let root: string;
+  try {
+    await mkdir(requestedRoot, { recursive: true });
+    root = await realpath(requestedRoot);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new WorkspaceError('GIT_FAILED', `cannot create ${requestedRoot}: ${reason}`, { cause: error });
+  }
   await checkGit(env);
   const main = await repositoryRoot(repo, env);
   const project = `${basename(main)}-${createHash('sha256').update(main).digest('hex').slice(0, 8)}`;
