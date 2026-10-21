@@ -8,7 +8,8 @@
   },
   "workspaces": [
     "apps/*",
-    "packages/*"
+    "packages/*",
+    ".github/scripts/plane-sync"
   ],
   "scripts": {
     "build": "turbo run build",
