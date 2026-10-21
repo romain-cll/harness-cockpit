@@ -76,12 +76,74 @@ export async function listWorktrees(repo: string, { env }: GitEnv = {}): Promise
   return list(repo, env);
 }
 
+export interface Branches {
+  /** Short names of the local branches. */
+  local: string[];
+  /** `origin/<branch>` remote-tracking branches, without `origin/HEAD`. */
+  remote: string[];
+  /** The branch a new workspace starts from unless told otherwise, `null` when there is none. */
+  defaultBase: string | null;
+}
+
+/**
+ * The local and `origin/*` branches of the repository, as they are: nothing is fetched. The default
+ * base is `origin/D` when it exists, else the local `D`, else `null`, where `D` is the branch
+ * `origin/HEAD` points at or, without it, the one checked out in the main working tree.
+ */
+export async function listBranches(repo: string, { env }: GitEnv = {}): Promise<Branches> {
+  await checkGit(env);
+  const [main] = await list(repo, env);
+  if (!main) throw new WorkspaceError('GIT_FAILED', `git worktree list found no worktree in ${repo}`);
+
+  const output = await git(
+    ['for-each-ref', '--format=%(refname)%00%(symref)', 'refs/heads', 'refs/remotes/origin'],
+    { cwd: main.path, env },
+  );
+  const local: string[] = [];
+  const remote: string[] = [];
+  for (const line of output.split('\n')) {
+    const [ref = '', symref = ''] = line.split('\0');
+    if (symref !== '') continue;
+    if (ref.startsWith('refs/heads/')) local.push(ref.slice('refs/heads/'.length));
+    else if (ref.startsWith('refs/remotes/origin/')) remote.push(ref.slice('refs/remotes/'.length));
+  }
+
+  let target: string | null = main.branch;
+  try {
+    const head = (await git(['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], { cwd: main.path, env })).trim();
+    target = head.replace(/^refs\/remotes\/origin\//, '');
+  } catch (error) {
+    // Exit 1 means `origin/HEAD` is not a symbolic ref (or is missing): fall back to the checked out branch.
+    if (!(error instanceof WorkspaceError && error.code === 'GIT_FAILED')) throw error;
+  }
+  const defaultBase =
+    target === null ? null : remote.includes(`origin/${target}`) ? `origin/${target}` : local.includes(target) ? target : null;
+  return { local, remote, defaultBase };
+}
+
+const queues = new Map<string, Promise<void>>();
+
+/** Runs `task` after the earlier ones for `key` settle, whatever their outcome. */
+function serialised<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const run = (queues.get(key) ?? Promise.resolve()).then(task);
+  const tail = run.then(
+    () => {},
+    () => {},
+  );
+  queues.set(key, tail);
+  void tail.then(() => {
+    if (queues.get(key) === tail) queues.delete(key);
+  });
+  return run;
+}
+
 /**
  * Creates the worktree at `<root>/<project>-<hash>/<branch>`, creating `root` if needed. With `base`
  * it creates `branch` from it; without, it checks out the existing local `branch`, and refuses a
  * name that is not a local branch (a tag, a SHA, a remote-only name). All or nothing: if git fails,
  * the worktree and the branch this call created are removed, and the original `GIT_FAILED` is
- * rethrown.
+ * rethrown. A name git refuses is `INVALID_BRANCH_NAME`. Calls for one repository run one at a time,
+ * so of two creating the same branch, the second gets `BRANCH_EXISTS`.
  */
 export async function createWorktree({
   repo,
@@ -101,58 +163,67 @@ export async function createWorktree({
   const root = await realpath(requestedRoot);
   await checkGit(env);
   const main = await repositoryRoot(repo, env);
-  // `--branch` expands shorthands such as `@{-1}`: a name it rewrites is not a branch name.
-  const checked = await git(['check-ref-format', '--branch', branch], { cwd: main, env });
-  if (checked.trim() !== branch) throw new WorkspaceError('GIT_FAILED', `invalid branch name: ${branch}`);
   const project = `${basename(main)}-${createHash('sha256').update(main).digest('hex').slice(0, 8)}`;
   const path = join(root, project, branch);
 
-  const exists = await succeeds(['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: main, env });
-  if (base === undefined && !exists) {
-    throw new WorkspaceError('GIT_FAILED', `no local branch to check out: ${branch}`);
-  }
-  if (base !== undefined && exists) throw new WorkspaceError('BRANCH_EXISTS', `branch already exists: ${branch}`);
-  const registered = (await findLinked(await list(main, env), path)) !== undefined;
+  return serialised(main, async () => {
+    // `--branch` expands shorthands such as `@{-1}`: a name it rewrites is not a branch name.
+    const checked = await git(['check-ref-format', '--branch', branch], { cwd: main, env }).catch(() => undefined);
+    if (checked?.trim() !== branch) throw new WorkspaceError('INVALID_BRANCH_NAME', `invalid branch name: ${branch}`);
 
-  try {
-    await git(
-      base === undefined
-        ? ['worktree', 'add', '--', path, branch]
-        : ['worktree', 'add', '-b', branch, '--', path, base],
-      { cwd: main, env },
-    );
-  } catch (error) {
-    // All or nothing: undo only what this call created. A failing hook leaves the worktree in place.
-    if (!registered) await succeeds(['worktree', 'remove', '--force', '--', path], { cwd: main, env });
-    if (!exists) await succeeds(['branch', '-D', '--', branch], { cwd: main, env });
-    throw error;
-  }
-  return linkedWorktree(await list(main, env), path);
+    const exists = await succeeds(['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], { cwd: main, env });
+    if (base === undefined && !exists) {
+      throw new WorkspaceError('GIT_FAILED', `no local branch to check out: ${branch}`);
+    }
+    if (base !== undefined && exists) throw new WorkspaceError('BRANCH_EXISTS', `branch already exists: ${branch}`);
+    const registered = (await findLinked(await list(main, env), path)) !== undefined;
+
+    try {
+      await git(
+        base === undefined
+          ? ['worktree', 'add', '--', path, branch]
+          : ['worktree', 'add', '-b', branch, '--', path, base],
+        { cwd: main, env },
+      );
+    } catch (error) {
+      // All or nothing: undo only what this call created. A failing hook leaves the worktree in place.
+      if (!registered) await succeeds(['worktree', 'remove', '--force', '--', path], { cwd: main, env });
+      if (!exists) await succeeds(['branch', '-D', '--', branch], { cwd: main, env });
+      throw error;
+    }
+    return linkedWorktree(await list(main, env), path);
+  });
 }
 
 /**
- * Removes a clean linked worktree. With `deleteBranch`, also deletes its branch if merged: when it
- * is not, the worktree is still removed and the call rejects with `BRANCH_NOT_MERGED`.
+ * Removes a clean linked worktree, or any with `force`, uncommitted changes included. With
+ * `deleteBranch`, also deletes its branch if merged: when it is not, the worktree is still removed
+ * and the call rejects with `BRANCH_NOT_MERGED`.
  */
 export async function removeWorktree({
   repo,
   path,
   deleteBranch,
+  force,
   env,
 }: {
   repo: string;
   path: string;
   deleteBranch?: boolean;
+  force?: boolean;
 } & GitEnv): Promise<void> {
   await checkGit(env);
   const worktrees = await list(repo, env);
   const worktree = await linkedWorktree(worktrees, path);
   const main = worktrees[0]!.path;
 
-  if ((await git(['status', '--porcelain', '--untracked-files=normal'], { cwd: worktree.path, env })).trim() !== '') {
+  if (
+    !force &&
+    (await git(['status', '--porcelain', '--untracked-files=normal'], { cwd: worktree.path, env })).trim() !== ''
+  ) {
     throw new WorkspaceError('DIRTY_WORKTREE', `worktree has uncommitted changes: ${worktree.path}`);
   }
-  await git(['worktree', 'remove', '--', worktree.path], { cwd: main, env });
+  await git(['worktree', 'remove', ...(force ? ['--force'] : []), '--', worktree.path], { cwd: main, env });
 
   if (!deleteBranch || worktree.branch === null) return;
   // A branch deleted by hand while checked out is still reported by the worktree: nothing to delete.

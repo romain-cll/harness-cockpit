@@ -1,4 +1,5 @@
-import { createRootRoute, Outlet } from '@tanstack/react-router';
+import { createRootRoute, Outlet, useRouter } from '@tanstack/react-router';
+import { useEffect } from 'react';
 import { AppSidebar } from '@/components/app-sidebar';
 
 export const Route = createRootRoute({
@@ -11,6 +12,13 @@ export const Route = createRootRoute({
 
 function RootLayout() {
   const { version, projects } = Route.useLoaderData();
+  const router = useRouter();
+  // Worktrees may be added or removed outside the app: list them again when the window gains focus.
+  useEffect(() => {
+    const refresh = () => void router.invalidate();
+    window.addEventListener('focus', refresh);
+    return () => window.removeEventListener('focus', refresh);
+  }, [router]);
   return (
     <div className="flex h-screen">
       <AppSidebar version={version} projects={projects} />

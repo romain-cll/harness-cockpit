@@ -10,10 +10,22 @@ export type { PtyExit };
  */
 export type PtySpawnRequest = Pick<PtySpawnOptions, 'cols' | 'rows'> & Partial<PtySpawnOptions>;
 
-/** A git repository the user added; `path` is its root, `name` its basename. */
+/** A linked git worktree of a project; `name` is its branch, or its folder name when detached. */
+export interface Workspace {
+  path: string;
+  name: string;
+  branch: string | null;
+}
+
+/**
+ * A git repository the user added; `path` is its root, `name` its basename. `error` says why git
+ * could not list its workspaces (the folder is gone, git is missing…), in which case there are none.
+ */
 export interface Project {
   path: string;
   name: string;
+  workspaces: Workspace[];
+  error?: string;
 }
 
 /** What adding a project came to; `refused` carries the message to show the user. */
@@ -21,6 +33,21 @@ export type AddProjectResult =
   | { status: 'added'; project: Project }
   | { status: 'cancelled' }
   | { status: 'refused'; message: string };
+
+/** A refusal carries the message to show the user. */
+export interface Refused {
+  status: 'refused';
+  message: string;
+}
+
+export type BranchesResult =
+  | { status: 'listed'; local: string[]; remote: string[]; defaultBase: string | null }
+  | Refused;
+
+export type CreateWorkspaceResult = { status: 'created'; workspace: Workspace } | Refused;
+
+/** `dirty`: the workspace has uncommitted changes and was not removed. `branchKept`: its branch is not merged. */
+export type RemoveWorkspaceResult = { status: 'removed'; branchKept: boolean } | { status: 'dirty' } | Refused;
 
 /**
  * The only surface the renderer may use to reach the main process, exposed by
@@ -48,6 +75,15 @@ export interface Api {
     add(): Promise<AddProjectResult>;
     /** Forgets the project; its files stay on disk. */
     remove(path: string): Promise<void>;
+  };
+  /** Git worktrees of a project; every call refuses a project path that is not in the app state. */
+  workspaces: {
+    /** The local and `origin/*` branches, and the base to preselect. Runs no fetch. */
+    branches(project: string): Promise<BranchesResult>;
+    /** Creates the branch `name` from `base` and its worktree under `$COCKPIT_HOME/worktrees`. */
+    create(project: string, name: string, base: string): Promise<CreateWorkspaceResult>;
+    /** Removes the worktree, and its branch when merged; `force` removes it with its uncommitted changes. */
+    remove(project: string, path: string, options?: { force?: boolean }): Promise<RemoveWorkspaceResult>;
   };
   /** The `PATH` of the user's login shell, the only part of its environment the renderer sees. */
   getShellPath(): Promise<string>;

@@ -1,4 +1,4 @@
-import { closeSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from 'node:fs';
+import { closeSync, constants, copyFileSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 
 // The state version this build reads and writes. It will drive migrations.
@@ -99,9 +99,35 @@ function parseState(content: string): State | undefined {
   }
 }
 
+const isExisting = (error: unknown) => (error as NodeJS.ErrnoException).code === 'EEXIST';
+
+// Keeps the bytes of `file` under the first free `<file>.corrupt-<timestamp>`,
+// then `-2`, `-3`… A hard link rather than a rename: the replacement written
+// by the caller swaps `state.json` in one step, so a crash in between never
+// leaves it missing. A copy when the volume cannot link. Neither overwrites
+// an existing backup.
+function keepBackup(file: string): string {
+  const base = `${file}.corrupt-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+  for (let n = 1; ; n++) {
+    const backup = n === 1 ? base : `${base}-${n}`;
+    try {
+      linkSync(file, backup);
+      return backup;
+    } catch (error) {
+      if (isExisting(error)) continue;
+    }
+    try {
+      copyFileSync(file, backup, constants.COPYFILE_EXCL);
+      return backup;
+    } catch (error) {
+      if (!isExisting(error)) throw error;
+    }
+  }
+}
+
 // Reads `<dir>/state.json`, creating the folder and the file when missing. A
 // file that is not valid state is set aside as `state.json.corrupt-<timestamp>`
-// and replaced; one from a newer version throws and is left alone.
+// (see `keepBackup`) and replaced; one from a newer version throws and is left alone.
 export function loadState(dir: string): State {
   mkdirSync(dir, { recursive: true });
   const file = join(dir, 'state.json');
@@ -113,10 +139,7 @@ export function loadState(dir: string): State {
       if (state.version > STATE_VERSION) throw new NewerStateError(file, state.version);
       return state;
     }
-    const backup = `${file}.corrupt-${new Date().toISOString().replace(/[:.]/g, '-')}`;
-    // A hard link rather than a rename: the replacement written below swaps
-    // `state.json` in one step, so a crash in between never leaves it missing.
-    linkSync(file, backup);
+    const backup = keepBackup(file);
     console.warn(`${file} is not a valid state file, kept as ${backup} and replaced.`);
   }
 
