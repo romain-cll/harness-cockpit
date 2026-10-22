@@ -279,10 +279,10 @@ function freePort(): Promise<number> {
 
 // Runs the `dev` script as a developer would, then attaches over the Chrome
 // DevTools Protocol.
-async function launchDev(): Promise<Session> {
+async function launchDev(base?: NodeJS.ProcessEnv): Promise<Session> {
   const port = await freePort();
   const inspectPort = await freePort();
-  const { dataDir, cockpitHome, env } = launchEnv(true);
+  const { dataDir, cockpitHome, env } = launchEnv(true, undefined, base);
   // Its own process group, so closing stops the dev server and Electron with it.
   // electron-vite ignores `--inspect 0` (0 is falsy for it): a free port instead.
   const dev = spawn('bun', ['run', 'dev', '--remoteDebuggingPort', String(port), '--inspect', String(inspectPort)], {
@@ -2654,6 +2654,8 @@ const launchBuiltWith = (env: NodeJS.ProcessEnv, dataDir?: string, cockpitHome?:
 
 const launchPackagedWith = (env: NodeJS.ProcessEnv, dataDir?: string) => launchPackaged({ env, dataDir });
 
+const launchDevWith = (env: NodeJS.ProcessEnv) => launchDev(env);
+
 interface StoredSession {
   id: string;
   name: string;
@@ -2772,10 +2774,8 @@ async function expectNoErrors(session: Session) {
   expect(await allConsoleErrorsOf(session.page)).toEqual([]);
 }
 
-describe.each([
-  ['built app', launchBuiltWith],
-  ['packaged app', launchPackagedWith],
-])('sessions: %s', (_mode, launch) => {
+// The full block runs in the built app only (see the split rule in AGENTS.md).
+describe('sessions: built app', () => {
   let fx: SessionsFixture;
   let session: Session;
   // Shared by the tests below, which run in order on one launch.
@@ -2787,7 +2787,7 @@ describe.each([
 
   beforeAll(async () => {
     fx = makeSessionsFixture(['claude', 'codex']);
-    session = await launch(fx.env());
+    session = await launchBuiltWith(fx.env());
     await session.page.getByText(versionLabel).waitFor();
   });
 
@@ -2946,6 +2946,47 @@ describe.each([
 
   test('logs no error and keeps running', async () => {
     expect(await sidebarLines(session.page)).toContain('Sessions');
+    await expectNoErrors(session);
+  });
+});
+
+// One smoke path through the sessions IPC in the other launch modes: the page,
+// the main process, the pty host and the disk. Each needs a launch of its own
+// with the fake login shell that holds the stubs. The launchd-environment mode
+// has none: its point is the user's real login shell, where a session would run
+// a real CLI.
+describe.each([
+  ['dev server', launchDevWith],
+  ['packaged app', launchPackagedWith],
+])('sessions smoke path: %s', (_mode, launch) => {
+  let fx: SessionsFixture;
+  let session: Session;
+
+  beforeAll(async () => {
+    fx = makeSessionsFixture(['claude']);
+    session = await launch(fx.env());
+    await session.page.getByText(versionLabel).waitFor();
+  });
+
+  afterAll(async () => {
+    await session?.close();
+    if (fx) rmSync(fx.root, { recursive: true, force: true });
+  });
+
+  test('smoke path — picking Claude Code runs the stub in a new folder under COCKPIT_HOME, lists the session and stores it', async () => {
+    const { page } = session;
+    const id = await startSession(page, 'Claude Code', 'Claude Code 1');
+    const home = join(session.cockpitHome, 'sessions', id);
+
+    const stub = await readStub(page);
+    expect(stub.cwd).toBe(realpathSync(home));
+    expect(stub.term).toBe('xterm-256color');
+    expect(await waitForSessionEntries(page, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+    const stored = await poll(() => sessionsInState(session.dataDir), (list) => list.length > 0, UI_TIMEOUT);
+    expect(stored.map((s) => [s.name, s.directory])).toEqual([['Claude Code 1', home]]);
+  });
+
+  test('logs no error and keeps running', async () => {
     await expectNoErrors(session);
   });
 });
