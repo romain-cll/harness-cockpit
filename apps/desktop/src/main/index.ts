@@ -358,14 +358,15 @@ function startProjects(userData: string): void {
 // Sessions outside any project: an agent CLI run in a folder of its own under
 // the Cockpit home, in a pty owned by the window that started it. The sessions
 // are kept in `state.json`; the pty ends with its page, the folder stays.
-function startSessions(
-  userData: string,
-  detected: Promise<DetectedHarness[]>,
-  { spawnFor, kill }: ReturnType<typeof startPty>,
-): void {
+function startSessions(userData: string, { spawnFor, kill }: ReturnType<typeof startPty>): void {
+  // Detected on the first call that needs it, never at startup: detecting runs
+  // each CLI's `--version`, and an app that never starts a session should not.
+  let detection: Promise<DetectedHarness[]> | undefined;
+  const detected = () => (detection ??= shellEnv.then((env) => detectHarnesses(env)));
+
   ipcMain.handle('sessions:harnesses', async (event) => {
     if (!isFromApp(event)) throw new Error('sessions:harnesses refused: unexpected origin');
-    return (await detected).map(({ id }) => {
+    return (await detected()).map(({ id }) => {
       const { name } = harnesses.find((harness) => harness.id === id)!;
       return { id, name };
     });
@@ -382,7 +383,7 @@ function startSessions(
     async (event, harnessId: string, size: { cols: number; rows: number }): Promise<StartSessionResult> => {
       if (!isFromApp(event)) throw new Error('sessions:start refused: unexpected origin');
       const harness = harnesses.find(({ id }) => id === harnessId);
-      const found = (await detected).find(({ id }) => id === harnessId);
+      const found = (await detected()).find(({ id }) => id === harnessId);
       if (!harness || !found) return { status: 'refused', message: `${harness?.name ?? harnessId} is not installed.` };
 
       const id = randomUUID();
@@ -446,11 +447,7 @@ void app.whenReady().then(() => {
     return (await shellEnv).PATH ?? '';
   });
   startProjects(userData);
-  startSessions(
-    userData,
-    shellEnv.then((env) => detectHarnesses(env)),
-    startPty(),
-  );
+  startSessions(userData, startPty());
 
   createWindow();
 
