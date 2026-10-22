@@ -93,19 +93,54 @@ async function attach(endpoint: string): Promise<{ browser: Browser; page: Page 
   const browser = await chromium.connectOverCDP(endpoint);
   const context = browser.contexts()[0]!;
   const page = context.pages()[0] ?? (await context.waitForEvent('page'));
+  // The window's target starts as `about:blank` while its first navigation to the
+  // app is pending: a reload racing that navigation waits for a load that never
+  // comes. Wait until the page is on the app's URL and loaded.
+  await page.waitForURL((url) => url.protocol !== 'about:', { timeout: 30_000 });
   await page.reload();
   return { browser, page };
 }
 
 // Stops a process started with `detached: true` and everything in its process
-// group, and waits for it to exit.
+// group, and waits until no process of the group is alive: the helpers of the
+// child can outlive it and still write in the data folder. The group gets
+// SIGKILL 10 s after the SIGTERM if anything is left, and an error names it
+// after 20 s.
 async function stopGroup(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  const exited = new Promise((resolve) => child.once('exit', resolve));
-  process.kill(-child.pid!, 'SIGTERM');
-  const killer = setTimeout(() => process.kill(-child.pid!, 'SIGKILL'), 10_000);
-  await exited;
-  clearTimeout(killer);
+  const pid = child.pid!;
+  const signalGroup = (signal: NodeJS.Signals) => {
+    try {
+      process.kill(-pid, signal);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+    }
+  };
+  // `kill(-pid, 0)` throws ESRCH once the group is gone.
+  const groupAlive = () => {
+    try {
+      process.kill(-pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+    }
+  };
+
+  const started = Date.now();
+  const exited =
+    child.exitCode !== null || child.signalCode !== null
+      ? Promise.resolve()
+      : new Promise((resolve) => child.once('exit', resolve));
+  signalGroup('SIGTERM');
+  const killer = setTimeout(() => signalGroup('SIGKILL'), 10_000);
+  try {
+    await exited;
+    while (groupAlive()) {
+      if (Date.now() - started > 20_000) throw new Error(`the process group ${pid} is still alive after 20 s`);
+      await sleep(100);
+    }
+  } finally {
+    clearTimeout(killer);
+  }
 }
 
 // Connects to the main process's Node inspector (`--inspect=0` prints
@@ -2848,6 +2883,36 @@ describe.each([
     test.runIf(full)('tabs AC11 — a same-origin navigation the app cannot serve (error page, no document) ends the shell, with no main-process error', async () => {
       await expectShellEndsOnNavigationTo('/%');
     });
+  });
+
+  // The host is stopped before the terminal page opens, so the spawn of the first
+  // tab's shell cannot resolve while the keys are typed: they must be held, then
+  // reach the shell in order. The first tab of a new visit is the one to use: its
+  // spawn is sent after the SIGSTOP whatever ran before, and it is the terminal
+  // "just opened" of the criterion. It runs before any test that kills the host.
+  test.runIf(full)('early keys AC1 — keys typed into a tab before its shell is spawned reach it once the pty host resumes', async () => {
+    const { page } = session;
+    // The host's pid, from the parent of a shell it runs (as the host-kill test).
+    const id = await spawnShell(page);
+    await ptyWrite(page, id, 'echo ppid-$PPID\n');
+    await waitForOutput(page, id, /ppid-\d+/);
+    const hostPid = Number(/ppid-(\d+)/.exec(await outputOf(page, id))![1]);
+    expect(hostPid).not.toBe(session.pid);
+    await ptyKill(page, id);
+    await waitForExit(page, id);
+
+    process.kill(hostPid, 'SIGSTOP');
+    let pane: Pane;
+    try {
+      await openTerminal(page);
+      pane = await focusedPane(page);
+      await typeLine(page, 'echo early-$((6*7))');
+    } finally {
+      process.kill(hostPid, 'SIGCONT');
+    }
+
+    // The echoed command line shows `$((6*7))`: only the shell prints `early-42`.
+    await waitForRow(page, 'early-42', pane);
   });
 
   // The smoke path of tabs and splits in the dev server and the packaged app (the
