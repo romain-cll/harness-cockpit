@@ -16,8 +16,6 @@ export default defineConfig({
     },
   },
   renderer: {
-    // Absolute asset paths, so nested routes resolve them under the `app://` protocol.
-    base: '/',
     build: { outDir: 'dist/renderer' },
     resolve: { alias: { '@': resolve('src/renderer') } },
     plugins: [
@@ -29,6 +27,10 @@ export default defineConfig({
       }),
       react(),
       tailwindcss(),
+      // Absolute asset paths, so a nested route such as `/sessions/<id>` resolves them
+      // under the `app://` protocol. electron-vite sets `base: './'` for a production
+      // build, whatever the config says, so this runs after it.
+      { name: 'absolute-base', enforce: 'post', config: () => ({ base: '/' }) },
     ],
   },
 });

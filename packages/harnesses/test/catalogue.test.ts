@@ -78,6 +78,83 @@ describe('catalogue', () => {
   });
 });
 
+describe('frozen catalogue', () => {
+  // Every attempt runs in strict mode (an ES module): a write to a frozen
+  // object throws. The restore keeps a failed attempt from leaking into the
+  // other tests of this file.
+  const expectTypeError = (change: () => void, restore: () => void) => {
+    try {
+      expect(change).toThrow(TypeError);
+    } finally {
+      try {
+        restore();
+      } catch {
+        // The object is frozen: nothing was changed, nothing to restore.
+      }
+    }
+  };
+
+  test('AC13 — pushing to continueLast throws a TypeError and leaves it unchanged', () => {
+    const list = harness('claude-code').continueLast as string[];
+
+    expectTypeError(
+      () => list.push('--extra'),
+      () => {
+        while (list.length > 1) list.pop();
+      },
+    );
+
+    expect(harness('claude-code').continueLast).toEqual(['--continue']);
+    expect(harness('codex').continueLast).toEqual(['resume', '--last']);
+    expect(harness('opencode').continueLast).toEqual(['--continue']);
+  });
+
+  test.each(['claude-code', 'codex', 'opencode'])('AC13 — assigning a field of the %s entry throws a TypeError', (id) => {
+    const entry = harness(id) as unknown as { name: string };
+    const name = entry.name;
+
+    expectTypeError(
+      () => {
+        entry.name = 'Changed';
+      },
+      () => {
+        entry.name = name;
+      },
+    );
+
+    expect(harness(id).name).toBe(name);
+  });
+
+  test('AC13 — pushing to harnesses throws a TypeError and leaves the three entries', () => {
+    const list = harnesses as unknown as unknown[];
+
+    expectTypeError(
+      () => list.push({ id: 'extra' }),
+      () => {
+        list.length = 3;
+      },
+    );
+
+    expect(harnesses.map((h) => h.id)).toEqual(['claude-code', 'codex', 'opencode']);
+  });
+
+  test('AC13 — assigning an index of harnesses throws a TypeError and leaves the entry', () => {
+    const list = harnesses as unknown as unknown[];
+    const first = list[0];
+
+    expectTypeError(
+      () => {
+        list[0] = { id: 'extra' };
+      },
+      () => {
+        list[0] = first;
+      },
+    );
+
+    expect(harnesses[0]!.id).toBe('claude-code');
+  });
+});
+
 describe('Electron boundary', () => {
   const packageDir = join(import.meta.dirname, '..');
 

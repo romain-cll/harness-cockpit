@@ -1,9 +1,21 @@
-import { statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { detectHarnesses, harnesses, type DetectedHarness } from '@cockpit/harnesses';
 import { createPtyClient, type PtySpawnOptions } from '@cockpit/pty';
-import { addProject, loadState, NewerStateError, ProjectExistsError, removeProject, saveState, type State } from '@cockpit/state';
+import {
+  addProject,
+  addSession,
+  loadState,
+  NewerStateError,
+  ProjectExistsError,
+  removeProject,
+  saveState,
+  sessionName,
+  type State,
+} from '@cockpit/state';
 import { createWorktree, findRepositoryRoot, listBranches, listWorktrees, removeWorktree, WorkspaceError } from '@cockpit/workspaces';
 import {
   app,
@@ -26,6 +38,7 @@ import type {
   PtySpawnRequest,
   Refused,
   RemoveWorkspaceResult,
+  StartSessionResult,
 } from '../shared/api';
 import ptyHostPath from './pty-host?modulePath';
 import { shellEnv } from './shell-env';
@@ -45,13 +58,14 @@ const devServerUrl = app.isPackaged ? undefined : process.env.ELECTRON_RENDERER_
 // honoured in the packaged app too: the packaged-app test needs them, and they
 // only change where the data lives and whether windows are shown.
 // - COCKPIT_USER_DATA_DIR: the app keeps its data in that folder.
-// - COCKPIT_HOME: where worktrees live, in `worktrees` under it (`~/.cockpit` when unset). They are
-//   the user's code, not app data, so they stay out of `userData`.
+// - COCKPIT_HOME: where worktrees and session folders live, in `worktrees` and `sessions` under it
+//   (`~/.cockpit` when unset). They are the user's work, not app data, so they stay out of `userData`.
 // - COCKPIT_TEST_BACKGROUND=1: no Dock icon, windows never shown, so a test
 //   launch does not take the user's focus.
 const background = process.env.COCKPIT_TEST_BACKGROUND === '1';
 const userDataDir = process.env.COCKPIT_USER_DATA_DIR;
-const worktreesRoot = join(resolve(process.env.COCKPIT_HOME || join(homedir(), '.cockpit')), 'worktrees');
+const cockpitHome = resolve(process.env.COCKPIT_HOME || join(homedir(), '.cockpit'));
+const worktreesRoot = join(cockpitHome, 'worktrees');
 if (userDataDir) app.setPath('userData', userDataDir);
 if (background && process.platform === 'darwin') app.setActivationPolicy('accessory');
 
@@ -128,7 +142,7 @@ function originOf(url: string): string | undefined {
   }
 }
 
-// Only the app's own page may drive terminals, manage projects or read the shell PATH.
+// Only the app's own page may drive terminals, manage projects, start sessions or read the shell PATH.
 function isFromApp({ senderFrame }: Pick<IpcMainEvent, 'senderFrame'>): boolean {
   const appOrigin = devServerUrl ? originOf(devServerUrl) : RENDERER_ORIGIN;
   return senderFrame !== null && originOf(senderFrame.url) === appOrigin;
@@ -148,17 +162,26 @@ async function withSpawnDefaults(request: PtySpawnRequest): Promise<PtySpawnOpti
   };
 }
 
+// The loaded state, replaced by a new one (and saved) on every change.
+let state: State;
+
 // Terminals live in a utility process, so a pty crash does not take the app down.
-function startPty(): void {
+// Returns what the main process needs to run a terminal of its own.
+function startPty() {
   const pty = createPtyClient(utilityProcess.fork(ptyHostPath, [], { serviceName: 'Cockpit Pty Host' }));
   // The window that spawned a session is the one that receives its output.
   const owners = new Map<number, WebContents>();
 
-  ipcMain.handle('pty:spawn', async (event, request: PtySpawnRequest) => {
-    if (!isFromApp(event)) throw new Error('pty:spawn refused: unexpected origin');
+  // Spawns with the defaults, for the window that will receive the output.
+  const spawnFor = async (contents: WebContents, request: PtySpawnRequest) => {
     const id = await pty.spawn(await withSpawnDefaults(request));
-    owners.set(id, event.sender);
+    owners.set(id, contents);
     return id;
+  };
+
+  ipcMain.handle('pty:spawn', (event, request: PtySpawnRequest) => {
+    if (!isFromApp(event)) throw new Error('pty:spawn refused: unexpected origin');
+    return spawnFor(event.sender, request);
   });
   ipcMain.on('pty:write', (event, id: number, data: string) => {
     if (isFromApp(event)) pty.write(id, data);
@@ -191,6 +214,8 @@ function startPty(): void {
     contents.on('did-navigate', () => killSessionsOf(contents));
     contents.on('destroyed', () => killSessionsOf(contents));
   });
+
+  return { spawnFor, kill: (id: number) => pty.kill(id) };
 }
 
 // Why git could not do what was asked of `path`, in words for the user.
@@ -213,11 +238,8 @@ async function toProject({ path }: { path: string }): Promise<Project> {
   }
 }
 
-// The projects the user added, kept in `state.json`. `state` is the loaded state,
-// replaced by a new one (and saved) on every change.
-function startProjects(userData: string, loaded: State): void {
-  let state = loaded;
-
+// The projects the user added, kept in `state.json`.
+function startProjects(userData: string): void {
   ipcMain.handle('projects:list', (event) => {
     if (!isFromApp(event)) throw new Error('projects:list refused: unexpected origin');
     return Promise.all(state.projects.map(toProject));
@@ -333,6 +355,60 @@ function startProjects(userData: string, loaded: State): void {
   );
 }
 
+// Sessions outside any project: an agent CLI run in a folder of its own under
+// the Cockpit home, in a pty owned by the window that started it. The sessions
+// are kept in `state.json`; the pty ends with its page, the folder stays.
+function startSessions(userData: string, { spawnFor, kill }: ReturnType<typeof startPty>): void {
+  // Detected on the first call that needs it, never at startup: detecting runs
+  // each CLI's `--version`, and an app that never starts a session should not.
+  let detection: Promise<DetectedHarness[]> | undefined;
+  const detected = () => (detection ??= shellEnv.then((env) => detectHarnesses(env)));
+
+  ipcMain.handle('sessions:harnesses', async (event) => {
+    if (!isFromApp(event)) throw new Error('sessions:harnesses refused: unexpected origin');
+    return (await detected()).map(({ id }) => {
+      const { name } = harnesses.find((harness) => harness.id === id)!;
+      return { id, name };
+    });
+  });
+
+  // Newest first.
+  ipcMain.handle('sessions:list', (event) => {
+    if (!isFromApp(event)) throw new Error('sessions:list refused: unexpected origin');
+    return [...state.sessions].reverse();
+  });
+
+  ipcMain.handle(
+    'sessions:start',
+    async (event, harnessId: string, size: { cols: number; rows: number }): Promise<StartSessionResult> => {
+      if (!isFromApp(event)) throw new Error('sessions:start refused: unexpected origin');
+      const harness = harnesses.find(({ id }) => id === harnessId);
+      const found = (await detected()).find(({ id }) => id === harnessId);
+      if (!harness || !found) return { status: 'refused', message: `${harness?.name ?? harnessId} is not installed.` };
+
+      const id = randomUUID();
+      const directory = join(cockpitHome, 'sessions', id);
+      let ptyId: number | undefined;
+      try {
+        mkdirSync(directory, { recursive: true });
+        ptyId = await spawnFor(event.sender, { ...size, command: found.path, args: harness.start(), cwd: directory });
+        const session = { id, name: sessionName(state, harness), harness: harness.id, directory, createdAt: new Date().toISOString() };
+        const next = addSession(state, session);
+        saveState(userData, next);
+        state = next;
+        return { status: 'started', session, ptyId };
+      } catch (error) {
+        if (ptyId !== undefined) kill(ptyId);
+        rmSync(directory, { recursive: true, force: true });
+        return {
+          status: 'refused',
+          message: `Could not start ${harness.name}: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    },
+  );
+}
+
 // The app never navigates away from its own page.
 app.on('web-contents-created', (_event, contents) => {
   contents.on('will-navigate', (event, url) => {
@@ -348,7 +424,6 @@ app.on('window-all-closed', () => {
 // ES module has finished evaluating, so the app would wait forever.
 void app.whenReady().then(() => {
   const userData = app.getPath('userData');
-  let state: State;
   try {
     state = loadState(userData);
   } catch (error) {
@@ -371,8 +446,8 @@ void app.whenReady().then(() => {
     if (!isFromApp(event)) throw new Error('get-shell-path refused: unexpected origin');
     return (await shellEnv).PATH ?? '';
   });
-  startProjects(userData, state);
-  startPty();
+  startProjects(userData);
+  startSessions(userData, startPty());
 
   createWindow();
 

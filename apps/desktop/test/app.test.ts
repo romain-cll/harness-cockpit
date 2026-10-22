@@ -33,7 +33,10 @@ interface Session {
   pid: number;
   /** The folder the app was told to keep its data in, removed on close. */
   dataDir: string;
-  /** `COCKPIT_HOME` the app was launched with: inside `dataDir`, so it goes away with it. */
+  /**
+   * `COCKPIT_HOME` the app was launched with: inside `dataDir`, so it goes away with it. Empty
+   * when the launch left it unset or empty.
+   */
   cockpitHome: string;
   /** Everything the app wrote to stdout and stderr. */
   output(): string;
@@ -57,21 +60,24 @@ interface Session {
 // A test that must start the app twice on the same data folder creates the
 // folder itself, passes it in and removes it afterwards: sessions leave a folder
 // they were given in place.
-// `COCKPIT_HOME` is a folder inside the data folder: the worktrees the app
-// creates live under it and are removed with it, and no test touches the
-// developer's `~/.cockpit`.
+// `COCKPIT_HOME` is a folder inside the data folder: the worktrees and session
+// folders the app creates live under it and are removed with it, and no test
+// touches the developer's `~/.cockpit`. Only a test of the default passes `null`
+// (unset) or `''` (empty), with a `HOME` of its own.
 // The terminal page runs whatever `$SHELL` says: by default `/bin/sh`, which keeps
 // the developer's shell configuration from slowing or breaking the tests.
 function launchEnv(
   background: boolean,
   dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-')),
   base: NodeJS.ProcessEnv = { ...process.env, SHELL: '/bin/sh' },
+  cockpitHome: string | null = join(dataDir, 'cockpit-home'),
 ) {
-  const cockpitHome = join(dataDir, 'cockpit-home');
-  const env = { ...base, COCKPIT_USER_DATA_DIR: dataDir, COCKPIT_HOME: cockpitHome } as Record<string, string>;
+  const env = { ...base, COCKPIT_USER_DATA_DIR: dataDir } as Record<string, string>;
+  if (cockpitHome === null) delete env.COCKPIT_HOME;
+  else env.COCKPIT_HOME = cockpitHome;
   if (background) env.COCKPIT_TEST_BACKGROUND = '1';
   else delete env.COCKPIT_TEST_BACKGROUND;
-  return { dataDir, cockpitHome, env };
+  return { dataDir, cockpitHome: cockpitHome ?? '', env };
 }
 
 // Attaches to a running Electron over the Chrome DevTools Protocol and returns
@@ -162,8 +168,9 @@ async function launchSpawned(
   background: boolean,
   givenDataDir?: string,
   base?: NodeJS.ProcessEnv,
+  givenCockpitHome?: string | null,
 ): Promise<Session> {
-  const { dataDir, cockpitHome, env } = launchEnv(background, givenDataDir, base);
+  const { dataDir, cockpitHome, env } = launchEnv(background, givenDataDir, base, givenCockpitHome);
   // Its own process group, so closing stops Electron and its helpers together.
   const child = spawn(executablePath, ['--remote-debugging-port=0', '--inspect=0', ...args], {
     cwd: appDir,
@@ -272,10 +279,10 @@ function freePort(): Promise<number> {
 
 // Runs the `dev` script as a developer would, then attaches over the Chrome
 // DevTools Protocol.
-async function launchDev(): Promise<Session> {
+async function launchDev(base?: NodeJS.ProcessEnv): Promise<Session> {
   const port = await freePort();
   const inspectPort = await freePort();
-  const { dataDir, cockpitHome, env } = launchEnv(true);
+  const { dataDir, cockpitHome, env } = launchEnv(true, undefined, base);
   // Its own process group, so closing stops the dev server and Electron with it.
   // electron-vite ignores `--inspect 0` (0 is falsy for it): a free port instead.
   const dev = spawn('bun', ['run', 'dev', '--remoteDebuggingPort', String(port), '--inspect', String(inspectPort)], {
@@ -2586,6 +2593,588 @@ describe('built app with no git on the login shell PATH', () => {
     expect(stateSnapshot(session.dataDir)).toEqual(before);
     expect(projectsInState(session.dataDir) ?? []).toEqual([]);
     expect(existsSync(join(session.dataDir, 'state.json.tmp'))).toBe(false);
+  });
+});
+
+// --- Sessions (COCKPIT-25) ---------------------------------------------------
+
+// A harness that is not a harness: prints what the tests check (working
+// directory, arguments, pid, `$TERM`), then echoes every line it reads and
+// exits with code 3 on `exit`. `pwd -P` because macOS temporary folders sit
+// behind a symlink (`/var` is `/private/var`).
+const STUB_HARNESS = `#!/bin/sh
+if [ "$1" = "--version" ]; then echo 9.9.9; exit 0; fi
+echo "cwd:$(pwd -P)"
+echo "args:$#:$*"
+echo "pid:$$"
+echo "term:$TERM"
+echo "ready"
+while IFS= read -r line; do
+  if [ "$line" = exit ]; then exit 3; fi
+  echo "got:$line"
+done
+`;
+
+interface SessionsFixture {
+  /** The temporary folder that holds everything below, removed by the test. */
+  root: string;
+  /** The fake login shell. */
+  shell: string;
+  /** The environment to launch the app with. */
+  env(): NodeJS.ProcessEnv;
+  /** The file the stubs append a line to on every run, when the fixture was made with `log`. */
+  runLog: string;
+}
+
+// Stubs named after the given catalogue binaries in a folder of their own, and
+// a login shell, like `makeShellWithoutGit`, whose printed environment has
+// `PATH=<that folder>:/usr/bin:/bin`: a real CLI installed on the developer's
+// machine never shows up.
+//
+// With `log`, every stub first appends `<binary> <arguments>` to `runLog`, which
+// is empty once the fixture is ready (its own warm-up runs are not counted).
+function makeSessionsFixture(binaries: string[], { log = false }: { log?: boolean } = {}): SessionsFixture {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-sessions-test-')));
+  const bin = join(root, 'bin');
+  mkdirSync(bin);
+  const runLog = join(root, 'runs.log');
+  const script = log ? STUB_HARNESS.replace('#!/bin/sh\n', `#!/bin/sh\necho "$(basename "$0") $*" >> '${runLog}'\n`) : STUB_HARNESS;
+  for (const name of binaries) {
+    const stub = join(bin, name);
+    writeFileSync(stub, script);
+    chmodSync(stub, 0o755);
+    // macOS scans a new executable the first time it runs.
+    expect(execFileSync(stub, ['--version'], { encoding: 'utf8' }).trim()).toBe('9.9.9');
+  }
+  const shell = join(root, 'login-shell');
+  writeFileSync(shell, `#!/bin/sh\n[ "$1" = --warmup ] && exit 0\nPATH='${bin}:/usr/bin:/bin' /bin/sh -c "$2"\n`);
+  chmodSync(shell, 0o755);
+  execFileSync(shell, ['--warmup']);
+  const printed = execFileSync(shell, ['-ilc', 'printf %s "$PATH"'], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
+  expect(printed).toBe(`${bin}:/usr/bin:/bin`);
+  if (log) writeFileSync(runLog, '');
+
+  return { root, shell, env: () => ({ ...process.env, SHELL: shell }), runLog };
+}
+
+const launchBuiltWith = (env: NodeJS.ProcessEnv, dataDir?: string, cockpitHome?: string | null) =>
+  launchSpawned(createRequire(import.meta.url)('electron') as string, ['.'], true, dataDir, env, cockpitHome);
+
+const launchPackagedWith = (env: NodeJS.ProcessEnv, dataDir?: string) => launchPackaged({ env, dataDir });
+
+const launchDevWith = (env: NodeJS.ProcessEnv) => launchDev(env);
+
+interface StoredSession {
+  id: string;
+  name: string;
+  harness: string;
+  directory: string;
+  createdAt: string;
+}
+
+const sessionsInState = (dataDir: string): StoredSession[] =>
+  (JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')) as { sessions?: StoredSession[] }).sessions ?? [];
+
+// The id in the page URL (`/sessions/<id>`), if the page is a session page.
+const sessionIdOf = (page: Page) => /^\/sessions\/([^/]+)$/.exec(new URL(page.url()).pathname)?.[1];
+
+interface SessionEntry {
+  id: string;
+  name: string;
+  ended: boolean;
+}
+
+// The links of the Sessions section: the name is the first text of the entry,
+// "Ended" is a text of its own.
+const sessionEntries = (page: Page): Promise<SessionEntry[]> =>
+  page.evaluate(() =>
+    [...document.querySelectorAll('aside a[href*="/sessions/"]')].map((link) => {
+      const entry = link.closest('li') ?? link;
+      const texts: string[] = [];
+      const walker = document.createTreeWalker(entry, NodeFilter.SHOW_TEXT);
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const text = (node.textContent ?? '').trim();
+        if (text) texts.push(text);
+      }
+      return {
+        id: link.getAttribute('href')!.split('/').pop()!,
+        name: texts[0] ?? '',
+        ended: texts.includes('Ended'),
+      };
+    }),
+  );
+
+const waitForSessionEntries = (page: Page, expected: Array<[name: string, ended: boolean]>) =>
+  poll(
+    async () => (await sessionEntries(page)).map((entry) => [entry.name, entry.ended]),
+    (entries) => JSON.stringify(entries) === JSON.stringify(expected),
+    UI_TIMEOUT,
+  );
+
+const START_MENU = 'Start session';
+
+async function openStartMenu(page: Page) {
+  await page.getByRole('button', { name: START_MENU, exact: true }).click({ timeout: UI_TIMEOUT });
+  await page.getByRole('menuitem').first().waitFor({ timeout: UI_TIMEOUT });
+}
+
+// Picks a harness in the "Start session" menu and waits for its session page.
+async function startSession(page: Page, harnessName: string, pageName: string): Promise<string> {
+  await openStartMenu(page);
+  await page.getByRole('menuitem', { name: harnessName, exact: true }).click({ timeout: UI_TIMEOUT });
+  await page.getByRole('heading', { name: pageName, exact: true }).waitFor({ timeout: UI_TIMEOUT });
+  const id = await poll(() => sessionIdOf(page), Boolean, UI_TIMEOUT);
+  expect(id, `the URL ${page.url()} is /sessions/<id>`).toBeTruthy();
+  return id!;
+}
+
+async function openSessionEntry(page: Page, name: string) {
+  const entry = page.locator('aside a[href*="/sessions/"]', { hasText: new RegExp(`^\\s*${escapeRegExp(name)}(\\s|$)`) });
+  await entry.first().click({ timeout: UI_TIMEOUT });
+  await page.getByRole('heading', { name, exact: true }).waitFor({ timeout: UI_TIMEOUT });
+}
+
+async function goHome(page: Page) {
+  await page.getByRole('link', { name: 'Home', exact: true }).click({ timeout: UI_TIMEOUT });
+  await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
+}
+
+interface StubFacts {
+  cwd: string;
+  argCount: number;
+  args: string;
+  pid: number;
+  term: string;
+}
+
+// What the stub printed, read from the terminal once it printed its last line.
+// A long line wraps onto the next row, so the rows are joined before parsing.
+async function readStub(page: Page): Promise<StubFacts> {
+  await waitForRow(page, 'ready');
+  const text = (await terminalRows(page)).join('');
+  const found = /cwd:(.+?)args:(\d+):(.*?)pid:(\d+)term:(.+?)ready/.exec(text);
+  if (!found) throw new Error(`The terminal does not show the stub's output:\n${text}`);
+  return { cwd: found[1]!, argCount: Number(found[2]), args: found[3]!, pid: Number(found[4]), term: found[5]! };
+}
+
+// Whether the deepest element whose text starts with `text` sits below the
+// "Sessions" header of the sidebar.
+const isBelowSessionsHeader = (page: Page, text: string) =>
+  page.evaluate((text) => {
+    const all = [...document.querySelectorAll('aside *')] as HTMLElement[];
+    const deepest = (matches: (element: HTMLElement) => boolean) =>
+      all.filter(matches).filter((element) => !all.some((other) => other !== element && element.contains(other) && matches(other)))[0];
+    const header = deepest((element) => (element.textContent ?? '').trim() === 'Sessions');
+    const found = deepest((element) => (element.textContent ?? '').trim().startsWith(text));
+    if (!header || !found) return false;
+    return found.getBoundingClientRect().top >= header.getBoundingClientRect().bottom - 1;
+  }, text);
+
+const sessionFoldersIn = (home: string) => {
+  const folder = join(home, 'sessions');
+  return existsSync(folder) ? readdirSync(folder).sort() : [];
+};
+
+async function expectNoErrors(session: Session) {
+  expect(session.isRunning()).toBe(true);
+  expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+  expect(await allPageErrorsOf(session.page)).toEqual([]);
+  expect(await allConsoleErrorsOf(session.page)).toEqual([]);
+}
+
+// The full block runs in the built app only (see the split rule in AGENTS.md).
+describe('sessions: built app', () => {
+  let fx: SessionsFixture;
+  let session: Session;
+  // Shared by the tests below, which run in order on one launch.
+  const known = {
+    claude1: { id: '', pid: 0 },
+    claude2: { id: '', pid: 0 },
+    codex1: { id: '', pid: 0 },
+  };
+
+  beforeAll(async () => {
+    fx = makeSessionsFixture(['claude', 'codex']);
+    session = await launchBuiltWith(fx.env());
+    await session.page.getByText(versionLabel).waitFor();
+  });
+
+  afterAll(async () => {
+    await session?.close();
+    if (fx) rmSync(fx.root, { recursive: true, force: true });
+  });
+
+  test('AC1 — the "Start session" menu lists Claude Code then Codex, and nothing else', async () => {
+    const { page } = session;
+    expect(await sidebarLines(page)).toContain('Sessions');
+
+    await openStartMenu(page);
+
+    const items = (await page.getByRole('menuitem').allInnerTexts()).map((text) => text.trim());
+    expect(items).toEqual(['Claude Code', 'Codex']);
+    await page.keyboard.press('Escape');
+    await page.getByRole('menuitem').first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+  });
+
+  test('AC3 — picking Claude Code opens its page, runs the stub in a new folder and stores the session', async () => {
+    const { page } = session;
+    const id = await startSession(page, 'Claude Code', 'Claude Code 1');
+    known.claude1.id = id;
+
+    const home = join(session.cockpitHome, 'sessions', id);
+    const stub = await readStub(page);
+    // The stub prints its physical path (`pwd -P`); the temporary folder may sit behind a symlink.
+    expect(stub.cwd).toBe(realpathSync(home));
+    expect(stub.argCount).toBe(0);
+    expect(stub.args).toBe('');
+    expect(stub.term).toBe('xterm-256color');
+    expect(isAlive(stub.pid)).toBe(true);
+    known.claude1.pid = stub.pid;
+    expect(statSync(home).isDirectory()).toBe(true);
+
+    expect(await waitForSessionEntries(page, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+
+    const stored = await poll(() => sessionsInState(session.dataDir), (list) => list.length > 0, UI_TIMEOUT);
+    expect(stored).toEqual([
+      { id, name: 'Claude Code 1', harness: 'claude-code', directory: home, createdAt: expect.any(String) },
+    ]);
+    expect(new Date(stored[0]!.createdAt).toISOString()).toBe(stored[0]!.createdAt);
+  });
+
+  test('AC4 — a line typed in the terminal reaches the harness and its answer shows', async () => {
+    const { page } = session;
+    await focusTerminal(page);
+    await typeLine(page, 'hello');
+    await waitForRow(page, 'got:hello');
+  });
+
+  test('AC6 — going Home and back keeps the process, its output and its input', async () => {
+    const { page } = session;
+    await goHome(page);
+    expect(isAlive(known.claude1.pid)).toBe(true);
+
+    await openSessionEntry(page, 'Claude Code 1');
+    await waitForRow(page, 'got:hello');
+    const stub = await readStub(page);
+    expect(stub.pid).toBe(known.claude1.pid);
+    expect(isAlive(known.claude1.pid)).toBe(true);
+
+    await focusTerminal(page);
+    await typeLine(page, 'again');
+    await waitForRow(page, 'got:again');
+  });
+
+  test('AC5 — the next sessions are numbered per harness, and the list shows the newest first', async () => {
+    const { page } = session;
+    known.claude2.id = await startSession(page, 'Claude Code', 'Claude Code 2');
+    known.claude2.pid = (await readStub(page)).pid;
+    known.codex1.id = await startSession(page, 'Codex', 'Codex 1');
+    known.codex1.pid = (await readStub(page)).pid;
+
+    expect(await waitForSessionEntries(page, [['Codex 1', false], ['Claude Code 2', false], ['Claude Code 1', false]])).toEqual([
+      ['Codex 1', false],
+      ['Claude Code 2', false],
+      ['Claude Code 1', false],
+    ]);
+    expect((await sessionEntries(page)).map((entry) => entry.id)).toEqual([known.codex1.id, known.claude2.id, known.claude1.id]);
+    expect(new Set([known.claude1.pid, known.claude2.pid, known.codex1.pid]).size).toBe(3);
+    expect(sessionsInState(session.dataDir).map((stored) => stored.name)).toEqual(['Claude Code 1', 'Claude Code 2', 'Codex 1']);
+    expect(sessionsInState(session.dataDir).map((stored) => stored.harness)).toEqual(['claude-code', 'claude-code', 'codex']);
+  });
+
+  test('AC7 — typing exit shows the exit code in the terminal and "Ended" on the entry', async () => {
+    const { page } = session;
+    await focusTerminal(page);
+    await typeLine(page, 'exit');
+
+    await waitForRow(page, '[Process exited with code 3]');
+    expect(
+      await waitForSessionEntries(page, [['Codex 1', true], ['Claude Code 2', false], ['Claude Code 1', false]]),
+    ).toEqual([
+      ['Codex 1', true],
+      ['Claude Code 2', false],
+      ['Claude Code 1', false],
+    ]);
+    await poll(() => isAlive(known.codex1.pid), (alive) => !alive, UI_TIMEOUT);
+    expect(isAlive(known.codex1.pid)).toBe(false);
+    expect(isAlive(known.claude2.pid)).toBe(true);
+  });
+
+  test('AC8 — reloading the page ends the processes, marks every entry "Ended" and shows the ended page', async () => {
+    const { page } = session;
+    await openSessionEntry(page, 'Claude Code 2');
+    const directory = sessionsInState(session.dataDir).find((stored) => stored.id === known.claude2.id)!.directory;
+    expect(isAlive(known.claude2.pid)).toBe(true);
+
+    await page.reload();
+
+    await page.getByText('This session has ended.').waitFor({ timeout: UI_TIMEOUT });
+    await page.getByText(directory).first().waitFor({ timeout: UI_TIMEOUT });
+    expect(sessionIdOf(page)).toBe(known.claude2.id);
+    expect(await poll(() => [isAlive(known.claude1.pid), isAlive(known.claude2.pid)], (alive) => !alive.includes(true), 10_000)).toEqual([
+      false,
+      false,
+    ]);
+    expect(await waitForSessionEntries(page, [['Codex 1', true], ['Claude Code 2', true], ['Claude Code 1', true]])).toEqual([
+      ['Codex 1', true],
+      ['Claude Code 2', true],
+      ['Claude Code 1', true],
+    ]);
+  });
+
+  // Kills the pty host, so it stays the last test of the launch that needs a working one.
+  test('AC10 — with the pty host dead, picking a harness shows a message under the Sessions header and changes nothing', async () => {
+    const { page } = session;
+    const hostPid = await (async () => {
+      const id = await spawnShell(page);
+      await ptyWrite(page, id, 'echo ppid-$PPID\n');
+      await waitForOutput(page, id, /ppid-\d+/);
+      return Number(/ppid-(\d+)/.exec(await outputOf(page, id))![1]);
+    })();
+    process.kill(hostPid, 'SIGKILL');
+    await poll(() => isAlive(hostPid), (alive) => !alive, 10_000);
+
+    const entriesBefore = await sessionEntries(page);
+    const stateBefore = stateSnapshot(session.dataDir);
+    const foldersBefore = sessionFoldersIn(session.cockpitHome);
+
+    await openStartMenu(page);
+    await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).click({ timeout: UI_TIMEOUT });
+
+    const lines = await poll(() => sidebarLines(page), (found) => found.some((line) => line.startsWith('Could not start Claude Code:')), UI_TIMEOUT);
+    expect(lines.some((line) => line.startsWith('Could not start Claude Code:'))).toBe(true);
+    expect(await isBelowSessionsHeader(page, 'Could not start Claude Code:')).toBe(true);
+    await sleep(300);
+
+    expect(await sessionEntries(page)).toEqual(entriesBefore);
+    expect(stateSnapshot(session.dataDir)).toEqual(stateBefore);
+    expect(sessionFoldersIn(session.cockpitHome)).toEqual(foldersBefore);
+    expect(existsSync(join(session.dataDir, 'state.json.tmp'))).toBe(false);
+  });
+
+  test('logs no error and keeps running', async () => {
+    expect(await sidebarLines(session.page)).toContain('Sessions');
+    await expectNoErrors(session);
+  });
+});
+
+// One smoke path through the sessions IPC in the dev server: the page, the
+// main process, the pty host and the disk. It needs a launch of its own with
+// the fake login shell that holds the stubs. The packaged app's smoke path is
+// folded into the first launch of the AC9 restart test below. The
+// launchd-environment mode has none: its point is the user's real login shell,
+// where a session would run a real CLI.
+describe('sessions smoke path: dev server', () => {
+  let fx: SessionsFixture;
+  let session: Session;
+
+  beforeAll(async () => {
+    fx = makeSessionsFixture(['claude']);
+    session = await launchDevWith(fx.env());
+    await session.page.getByText(versionLabel).waitFor();
+  });
+
+  afterAll(async () => {
+    await session?.close();
+    if (fx) rmSync(fx.root, { recursive: true, force: true });
+  });
+
+  test('smoke path — picking Claude Code runs the stub in a new folder under COCKPIT_HOME, lists the session and stores it', async () => {
+    const { page } = session;
+    const id = await startSession(page, 'Claude Code', 'Claude Code 1');
+    const home = join(session.cockpitHome, 'sessions', id);
+
+    const stub = await readStub(page);
+    expect(stub.cwd).toBe(realpathSync(home));
+    expect(stub.term).toBe('xterm-256color');
+    expect(await waitForSessionEntries(page, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+    const stored = await poll(() => sessionsInState(session.dataDir), (list) => list.length > 0, UI_TIMEOUT);
+    expect(stored.map((s) => [s.name, s.directory])).toEqual([['Claude Code 1', home]]);
+  });
+
+  test('logs no error and keeps running', async () => {
+    await expectNoErrors(session);
+  });
+});
+
+// Harness detection runs `--version` on each harness: it must not happen at
+// startup (a test launch must never run a real CLI), only when the menu first
+// needs the list, and only once per launch.
+describe('built app harness detection timing', () => {
+  let fx: SessionsFixture;
+  let session: Session;
+
+  beforeAll(async () => {
+    fx = makeSessionsFixture(['claude', 'codex'], { log: true });
+    session = await launchBuiltWith(fx.env());
+    await session.page.getByText(versionLabel).waitFor();
+  });
+
+  afterAll(async () => {
+    await session?.close();
+    if (fx) rmSync(fx.root, { recursive: true, force: true });
+  });
+
+  const runs = () =>
+    readFileSync(fx.runLog, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .sort();
+
+  test('AC14 — no stub runs at startup, each runs --version once on the first menu open, none on the next', async () => {
+    const { page } = session;
+    await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
+    await sleep(2000);
+    expect(runs()).toEqual([]);
+
+    await openStartMenu(page);
+    expect((await page.getByRole('menuitem').allInnerTexts()).map((text) => text.trim())).toEqual(['Claude Code', 'Codex']);
+    expect(runs()).toEqual(['claude --version', 'codex --version']);
+
+    await page.keyboard.press('Escape');
+    await page.getByRole('menuitem').first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+    await openStartMenu(page);
+    await sleep(500);
+    expect(runs()).toEqual(['claude --version', 'codex --version']);
+
+    await page.keyboard.press('Escape');
+    await expectNoErrors(session);
+  });
+});
+
+describe('built app without any agent CLI on the login shell PATH', () => {
+  let fx: SessionsFixture;
+  let session: Session;
+
+  beforeAll(async () => {
+    fx = makeSessionsFixture([]);
+    session = await launchBuiltWith(fx.env());
+    await session.page.getByText(versionLabel).waitFor();
+  });
+
+  afterAll(async () => {
+    await session?.close();
+    if (fx) rmSync(fx.root, { recursive: true, force: true });
+  });
+
+  test('AC2 — the "Start session" menu shows one disabled item "No agent CLI found"', async () => {
+    const { page } = session;
+    const before = stateSnapshot(session.dataDir);
+
+    await openStartMenu(page);
+
+    const items = page.getByRole('menuitem');
+    expect(await items.count()).toBe(1);
+    expect((await items.first().innerText()).trim()).toBe('No agent CLI found');
+    expect(await items.first().isDisabled()).toBe(true);
+
+    await items.first().click({ force: true, timeout: UI_TIMEOUT }).catch(() => {});
+    await sleep(300);
+    expect(await sessionEntries(page)).toEqual([]);
+    expect(sessionIdOf(page)).toBeUndefined();
+    expect(stateSnapshot(session.dataDir)).toEqual(before);
+    await expectNoErrors(session);
+  });
+});
+
+describe('built app sessions folder when COCKPIT_HOME is unset or empty', () => {
+  let fx: SessionsFixture;
+
+  beforeAll(() => {
+    fx = makeSessionsFixture(['claude']);
+  });
+
+  afterAll(() => {
+    if (fx) rmSync(fx.root, { recursive: true, force: true });
+  });
+
+  test.each([
+    ['unset', undefined],
+    ['empty', ''],
+  ])('AC11 — with COCKPIT_HOME %s and HOME=<tmp>, the session folder is <tmp>/.cockpit/sessions/<id>', async (label, value) => {
+    const userHome = join(fx.root, `user-home-${label}`);
+    mkdirSync(userHome);
+    const session = await launchBuiltWith({ ...fx.env(), HOME: userHome }, undefined, value ?? null);
+    try {
+      await session.page.getByText(versionLabel).waitFor();
+      const id = await startSession(session.page, 'Claude Code', 'Claude Code 1');
+      const directory = join(userHome, '.cockpit', 'sessions', id);
+
+      expect((await readStub(session.page)).cwd).toBe(directory);
+      expect(statSync(directory).isDirectory()).toBe(true);
+      const stored = await poll(() => sessionsInState(session.dataDir), (list) => list.length > 0, UI_TIMEOUT);
+      expect(stored.map((s) => s.directory)).toEqual([directory]);
+      // Nothing went to the developer's own Cockpit home.
+      expect(existsSync(join(homedir(), '.cockpit', 'sessions', id))).toBe(false);
+      await expectNoErrors(session);
+    } finally {
+      await session.close();
+    }
+  });
+});
+
+// Sessions across a restart of the packaged app, on a data folder the test
+// creates and removes; the launch's Cockpit home is inside it.
+describe('packaged app sessions after a restart', () => {
+  let fx: SessionsFixture;
+  let dataDir: string;
+
+  beforeEach(() => {
+    fx = makeSessionsFixture(['claude', 'codex']);
+    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+  });
+
+  afterEach(() => {
+    rmSync(fx.root, { recursive: true, force: true });
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  test('AC9 — sessions of a previous launch are listed as "Ended", newest first, open as ended and leave state.json and their folders alone', async () => {
+    const first = await launchPackagedWith(fx.env(), dataDir);
+    try {
+      await first.page.getByText(versionLabel).waitFor();
+      // The packaged app's sessions smoke path: the stub runs in a new folder
+      // under COCKPIT_HOME, the entry shows as running, the session is stored.
+      const id = await startSession(first.page, 'Claude Code', 'Claude Code 1');
+      const home = join(first.cockpitHome, 'sessions', id);
+      const stub = await readStub(first.page);
+      expect(stub.cwd).toBe(realpathSync(home));
+      expect(stub.term).toBe('xterm-256color');
+      expect(await waitForSessionEntries(first.page, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+      const storedFirst = await poll(() => sessionsInState(dataDir), (list) => list.length > 0, UI_TIMEOUT);
+      expect(storedFirst.map((s) => [s.name, s.directory])).toEqual([['Claude Code 1', home]]);
+
+      await startSession(first.page, 'Codex', 'Codex 1');
+      await poll(() => sessionsInState(dataDir), (list) => list.length === 2, UI_TIMEOUT);
+      await expectNoErrors(first);
+    } finally {
+      await first.close();
+    }
+
+    const stored = sessionsInState(dataDir);
+    expect(stored.map((s) => s.name)).toEqual(['Claude Code 1', 'Codex 1']);
+    const before = stateSnapshot(dataDir);
+
+    const second = await launchPackagedWith(fx.env(), dataDir);
+    try {
+      await second.page.getByText(versionLabel).waitFor();
+      expect(await waitForSessionEntries(second.page, [['Codex 1', true], ['Claude Code 1', true]])).toEqual([
+        ['Codex 1', true],
+        ['Claude Code 1', true],
+      ]);
+
+      await openSessionEntry(second.page, 'Claude Code 1');
+      await second.page.getByText('This session has ended.').waitFor({ timeout: UI_TIMEOUT });
+      await second.page.getByText(stored[0]!.directory).first().waitFor({ timeout: UI_TIMEOUT });
+      expect(statSync(stored[0]!.directory).isDirectory()).toBe(true);
+      expect(statSync(stored[1]!.directory).isDirectory()).toBe(true);
+      await expectNoErrors(second);
+    } finally {
+      await second.close();
+    }
+
+    expect(stateSnapshot(dataDir)).toEqual(before);
+    expect(backupsIn(dataDir)).toEqual([]);
   });
 });
 

@@ -16,7 +16,7 @@ export interface Harness {
   /** Arguments that start an interactive session in the spawn's cwd, with an optional initial prompt. */
   start(prompt?: string): string[];
   /** Arguments that continue the most recent session of the cwd. */
-  continueLast: string[];
+  continueLast: readonly string[];
   /** Arguments that resume the session with this id. */
   resume(sessionId: string): string[];
   /** Where the harness keeps its sessions, given the environment it runs with. */
@@ -30,7 +30,9 @@ function home(env: NodeJS.ProcessEnv): string {
   return env.HOME || homedir();
 }
 
-export const harnesses: Harness[] = [
+// Callers share one catalogue and none may change it for the others: it is frozen
+// below, with its entries and their `continueLast` lists.
+const catalogue: Harness[] = [
   // Claude Code 2.1.304
   {
     id: 'claude-code',
@@ -101,3 +103,10 @@ export const harnesses: Harness[] = [
     }),
   },
 ];
+
+for (const harness of catalogue) {
+  Object.freeze(harness.continueLast);
+  Object.freeze(harness);
+}
+
+export const harnesses: readonly Harness[] = Object.freeze(catalogue);

@@ -28,6 +28,11 @@ const api: Api = {
     create: (project, name, base) => ipcRenderer.invoke('workspaces:create', project, name, base),
     remove: (project, path, options) => ipcRenderer.invoke('workspaces:remove', project, path, options),
   },
+  sessions: {
+    harnesses: () => ipcRenderer.invoke('sessions:harnesses'),
+    list: () => ipcRenderer.invoke('sessions:list'),
+    start: (harness, size) => ipcRenderer.invoke('sessions:start', harness, size),
+  },
   getShellPath: () => ipcRenderer.invoke('get-shell-path'),
 };
 
