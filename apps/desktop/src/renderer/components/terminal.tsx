@@ -104,7 +104,6 @@ export function Terminal({ focused }: { focused: boolean }) {
         pending.length = 0;
       })
       .catch((error: unknown) => {
-        pending.length = 0;
         if (!disposed) term.write(`\r\n[Could not start the shell: ${error instanceof Error ? error.message : error}]`);
       });
 
