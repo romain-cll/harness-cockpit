@@ -1,10 +1,10 @@
 import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, extname, isAbsolute, join, relative } from 'node:path';
+import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createPtyClient, type PtySpawnOptions } from '@cockpit/pty';
 import { addProject, loadState, NewerStateError, ProjectExistsError, removeProject, saveState, type State } from '@cockpit/state';
-import { findRepositoryRoot, WorkspaceError } from '@cockpit/workspaces';
+import { createWorktree, findRepositoryRoot, listBranches, listWorktrees, removeWorktree, WorkspaceError } from '@cockpit/workspaces';
 import {
   app,
   BrowserWindow,
@@ -15,9 +15,18 @@ import {
   shell,
   utilityProcess,
   type IpcMainEvent,
+  type IpcMainInvokeEvent,
   type WebContents,
 } from 'electron';
-import type { AddProjectResult, PtySpawnRequest, Project } from '../shared/api';
+import type {
+  AddProjectResult,
+  BranchesResult,
+  CreateWorkspaceResult,
+  Project,
+  PtySpawnRequest,
+  Refused,
+  RemoveWorkspaceResult,
+} from '../shared/api';
 import ptyHostPath from './pty-host?modulePath';
 import { shellEnv } from './shell-env';
 
@@ -36,10 +45,13 @@ const devServerUrl = app.isPackaged ? undefined : process.env.ELECTRON_RENDERER_
 // honoured in the packaged app too: the packaged-app test needs them, and they
 // only change where the data lives and whether windows are shown.
 // - COCKPIT_USER_DATA_DIR: the app keeps its data in that folder.
+// - COCKPIT_HOME: where worktrees live, in `worktrees` under it (`~/.cockpit` when unset). They are
+//   the user's code, not app data, so they stay out of `userData`.
 // - COCKPIT_TEST_BACKGROUND=1: no Dock icon, windows never shown, so a test
 //   launch does not take the user's focus.
 const background = process.env.COCKPIT_TEST_BACKGROUND === '1';
 const userDataDir = process.env.COCKPIT_USER_DATA_DIR;
+const worktreesRoot = join(resolve(process.env.COCKPIT_HOME || join(homedir(), '.cockpit')), 'worktrees');
 if (userDataDir) app.setPath('userData', userDataDir);
 if (background && process.platform === 'darwin') app.setActivationPolicy('accessory');
 
@@ -181,7 +193,25 @@ function startPty(): void {
   });
 }
 
-const toProject = ({ path }: { path: string }): Project => ({ path, name: basename(path) });
+// Why git could not do what was asked of `path`, in words for the user.
+function describeFailure(error: WorkspaceError, path: string): string {
+  return error.code === 'NOT_A_REPOSITORY' ? `${path} is not a git repository.` : error.message;
+}
+
+// A project with its workspaces, which git tells: the linked worktrees, the main one being the project.
+async function toProject({ path }: { path: string }): Promise<Project> {
+  const project = { path, name: basename(path) };
+  try {
+    const worktrees = await listWorktrees(path, { env: await shellEnv });
+    const workspaces = worktrees
+      .filter((worktree) => !worktree.main)
+      .map(({ path, branch }) => ({ path, name: branch ?? basename(path), branch }));
+    return { ...project, workspaces };
+  } catch (error) {
+    if (!(error instanceof WorkspaceError)) throw error;
+    return { ...project, workspaces: [], error: describeFailure(error, path) };
+  }
+}
 
 // The projects the user added, kept in `state.json`. `state` is the loaded state,
 // replaced by a new one (and saved) on every change.
@@ -190,7 +220,7 @@ function startProjects(userData: string, loaded: State): void {
 
   ipcMain.handle('projects:list', (event) => {
     if (!isFromApp(event)) throw new Error('projects:list refused: unexpected origin');
-    return state.projects.map(toProject);
+    return Promise.all(state.projects.map(toProject));
   });
 
   ipcMain.handle('projects:add', async (event): Promise<AddProjectResult> => {
@@ -204,9 +234,14 @@ function startProjects(userData: string, loaded: State): void {
     try {
       const root = await findRepositoryRoot(folder, { env: await shellEnv });
       const next = addProject(state, root);
-      saveState(userData, next);
+      try {
+        saveState(userData, next);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        return { status: 'refused', message: `Cockpit could not save its data: ${reason}` };
+      }
       state = next;
-      return { status: 'added', project: toProject({ path: root }) };
+      return { status: 'added', project: await toProject({ path: root }) };
     } catch (error) {
       if (error instanceof ProjectExistsError) {
         return { status: 'refused', message: `${basename(error.path)} is already in Cockpit.` };
@@ -226,6 +261,76 @@ function startProjects(userData: string, loaded: State): void {
     saveState(userData, next);
     state = next;
   });
+
+  // Runs `action` for a project of the state, turning a git failure into a refusal (or into what
+  // `handle` makes of it). `Result` is one of the `Refused` unions of the API.
+  async function forProject<Result extends { status: string }>(
+    event: IpcMainInvokeEvent,
+    channel: string,
+    path: string,
+    action: () => Promise<Result>,
+    handle: (error: WorkspaceError) => Result | undefined = () => undefined,
+  ): Promise<Result | Refused> {
+    if (!isFromApp(event)) throw new Error(`${channel} refused: unexpected origin`);
+    if (!state.projects.some((project) => project.path === path)) {
+      return { status: 'refused', message: `${path} is not a project in Cockpit.` };
+    }
+    try {
+      return await action();
+    } catch (error) {
+      if (!(error instanceof WorkspaceError)) throw error;
+      return handle(error) ?? { status: 'refused', message: describeFailure(error, path) };
+    }
+  }
+
+  ipcMain.handle('workspaces:branches', (event, project: string): Promise<BranchesResult> =>
+    forProject<BranchesResult>(event, 'workspaces:branches', project, async () => {
+      const branches = await listBranches(project, { env: await shellEnv });
+      return { status: 'listed', ...branches };
+    }),
+  );
+
+  ipcMain.handle('workspaces:create', (event, project: string, name: string, base: string): Promise<CreateWorkspaceResult> =>
+    forProject<CreateWorkspaceResult>(
+      event,
+      'workspaces:create',
+      project,
+      async () => {
+        const { path, branch } = await createWorktree({
+          repo: project,
+          root: worktreesRoot,
+          branch: name,
+          base,
+          env: await shellEnv,
+        });
+        return { status: 'created', workspace: { path, name: branch ?? basename(path), branch } };
+      },
+      (error) => {
+        if (error.code === 'BRANCH_EXISTS') return { status: 'refused', message: `A branch named ${name} already exists.` };
+        if (error.code === 'INVALID_BRANCH_NAME') return { status: 'refused', message: `${name} is not a valid branch name.` };
+        return undefined;
+      },
+    ),
+  );
+
+  ipcMain.handle(
+    'workspaces:remove',
+    (event, project: string, path: string, options?: { force?: boolean }): Promise<RemoveWorkspaceResult> =>
+      forProject<RemoveWorkspaceResult>(
+        event,
+        'workspaces:remove',
+        project,
+        async () => {
+          await removeWorktree({ repo: project, path, deleteBranch: true, force: options?.force, env: await shellEnv });
+          return { status: 'removed', branchKept: false };
+        },
+        (error) => {
+          if (error.code === 'BRANCH_NOT_MERGED') return { status: 'removed', branchKept: true };
+          if (error.code === 'DIRTY_WORKTREE') return { status: 'dirty' };
+          return undefined;
+        },
+      ),
+  );
 }
 
 // The app never navigates away from its own page.

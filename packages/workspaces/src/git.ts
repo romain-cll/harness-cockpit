@@ -9,6 +9,7 @@ const MIN_GIT = { major: 2, minor: 36 };
 export type WorkspaceErrorCode =
   | 'NOT_A_REPOSITORY'
   | 'BRANCH_EXISTS'
+  | 'INVALID_BRANCH_NAME'
   | 'DIRTY_WORKTREE'
   | 'BRANCH_NOT_MERGED'
   | 'GIT_MISSING'

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { WorkspaceError } from '../src/git';
-import { createWorktree, findRepositoryRoot, listWorktrees, removeWorktree } from '../src/index';
+import { createWorktree, findRepositoryRoot, listBranches, listWorktrees, removeWorktree } from '../src/index';
 
 // Drives the real git on temporary repositories and roots under os.tmpdir(),
 // with an env that ignores the user's global and system git config.
@@ -226,7 +226,7 @@ describe('createWorktree', () => {
     expect((await listWorktrees(repo, { env: testEnv })).some((w) => w.path === expected)).toBe(false);
   });
 
-  test.each(['../escape', '-x'])('AC13 — rejects GIT_FAILED for the invalid branch name %s', async (branch) => {
+  test.each(['../escape', '-x'])('AC13 — rejects INVALID_BRANCH_NAME for the invalid branch name %s', async (branch) => {
     const repo = await makeRepo();
     const container = await tempDir();
     const root = join(container, 'root');
@@ -234,7 +234,7 @@ describe('createWorktree', () => {
 
     for (const base of ['main', undefined]) {
       const error = await rejection(createWorktree({ repo, root, branch, base, env: testEnv }));
-      expect(error.code).toBe('GIT_FAILED');
+      expect(error.code).toBe('INVALID_BRANCH_NAME');
     }
 
     expect(readdirSync(root)).toEqual([]);
@@ -273,7 +273,7 @@ describe('createWorktree arguments', () => {
     }
   });
 
-  test('AC20 — rejects GIT_FAILED for @{-1}, with or without a base, creating nothing', async () => {
+  test('AC20 — rejects INVALID_BRANCH_NAME for @{-1}, with or without a base, creating nothing', async () => {
     const repo = await makeRepo();
     const root = await tempDir();
     git(repo, 'checkout', '-b', 'other');
@@ -282,7 +282,7 @@ describe('createWorktree arguments', () => {
 
     for (const base of ['main', undefined]) {
       const error = await rejection(createWorktree({ repo, root, branch: '@{-1}', base, env: testEnv }));
-      expect(error.code, `base: ${String(base)}`).toBe('GIT_FAILED');
+      expect(error.code, `base: ${String(base)}`).toBe('INVALID_BRANCH_NAME');
     }
 
     expect(readdirSync(root)).toEqual([]);
@@ -477,6 +477,323 @@ describe('removeWorktree', () => {
     expect(existsSync(path)).toBe(false);
     expect(branchExists(repo, 'unmerged')).toBe(true);
     expect(git(repo, 'rev-parse', 'unmerged')).toBe(branchHead);
+  });
+});
+
+/** A repository with `develop`, `feature/x` and `release/1.0` on top of `main`, and a clone of it as `origin`. */
+async function makeClone(): Promise<{ upstream: string; clone: string }> {
+  const upstream = await makeRepo();
+  git(upstream, 'branch', 'develop');
+  git(upstream, 'branch', 'feature/x');
+  git(upstream, 'branch', 'release/1.0');
+  const clone = join(await tempDir(), 'my-clone');
+  git(upstream, 'clone', upstream, clone);
+  return { upstream, clone };
+}
+
+describe('listBranches', () => {
+  test('AC2 — lists local and origin branches, skips origin/HEAD, preselects origin/main, runs no fetch', async () => {
+    const { upstream, clone } = await makeClone();
+    git(clone, 'branch', 'local-only');
+    git(clone, 'branch', 'topic/nested');
+    // A commit that only a fetch would bring in.
+    const upstreamHead = commit(upstream, 'new on origin');
+    const originMain = git(clone, 'rev-parse', 'refs/remotes/origin/main');
+    expect(originMain).not.toBe(upstreamHead);
+
+    const result = await listBranches(clone, { env: testEnv });
+
+    expect([...result.local].sort()).toEqual(['local-only', 'main', 'topic/nested']);
+    expect([...result.remote].sort()).toEqual([
+      'origin/develop',
+      'origin/feature/x',
+      'origin/main',
+      'origin/release/1.0',
+    ]);
+    expect(result.remote).not.toContain('origin/HEAD');
+    expect(result.local.some((name) => name.includes('HEAD'))).toBe(false);
+    expect(result.defaultBase).toBe('origin/main');
+    expect(git(clone, 'rev-parse', 'refs/remotes/origin/main')).toBe(originMain);
+    expect(existsSync(join(clone, '.git', 'FETCH_HEAD'))).toBe(false);
+  });
+
+  test('AC2 — works from a linked worktree and lists the branches checked out elsewhere', async () => {
+    const { clone } = await makeClone();
+    const linked = await addWorktree(clone, 'linked', 'linked-branch');
+
+    const result = await listBranches(linked, { env: testEnv });
+
+    expect([...result.local].sort()).toEqual(['linked-branch', 'main']);
+    expect(result.remote).toContain('origin/main');
+  });
+
+  test('AC2 — a repository without a remote has no remote branch', async () => {
+    const repo = await makeRepo();
+    git(repo, 'branch', 'other');
+
+    const result = await listBranches(repo, { env: testEnv });
+
+    expect([...result.local].sort()).toEqual(['main', 'other']);
+    expect(result.remote).toEqual([]);
+  });
+
+  test('AC2 — only origin is listed, not other remotes', async () => {
+    const { upstream, clone } = await makeClone();
+    git(clone, 'remote', 'add', 'fork', upstream);
+    git(clone, 'fetch', '--quiet', 'fork');
+    expect(git(clone, 'branch', '-r')).toContain('fork/main');
+
+    const result = await listBranches(clone, { env: testEnv });
+
+    expect(result.remote.every((name) => name.startsWith('origin/'))).toBe(true);
+    expect(result.remote).toContain('origin/main');
+  });
+
+  test('AC3 — origin/HEAD pointing at another branch gives that branch as the default base', async () => {
+    const { clone } = await makeClone();
+    git(clone, 'remote', 'set-head', 'origin', 'develop');
+    expect(git(clone, 'branch', '--show-current')).toBe('main');
+
+    expect((await listBranches(clone, { env: testEnv })).defaultBase).toBe('origin/develop');
+  });
+
+  test('AC3 — no origin/HEAD: the branch checked out in the main working tree, as origin/<branch> when it exists', async () => {
+    const { clone } = await makeClone();
+    git(clone, 'remote', 'set-head', 'origin', '--delete');
+    expect(() => git(clone, 'symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD')).toThrow();
+
+    const result = await listBranches(clone, { env: testEnv });
+
+    expect(result.defaultBase).toBe('origin/main');
+    expect(result.remote).not.toContain('origin/HEAD');
+  });
+
+  test('AC3 — no origin/HEAD and a branch without a remote-tracking twin: the local branch', async () => {
+    const { clone } = await makeClone();
+    git(clone, 'remote', 'set-head', 'origin', '--delete');
+    git(clone, 'checkout', '-b', 'local-only');
+
+    expect((await listBranches(clone, { env: testEnv })).defaultBase).toBe('local-only');
+  });
+
+  test('AC3 — a local main only (no remote) is the default base', async () => {
+    const repo = await makeRepo();
+
+    expect(await listBranches(repo, { env: testEnv })).toEqual({ local: ['main'], remote: [], defaultBase: 'main' });
+  });
+
+  test('AC3 — origin/HEAD naming a branch whose origin/<D> is gone falls back to the local <D>', async () => {
+    const { clone } = await makeClone();
+    git(clone, 'remote', 'set-head', 'origin', 'develop');
+    git(clone, 'branch', 'develop', 'origin/develop');
+    git(clone, 'update-ref', '-d', 'refs/remotes/origin/develop');
+
+    const result = await listBranches(clone, { env: testEnv });
+
+    expect(result.defaultBase).toBe('develop');
+    expect(result.remote).not.toContain('origin/develop');
+  });
+
+  test('AC3 — origin/HEAD naming a branch with neither origin/<D> nor a local <D> gives no default base', async () => {
+    const { clone } = await makeClone();
+    git(clone, 'remote', 'set-head', 'origin', 'develop');
+    git(clone, 'update-ref', '-d', 'refs/remotes/origin/develop');
+
+    expect((await listBranches(clone, { env: testEnv })).defaultBase).toBeNull();
+  });
+
+  test('AC3 — no origin/HEAD and a detached main working tree: no default base, branches still listed', async () => {
+    const repo = await makeRepo();
+    git(repo, 'branch', 'other');
+    git(repo, 'checkout', '--detach');
+
+    const result = await listBranches(repo, { env: testEnv });
+
+    expect(result.defaultBase).toBeNull();
+    expect([...result.local].sort()).toEqual(['main', 'other']);
+  });
+
+  test('AC3 — an empty repository (no commit) has no branch and no default base', async () => {
+    const empty = join(await tempDir(), 'empty');
+    await mkdir(empty);
+    git(empty, 'init', '-b', 'main');
+
+    expect(await listBranches(empty, { env: testEnv })).toEqual({ local: [], remote: [], defaultBase: null });
+  });
+
+  test('AC8 — rejects NOT_A_REPOSITORY outside a repository and for a missing folder', async () => {
+    const folder = await tempDir();
+    expect((await rejection(listBranches(folder, { env: testEnv }))).code).toBe('NOT_A_REPOSITORY');
+    expect((await rejection(listBranches(join(folder, 'gone'), { env: testEnv }))).code).toBe('NOT_A_REPOSITORY');
+  });
+
+  test('AC8 — rejects GIT_MISSING when PATH holds no git', async () => {
+    const repo = await makeRepo();
+    const env = { ...testEnv, PATH: await tempDir() };
+
+    expect((await rejection(listBranches(repo, { env }))).code).toBe('GIT_MISSING');
+  });
+});
+
+describe('createWorktree branch names and concurrency', () => {
+  test.each(['my feature', 'a..b', 'bad~name', 'with:colon', 'ends.lock', '/leading', 'trailing/'])(
+    'AC7 — rejects INVALID_BRANCH_NAME for %j, creating nothing',
+    async (branch) => {
+      const repo = await makeRepo();
+      const root = await tempDir();
+      const listBefore = git(repo, 'worktree', 'list', '--porcelain');
+      const branchesBefore = git(repo, 'branch', '--list');
+
+      for (const base of ['main', undefined]) {
+        const error = await rejection(createWorktree({ repo, root, branch, base, env: testEnv }));
+        expect(error.code, `base: ${String(base)}`).toBe('INVALID_BRANCH_NAME');
+      }
+
+      expect(readdirSync(root)).toEqual([]);
+      expect(git(repo, 'worktree', 'list', '--porcelain')).toBe(listBefore);
+      expect(git(repo, 'branch', '--list')).toBe(branchesBefore);
+    },
+  );
+
+  test('AC6 — an existing local branch is BRANCH_EXISTS, not INVALID_BRANCH_NAME, and nothing is created', async () => {
+    const repo = await makeRepo();
+    const root = await tempDir();
+    git(repo, 'branch', 'feature/login');
+    const listBefore = git(repo, 'worktree', 'list', '--porcelain');
+
+    const error = await rejection(createWorktree({ repo, root, branch: 'feature/login', base: 'main', env: testEnv }));
+
+    expect(error.code).toBe('BRANCH_EXISTS');
+    expect(readdirSync(root)).toEqual([]);
+    expect(git(repo, 'worktree', 'list', '--porcelain')).toBe(listBefore);
+  });
+
+  test('AC9 — two simultaneous calls for the same new branch: one resolves, the other is BRANCH_EXISTS, the winner is intact', async () => {
+    // A race is not certain to show on one attempt: repeat on fresh repositories.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const repo = await makeRepo();
+      const root = await tempDir();
+      const mainHead = git(repo, 'rev-parse', 'main');
+      const expected = join(root, projectDir(repo), 'race');
+
+      const settled = await Promise.allSettled([
+        createWorktree({ repo, root, branch: 'race', base: 'main', env: testEnv }),
+        createWorktree({ repo, root, branch: 'race', base: 'main', env: testEnv }),
+      ]);
+
+      const winners = settled.filter((outcome) => outcome.status === 'fulfilled');
+      const losers = settled.filter((outcome) => outcome.status === 'rejected');
+      expect(winners, `attempt ${attempt}`).toHaveLength(1);
+      expect(losers, `attempt ${attempt}`).toHaveLength(1);
+      const reason = (losers[0] as PromiseRejectedResult).reason as WorkspaceError;
+      expect(reason).toBeInstanceOf(WorkspaceError);
+      expect(reason.code, `attempt ${attempt}`).toBe('BRANCH_EXISTS');
+
+      expect((winners[0] as PromiseFulfilledResult<{ path: string }>).value.path).toBe(expected);
+      expect(existsSync(join(expected, 'README.md')), `attempt ${attempt}`).toBe(true);
+      expect(branchExists(repo, 'race'), `attempt ${attempt}`).toBe(true);
+      expect(git(expected, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('race');
+      expect(git(expected, 'rev-parse', 'HEAD')).toBe(mainHead);
+      const listed = await listWorktrees(repo, { env: testEnv });
+      expect(listed.filter((w) => w.path === expected && w.branch === 'race')).toHaveLength(1);
+    }
+  });
+
+  test('AC9 — simultaneous calls for different branches of one repository all resolve', async () => {
+    const repo = await makeRepo();
+    const root = await tempDir();
+    const branches = ['one', 'two', 'three', 'four'];
+
+    const created = await Promise.all(
+      branches.map((branch) => createWorktree({ repo, root, branch, base: 'main', env: testEnv })),
+    );
+
+    expect(created.map((w) => w.branch).sort()).toEqual([...branches].sort());
+    const listed = await listWorktrees(repo, { env: testEnv });
+    for (const branch of branches) {
+      expect(listed.some((w) => w.branch === branch && w.path === join(root, projectDir(repo), branch))).toBe(true);
+      expect(branchExists(repo, branch)).toBe(true);
+    }
+  });
+
+  test('AC9 — a rejected call does not block the next one for the same repository', async () => {
+    const repo = await makeRepo();
+    const root = await tempDir();
+
+    await rejection(createWorktree({ repo, root, branch: 'my feature', base: 'main', env: testEnv }));
+    const created = await createWorktree({ repo, root, branch: 'after', base: 'main', env: testEnv });
+
+    expect(created.branch).toBe('after');
+  });
+});
+
+describe('removeWorktree force', () => {
+  test('AC18 — force removes a worktree with modified and untracked files, and the changes are gone', async () => {
+    const repo = await makeRepo();
+    const path = await addWorktree(repo, 'dirty', 'dirty');
+    await writeFile(join(path, 'README.md'), 'changed\n');
+    await writeFile(join(path, 'notes.txt'), 'untracked\n');
+
+    await removeWorktree({ repo, path, force: true, env: testEnv });
+
+    expect(existsSync(path)).toBe(false);
+    expect((await listWorktrees(repo, { env: testEnv })).some((w) => w.path === path)).toBe(false);
+    expect(branchExists(repo, 'dirty')).toBe(true);
+    // The main working tree is untouched.
+    expect(await readFile(join(repo, 'README.md'), 'utf8')).toBe('hello\n');
+  });
+
+  test('AC18 — without force the same worktree is still DIRTY_WORKTREE, and force: false is the same', async () => {
+    const repo = await makeRepo();
+    const path = await addWorktree(repo, 'dirty', 'dirty');
+    await writeFile(join(path, 'notes.txt'), 'untracked\n');
+
+    for (const force of [undefined, false]) {
+      const error = await rejection(removeWorktree({ repo, path, force, env: testEnv }));
+      expect(error.code, `force: ${String(force)}`).toBe('DIRTY_WORKTREE');
+    }
+
+    expect(existsSync(path)).toBe(true);
+    expect(await readFile(join(path, 'notes.txt'), 'utf8')).toBe('untracked\n');
+  });
+
+  test('AC18 — force with deleteBranch deletes a merged branch (AC16 rule)', async () => {
+    const repo = await makeRepo();
+    const path = await addWorktree(repo, 'dirty-merged', 'dirty-merged');
+    await writeFile(join(path, 'notes.txt'), 'untracked\n');
+
+    await removeWorktree({ repo, path, force: true, deleteBranch: true, env: testEnv });
+
+    expect(existsSync(path)).toBe(false);
+    expect(branchExists(repo, 'dirty-merged')).toBe(false);
+  });
+
+  test('AC18 — force with deleteBranch keeps an unmerged branch and rejects BRANCH_NOT_MERGED (AC17 rule)', async () => {
+    const repo = await makeRepo();
+    const path = await addWorktree(repo, 'dirty-unmerged', 'dirty-unmerged');
+    const branchHead = commit(path, 'not on main');
+    await writeFile(join(path, 'README.md'), 'changed\n');
+
+    const error = await rejection(removeWorktree({ repo, path, force: true, deleteBranch: true, env: testEnv }));
+
+    expect(error.code).toBe('BRANCH_NOT_MERGED');
+    expect(existsSync(path)).toBe(false);
+    expect((await listWorktrees(repo, { env: testEnv })).some((w) => w.path === path)).toBe(false);
+    expect(git(repo, 'rev-parse', 'dirty-unmerged')).toBe(branchHead);
+  });
+
+  test('AC19 — a locked worktree is not removed, with or without force', async () => {
+    const repo = await makeRepo();
+    const path = await addWorktree(repo, 'locked', 'locked');
+    git(repo, 'worktree', 'lock', path);
+
+    for (const force of [undefined, true]) {
+      const error = await rejection(removeWorktree({ repo, path, force, env: testEnv }));
+      expect(error.code, `force: ${String(force)}`).toBe('GIT_FAILED');
+    }
+
+    expect(existsSync(path)).toBe(true);
+    expect(branchExists(repo, 'locked')).toBe(true);
   });
 });
 

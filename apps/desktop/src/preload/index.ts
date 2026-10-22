@@ -23,6 +23,11 @@ const api: Api = {
     add: () => ipcRenderer.invoke('projects:add'),
     remove: (path) => ipcRenderer.invoke('projects:remove', path),
   },
+  workspaces: {
+    branches: (project) => ipcRenderer.invoke('workspaces:branches', project),
+    create: (project, name, base) => ipcRenderer.invoke('workspaces:create', project, name, base),
+    remove: (project, path, options) => ipcRenderer.invoke('workspaces:remove', project, path, options),
+  },
   getShellPath: () => ipcRenderer.invoke('get-shell-path'),
 };
 
