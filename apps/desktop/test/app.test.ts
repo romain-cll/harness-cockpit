@@ -3781,8 +3781,10 @@ describe('sessions: built app', () => {
     await page.getByRole('heading', { name: 'Claude Code 3', exact: true }).waitFor({ timeout: UI_TIMEOUT });
   });
 
-  // Last of the launch: it removes the Claude Code stub, which the tests above need.
-  test('AC16 — with the Claude Code stub removed after the menu detected it, picking Claude Code is refused under the Sessions header and changes nothing', async () => {
+  // A folder named `state.json.tmp` in the data folder makes `saveState` fail
+  // after the spawn succeeded, which runs the whole rollback. (A removed stub
+  // would not do: node-pty does not throw on a missing executable.)
+  test('AC16 — with a folder named state.json.tmp in the data folder, picking Claude Code is refused under the Sessions header and changes nothing', async () => {
     const { page } = session;
     // The menu detected the stubs (AC1) and keeps the answer.
     await openStartMenu(page);
@@ -3802,22 +3804,26 @@ describe('sessions: built app', () => {
     const entriesBefore = await sessionEntries(page);
     const stateBefore = stateSnapshot(session.dataDir);
     const foldersBefore = sessionFoldersIn(session.cockpitHome);
-    rmSync(join(fx.root, 'bin', 'claude'));
+    const blocker = join(session.dataDir, 'state.json.tmp');
+    mkdirSync(blocker);
+    try {
+      await openStartMenu(page);
+      await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).click({ timeout: UI_TIMEOUT });
 
-    await openStartMenu(page);
-    await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).click({ timeout: UI_TIMEOUT });
+      const lines = await poll(() => sidebarLines(page), (found) => found.some((line) => line.startsWith('Could not start Claude Code:')), UI_TIMEOUT);
+      expect(lines.some((line) => line.startsWith('Could not start Claude Code:'))).toBe(true);
+      expect(await isBelowSessionsHeader(page, 'Could not start Claude Code:')).toBe(true);
 
-    const lines = await poll(() => sidebarLines(page), (found) => found.some((line) => line.startsWith('Could not start Claude Code:')), UI_TIMEOUT);
-    expect(lines.some((line) => line.startsWith('Could not start Claude Code:'))).toBe(true);
-    expect(await isBelowSessionsHeader(page, 'Could not start Claude Code:')).toBe(true);
-
-    // The refusal comes after the rollback: no pty left on the host, no folder, no change in the state.
-    expect(isAlive(hostPid)).toBe(true);
-    expect(await poll(() => childPidsOf(hostPid), (children) => children.length === 0, 5_000)).toEqual([]);
-    expect(await sessionEntries(page)).toEqual(entriesBefore);
-    expect(stateSnapshot(session.dataDir)).toEqual(stateBefore);
-    expect(sessionFoldersIn(session.cockpitHome)).toEqual(foldersBefore);
-    expect(existsSync(join(session.dataDir, 'state.json.tmp'))).toBe(false);
+      // The refusal comes after the rollback: the spawned pty is killed, the folder removed, no change in the state.
+      expect(isAlive(hostPid)).toBe(true);
+      expect(await poll(() => childPidsOf(hostPid), (children) => children.length === 0, 5_000)).toEqual([]);
+      expect(await sessionEntries(page)).toEqual(entriesBefore);
+      expect(stateSnapshot(session.dataDir)).toEqual(stateBefore);
+      expect(sessionFoldersIn(session.cockpitHome)).toEqual(foldersBefore);
+      expect(statSync(blocker).isDirectory()).toBe(true);
+    } finally {
+      rmSync(blocker, { recursive: true, force: true });
+    }
   });
 
   test('logs no error and keeps running', async () => {
