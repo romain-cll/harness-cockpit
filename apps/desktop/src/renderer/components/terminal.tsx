@@ -76,6 +76,8 @@ export function Terminal({ focused }: { focused: boolean }) {
       if (sessionId === undefined) early.push({ id, apply });
       else if (id === sessionId) apply();
     };
+    // Keys typed before that are held too, and written in order once the shell runs.
+    const pending: string[] = [];
     const offData = pty.onData((id, data) => onSession(id, () => term.write(data)));
     const offExit = pty.onExit((id, exit) =>
       onSession(id, () => {
@@ -98,13 +100,17 @@ export function Terminal({ focused }: { focused: boolean }) {
         if (term.cols !== requested.cols || term.rows !== requested.rows) pty.resize(id, term.cols, term.rows);
         for (const event of early) if (event.id === id) event.apply();
         early.length = 0;
+        if (pending.length > 0 && !exited) pty.write(id, pending.join(''));
+        pending.length = 0;
       })
       .catch((error: unknown) => {
+        pending.length = 0;
         if (!disposed) term.write(`\r\n[Could not start the shell: ${error instanceof Error ? error.message : error}]`);
       });
 
     const input = term.onData((data) => {
-      if (sessionId !== undefined && !exited) pty.write(sessionId, data);
+      if (sessionId === undefined) pending.push(data);
+      else if (!exited) pty.write(sessionId, data);
     });
     const resize = term.onResize(({ cols, rows }) => {
       if (sessionId !== undefined && !exited) pty.resize(sessionId, cols, rows);
@@ -120,6 +126,7 @@ export function Terminal({ focused }: { focused: boolean }) {
 
     return () => {
       disposed = true;
+      pending.length = 0;
       scheme.removeEventListener('change', onSchemeChange);
       observer.disconnect();
       resize.dispose();
