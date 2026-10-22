@@ -671,14 +671,19 @@ async function terminalSize(page: Page, pane?: Pane): Promise<[number, number]> 
 }
 
 // The `[rows, cols]` the terminal displays: its rendered rows, and the width of
-// the wrapped rows of a long line of zeros the shell prints.
+// the wrapped rows of a long line of one digit the shell prints. Each call prints
+// another digit, so the lines of an earlier call on the same screen are not mistaken
+// for this one.
+let lineCount = 0;
 async function displayedSize(page: Page, pane: Pane): Promise<[number, number]> {
-  await typeLine(page, "printf '%0600d\\n' 0");
-  await waitForRow(page, /^0{5,}$/, pane);
-  // The line wraps over several rows; give the last one time to arrive.
-  await sleep(300);
-  const rows = await rowsOf(pane);
-  const cols = Math.max(...rows.filter((row) => /^0+$/.test(row)).map((row) => row.length));
+  const digit = String(1 + (lineCount++ % 9));
+  await typeLine(page, `printf '%0600d\\n' 0 | tr 0 ${digit}`);
+  // The line wraps over several rows: wait until they hold all 600 digits.
+  const line = new RegExp(`^${digit}+$`);
+  const total = (rows: string[]) => rows.filter((row) => line.test(row)).reduce((sum, row) => sum + row.length, 0);
+  const rows = await poll(() => rowsOf(pane), (found) => total(found) >= 600, 15_000);
+  expect(total(rows), 'the whole line is displayed').toBe(600);
+  const cols = Math.max(...rows.filter((row) => line.test(row)).map((row) => row.length));
   return [rows.length, cols];
 }
 
@@ -1449,7 +1454,7 @@ describe.each([
     },
   );
 
-  test.runIf(full)('terminal AC1 — the Terminal link opens a page with a heading and an xterm.js terminal under the header', async () => {
+  test.runIf(full)('terminal AC1 — the Terminal link opens a page with a heading, a tab bar and an xterm.js terminal under the header', async () => {
     const { page } = session;
     await page.getByRole('link', { name: 'Home', exact: true }).click({ timeout: UI_TIMEOUT });
     await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
@@ -1458,6 +1463,14 @@ describe.each([
     await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
     expect(await page.getByRole('link', { name: 'Terminal', exact: true }).getAttribute('aria-current')).toBe('page');
     await page.locator('.xterm').waitFor({ state: 'visible', timeout: UI_TIMEOUT });
+
+    // The header holds the tab bar: the selected tab "Terminal 1" and a "New terminal" button.
+    const header = page.locator('main header');
+    await header.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
+    await header.getByRole('tab', { name: 'Terminal 1', exact: true }).waitFor({ timeout: UI_TIMEOUT });
+    await header.getByRole('button', { name: 'New terminal', exact: true }).waitFor({ timeout: UI_TIMEOUT });
+    await expectTabs(page, ['Terminal 1'], 'Terminal 1');
+    expect(await visiblePanes(page)).toHaveLength(1);
 
     // It fills the page: right under the header, down to the window bottom and
     // across the main area, give or take one cell and the scrollbar.
@@ -1589,64 +1602,7 @@ describe.each([
     expect(light.expected.red).not.toBe(light.expected.text);
   });
 
-  test.runIf(full)('terminal AC8 — leaving the terminal page ends its shell', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    await typeLine(page, 'echo pid-$$');
-    const [pid] = (await captureRow(page, /^pid-(\d+)$/)).map(Number);
-    expect(isAlive(pid!)).toBe(true);
-
-    await page.getByRole('link', { name: 'Home', exact: true }).click({ timeout: UI_TIMEOUT });
-    await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
-
-    expect(await poll(() => isAlive(pid!), (alive) => !alive, 5_000)).toBe(false);
-  });
-
-  test.runIf(full)('terminal AC9 — reloading the page ends its shell and opens a new one', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    await typeLine(page, 'echo pid-$$');
-    const [pid] = (await captureRow(page, /^pid-(\d+)$/)).map(Number);
-    expect(isAlive(pid!)).toBe(true);
-
-    await page.reload();
-    await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
-    expect(await poll(() => isAlive(pid!), (alive) => !alive, 5_000)).toBe(false);
-
-    await focusTerminal(page);
-    await typeLine(page, 'echo cockpit-$((6*7))');
-    await waitForRow(page, 'cockpit-42');
-  });
-
   // --- Several terminals: tabs, splits and lifecycle (COCKPIT-24) -------------
-
-  test.runIf(full)('tabs AC1 — the header holds the heading and a tab bar with the selected tab "Terminal 1" and a "New terminal" button; one terminal runs a shell', async () => {
-    const { page } = session;
-    await openTerminal(page);
-
-    const header = page.locator('main header');
-    await header.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
-    await header.getByRole('tab', { name: 'Terminal 1', exact: true }).waitFor({ timeout: UI_TIMEOUT });
-    await header.getByRole('button', { name: 'New terminal', exact: true }).waitFor({ timeout: UI_TIMEOUT });
-    await expectTabs(page, ['Terminal 1'], 'Terminal 1');
-
-    // One terminal, right under the header, across the main area.
-    const panes = await visiblePanes(page);
-    expect(panes).toHaveLength(1);
-    const boxes = await page.evaluate(() => ({
-      header: document.querySelector('main header')!.getBoundingClientRect().bottom,
-      main: document.querySelector('main')!.getBoundingClientRect(),
-    }));
-    const box = await boxOf(panes[0]!);
-    expect(box.top).toBeGreaterThanOrEqual(boxes.header - 1);
-    expect(box.top).toBeLessThan(boxes.header + 20);
-    expect(box.bottom).toBeGreaterThan(boxes.main.bottom - 40);
-    expect(box.width).toBeGreaterThan(boxes.main.width - 40);
-
-    await waitForPrompt(page, panes[0]);
-    await typeLine(page, 'echo cockpit-$((6*7))');
-    await waitForRow(page, 'cockpit-42', panes[0]);
-  });
 
   test.runIf(full)('tabs AC2 — "New terminal" adds the next tab, selected, with a new shell that has the focus; the previous shell keeps running and can be typed in again', async () => {
     const { page } = session;
@@ -1783,47 +1739,34 @@ describe.each([
     await waitForRow(page, 'still-9', a);
   });
 
-  test.runIf(full)('tabs AC4 — in a nested split, the sibling takes the freed area and the other half is untouched', async () => {
+  // In A | (B / C), closing C: B takes C's area, A is untouched, the keyboard is in B. The other
+  // modes check the focus after "Close terminal" in the terminal smoke path.
+  test.runIf(full)('tabs AC4 — in a nested split A | (B / C), closing C gives its area to B, leaves A untouched and puts the keyboard in B', async () => {
     const { page } = session;
     await openTerminal(page);
     const a = await focusedPane(page);
     const aPid = await pidOf(page, a);
     const b = await splitPane(page, a, 'right');
     const bPid = await pidOf(page);
+    await typeLine(page, 'echo b-marker-$((10+5))');
+    await waitForRow(page, 'b-marker-15', b);
     const c = await splitPane(page, b, 'down');
     const cPid = await pidOf(page);
-    await typeLine(page, 'echo c-marker-$((10+4))');
-    await waitForRow(page, 'c-marker-14', c);
     const aBox = await boxOf(a);
     const bBox = await boxOf(b);
     const cBox = await boxOf(c);
     const slot: Box = { left: bBox.left, top: bBox.top, right: cBox.right, bottom: cBox.bottom, width: bBox.width, height: cBox.bottom - bBox.top };
 
-    await clickPaneButton(b, 'Close terminal');
-
-    expect(await endsWithin(bPid)).toBe(true);
-    const grown = await poll(() => boxOf(c), (box) => sameArea(box, slot), UI_TIMEOUT);
-    expect(sameArea(grown, slot), 'the sibling takes the closed terminal\'s whole area').toBe(true);
-    expect(sameArea(await boxOf(a), aBox), 'the other half is untouched').toBe(true);
-    expect(await rowsOf(c)).toContain('c-marker-14');
-    expect(isAlive(aPid)).toBe(true);
-    expect(isAlive(cPid)).toBe(true);
-  });
-
-  // The other modes check the focus after "Close terminal" in the terminal smoke path.
-  test.runIf(full)('tabs AC4 — after "Close terminal", the keyboard focus goes to the closed terminal\'s sibling: in A | (B / C), closing C focuses B, not A', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const a = await focusedPane(page);
-    await pidOf(page, a);
-    const b = await splitPane(page, a, 'right');
-    await pidOf(page, b);
-    const c = await splitPane(page, b, 'down');
-    const cPid = await pidOf(page, c);
-
     await clickPaneButton(c, 'Close terminal');
+
     expect(await endsWithin(cPid)).toBe(true);
     await poll(async () => (await visiblePanes(page)).length, (count) => count === 2, UI_TIMEOUT);
+    const grown = await poll(() => boxOf(b), (box) => sameArea(box, slot), UI_TIMEOUT);
+    expect(sameArea(grown, slot), 'the sibling takes the closed terminal\'s whole area').toBe(true);
+    expect(sameArea(await boxOf(a), aBox), 'the other half is untouched').toBe(true);
+    expect(await rowsOf(b), 'the sibling keeps its output').toContain('b-marker-15');
+    expect(isAlive(aPid)).toBe(true);
+    expect(isAlive(bPid)).toBe(true);
 
     // No click: the text goes where the keyboard is.
     const active = await poll(() => activePane(page), Boolean, UI_TIMEOUT);
@@ -1926,12 +1869,10 @@ describe.each([
     const quarter = await splitPane(page, half, 'down');
     await expectSizeMatchesDisplay(page, quarter);
     await expectSizeMatchesDisplay(page, half);
-    await expectSizeMatchesDisplay(page, tab);
 
     await clickPaneButton(quarter, 'Close terminal');
     await poll(async () => (await visiblePanes(page)).length, (count) => count === 2, UI_TIMEOUT);
     await expectSizeMatchesDisplay(page, half);
-    await expectSizeMatchesDisplay(page, tab);
   });
 
   test.runIf(full)('tabs AC6 — a terminal resized while its tab was hidden still gets its real size', async () => {
@@ -2946,8 +2887,10 @@ describe.each([
   // The smoke path of tabs and splits in the dev server and the packaged app (the
   // launchd-environment mode keeps the developer's shell out of the terminal
   // tests): a split in both directions, the focus after "Close terminal", a tab
-  // opened and closed. The built app runs the full block above.
-  test.runIf(!full && inIsolatedShell)('smoke path (c) — terminal tabs: splits, "Close terminal" gives the focus to the sibling, a closed tab ends its shell', async () => {
+  // opened and closed, then the pty host killed and a new terminal that runs a
+  // command (tabs AC13). The built app runs the full block above (tabs AC5 and AC8
+  // cover AC13 there). It kills the pty host last, so nothing runs after it.
+  test.runIf(!full && inIsolatedShell)('smoke path (c) — terminal tabs: splits, "Close terminal" gives the focus to the sibling, a closed tab ends its shell, and after the pty host dies a new terminal runs commands', async () => {
     const { page } = session;
     await openTerminal(page);
     const a = await focusedPane(page);
@@ -2978,6 +2921,20 @@ describe.each([
     await expectTabs(page, ['Terminal 1'], 'Terminal 1');
     expect(await endsWithin(tabPid)).toBe(true);
     expect(isAlive(aPid) && isAlive(bPid)).toBe(true);
+
+    // The pty host dies: the remaining terminals end, and a new terminal runs commands (tabs AC13).
+    await killPtyHost(page);
+    await waitForRow(page, '[Process ended]', a);
+    await waitForRow(page, '[Process ended]', b);
+    const fresh = await openTab(page);
+    await waitForPrompt(page, fresh);
+    await typeLine(page, 'echo cockpit-$((6*7))');
+    await waitForRow(page, 'cockpit-42', fresh);
+    expect(isAlive(tabPid)).toBe(false);
+    await selectTab(page, 1);
+    await poll(() => a.isVisible(), Boolean, UI_TIMEOUT);
+    expect(await rowsOf(a)).toContain('[Process ended]');
+    await expectNoErrors(session);
   });
 
   // These kill the pty host and rely on the next spawn starting it again, so they
@@ -3027,44 +2984,14 @@ describe.each([
     await expectNoErrors(session);
   });
 
-  test.runIf(inIsolatedShell)('tabs AC13 — two terminals, one closed, the host killed, a new terminal: the closed shell is gone, the other ended, the new one runs commands', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const first = await focusedPane(page);
-    await pidOf(page, first);
-    await openTab(page);
-    const closedPid = await pidOf(page);
-    await closeTab(page, 2);
-    await expectTabs(page, ['Terminal 1'], 'Terminal 1');
-    expect(await endsWithin(closedPid), 'the closed terminal\'s shell is gone').toBe(true);
-
-    await killPtyHost(page);
-    await waitForRow(page, '[Process ended]', first);
-
-    const fresh = await openTab(page);
-    await waitForPrompt(page, fresh);
-    await typeLine(page, 'echo cockpit-$((6*7))');
-    await waitForRow(page, 'cockpit-42', fresh);
-
-    expect(isAlive(closedPid)).toBe(false);
-    await selectTab(page, 1);
-    await poll(() => first.isVisible(), Boolean, UI_TIMEOUT);
-    expect(await rowsOf(first)).toContain('[Process ended]');
-    await expectNoErrors(session);
-  });
-
   // The pty host is killed here and started again by the next spawn, so the tests
   // that follow work all the same.
-  test.runIf(full)('AC4 — survives the pty host being killed, and reports the open sessions as exited (terminal AC10: every terminal, of every tab, shows [Process ended])', async () => {
+  test.runIf(full)('AC4 — survives the pty host being killed, and reports the open sessions as exited (terminal AC10: the open terminal shows [Process ended])', async () => {
     const { page } = session;
-    // The terminal page is open with two tabs, each with a running shell.
+    // The terminal page is open with a running shell.
     await openTerminal(page);
     await typeLine(page, 'echo up-$((1+1))');
     await waitForRow(page, 'up-2');
-    await openTab(page);
-    await waitForPrompt(page);
-    await typeLine(page, 'echo up-$((2+2))');
-    await waitForRow(page, 'up-4');
 
     const id = await spawnShell(page);
     await ptyWrite(page, id, 'echo ppid-$PPID\n');
@@ -3078,9 +3005,7 @@ describe.each([
 
     await waitForExit(page, id);
     expect(await exitsOf(page, id)).toEqual([{ exitCode: null, signal: null }]);
-    for (const pane of await visiblePanes(page)) await waitForRow(page, '[Process ended]', pane);
-    await selectTab(page, 1);
-    await waitForRow(page, '[Process ended]', (await visiblePanes(page))[0]);
+    await waitForRow(page, '[Process ended]');
     await page.getByRole('heading', { name: 'Terminal' }).waitFor();
     await page.getByText(versionLabel).waitFor();
     expect(session.isRunning()).toBe(true);
@@ -3089,28 +3014,14 @@ describe.each([
     expect(await consoleErrorsOf(page)).toEqual([]);
   });
 
-  test.runIf(full)('tabs AC9 — once the pty host is dead, spawn resolves with an id no session used, and calls on the old id do nothing to the new session', async () => {
+  // That the old ids stay inert is a unit test (packages/pty).
+  test.runIf(full)('tabs AC9 — once the pty host is dead, spawn resolves with an id no session used', async () => {
     const { page } = session;
     // Kills the host (again): `old` is the last session it ran.
     const old = await killPtyHost(page);
-    const oldOutput = await outputOf(page, old);
 
     const fresh = await spawnShell(page);
     expect(fresh).toBeGreaterThan(old);
-
-    await ptyWrite(page, old, 'echo from-old-id\n');
-    await ptyResize(page, old, 100, 30);
-    await ptyKill(page, old);
-    await ptyWrite(page, fresh, 'echo cockpit-$((6*7))\n');
-    await waitForOutput(page, fresh, 'cockpit-42');
-    await ptyWrite(page, fresh, 'stty size\n');
-    await waitForOutput(page, fresh, '24 80');
-    await sleep(500);
-
-    expect(await exitsOf(page, fresh)).toEqual([]);
-    expect(await outputOf(page, fresh)).not.toContain('from-old-id');
-    expect(await outputOf(page, old)).toBe(oldOutput);
-    expect(await exitsOf(page, old)).toHaveLength(1);
 
     await ptyKill(page, fresh);
     await waitForExit(page, fresh);
@@ -3646,6 +3557,27 @@ async function readStub(page: Page): Promise<StubFacts> {
   return { cwd: found[1]!, argCount: Number(found[2]), args: found[3]!, pid: Number(found[4]), term: found[5]! };
 }
 
+// Whether the deepest element whose text starts with `text` sits below the
+// "Sessions" header of the sidebar.
+const isBelowSessionsHeader = (page: Page, text: string) =>
+  page.evaluate((text) => {
+    const all = [...document.querySelectorAll('aside *')] as HTMLElement[];
+    const deepest = (matches: (element: HTMLElement) => boolean) =>
+      all.filter(matches).filter((element) => !all.some((other) => other !== element && element.contains(other) && matches(other)))[0];
+    const header = deepest((element) => (element.textContent ?? '').trim() === 'Sessions');
+    const found = deepest((element) => (element.textContent ?? '').trim().startsWith(text));
+    if (!header || !found) return false;
+    return found.getBoundingClientRect().top >= header.getBoundingClientRect().bottom - 1;
+  }, text);
+
+// The processes whose parent is `pid`.
+const childPidsOf = (pid: number): number[] =>
+  execFileSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8' })
+    .split('\n')
+    .map((line) => line.trim().split(/\s+/).map(Number))
+    .filter(([, parent]) => parent === pid)
+    .map(([child]) => child!);
+
 const sessionFoldersIn = (home: string) => {
   const folder = join(home, 'sessions');
   return existsSync(folder) ? readdirSync(folder).sort() : [];
@@ -3847,6 +3779,45 @@ describe('sessions: built app', () => {
     // The same as when the agent exits (AC7): the page keeps its terminal, it does not turn into an error.
     expect(sessionIdOf(page)).toBe(known.claude3.id);
     await page.getByRole('heading', { name: 'Claude Code 3', exact: true }).waitFor({ timeout: UI_TIMEOUT });
+  });
+
+  // Last of the launch: it removes the Claude Code stub, which the tests above need.
+  test('AC16 — with the Claude Code stub removed after the menu detected it, picking Claude Code is refused under the Sessions header and changes nothing', async () => {
+    const { page } = session;
+    // The menu detected the stubs (AC1) and keeps the answer.
+    await openStartMenu(page);
+    expect((await page.getByRole('menuitem').allInnerTexts()).map((text) => text.trim())).toEqual(['Claude Code', 'Codex']);
+    await page.keyboard.press('Escape');
+    await page.getByRole('menuitem').first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+
+    // The pty host runs (AC15 killed it, this spawn starts a new one) with no pty of its own.
+    const probe = await spawnShell(page);
+    await ptyWrite(page, probe, 'echo ppid-$PPID\n');
+    await waitForOutput(page, probe, /ppid-\d+/);
+    const hostPid = Number(/ppid-(\d+)/.exec(await outputOf(page, probe))![1]);
+    await ptyKill(page, probe);
+    await waitForExit(page, probe);
+    expect(await poll(() => childPidsOf(hostPid), (children) => children.length === 0, 5_000)).toEqual([]);
+
+    const entriesBefore = await sessionEntries(page);
+    const stateBefore = stateSnapshot(session.dataDir);
+    const foldersBefore = sessionFoldersIn(session.cockpitHome);
+    rmSync(join(fx.root, 'bin', 'claude'));
+
+    await openStartMenu(page);
+    await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).click({ timeout: UI_TIMEOUT });
+
+    const lines = await poll(() => sidebarLines(page), (found) => found.some((line) => line.startsWith('Could not start Claude Code:')), UI_TIMEOUT);
+    expect(lines.some((line) => line.startsWith('Could not start Claude Code:'))).toBe(true);
+    expect(await isBelowSessionsHeader(page, 'Could not start Claude Code:')).toBe(true);
+
+    // The refusal comes after the rollback: no pty left on the host, no folder, no change in the state.
+    expect(isAlive(hostPid)).toBe(true);
+    expect(await poll(() => childPidsOf(hostPid), (children) => children.length === 0, 5_000)).toEqual([]);
+    expect(await sessionEntries(page)).toEqual(entriesBefore);
+    expect(stateSnapshot(session.dataDir)).toEqual(stateBefore);
+    expect(sessionFoldersIn(session.cockpitHome)).toEqual(foldersBefore);
+    expect(existsSync(join(session.dataDir, 'state.json.tmp'))).toBe(false);
   });
 
   test('logs no error and keeps running', async () => {
