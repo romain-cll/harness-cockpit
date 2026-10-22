@@ -78,7 +78,11 @@ export interface Api {
   getVersion(): Promise<string>;
   /** Pseudo-terminals, which run in a utility process. */
   pty: {
-    /** Resolves to the session id; rejects when the pty host is not running. */
+    /**
+     * Resolves to the session id. The pty host restarts at the next spawn after it
+     * died, and ids are never reused; rejects only when the host dies while the
+     * spawn waits for it.
+     */
     spawn(request: PtySpawnRequest): Promise<number>;
     write(id: number, data: string): void;
     resize(id: number, cols: number, rows: number): void;

@@ -47,6 +47,7 @@ import { shellEnv } from './shell-env';
 // as the Electron security checklist recommends. It also gives the router
 // real URLs, as on the web.
 const RENDERER_ORIGIN = 'app://renderer';
+const ERR_ABORTED = -3;
 const rendererDir = join(import.meta.dirname, '../renderer');
 
 // Set by `electron-vite dev`. Ignored once packaged, so the environment cannot
@@ -166,9 +167,10 @@ async function withSpawnDefaults(request: PtySpawnRequest): Promise<PtySpawnOpti
 let state: State;
 
 // Terminals live in a utility process, so a pty crash does not take the app down.
+// The client starts it again at the next spawn after it died.
 // Returns what the main process needs to run a terminal of its own.
 function startPty() {
-  const pty = createPtyClient(utilityProcess.fork(ptyHostPath, [], { serviceName: 'Cockpit Pty Host' }));
+  const pty = createPtyClient(() => utilityProcess.fork(ptyHostPath, [], { serviceName: 'Cockpit Pty Host' }));
   // The window that spawned a session is the one that receives its output.
   const owners = new Map<number, WebContents>();
 
@@ -206,12 +208,17 @@ function startPty() {
   // A page's shells end with it: when its main frame commits another document
   // (a reload included) or the page is destroyed. `did-navigate` fires only for a
   // committed main-frame document, so a navigation that `will-navigate` cancels,
-  // and route changes inside the app (same-document), kill nothing.
+  // and route changes inside the app (same-document), kill nothing. A main frame
+  // that commits an error page fires `did-fail-load` instead (an aborted
+  // navigation, `ERR_ABORTED`, commits nothing and kills nothing).
   const killSessionsOf = (contents: WebContents) => {
     for (const [id, owner] of owners) if (owner === contents) pty.kill(id);
   };
   app.on('web-contents-created', (_event, contents) => {
     contents.on('did-navigate', () => killSessionsOf(contents));
+    contents.on('did-fail-load', (_event, errorCode, _description, _url, isMainFrame) => {
+      if (isMainFrame && errorCode !== ERR_ABORTED) killSessionsOf(contents);
+    });
     contents.on('destroyed', () => killSessionsOf(contents));
   });
 
@@ -357,7 +364,8 @@ function startProjects(userData: string): void {
 
 // Sessions outside any project: an agent CLI run in a folder of its own under
 // the Cockpit home, in a pty owned by the window that started it. The sessions
-// are kept in `state.json`; the pty ends with its page, the folder stays.
+// are kept in `state.json`; the pty ends with its page or with the pty host (a start
+// after the host died starts a new one), the folder stays.
 function startSessions(userData: string, { spawnFor, kill }: ReturnType<typeof startPty>): void {
   // Detected on the first call that needs it, never at startup: detecting runs
   // each CLI's `--version`, and an app that never starts a session should not.

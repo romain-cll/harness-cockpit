@@ -5,7 +5,8 @@ import { exitMessage, readTheme } from './terminal';
 
 // A running session's terminal, kept for the page's lifetime so that leaving the
 // session's page and coming back finds the agent and its output as they were.
-// Nothing is disposed: a reload drops the whole store, and the sessions with it.
+// Nothing is disposed: a reload drops the whole store, and the sessions with it. A pty
+// host crash ends a session like its agent exiting (`exited`), the terminal stays.
 export interface SessionTerminal {
   term: XTerm;
   fit: FitAddon;

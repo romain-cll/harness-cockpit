@@ -8,7 +8,7 @@ import { basename, dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
-import { chromium, type Browser, type Page } from 'playwright-core';
+import { chromium, type Browser, type ElementHandle, type Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 
 // Launches the app the four ways it runs: the dev server, the built app, the
@@ -47,6 +47,12 @@ interface Session {
    * replaces the folder picker.
    */
   evaluateInMain<T = unknown>(expression: string): Promise<T>;
+  /**
+   * Closes the connection to the main process's inspector. A Node process with a
+   * connected inspector waits for it to disconnect before it exits, so a test
+   * that makes the app quit disconnects first.
+   */
+  disconnectInspector(): Promise<void>;
   isRunning(): boolean;
   close(): Promise<void>;
 }
@@ -202,6 +208,7 @@ async function launchSpawned(
       cockpitHome,
       output: () => output,
       evaluateInMain: inspector.evaluate,
+      disconnectInspector: inspector.close,
       isRunning: () => child.exitCode === null,
       close: async () => {
         await inspector.close();
@@ -317,6 +324,7 @@ async function launchDev(base?: NodeJS.ProcessEnv): Promise<Session> {
       cockpitHome,
       output: () => output,
       evaluateInMain: inspector.evaluate,
+      disconnectInspector: inspector.close,
       isRunning: () => dev.exitCode === null,
       close: async () => {
         await inspector.close();
@@ -481,8 +489,94 @@ const allPageErrorsOf = (page: Page) => page.pageErrors({ filter: 'all' });
 
 const UI_TIMEOUT = 10_000;
 
+// A terminal on the page. The page keeps every terminal of every tab in the DOM
+// (the ones of other tabs are hidden), so a helper never reads "the terminal":
+// it reads one pane, the one the keyboard is in unless the test gives another.
+type Pane = ElementHandle<HTMLElement>;
+
+// The visible terminals (those of the selected tab), in DOM order.
+// Read through `evaluateHandle`, not a locator: after a refused navigation a
+// locator wait hangs (see the navigation tests).
+async function visiblePanes(page: Page): Promise<Pane[]> {
+  const list = await page.evaluateHandle(() =>
+    [...document.querySelectorAll('.xterm')].filter((element) => {
+      const { width, height } = element.getBoundingClientRect();
+      return width > 0 && height > 0 && getComputedStyle(element).visibility === 'visible';
+    }),
+  );
+  const panes = [...(await list.getProperties()).values()].map((handle) => handle.asElement() as Pane);
+  await list.dispose();
+  return panes;
+}
+
+// The visible terminal that holds the keyboard focus, or null.
+async function activePane(page: Page): Promise<Pane | null> {
+  const handle = await page.evaluateHandle(() => {
+    const focused = document.activeElement?.closest('.xterm');
+    if (!focused) return null;
+    const { width, height } = focused.getBoundingClientRect();
+    return width > 0 && height > 0 && getComputedStyle(focused).visibility === 'visible' ? focused : null;
+  });
+  return (handle.asElement() as Pane | null) ?? null;
+}
+
+// The terminal that holds the keyboard focus; else the first visible one.
+async function focusedPane(page: Page): Promise<Pane> {
+  const pane = await poll(
+    async () => (await activePane(page)) ?? (await visiblePanes(page))[0] ?? null,
+    Boolean,
+    UI_TIMEOUT,
+  );
+  if (!pane) throw new Error('No terminal is visible');
+  return pane;
+}
+
+const isSamePane = (a: Pane, b: Pane) => a.evaluate((one, other) => one === other, b);
+
+async function isOneOf(pane: Pane, panes: Pane[]): Promise<boolean> {
+  for (const other of panes) if (await isSamePane(pane, other)) return true;
+  return false;
+}
+
+// Waits until a visible terminal that is not one of `previous` holds the keyboard
+// focus, and returns it.
+async function newlyFocusedPane(page: Page, previous: Pane[]): Promise<Pane> {
+  const deadline = Date.now() + UI_TIMEOUT;
+  for (;;) {
+    const active = await activePane(page);
+    if (active && !(await isOneOf(active, previous))) return active;
+    if (Date.now() > deadline) throw new Error('No new terminal has the keyboard focus');
+    await sleep(100);
+  }
+}
+
+const boxOf = (pane: Pane) =>
+  pane.evaluate((element) => {
+    const { left, top, right, bottom, width, height } = element.getBoundingClientRect();
+    return { left, top, right, bottom, width, height };
+  });
+type Box = Awaited<ReturnType<typeof boxOf>>;
+
+// Waits until the terminals stop moving: a terminal is refitted to its area a
+// moment after the area changes, and a terminal's box follows its rows.
+async function settle(...panes: Pane[]) {
+  const read = async () => JSON.stringify(await Promise.all(panes.map(boxOf)));
+  let last = await read();
+  const deadline = Date.now() + UI_TIMEOUT;
+  for (;;) {
+    await sleep(250);
+    const now = await read();
+    if (now === last || Date.now() > deadline) return;
+    last = now;
+  }
+}
+
+// Whether two boxes are the same area, give or take `tolerance` px per edge.
+const sameArea = (a: Box, b: Box, tolerance = 2) =>
+  (['left', 'top', 'right', 'bottom'] as const).every((edge) => Math.abs(a[edge] - b[edge]) <= tolerance);
+
 // Goes Home, then to the terminal page through the sidebar, so each call opens
-// a new shell, and focuses the terminal.
+// a new visit of the page (one tab, one shell), and focuses the terminal.
 async function openTerminal(page: Page) {
   await page.getByRole('link', { name: 'Home', exact: true }).click({ timeout: UI_TIMEOUT });
   await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
@@ -491,68 +585,126 @@ async function openTerminal(page: Page) {
   await focusTerminal(page);
 }
 
+// For a page with a single visible terminal.
 async function focusTerminal(page: Page) {
-  const terminal = page.locator('.xterm');
+  const terminal = page.locator('.xterm:visible').first();
   await terminal.waitFor({ state: 'visible', timeout: UI_TIMEOUT });
   await terminal.click({ timeout: UI_TIMEOUT });
-  await page.locator('.xterm-helper-textarea').focus({ timeout: UI_TIMEOUT });
+  await page.locator('.xterm:visible .xterm-helper-textarea').first().focus({ timeout: UI_TIMEOUT });
 }
 
-// Types on the keyboard, as a user does.
+// Clicks a terminal and puts the keyboard in it.
+async function focusPane(pane: Pane) {
+  await pane.click({ timeout: UI_TIMEOUT });
+  await pane.$eval('.xterm-helper-textarea', (textarea) => (textarea as HTMLElement).focus());
+}
+
+// Types on the keyboard, as a user does: it goes to the focused terminal.
 async function typeLine(page: Page, text: string) {
   await page.keyboard.type(text);
   await page.keyboard.press('Enter');
 }
 
-// The text of each row xterm.js renders (its DOM renderer), cell padding removed.
-const terminalRows = (page: Page) =>
-  page.evaluate(() =>
-    [...document.querySelectorAll('.xterm-rows > div')].map((row) => (row.textContent ?? '').replace(/ /g, ' ').trimEnd()),
+// The text of each row xterm.js renders (its DOM renderer) in one terminal, cell
+// padding removed.
+const rowsOf = (pane: Pane) =>
+  pane.evaluate((element) =>
+    [...element.querySelectorAll('.xterm-rows > div')].map((row) => (row.textContent ?? '').replace(/ /g, ' ').trimEnd()),
   );
+
+const terminalRows = async (page: Page, pane?: Pane) => rowsOf(pane ?? (await focusedPane(page)));
 
 const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-// Waits until a row is exactly `text`, or matches it when it is a regular
-// expression. Output reaches the DOM on animation frames, so it is polled.
-const waitForRow = (page: Page, text: string | RegExp) =>
-  page.waitForFunction(
-    (source) => {
+// Waits until a row of the terminal is exactly `text`, or matches it when it is a
+// regular expression. Output reaches the DOM on animation frames, so it is polled.
+async function waitForRow(page: Page, text: string | RegExp, pane?: Pane) {
+  await page.waitForFunction(
+    ([element, source]) => {
       const pattern = new RegExp(source);
-      return [...document.querySelectorAll('.xterm-rows > div')].some((row) =>
+      return [...element.querySelectorAll('.xterm-rows > div')].some((row) =>
         pattern.test((row.textContent ?? '').replace(/ /g, ' ').trimEnd()),
       );
     },
-    typeof text === 'string' ? `^${escapeRegExp(text)}$` : text.source,
+    [pane ?? (await focusedPane(page)), typeof text === 'string' ? `^${escapeRegExp(text)}$` : text.source] as const,
     { timeout: 15_000 },
   );
+}
 
 // Waits for a row matching `pattern` and returns its capture groups.
-async function captureRow(page: Page, pattern: RegExp): Promise<string[]> {
-  await waitForRow(page, pattern);
-  for (const row of await terminalRows(page)) {
+async function captureRow(page: Page, pattern: RegExp, pane?: Pane): Promise<string[]> {
+  const target = pane ?? (await focusedPane(page));
+  await waitForRow(page, pattern, target);
+  for (const row of await rowsOf(target)) {
     const match = pattern.exec(row);
     if (match) return match.slice(1);
   }
   throw new Error(`No terminal row matches ${pattern}`);
 }
 
-// Types `stty size` and returns the `[rows, cols]` of its answer.
-async function terminalSize(page: Page): Promise<[number, number]> {
-  const answers = () => page.evaluate(() =>
-    [...document.querySelectorAll('.xterm-rows > div')].filter((row) => /^\d+\s\d+\s*$/.test(row.textContent ?? '')).length,
+// Waits until the shell has printed something (its prompt), so typed keys are
+// not lost before the terminal is connected to it.
+const waitForPrompt = async (page: Page, pane?: Pane) =>
+  page.waitForFunction(
+    (element) => [...element.querySelectorAll('.xterm-rows > div')].some((row) => (row.textContent ?? '').trim() !== ''),
+    pane ?? (await focusedPane(page)),
+    { timeout: 20_000 },
   );
-  const before = await answers();
+
+// Types `stty size` and returns the `[rows, cols]` of its answer.
+async function terminalSize(page: Page, pane?: Pane): Promise<[number, number]> {
+  const target = pane ?? (await focusedPane(page));
+  const answers = (element: HTMLElement) =>
+    [...element.querySelectorAll('.xterm-rows > div')].filter((row) => /^\d+\s\d+\s*$/.test(row.textContent ?? '')).length;
+  const before = await target.evaluate(answers);
   await typeLine(page, 'stty size');
   await page.waitForFunction(
-    (before) =>
-      [...document.querySelectorAll('.xterm-rows > div')].filter((row) => /^\d+\s\d+\s*$/.test(row.textContent ?? '')).length > before,
-    before,
+    ([element, before]) =>
+      [...element.querySelectorAll('.xterm-rows > div')].filter((row) => /^\d+\s\d+\s*$/.test(row.textContent ?? '')).length > before,
+    [target, before] as const,
     { timeout: 15_000 },
   );
-  const rows = await terminalRows(page);
+  const rows = await rowsOf(target);
   const last = rows.filter((row) => /^\d+ \d+$/.test(row)).at(-1)!;
   const [r, c] = last.split(' ').map(Number);
   return [r!, c!];
+}
+
+// The `[rows, cols]` the terminal displays: its rendered rows, and the width of
+// the wrapped rows of a long line of one digit the shell prints. Each call prints
+// another digit, so the lines of an earlier call on the same screen are not mistaken
+// for this one.
+let lineCount = 0;
+async function displayedSize(page: Page, pane: Pane): Promise<[number, number]> {
+  const digit = String(1 + (lineCount++ % 9));
+  await typeLine(page, `printf '%0600d\\n' 0 | tr 0 ${digit}`);
+  // The line wraps over several rows: wait until they hold all 600 digits.
+  const line = new RegExp(`^${digit}+$`);
+  const total = (rows: string[]) => rows.filter((row) => line.test(row)).reduce((sum, row) => sum + row.length, 0);
+  const rows = await poll(() => rowsOf(pane), (found) => total(found) >= 600, 15_000);
+  expect(total(rows), 'the whole line is displayed').toBe(600);
+  const cols = Math.max(...rows.filter((row) => line.test(row)).map((row) => row.length));
+  return [rows.length, cols];
+}
+
+// What `stty size` answers in a terminal must be what the terminal displays.
+async function expectSizeMatchesDisplay(page: Page, pane: Pane) {
+  await focusPane(pane);
+  await waitForPrompt(page, pane);
+  const answered = await terminalSize(page, pane);
+  const shown = await displayedSize(page, pane);
+  expect(answered, 'the shell is told the rows and columns the terminal displays').toEqual(shown);
+}
+
+// Types `echo pid-$$` in a terminal and returns the shell's process id. With a
+// pane, it clicks it first; without, it types where the keyboard already is.
+async function pidOf(page: Page, pane?: Pane): Promise<number> {
+  if (pane) await focusPane(pane);
+  const target = pane ?? (await focusedPane(page));
+  await waitForPrompt(page, target);
+  await typeLine(page, 'echo pid-$$');
+  const [pid] = await captureRow(page, /^pid-(\d+)$/, target);
+  return Number(pid);
 }
 
 // `process.kill(pid, 0)` throws ESRCH once the process is gone.
@@ -564,6 +716,147 @@ function isAlive(pid: number): boolean {
     return (error as NodeJS.ErrnoException).code !== 'ESRCH';
   }
 }
+
+// Whether the process is gone within `timeout` ms.
+const endsWithin = async (pid: number, timeout = 5_000) => !(await poll(() => isAlive(pid), (alive) => !alive, timeout));
+
+// --- Tabs and splits ---------------------------------------------------------
+
+const newTerminalButton = (page: Page) => page.getByRole('button', { name: 'New terminal', exact: true }).first();
+const newTerminal = (page: Page) => newTerminalButton(page).click({ timeout: UI_TIMEOUT });
+const tabNamed = (page: Page, number: number) => page.getByRole('tab', { name: `Terminal ${number}`, exact: true });
+const selectTab = (page: Page, number: number) => tabNamed(page, number).click({ timeout: UI_TIMEOUT });
+const closeTab = (page: Page, number: number) =>
+  page.getByRole('button', { name: `Close Terminal ${number}`, exact: true }).click({ timeout: UI_TIMEOUT });
+
+interface TabsShown {
+  names: string[];
+  selected: string | undefined;
+}
+
+// The tabs of the tab bar, in order, and the selected one.
+const tabsShown = (page: Page): Promise<TabsShown> =>
+  page.getByRole('tab').evaluateAll((tabs) => {
+    const names = tabs.map((tab) => (tab.textContent ?? '').trim());
+    return { names, selected: names[tabs.findIndex((tab) => tab.getAttribute('aria-selected') === 'true')] };
+  });
+
+// Waits for the tab bar to show exactly these tabs, with this one selected.
+async function expectTabs(page: Page, names: string[], selected: string | undefined) {
+  const expected = { names, selected };
+  const shown = await poll(() => tabsShown(page), (tabs) => JSON.stringify(tabs) === JSON.stringify(expected), UI_TIMEOUT);
+  expect(shown).toEqual(expected);
+}
+
+// The "Split right", "Split down" or "Close terminal" button of a terminal: the
+// one in the pane's own toolbar, found by the DOM when the toolbar sits next to
+// the terminal, else by the position nearest to the terminal.
+async function paneButton(pane: Pane, label: 'Split right' | 'Split down' | 'Close terminal') {
+  await pane.hover({ timeout: UI_TIMEOUT });
+  const handle = await pane.evaluateHandle((element, label) => {
+    const selector = `button[aria-label="${label}"]`;
+    const shown = (button: Element) => {
+      const { width, height } = button.getBoundingClientRect();
+      return width > 0 && height > 0 && getComputedStyle(button).visibility === 'visible';
+    };
+    for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      if (ancestor.querySelectorAll('.xterm').length > 1) break;
+      const own = [...ancestor.querySelectorAll(selector)].filter(shown);
+      if (own.length === 1) return own[0]!;
+    }
+    const terminal = element.getBoundingClientRect();
+    const distance = (button: Element) => {
+      const { left, top, width, height } = button.getBoundingClientRect();
+      const x = left + width / 2;
+      const y = top + height / 2;
+      return Math.hypot(Math.max(terminal.left - x, 0, x - terminal.right), Math.max(terminal.top - y, 0, y - terminal.bottom));
+    };
+    return [...document.querySelectorAll(selector)].filter(shown).sort((a, b) => distance(a) - distance(b))[0] ?? null;
+  }, label);
+  const button = handle.asElement();
+  if (!button) throw new Error(`No "${label}" button for this terminal`);
+  return button;
+}
+
+async function clickPaneButton(pane: Pane, label: 'Split right' | 'Split down' | 'Close terminal') {
+  await (await paneButton(pane, label)).click({ timeout: UI_TIMEOUT });
+}
+
+// Splits a terminal and returns the new one, which must hold the keyboard focus.
+async function splitPane(page: Page, pane: Pane, direction: 'right' | 'down'): Promise<Pane> {
+  const before = await visiblePanes(page);
+  await clickPaneButton(pane, direction === 'right' ? 'Split right' : 'Split down');
+  const created = await newlyFocusedPane(page, before);
+  expect(await visiblePanes(page)).toHaveLength(before.length + 1);
+  await settle(...before, created);
+  return created;
+}
+
+// Opens a new tab and returns its terminal, which must hold the keyboard focus.
+async function openTab(page: Page): Promise<Pane> {
+  const before = await visiblePanes(page);
+  await newTerminal(page);
+  return newlyFocusedPane(page, before);
+}
+
+// Two tabs, the second one split in two: the shells' pids, in creation order.
+async function openTwoTabsOneSplit(page: Page): Promise<number[]> {
+  await openTerminal(page);
+  const pids = [await pidOf(page)];
+  await openTab(page);
+  pids.push(await pidOf(page));
+  const second = await focusedPane(page);
+  await splitPane(page, second, 'right');
+  pids.push(await pidOf(page));
+  for (const pid of pids) expect(isAlive(pid)).toBe(true);
+  return pids;
+}
+
+// Kills the pty utility process, the way a crash does, and returns the id of the
+// session that found it (its exit is reported). Works at the API level, so it
+// also runs in the launchd-environment mode.
+async function killPtyHost(page: Page): Promise<number> {
+  const id = await spawnShell(page);
+  await ptyWrite(page, id, 'echo ppid-$PPID\n');
+  await waitForOutput(page, id, /ppid-\d+/);
+  const hostPid = Number(/ppid-(\d+)/.exec(await outputOf(page, id))![1]);
+  expect(hostPid, 'the host is a process of its own, not the main process').toBeGreaterThan(0);
+  process.kill(hostPid, 'SIGKILL');
+  await waitForExit(page, id);
+  return id;
+}
+
+// Makes the main process hold every `pty:spawn` answer until `releasePtySpawn`, so
+// a test can change a terminal's size while its shell is still starting. Uses the
+// handler table of Electron's `ipcMain` (private), because the app has no hook for it.
+const holdPtySpawn = (session: Session) =>
+  session.evaluateInMain(`(() => {
+    const handlers = require('electron').ipcMain._invokeHandlers;
+    const original = handlers.get('pty:spawn');
+    if (!original) throw new Error('the main process has no pty:spawn handler');
+    const gate = new Promise((resolve) => { globalThis.__releasePtySpawn = resolve; });
+    globalThis.__originalPtySpawn = original;
+    handlers.set('pty:spawn', async (...args) => {
+      await gate;
+      return original(...args);
+    });
+  })()`);
+
+// Lets the held spawns go on and puts the real handler back.
+const releasePtySpawn = (session: Session) =>
+  session.evaluateInMain(`(() => {
+    const original = globalThis.__originalPtySpawn;
+    if (original) require('electron').ipcMain._invokeHandlers.set('pty:spawn', original);
+    globalThis.__releasePtySpawn?.();
+    delete globalThis.__originalPtySpawn;
+    delete globalThis.__releasePtySpawn;
+  })()`);
+
+// The console errors of the navigation tests that are not the refusal of the
+// file:// URL they tried: Chromium words it `Not allowed to load local resource:
+// <url>`, and any other message of that kind is a failure.
+const unexpectedConsoleErrors = (errors: string[], fileUrl: string) =>
+  errors.filter((text) => text !== `Not allowed to load local resource: ${fileUrl}`);
 
 // What the terminal paints against what the tokens say, in `rgb()` form: a
 // token is normalised through a 1x1 canvas, whatever notation it is written in.
@@ -1165,7 +1458,7 @@ describe.each([
     },
   );
 
-  test.runIf(full)('terminal AC1 — the Terminal link opens a page with a heading and an xterm.js terminal under the header', async () => {
+  test.runIf(full)('terminal AC1 — the Terminal link opens a page with a heading, a tab bar and an xterm.js terminal under the header', async () => {
     const { page } = session;
     await page.getByRole('link', { name: 'Home', exact: true }).click({ timeout: UI_TIMEOUT });
     await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
@@ -1174,6 +1467,14 @@ describe.each([
     await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
     expect(await page.getByRole('link', { name: 'Terminal', exact: true }).getAttribute('aria-current')).toBe('page');
     await page.locator('.xterm').waitFor({ state: 'visible', timeout: UI_TIMEOUT });
+
+    // The header holds the tab bar: the selected tab "Terminal 1" and a "New terminal" button.
+    const header = page.locator('main header');
+    await header.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
+    await header.getByRole('tab', { name: 'Terminal 1', exact: true }).waitFor({ timeout: UI_TIMEOUT });
+    await header.getByRole('button', { name: 'New terminal', exact: true }).waitFor({ timeout: UI_TIMEOUT });
+    await expectTabs(page, ['Terminal 1'], 'Terminal 1');
+    expect(await visiblePanes(page)).toHaveLength(1);
 
     // It fills the page: right under the header, down to the window bottom and
     // across the main area, give or take one cell and the scrollbar.
@@ -1305,31 +1606,307 @@ describe.each([
     expect(light.expected.red).not.toBe(light.expected.text);
   });
 
-  test.runIf(full)('terminal AC8 — leaving the terminal page ends its shell', async () => {
+  // --- Several terminals: tabs, splits and lifecycle (COCKPIT-24) -------------
+
+  test.runIf(full)('tabs AC2 — "New terminal" adds the next tab, selected, with a new shell that has the focus; the previous shell keeps running and can be typed in again', async () => {
     const { page } = session;
     await openTerminal(page);
-    await typeLine(page, 'echo pid-$$');
-    const [pid] = (await captureRow(page, /^pid-(\d+)$/)).map(Number);
-    expect(isAlive(pid!)).toBe(true);
+    const first = await focusedPane(page);
+    const firstPid = await pidOf(page, first);
+    await typeLine(page, 'echo first-marker-$((20+1))');
+    await waitForRow(page, 'first-marker-21', first);
+
+    await newTerminal(page);
+    await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 2');
+    // The keyboard is in the new terminal already: no click before typing.
+    const second = await newlyFocusedPane(page, [first]);
+    expect(await visiblePanes(page)).toHaveLength(1);
+    const secondPid = await pidOf(page);
+    expect(secondPid).not.toBe(firstPid);
+    expect(isAlive(firstPid)).toBe(true);
+    expect(await rowsOf(second)).not.toContain('first-marker-21');
+
+    await selectTab(page, 1);
+    await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 1');
+    expect(await first.isVisible()).toBe(true);
+    expect(await rowsOf(first)).toContain('first-marker-21');
+    await focusPane(first);
+    await typeLine(page, 'echo back-$((3*5))');
+    await waitForRow(page, 'back-15', first);
+    expect(isAlive(firstPid)).toBe(true);
+    expect(isAlive(secondPid)).toBe(true);
+  });
+
+  test.runIf(full)('tabs AC3 — "Split right" and "Split down" divide the terminal into two halves of equal width or height, the original keeps its shell and output, the new half has the focus; splits nest', async () => {
+    const { page } = session;
+    await openTerminal(page);
+    const a = await focusedPane(page);
+    const aPid = await pidOf(page, a);
+    await typeLine(page, 'echo a-marker-$((10+1))');
+    await waitForRow(page, 'a-marker-11', a);
+    await settle(a);
+    const whole = await boxOf(a);
+
+    const b = await splitPane(page, a, 'right');
+    const aBox = await boxOf(a);
+    const bBox = await boxOf(b);
+    expect(Math.abs(aBox.width - bBox.width), 'equal widths').toBeLessThanOrEqual(2);
+    expect(Math.abs(aBox.top - bBox.top)).toBeLessThanOrEqual(2);
+    expect(Math.abs(aBox.height - bBox.height)).toBeLessThanOrEqual(2);
+    expect(Math.abs(aBox.height - whole.height), 'full height').toBeLessThanOrEqual(2);
+    expect(aBox.left, 'the original is the first half').toBeLessThan(bBox.left);
+    expect(aBox.right, 'side by side').toBeLessThanOrEqual(bBox.left + 2);
+    expect(aBox.width + bBox.width, 'the two halves share the area').toBeGreaterThan(whole.width - 24);
+    expect(aBox.width + bBox.width).toBeLessThanOrEqual(whole.width + 2);
+
+    // The original terminal was not rebuilt: same element, same shell, same output.
+    expect(await a.evaluate((element) => element.isConnected)).toBe(true);
+    expect(await rowsOf(a)).toContain('a-marker-11');
+    expect(isAlive(aPid)).toBe(true);
+    // The new half runs a new shell and the keyboard is in it.
+    const bPid = await pidOf(page);
+    expect(bPid).not.toBe(aPid);
+    expect(await rowsOf(b)).not.toContain('a-marker-11');
+
+    // A half can be split again.
+    const c = await splitPane(page, b, 'down');
+    const bBox2 = await boxOf(b);
+    const cBox = await boxOf(c);
+    expect(Math.abs(bBox2.height - cBox.height), 'equal heights').toBeLessThanOrEqual(2);
+    expect(Math.abs(bBox2.width - cBox.width)).toBeLessThanOrEqual(2);
+    expect(Math.abs(bBox2.left - cBox.left)).toBeLessThanOrEqual(2);
+    expect(bBox2.top).toBeLessThan(cBox.top);
+    expect(bBox2.bottom, 'stacked').toBeLessThanOrEqual(cBox.top + 2);
+    expect(Math.abs(bBox2.width - bBox.width), 'inside the half it split').toBeLessThanOrEqual(2);
+    expect(bBox2.height + cBox.height).toBeGreaterThan(bBox.height - 24);
+    expect(sameArea(await boxOf(a), aBox), 'the first half is untouched').toBe(true);
+    expect(await b.evaluate((element) => element.isConnected)).toBe(true);
+    expect(isAlive(bPid)).toBe(true);
+    expect(await rowsOf(b), 'the split terminal keeps its shell and output').toContain(`pid-${bPid}`);
+    const cPid = await pidOf(page);
+    expect(new Set([aPid, bPid, cPid]).size).toBe(3);
+  });
+
+  // In A | (B / C), closing C: B takes C's area, A is untouched, the keyboard is in B. The other
+  // modes check the focus after "Close terminal" in the terminal smoke path.
+  test.runIf(full)('tabs AC4 — in a nested split A | (B / C), closing C gives its area to B, leaves A untouched and puts the keyboard in B', async () => {
+    const { page } = session;
+    await openTerminal(page);
+    const a = await focusedPane(page);
+    const aPid = await pidOf(page, a);
+    const b = await splitPane(page, a, 'right');
+    const bPid = await pidOf(page);
+    await typeLine(page, 'echo b-marker-$((10+5))');
+    await waitForRow(page, 'b-marker-15', b);
+    const c = await splitPane(page, b, 'down');
+    const cPid = await pidOf(page);
+    const aBox = await boxOf(a);
+    const bBox = await boxOf(b);
+    const cBox = await boxOf(c);
+    const slot: Box = { left: bBox.left, top: bBox.top, right: cBox.right, bottom: cBox.bottom, width: bBox.width, height: cBox.bottom - bBox.top };
+
+    await clickPaneButton(c, 'Close terminal');
+
+    expect(await endsWithin(cPid)).toBe(true);
+    await poll(async () => (await visiblePanes(page)).length, (count) => count === 2, UI_TIMEOUT);
+    const grown = await poll(() => boxOf(b), (box) => sameArea(box, slot), UI_TIMEOUT);
+    expect(sameArea(grown, slot), 'the sibling takes the closed terminal\'s whole area').toBe(true);
+    expect(sameArea(await boxOf(a), aBox), 'the other half is untouched').toBe(true);
+    expect(await rowsOf(b), 'the sibling keeps its output').toContain('b-marker-15');
+    expect(isAlive(aPid)).toBe(true);
+    expect(isAlive(bPid)).toBe(true);
+
+    // No click: the text goes where the keyboard is.
+    const active = await poll(() => activePane(page), Boolean, UI_TIMEOUT);
+    expect(active, 'a visible terminal holds the keyboard focus').not.toBeNull();
+    expect(await isSamePane(active!, b), 'the sibling B holds the focus').toBe(true);
+    await typeLine(page, 'echo sibling-$((6*7))');
+    await waitForRow(page, 'sibling-42', b);
+    expect(await rowsOf(a), 'A did not receive the typed text').not.toContain('sibling-42');
+    expect((await rowsOf(a)).join('\n')).not.toContain('echo sibling-');
+
+    // The layout is now A | B. Closing A, the first child, gives the keyboard to B too.
+    const whole: Box = { left: aBox.left, top: slot.top, right: slot.right, bottom: slot.bottom, width: slot.right - aBox.left, height: slot.height };
+    await clickPaneButton(a, 'Close terminal');
+
+    expect(await endsWithin(aPid), 'the first child\'s shell ends within 5 s').toBe(true);
+    await poll(async () => (await visiblePanes(page)).length, (count) => count === 1, UI_TIMEOUT);
+    const whole2 = await poll(() => boxOf(b), (box) => sameArea(box, whole), UI_TIMEOUT);
+    expect(sameArea(whole2, whole), 'B takes the whole area').toBe(true);
+    expect(isAlive(bPid)).toBe(true);
+    const active2 = await poll(() => activePane(page), Boolean, UI_TIMEOUT);
+    expect(await isSamePane(active2!, b), 'B holds the focus after the first child closed').toBe(true);
+    await typeLine(page, 'echo first-closed-$((8*8))');
+    await waitForRow(page, 'first-closed-64', b);
+  });
+
+  test.runIf(full)('tabs AC5 — closing a tab ends all its shells, selects the tab on its left (the new first one for the first), numbers are not reused, and an empty page offers "New terminal"', async () => {
+    const { page } = session;
+    await openTerminal(page);
+    const pid1 = await pidOf(page);
+    await openTab(page);
+    const pid2 = await pidOf(page);
+    await splitPane(page, await focusedPane(page), 'right');
+    const pid2b = await pidOf(page);
+    await openTab(page);
+    const pid3 = await pidOf(page);
+    await expectTabs(page, ['Terminal 1', 'Terminal 2', 'Terminal 3'], 'Terminal 3');
+
+    // A middle tab with two shells: both end, the selection moves to its left.
+    await selectTab(page, 2);
+    await closeTab(page, 2);
+    await expectTabs(page, ['Terminal 1', 'Terminal 3'], 'Terminal 1');
+    expect(await endsWithin(pid2), 'the first shell of the closed tab ends within 5 s').toBe(true);
+    expect(await endsWithin(pid2b), 'the second shell of the closed tab ends within 5 s').toBe(true);
+    expect(isAlive(pid1)).toBe(true);
+    expect(isAlive(pid3)).toBe(true);
+
+    // Numbers are never reused: the next tab is 4, not 2.
+    await openTab(page);
+    const pid4 = await pidOf(page);
+    await expectTabs(page, ['Terminal 1', 'Terminal 3', 'Terminal 4'], 'Terminal 4');
+
+    await closeTab(page, 4);
+    await expectTabs(page, ['Terminal 1', 'Terminal 3'], 'Terminal 3');
+    expect(await endsWithin(pid4)).toBe(true);
+
+    // The first tab: the selection goes to the new first tab.
+    await selectTab(page, 1);
+    await closeTab(page, 1);
+    await expectTabs(page, ['Terminal 3'], 'Terminal 3');
+    expect(await endsWithin(pid1)).toBe(true);
+    expect(isAlive(pid3)).toBe(true);
+
+    // The last tab: an empty state.
+    await closeTab(page, 3);
+    await expectTabs(page, [], undefined);
+    expect(await endsWithin(pid3)).toBe(true);
+    await page.getByText('No terminal open', { exact: true }).waitFor({ timeout: UI_TIMEOUT });
+    expect(await visiblePanes(page)).toHaveLength(0);
+    await newTerminalButton(page).waitFor({ state: 'visible', timeout: UI_TIMEOUT });
+
+    // "New terminal" opens Terminal N+1: the highest number used was 4.
+    await newTerminal(page);
+    await expectTabs(page, ['Terminal 5'], 'Terminal 5');
+    await page.getByText('No terminal open', { exact: true }).waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+    const fresh = await newlyFocusedPane(page, []);
+    await waitForPrompt(page, fresh);
+    await typeLine(page, 'echo cockpit-$((6*7))');
+    await waitForRow(page, 'cockpit-42', fresh);
+  });
+
+  test.runIf(full)('tabs AC5 — closing the last terminal of a tab closes the tab, and the last tab leaves the empty state', async () => {
+    const { page } = session;
+    await openTerminal(page);
+    const first = await focusedPane(page);
+    const pid1 = await pidOf(page, first);
+    const second = await openTab(page);
+    const pid2 = await pidOf(page);
+    await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 2');
+
+    await clickPaneButton(second, 'Close terminal');
+    await expectTabs(page, ['Terminal 1'], 'Terminal 1');
+    expect(await endsWithin(pid2)).toBe(true);
+    expect(isAlive(pid1)).toBe(true);
+
+    await clickPaneButton(first, 'Close terminal');
+    await expectTabs(page, [], undefined);
+    expect(await endsWithin(pid1)).toBe(true);
+    await page.getByText('No terminal open', { exact: true }).waitFor({ timeout: UI_TIMEOUT });
+
+    await newTerminal(page);
+    await expectTabs(page, ['Terminal 3'], 'Terminal 3');
+  });
+
+  test.runIf(full)('tabs AC6 — stty size equals the rows and columns displayed in a new tab, in both halves of a split and in a sibling that grew', async () => {
+    const { page } = session;
+    await openTerminal(page);
+    const tab = await openTab(page);
+    await expectSizeMatchesDisplay(page, tab);
+
+    const half = await splitPane(page, tab, 'right');
+    await expectSizeMatchesDisplay(page, half);
+    await expectSizeMatchesDisplay(page, tab);
+
+    const quarter = await splitPane(page, half, 'down');
+    await expectSizeMatchesDisplay(page, quarter);
+    await expectSizeMatchesDisplay(page, half);
+
+    await clickPaneButton(quarter, 'Close terminal');
+    await poll(async () => (await visiblePanes(page)).length, (count) => count === 2, UI_TIMEOUT);
+    await expectSizeMatchesDisplay(page, half);
+  });
+
+  test.runIf(full)('tabs AC6 — a terminal resized while its tab was hidden still gets its real size', async () => {
+    const { page } = session;
+    await openTerminal(page);
+    const first = await focusedPane(page);
+    await waitForPrompt(page, first);
+    await openTab(page);
+    const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+    const rowsBefore = (await rowsOf(first)).length;
+
+    try {
+      await page.setViewportSize({ width: viewport.width - 300, height: viewport.height - 150 });
+      // The hidden terminal is refitted while its tab is not shown.
+      const rowsAfter = await poll(async () => (await rowsOf(first)).length, (count) => count !== rowsBefore, UI_TIMEOUT);
+      expect(rowsAfter, 'the hidden terminal was resized').not.toBe(rowsBefore);
+      await selectTab(page, 1);
+      await poll(() => first.isVisible(), Boolean, UI_TIMEOUT);
+      await expectSizeMatchesDisplay(page, first);
+    } finally {
+      await page.setViewportSize(viewport);
+    }
+  });
+
+  test.runIf(full)('tabs AC6 — a terminal resized while its shell is starting gets the size it ends up with', async () => {
+    const { page } = session;
+    await openTerminal(page);
+    const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+    let tab: Pane | undefined;
+
+    await holdPtySpawn(session);
+    try {
+      tab = await openTab(page);
+      const rowsBefore = (await rowsOf(tab)).length;
+      await page.setViewportSize({ width: viewport.width - 300, height: viewport.height - 150 });
+      const rowsAfter = await poll(async () => (await rowsOf(tab!)).length, (count) => count !== rowsBefore, UI_TIMEOUT);
+      // The premise: the shell has not started yet, and the terminal is already resized.
+      expect(rowsAfter, 'the terminal was resized').not.toBe(rowsBefore);
+      expect((await rowsOf(tab)).some((row) => row.trim() !== ''), 'the shell is still starting').toBe(false);
+    } finally {
+      await releasePtySpawn(session);
+    }
+
+    try {
+      await waitForPrompt(page, tab);
+      await expectSizeMatchesDisplay(page, tab);
+    } finally {
+      await page.setViewportSize(viewport);
+    }
+  });
+
+  test.runIf(full)('tabs AC7 — leaving the page ends every shell of every tab', async () => {
+    const { page } = session;
+    const pids = await openTwoTabsOneSplit(page);
 
     await page.getByRole('link', { name: 'Home', exact: true }).click({ timeout: UI_TIMEOUT });
     await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
 
-    expect(await poll(() => isAlive(pid!), (alive) => !alive, 5_000)).toBe(false);
+    for (const pid of pids) expect(await endsWithin(pid), `shell ${pid} ends within 5 s`).toBe(true);
   });
 
-  test.runIf(full)('terminal AC9 — reloading the page ends its shell and opens a new one', async () => {
+  test.runIf(full)('tabs AC7 — reloading the page ends every shell of every tab, and the page starts over with one tab', async () => {
     const { page } = session;
-    await openTerminal(page);
-    await typeLine(page, 'echo pid-$$');
-    const [pid] = (await captureRow(page, /^pid-(\d+)$/)).map(Number);
-    expect(isAlive(pid!)).toBe(true);
+    const pids = await openTwoTabsOneSplit(page);
 
     await page.reload();
     await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
-    expect(await poll(() => isAlive(pid!), (alive) => !alive, 5_000)).toBe(false);
 
+    for (const pid of pids) expect(await endsWithin(pid), `shell ${pid} ends within 5 s`).toBe(true);
+    await expectTabs(page, ['Terminal 1'], 'Terminal 1');
     await focusTerminal(page);
+    await waitForPrompt(page);
     await typeLine(page, 'echo cockpit-$((6*7))');
     await waitForRow(page, 'cockpit-42');
   });
@@ -2163,7 +2740,6 @@ describe.each([
   describe.runIf(inIsolatedShell)('navigations away from the app', () => {
     // The file:// URL of a file that exists.
     const existingFileUrl = pathToFileURL(import.meta.filename).href;
-    const CHROMIUM_LOCAL_RESOURCE = /Not allowed to load local resource/;
 
     // The console messages and page errors of earlier tests are not this
     // suite's business, and its own (Chromium's refusal of the file:// URL) must
@@ -2225,26 +2801,163 @@ describe.each([
       await attemptNavigation(existingFileUrl);
     });
 
-    test('navigation AC5 — those attempts log no console error but Chromium refusing the file:// URL, no page error and no main-process error', async () => {
+    test('navigation AC5 — those attempts log no console error but Chromium refusing the file:// URL they tried, no page error and no main-process error', async () => {
       const { page } = session;
       const errors = await allConsoleErrorsOf(page);
-      expect(errors.filter((text) => !CHROMIUM_LOCAL_RESOURCE.test(text))).toEqual([]);
+      // Only the refusal of the exact URL of navigation AC4 is allowed (tabs AC12).
+      expect(unexpectedConsoleErrors(errors, existingFileUrl)).toEqual([]);
       expect(await allPageErrorsOf(page)).toEqual([]);
       expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
       expect(session.isRunning()).toBe(true);
     });
+
+    // The URL is on the app's origin, so the navigation is allowed, and it ends on
+    // an error page. The shell must end all the same.
+    async function expectShellEndsOnNavigationTo(path: string) {
+      const { page } = session;
+      await openTerminal(page);
+      const appUrl = await page.evaluate(() => location.href);
+      const pid = await pidOf(page);
+      expect(isAlive(pid)).toBe(true);
+
+      try {
+        await page
+          .evaluate((path) => {
+            location.href = new URL(path, location.href).href;
+          }, path)
+          .catch(() => {});
+        expect(await endsWithin(pid), 'the shell ends within 5 s').toBe(true);
+        expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+        expect(session.isRunning()).toBe(true);
+      } finally {
+        await page.goto(appUrl);
+        await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
+      }
+      expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+    }
+
+    test.runIf(full)('tabs AC11 — a same-origin navigation to a missing file (a 404) ends the shell, with no main-process error', async () => {
+      await expectShellEndsOnNavigationTo('/missing.js');
+    });
+
+    // The app's protocol handler throws on a malformed percent-encoding
+    // (`decodeURIComponent`), so the load fails instead of answering a 404 with a
+    // document: the navigation commits an error page, and `did-navigate` is not
+    // what the main process hears (a 404 does commit a document, which is why the
+    // test above passes without `did-fail-load`).
+    test.runIf(full)('tabs AC11 — a same-origin navigation the app cannot serve (error page, no document) ends the shell, with no main-process error', async () => {
+      await expectShellEndsOnNavigationTo('/%');
+    });
   });
 
-  // Kills the pty host, so it stays the last test that needs a working one.
-  test.runIf(full)('AC4 — survives the pty host being killed, and reports the open session as exited (terminal AC10: the terminal shows [Process ended])', async () => {
+  // The smoke path of tabs and splits in the dev server and the packaged app (the
+  // launchd-environment mode keeps the developer's shell out of the terminal
+  // tests): a split in both directions, the focus after "Close terminal", a tab
+  // opened and closed, then the pty host killed and a new terminal that runs a
+  // command (tabs AC13). The built app runs the full block above (tabs AC5 and AC8
+  // cover AC13 there). It kills the pty host last, so nothing runs after it.
+  test.runIf(!full && inIsolatedShell)('smoke path (c) — terminal tabs: splits, "Close terminal" gives the focus to the sibling, a closed tab ends its shell, and after the pty host dies a new terminal runs commands', async () => {
     const { page } = session;
-    // The terminal page is open, with a running shell (not in the launchd mode,
-    // which keeps the developer's shell out of the tests).
-    if (inIsolatedShell) {
-      await openTerminal(page);
-      await typeLine(page, 'echo up-$((1+1))');
-      await waitForRow(page, 'up-2');
+    await openTerminal(page);
+    const a = await focusedPane(page);
+    const aPid = await pidOf(page, a);
+    const b = await splitPane(page, a, 'right');
+    const bPid = await pidOf(page, b);
+    const c = await splitPane(page, b, 'down');
+    const cPid = await pidOf(page, c);
+    expect(new Set([aPid, bPid, cPid]).size).toBe(3);
+
+    // In A | (B / C), closing C: its shell ends, and the keyboard is in B, not A.
+    await clickPaneButton(c, 'Close terminal');
+    expect(await endsWithin(cPid)).toBe(true);
+    await poll(async () => (await visiblePanes(page)).length, (count) => count === 2, UI_TIMEOUT);
+    const active = await poll(() => activePane(page), Boolean, UI_TIMEOUT);
+    expect(active, 'a visible terminal holds the keyboard focus').not.toBeNull();
+    expect(await isSamePane(active!, b), 'the sibling B holds the focus').toBe(true);
+    await typeLine(page, 'echo sibling-$((6*7))');
+    await waitForRow(page, 'sibling-42', b);
+    expect((await rowsOf(a)).join('\n')).not.toContain('echo sibling-');
+    expect(isAlive(aPid)).toBe(true);
+
+    // A second tab, then closed: its shell ends, the first tab is selected again.
+    await openTab(page);
+    const tabPid = await pidOf(page);
+    await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 2');
+    await closeTab(page, 2);
+    await expectTabs(page, ['Terminal 1'], 'Terminal 1');
+    expect(await endsWithin(tabPid)).toBe(true);
+    expect(isAlive(aPid) && isAlive(bPid)).toBe(true);
+
+    // The pty host dies: the remaining terminals end, and a new terminal runs commands (tabs AC13).
+    await killPtyHost(page);
+    await waitForRow(page, '[Process ended]', a);
+    await waitForRow(page, '[Process ended]', b);
+    const fresh = await openTab(page);
+    await waitForPrompt(page, fresh);
+    await typeLine(page, 'echo cockpit-$((6*7))');
+    await waitForRow(page, 'cockpit-42', fresh);
+    expect(isAlive(tabPid)).toBe(false);
+    await selectTab(page, 1);
+    await poll(() => a.isVisible(), Boolean, UI_TIMEOUT);
+    expect(await rowsOf(a)).toContain('[Process ended]');
+    await expectNoErrors(session);
+  });
+
+  // These kill the pty host and rely on the next spawn starting it again, so they
+  // come after every test that does not need to.
+  test.runIf(full)('tabs AC8 — when the pty host dies every terminal shows [Process ended], and a new tab or a new half runs a shell again', async () => {
+    const { page } = session;
+    await openTerminal(page);
+    const first = await focusedPane(page);
+    await pidOf(page, first);
+    await openTab(page);
+    const second = await focusedPane(page);
+    await pidOf(page, second);
+    const third = await splitPane(page, second, 'down');
+    await pidOf(page, third);
+
+    await killPtyHost(page);
+
+    // Every terminal of every tab: the selected one, then the first tab.
+    for (const pane of await visiblePanes(page)) await waitForRow(page, '[Process ended]', pane);
+    await selectTab(page, 1);
+    await poll(() => first.isVisible(), Boolean, UI_TIMEOUT);
+    await waitForRow(page, '[Process ended]', first);
+
+    // A new tab: its shell runs commands.
+    const fresh = await openTab(page);
+    await waitForPrompt(page, fresh);
+    await typeLine(page, 'echo cockpit-$((6*7))');
+    await waitForRow(page, 'cockpit-42', fresh);
+    await expectTabs(page, ['Terminal 1', 'Terminal 2', 'Terminal 3'], 'Terminal 3');
+
+    // A split of an ended terminal: the new half runs commands, the ended one stays ended.
+    await selectTab(page, 1);
+    await poll(() => first.isVisible(), Boolean, UI_TIMEOUT);
+    const half = await splitPane(page, first, 'right');
+    await waitForPrompt(page, half);
+    await typeLine(page, 'echo cockpit-$((7*8))');
+    await waitForRow(page, 'cockpit-56', half);
+    expect(await rowsOf(first)).toContain('[Process ended]');
+    expect((await rowsOf(first)).some((row) => row.includes('cockpit-'))).toBe(false);
+
+    await selectTab(page, 2);
+    await poll(() => second.isVisible(), Boolean, UI_TIMEOUT);
+    for (const pane of await visiblePanes(page)) {
+      expect(await rowsOf(pane)).toContain('[Process ended]');
+      expect((await rowsOf(pane)).some((row) => row.includes('cockpit-'))).toBe(false);
     }
+    await expectNoErrors(session);
+  });
+
+  // The pty host is killed here and started again by the next spawn, so the tests
+  // that follow work all the same.
+  test.runIf(full)('AC4 — survives the pty host being killed, and reports the open sessions as exited (terminal AC10: the open terminal shows [Process ended])', async () => {
+    const { page } = session;
+    // The terminal page is open with a running shell.
+    await openTerminal(page);
+    await typeLine(page, 'echo up-$((1+1))');
+    await waitForRow(page, 'up-2');
 
     const id = await spawnShell(page);
     await ptyWrite(page, id, 'echo ppid-$PPID\n');
@@ -2258,10 +2971,8 @@ describe.each([
 
     await waitForExit(page, id);
     expect(await exitsOf(page, id)).toEqual([{ exitCode: null, signal: null }]);
-    if (inIsolatedShell) {
-      await waitForRow(page, '[Process ended]');
-      await page.getByRole('heading', { name: 'Terminal' }).waitFor();
-    }
+    await waitForRow(page, '[Process ended]');
+    await page.getByRole('heading', { name: 'Terminal' }).waitFor();
     await page.getByText(versionLabel).waitFor();
     expect(session.isRunning()).toBe(true);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
@@ -2269,22 +2980,17 @@ describe.each([
     expect(await consoleErrorsOf(page)).toEqual([]);
   });
 
-  test.runIf(full)('AC5 — spawn rejects once the pty host is dead, and the host is not restarted', async () => {
+  // That the old ids stay inert is a unit test (packages/pty).
+  test.runIf(full)('tabs AC9 — once the pty host is dead, spawn resolves with an id no session used', async () => {
     const { page } = session;
-    const attempt = () =>
-      page.evaluate(async (options) => {
-        try {
-          await (window as unknown as PtyWindow).api.pty.spawn(options);
-          return null;
-        } catch (error) {
-          return error instanceof Error ? error.message : String(error);
-        }
-      }, shellOptions);
+    // Kills the host (again): `old` is the last session it ran.
+    const old = await killPtyHost(page);
 
-    expect(await attempt()).toContain('pty host is not running');
-    // Still rejected after a while: nothing restarted the host.
-    await sleep(2_000);
-    expect(await attempt()).toContain('pty host is not running');
+    const fresh = await spawnShell(page);
+    expect(fresh).toBeGreaterThan(old);
+
+    await ptyKill(page, fresh);
+    await waitForExit(page, fresh);
     expect(session.isRunning()).toBe(true);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
     expect(await consoleErrorsOf(page)).toEqual([]);
@@ -2335,6 +3041,21 @@ describe.each([
       rmSync(repo.parent, { recursive: true, force: true });
     }
   });
+});
+
+// The matcher of the navigation tests (tabs AC12): the refusal of the file:// URL
+// the test tried is the only console error they allow.
+test('tabs AC12 — only the refusal of the exact file:// URL tried is allowed, any other "Not allowed to load local resource" fails', () => {
+  const tried = 'file:///tmp/cockpit/test.ts';
+  expect(unexpectedConsoleErrors([`Not allowed to load local resource: ${tried}`], tried)).toEqual([]);
+  const other = [
+    'Not allowed to load local resource: file:///etc/hosts',
+    `Not allowed to load local resource: ${tried}/more`,
+    'Not allowed to load local resource: ',
+    'Not allowed to load local resource',
+  ];
+  for (const message of other) expect(unexpectedConsoleErrors([message], tried), message).toEqual([message]);
+  expect(unexpectedConsoleErrors(['TypeError: x'], tried)).toEqual(['TypeError: x']);
 });
 
 interface QuickRun {
@@ -2536,6 +3257,51 @@ describe('packaged app state file', () => {
     expect(readdirSync(file)).toEqual([]);
     expect(readdirSync(dataDir).filter((name) => name.startsWith('state.json'))).toEqual(['state.json']);
     expect(windowTracesIn(dataDir)).toEqual([]);
+  });
+});
+
+// Quitting as Cmd+Q does (`app.quit()`): no shell may be left running behind the
+// user's back.
+describe('packaged app quit', () => {
+  test('tabs AC10 — quitting the app with two shells open ends the app and both shells within 5 s', async () => {
+    const session = await launchPackaged();
+    const pids: number[] = [];
+    try {
+      const { page } = session;
+      await page.getByText(versionLabel).waitFor();
+      await openTerminal(page);
+      pids.push(await pidOf(page));
+      await openTab(page);
+      pids.push(await pidOf(page));
+      for (const pid of pids) expect(isAlive(pid)).toBe(true);
+
+      // `app.quit()` is what Cmd+Q does. It runs a moment later, so the test can
+      // disconnect its inspector first: a Node process waits for a connected
+      // inspector to disconnect before it exits.
+      const quitAt = Date.now();
+      await session.evaluateInMain(`(() => {
+        const { app } = require('electron');
+        setTimeout(() => app.quit(), 300);
+      })()`);
+      await session.disconnectInspector();
+      const remaining = () => Math.max(0, 5_000 - (Date.now() - quitAt));
+
+      expect(await poll(() => session.isRunning(), (running) => !running, remaining()), 'the app exits within 5 s').toBe(false);
+      for (const pid of pids) {
+        expect(await poll(() => isAlive(pid), (alive) => !alive, remaining()), `shell ${pid} is gone within 5 s`).toBe(false);
+      }
+    } finally {
+      // A shell that survived must not outlive the test.
+      for (const pid of pids) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
+      await Promise.race([session.close().catch(() => {}), sleep(15_000)]);
+      rmSync(session.dataDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -2770,6 +3536,14 @@ const isBelowSessionsHeader = (page: Page, text: string) =>
     return found.getBoundingClientRect().top >= header.getBoundingClientRect().bottom - 1;
   }, text);
 
+// The processes whose parent is `pid`.
+const childPidsOf = (pid: number): number[] =>
+  execFileSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8' })
+    .split('\n')
+    .map((line) => line.trim().split(/\s+/).map(Number))
+    .filter(([, parent]) => parent === pid)
+    .map(([child]) => child!);
+
 const sessionFoldersIn = (home: string) => {
   const folder = join(home, 'sessions');
   return existsSync(folder) ? readdirSync(folder).sort() : [];
@@ -2791,6 +3565,7 @@ describe('sessions: built app', () => {
     claude1: { id: '', pid: 0 },
     claude2: { id: '', pid: 0 },
     codex1: { id: '', pid: 0 },
+    claude3: { id: '', pid: 0 },
   };
 
   beforeAll(async () => {
@@ -2922,34 +3697,99 @@ describe('sessions: built app', () => {
     ]);
   });
 
-  // Kills the pty host, so it stays the last test of the launch that needs a working one.
-  test('AC10 — with the pty host dead, picking a harness shows a message under the Sessions header and changes nothing', async () => {
+  // The pty host dies here and the next spawn starts it again, so AC15 and the
+  // tests that follow work all the same.
+  test('AC14 — with the pty host dead, picking a harness starts the session: its page opens, the stub runs in a new folder under COCKPIT_HOME, and it is listed and stored', async () => {
     const { page } = session;
-    const hostPid = await (async () => {
-      const id = await spawnShell(page);
-      await ptyWrite(page, id, 'echo ppid-$PPID\n');
-      await waitForOutput(page, id, /ppid-\d+/);
-      return Number(/ppid-(\d+)/.exec(await outputOf(page, id))![1]);
-    })();
-    process.kill(hostPid, 'SIGKILL');
-    await poll(() => isAlive(hostPid), (alive) => !alive, 10_000);
+    await killPtyHost(page);
+    const stored = sessionsInState(session.dataDir).length;
+    const entriesBefore = await sessionEntries(page);
+
+    const id = await startSession(page, 'Claude Code', 'Claude Code 3');
+    known.claude3.id = id;
+
+    const home = join(session.cockpitHome, 'sessions', id);
+    const stub = await readStub(page);
+    expect(stub.cwd).toBe(realpathSync(home));
+    expect(stub.term).toBe('xterm-256color');
+    expect(isAlive(stub.pid)).toBe(true);
+    known.claude3.pid = stub.pid;
+    expect(statSync(home).isDirectory()).toBe(true);
+
+    expect((await sidebarLines(page)).filter((line) => line.startsWith('Could not start'))).toEqual([]);
+    const entries = await poll(() => sessionEntries(page), (list) => list.length === entriesBefore.length + 1, UI_TIMEOUT);
+    expect(entries.map((entry) => [entry.name, entry.ended])).toEqual([['Claude Code 3', false], ...entriesBefore.map((entry) => [entry.name, entry.ended])]);
+    const list = await poll(() => sessionsInState(session.dataDir), (found) => found.length === stored + 1, UI_TIMEOUT);
+    expect(list.at(-1)).toEqual({ id, name: 'Claude Code 3', harness: 'claude-code', directory: home, createdAt: expect.any(String) });
+    expect(sessionFoldersIn(session.cockpitHome)).toContain(id);
+  });
+
+  test('AC15 — a running session shows as ended when the pty host dies: [Process ended] in its terminal, "Ended" on its entry', async () => {
+    const { page } = session;
+    // The session AC14 started runs on the new host and is open on its page.
+    expect(sessionIdOf(page)).toBe(known.claude3.id);
+    expect(isAlive(known.claude3.pid)).toBe(true);
+    expect((await sessionEntries(page)).find((entry) => entry.id === known.claude3.id)?.ended).toBe(false);
+
+    await killPtyHost(page);
+
+    await waitForRow(page, '[Process ended]');
+    expect(
+      await waitForSessionEntries(page, [['Claude Code 3', true], ['Codex 1', true], ['Claude Code 2', true], ['Claude Code 1', true]]),
+    ).toEqual([
+      ['Claude Code 3', true],
+      ['Codex 1', true],
+      ['Claude Code 2', true],
+      ['Claude Code 1', true],
+    ]);
+    // The same as when the agent exits (AC7): the page keeps its terminal, it does not turn into an error.
+    expect(sessionIdOf(page)).toBe(known.claude3.id);
+    await page.getByRole('heading', { name: 'Claude Code 3', exact: true }).waitFor({ timeout: UI_TIMEOUT });
+  });
+
+  // A folder named `state.json.tmp` in the data folder makes `saveState` fail
+  // after the spawn succeeded, which runs the whole rollback. (A removed stub
+  // would not do: node-pty does not throw on a missing executable.)
+  test('AC16 — with a folder named state.json.tmp in the data folder, picking Claude Code is refused under the Sessions header and changes nothing', async () => {
+    const { page } = session;
+    // The menu detected the stubs (AC1) and keeps the answer.
+    await openStartMenu(page);
+    expect((await page.getByRole('menuitem').allInnerTexts()).map((text) => text.trim())).toEqual(['Claude Code', 'Codex']);
+    await page.keyboard.press('Escape');
+    await page.getByRole('menuitem').first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+
+    // The pty host runs (AC15 killed it, this spawn starts a new one) with no pty of its own.
+    const probe = await spawnShell(page);
+    await ptyWrite(page, probe, 'echo ppid-$PPID\n');
+    await waitForOutput(page, probe, /ppid-\d+/);
+    const hostPid = Number(/ppid-(\d+)/.exec(await outputOf(page, probe))![1]);
+    await ptyKill(page, probe);
+    await waitForExit(page, probe);
+    expect(await poll(() => childPidsOf(hostPid), (children) => children.length === 0, 5_000)).toEqual([]);
 
     const entriesBefore = await sessionEntries(page);
     const stateBefore = stateSnapshot(session.dataDir);
     const foldersBefore = sessionFoldersIn(session.cockpitHome);
+    const blocker = join(session.dataDir, 'state.json.tmp');
+    mkdirSync(blocker);
+    try {
+      await openStartMenu(page);
+      await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).click({ timeout: UI_TIMEOUT });
 
-    await openStartMenu(page);
-    await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).click({ timeout: UI_TIMEOUT });
+      const lines = await poll(() => sidebarLines(page), (found) => found.some((line) => line.startsWith('Could not start Claude Code:')), UI_TIMEOUT);
+      expect(lines.some((line) => line.startsWith('Could not start Claude Code:'))).toBe(true);
+      expect(await isBelowSessionsHeader(page, 'Could not start Claude Code:')).toBe(true);
 
-    const lines = await poll(() => sidebarLines(page), (found) => found.some((line) => line.startsWith('Could not start Claude Code:')), UI_TIMEOUT);
-    expect(lines.some((line) => line.startsWith('Could not start Claude Code:'))).toBe(true);
-    expect(await isBelowSessionsHeader(page, 'Could not start Claude Code:')).toBe(true);
-    await sleep(300);
-
-    expect(await sessionEntries(page)).toEqual(entriesBefore);
-    expect(stateSnapshot(session.dataDir)).toEqual(stateBefore);
-    expect(sessionFoldersIn(session.cockpitHome)).toEqual(foldersBefore);
-    expect(existsSync(join(session.dataDir, 'state.json.tmp'))).toBe(false);
+      // The refusal comes after the rollback: the spawned pty is killed, the folder removed, no change in the state.
+      expect(isAlive(hostPid)).toBe(true);
+      expect(await poll(() => childPidsOf(hostPid), (children) => children.length === 0, 5_000)).toEqual([]);
+      expect(await sessionEntries(page)).toEqual(entriesBefore);
+      expect(stateSnapshot(session.dataDir)).toEqual(stateBefore);
+      expect(sessionFoldersIn(session.cockpitHome)).toEqual(foldersBefore);
+      expect(statSync(blocker).isDirectory()).toBe(true);
+    } finally {
+      rmSync(blocker, { recursive: true, force: true });
+    }
   });
 
   test('logs no error and keeps running', async () => {
