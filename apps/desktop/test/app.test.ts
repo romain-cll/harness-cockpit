@@ -1818,6 +1818,31 @@ describe.each([
     expect(isAlive(cPid)).toBe(true);
   });
 
+  // Tested in full in the built app only; the other modes run a smoke path.
+  test.runIf(mode === 'built app')('tabs AC4 — after "Close terminal", the keyboard focus goes to the closed terminal\'s sibling: in A | (B / C), closing C focuses B, not A', async () => {
+    const { page } = session;
+    await openTerminal(page);
+    const a = await focusedPane(page);
+    await pidOf(page, a);
+    const b = await splitPane(page, a, 'right');
+    await pidOf(page, b);
+    const c = await splitPane(page, b, 'down');
+    const cPid = await pidOf(page, c);
+
+    await clickPaneButton(c, 'Close terminal');
+    expect(await endsWithin(cPid)).toBe(true);
+    await poll(async () => (await visiblePanes(page)).length, (count) => count === 2, UI_TIMEOUT);
+
+    // No click: the text goes where the keyboard is.
+    const active = await poll(() => activePane(page), Boolean, UI_TIMEOUT);
+    expect(active, 'a visible terminal holds the keyboard focus').not.toBeNull();
+    expect(await isSamePane(active!, b), 'the sibling B holds the focus').toBe(true);
+    await typeLine(page, 'echo sibling-$((6*7))');
+    await waitForRow(page, 'sibling-42', b);
+    expect(await rowsOf(a), 'A did not receive the typed text').not.toContain('sibling-42');
+    expect((await rowsOf(a)).join('\n')).not.toContain('echo sibling-');
+  });
+
   test.runIf(inIsolatedShell)('tabs AC5 — closing a tab ends all its shells, selects the tab on its left (the new first one for the first), numbers are not reused, and an empty page offers "New terminal"', async () => {
     const { page } = session;
     await openTerminal(page);
