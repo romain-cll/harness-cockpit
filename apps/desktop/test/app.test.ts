@@ -2622,19 +2622,26 @@ interface SessionsFixture {
   shell: string;
   /** The environment to launch the app with. */
   env(): NodeJS.ProcessEnv;
+  /** The file the stubs append a line to on every run, when the fixture was made with `log`. */
+  runLog: string;
 }
 
 // Stubs named after the given catalogue binaries in a folder of their own, and
 // a login shell, like `makeShellWithoutGit`, whose printed environment has
 // `PATH=<that folder>:/usr/bin:/bin`: a real CLI installed on the developer's
 // machine never shows up.
-function makeSessionsFixture(binaries: string[]): SessionsFixture {
+//
+// With `log`, every stub first appends `<binary> <arguments>` to `runLog`, which
+// is empty once the fixture is ready (its own warm-up runs are not counted).
+function makeSessionsFixture(binaries: string[], { log = false }: { log?: boolean } = {}): SessionsFixture {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-sessions-test-')));
   const bin = join(root, 'bin');
   mkdirSync(bin);
+  const runLog = join(root, 'runs.log');
+  const script = log ? STUB_HARNESS.replace('#!/bin/sh\n', `#!/bin/sh\necho "$(basename "$0") $*" >> '${runLog}'\n`) : STUB_HARNESS;
   for (const name of binaries) {
     const stub = join(bin, name);
-    writeFileSync(stub, STUB_HARNESS);
+    writeFileSync(stub, script);
     chmodSync(stub, 0o755);
     // macOS scans a new executable the first time it runs.
     expect(execFileSync(stub, ['--version'], { encoding: 'utf8' }).trim()).toBe('9.9.9');
@@ -2645,8 +2652,9 @@ function makeSessionsFixture(binaries: string[]): SessionsFixture {
   execFileSync(shell, ['--warmup']);
   const printed = execFileSync(shell, ['-ilc', 'printf %s "$PATH"'], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
   expect(printed).toBe(`${bin}:/usr/bin:/bin`);
+  if (log) writeFileSync(runLog, '');
 
-  return { root, shell, env: () => ({ ...process.env, SHELL: shell }) };
+  return { root, shell, env: () => ({ ...process.env, SHELL: shell }), runLog };
 }
 
 const launchBuiltWith = (env: NodeJS.ProcessEnv, dataDir?: string, cockpitHome?: string | null) =>
@@ -2950,21 +2958,19 @@ describe('sessions: built app', () => {
   });
 });
 
-// One smoke path through the sessions IPC in the other launch modes: the page,
-// the main process, the pty host and the disk. Each needs a launch of its own
-// with the fake login shell that holds the stubs. The launchd-environment mode
-// has none: its point is the user's real login shell, where a session would run
-// a real CLI.
-describe.each([
-  ['dev server', launchDevWith],
-  ['packaged app', launchPackagedWith],
-])('sessions smoke path: %s', (_mode, launch) => {
+// One smoke path through the sessions IPC in the dev server: the page, the
+// main process, the pty host and the disk. It needs a launch of its own with
+// the fake login shell that holds the stubs. The packaged app's smoke path is
+// folded into the first launch of the AC9 restart test below. The
+// launchd-environment mode has none: its point is the user's real login shell,
+// where a session would run a real CLI.
+describe('sessions smoke path: dev server', () => {
   let fx: SessionsFixture;
   let session: Session;
 
   beforeAll(async () => {
     fx = makeSessionsFixture(['claude']);
-    session = await launch(fx.env());
+    session = await launchDevWith(fx.env());
     await session.page.getByText(versionLabel).waitFor();
   });
 
@@ -2987,6 +2993,51 @@ describe.each([
   });
 
   test('logs no error and keeps running', async () => {
+    await expectNoErrors(session);
+  });
+});
+
+// Harness detection runs `--version` on each harness: it must not happen at
+// startup (a test launch must never run a real CLI), only when the menu first
+// needs the list, and only once per launch.
+describe('built app harness detection timing', () => {
+  let fx: SessionsFixture;
+  let session: Session;
+
+  beforeAll(async () => {
+    fx = makeSessionsFixture(['claude', 'codex'], { log: true });
+    session = await launchBuiltWith(fx.env());
+    await session.page.getByText(versionLabel).waitFor();
+  });
+
+  afterAll(async () => {
+    await session?.close();
+    if (fx) rmSync(fx.root, { recursive: true, force: true });
+  });
+
+  const runs = () =>
+    readFileSync(fx.runLog, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .sort();
+
+  test('AC14 — no stub runs at startup, each runs --version once on the first menu open, none on the next', async () => {
+    const { page } = session;
+    await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
+    await sleep(2000);
+    expect(runs()).toEqual([]);
+
+    await openStartMenu(page);
+    expect((await page.getByRole('menuitem').allInnerTexts()).map((text) => text.trim())).toEqual(['Claude Code', 'Codex']);
+    expect(runs()).toEqual(['claude --version', 'codex --version']);
+
+    await page.keyboard.press('Escape');
+    await page.getByRole('menuitem').first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+    await openStartMenu(page);
+    await sleep(500);
+    expect(runs()).toEqual(['claude --version', 'codex --version']);
+
+    await page.keyboard.press('Escape');
     await expectNoErrors(session);
   });
 });
@@ -3082,9 +3133,20 @@ describe('packaged app sessions after a restart', () => {
     const first = await launchPackagedWith(fx.env(), dataDir);
     try {
       await first.page.getByText(versionLabel).waitFor();
-      await startSession(first.page, 'Claude Code', 'Claude Code 1');
+      // The packaged app's sessions smoke path: the stub runs in a new folder
+      // under COCKPIT_HOME, the entry shows as running, the session is stored.
+      const id = await startSession(first.page, 'Claude Code', 'Claude Code 1');
+      const home = join(first.cockpitHome, 'sessions', id);
+      const stub = await readStub(first.page);
+      expect(stub.cwd).toBe(realpathSync(home));
+      expect(stub.term).toBe('xterm-256color');
+      expect(await waitForSessionEntries(first.page, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+      const storedFirst = await poll(() => sessionsInState(dataDir), (list) => list.length > 0, UI_TIMEOUT);
+      expect(storedFirst.map((s) => [s.name, s.directory])).toEqual([['Claude Code 1', home]]);
+
       await startSession(first.page, 'Codex', 'Codex 1');
       await poll(() => sessionsInState(dataDir), (list) => list.length === 2, UI_TIMEOUT);
+      await expectNoErrors(first);
     } finally {
       await first.close();
     }
