@@ -986,6 +986,10 @@ describe.each([
   // launchd-environment mode runs the developer's real shell and its
   // configuration, so it only gets the PATH check (terminal AC12).
   const inIsolatedShell = launch !== launchLaunchd;
+  // COCKPIT-48: a feature's full block runs once, in the built app. The other
+  // modes run one smoke path per feature that goes through its IPC end to end
+  // (`smoke paths` below), plus the checks that differ between modes.
+  const full = mode === 'built app';
 
   beforeAll(async () => {
     front = watchFrontmost();
@@ -1078,7 +1082,7 @@ describe.each([
     await ptyKill(page, id);
   });
 
-  test('AC2 — resizes the pty', async () => {
+  test.runIf(full)('AC2 — resizes the pty', async () => {
     const { page } = session;
     const id = await spawnShell(page);
 
@@ -1089,7 +1093,7 @@ describe.each([
     await ptyKill(page, id);
   });
 
-  test('AC3 — kill ends the session with a single exit, and later calls on it do nothing', async () => {
+  test.runIf(full)('AC3 — kill ends the session with a single exit, and later calls on it do nothing', async () => {
     const { page } = session;
     const id = await spawnShell(page);
 
@@ -1154,7 +1158,7 @@ describe.each([
     },
   );
 
-  test.runIf(inIsolatedShell)('terminal AC1 — the Terminal link opens a page with a heading and an xterm.js terminal under the header', async () => {
+  test.runIf(full)('terminal AC1 — the Terminal link opens a page with a heading and an xterm.js terminal under the header', async () => {
     const { page } = session;
     await page.getByRole('link', { name: 'Home', exact: true }).click({ timeout: UI_TIMEOUT });
     await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
@@ -1190,7 +1194,7 @@ describe.each([
     await waitForRow(page, 'cockpit-42');
   });
 
-  test.runIf(inIsolatedShell)('terminal AC3 — resizing the viewport resizes the pty to the terminal columns and rows', async () => {
+  test.runIf(full)('terminal AC3 — resizing the viewport resizes the pty to the terminal columns and rows', async () => {
     const { page } = session;
     await openTerminal(page);
     const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
@@ -1217,7 +1221,7 @@ describe.each([
     }
   });
 
-  test.runIf(inIsolatedShell)('terminal AC4 — exit shows the exit code, and later keys do nothing', async () => {
+  test.runIf(full)('terminal AC4 — exit shows the exit code, and later keys do nothing', async () => {
     const { page } = session;
     await openTerminal(page);
 
@@ -1233,7 +1237,7 @@ describe.each([
     expect(await consoleErrorsOf(page)).toEqual([]);
   });
 
-  test.runIf(inIsolatedShell)('terminal AC5 — copy puts the selected word in the clipboard data as text/plain', async () => {
+  test.runIf(full)('terminal AC5 — copy puts the selected word in the clipboard data as text/plain', async () => {
     const { page } = session;
     await openTerminal(page);
     await typeLine(page, 'echo copy-me-123');
@@ -1257,7 +1261,7 @@ describe.each([
     expect(await poll(copied, (text) => text !== '', 5_000)).toBe('copy-me-123');
   });
 
-  test.runIf(inIsolatedShell)('terminal AC6 — pasting text then pressing Enter runs it', async () => {
+  test.runIf(full)('terminal AC6 — pasting text then pressing Enter runs it', async () => {
     const { page } = session;
     await openTerminal(page);
 
@@ -1271,7 +1275,7 @@ describe.each([
     await waitForRow(page, 'pasted-42');
   });
 
-  test.runIf(inIsolatedShell)('terminal AC7 — text, background and ANSI red follow the tokens as the color scheme changes', async () => {
+  test.runIf(full)('terminal AC7 — text, background and ANSI red follow the tokens as the color scheme changes', async () => {
     const { page } = session;
     await openTerminal(page);
     await page.emulateMedia({ colorScheme: 'dark' });
@@ -1294,7 +1298,7 @@ describe.each([
     expect(light.expected.red).not.toBe(light.expected.text);
   });
 
-  test.runIf(inIsolatedShell)('terminal AC8 — leaving the terminal page ends its shell', async () => {
+  test.runIf(full)('terminal AC8 — leaving the terminal page ends its shell', async () => {
     const { page } = session;
     await openTerminal(page);
     await typeLine(page, 'echo pid-$$');
@@ -1307,7 +1311,7 @@ describe.each([
     expect(await poll(() => isAlive(pid!), (alive) => !alive, 5_000)).toBe(false);
   });
 
-  test.runIf(inIsolatedShell)('terminal AC9 — reloading the page ends its shell and opens a new one', async () => {
+  test.runIf(full)('terminal AC9 — reloading the page ends its shell and opens a new one', async () => {
     const { page } = session;
     await openTerminal(page);
     await typeLine(page, 'echo pid-$$');
@@ -1361,7 +1365,7 @@ describe.each([
   // The picker is stubbed in the main process (`session.evaluateInMain`). The
   // tests share the session and run in order: the repository added by AC1 is
   // the one AC2 adds again, and AC6 removes what AC1 and AC4 added.
-  describe('projects', () => {
+  describe.runIf(full)('projects', () => {
     let alpha: TempRepo;
     let bravo: TempRepo;
     let plain: TempRepo;
@@ -1486,7 +1490,7 @@ describe.each([
   // to the "delete" tests, and the workspaces `feature/login` and
   // `second-by-enter`, created by the AC5 test, are the ones the delete tests
   // delete. Worktrees the app creates land under the launch's COCKPIT_HOME.
-  describe('workspaces', () => {
+  describe.runIf(full)('workspaces', () => {
     let clone: TempClone;
     let noDefault: TempRepo;
     const folders: TempRepo[] = [];
@@ -1501,10 +1505,15 @@ describe.each([
     });
 
     // A failing test must not leave a menu or a dialog that blocks the tests after it.
+    // Escape only while something is open (at most 4 times), and wait for it to close.
     afterEach(async () => {
+      const { page } = session;
+      const overlays = page.locator('[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]');
       for (let attempt = 0; attempt < 4; attempt++) {
-        await session.page.keyboard.press('Escape');
-        await sleep(150);
+        const open = await overlays.count();
+        if (open === 0) break;
+        await page.keyboard.press('Escape');
+        await poll(() => overlays.count(), (count) => count < open, 1_000);
       }
     });
 
@@ -2063,6 +2072,74 @@ describe.each([
     }, 120_000);
   });
 
+  // One smoke path per feature in the modes that do not run its full block: it
+  // goes through the IPC end to end, with the same helpers as the full blocks.
+  // In the launchd-environment mode these are the paths that spawn git.
+  describe.runIf(!full)('smoke paths', () => {
+    const folders: TempRepo[] = [];
+
+    afterAll(() => {
+      for (const folder of folders) rmSync(folder.parent, { recursive: true, force: true });
+    });
+
+    test('smoke path (a) — projects: a repository added through the picker is listed and stored, then removed through the "…" menu and left on disk', async () => {
+      const { page } = session;
+      const repo = makeRepo('smoke-project');
+      folders.push(repo);
+      await page.getByText(versionLabel).waitFor();
+      expect(await entryTitles(page)).toEqual([]);
+
+      await addProject(session, repo.root);
+      await waitForEntries(page, [repo.root]);
+      expect((await sidebarEntries(page))[0]!.text).toContain(repo.name);
+      await poll(() => projectsInState(session.dataDir), (projects) => Array.isArray(projects) && projects.length > 0, UI_TIMEOUT);
+      expect(projectsInState(session.dataDir)).toEqual([{ path: repo.root }]);
+
+      const onDisk = snapshotRepo(repo);
+      await removeThroughMenu(page, repo.root);
+      await waitForEntries(page, []);
+      await poll(() => projectsInState(session.dataDir), (projects) => Array.isArray(projects) && projects.length === 0, UI_TIMEOUT);
+      expect(projectsInState(session.dataDir)).toEqual([]);
+      expect(snapshotRepo(repo)).toEqual(onDisk);
+      expect(onDisk.hasGit).toBe(true);
+    });
+
+    test('smoke path (b) — workspaces: "New workspace…" creates a worktree under COCKPIT_HOME from the preselected base main and lists it; "Delete workspace…" removes the folder, the worktree, the branch and the row', async () => {
+      const { page } = session;
+      const repo = makeRepo('smoke-workspace');
+      folders.push(repo);
+      const branch = 'smoke-ws';
+      await addRepository(session, repo);
+      const path = worktreePath(session, repo, branch);
+
+      const dialog = await openNewWorkspaceDialog(page, repo);
+      await poll(() => selectedBase(dialog), (value) => value === 'main', UI_TIMEOUT);
+      await nameField(dialog).fill(branch);
+      await createButton(dialog).click({ timeout: UI_TIMEOUT });
+      await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
+      await waitForEntries(page, [repo.root, path]);
+
+      expect(existsSync(join(path, 'README.md'))).toBe(true);
+      expect(linkedWorktrees(repo)).toContainEqual({ path, branch });
+      expect(localBranches(repo)).toContain(branch);
+
+      await startDeletion(page, path);
+      const confirm = deleteDialog(page, `Delete ${branch}?`);
+      await confirm.waitFor({ timeout: UI_TIMEOUT });
+      await confirm.getByRole('button', { name: 'Delete', exact: true }).click({ timeout: UI_TIMEOUT });
+      await confirm.waitFor({ state: 'hidden', timeout: 15_000 });
+      await waitForEntries(page, [repo.root]);
+
+      expect(existsSync(path)).toBe(false);
+      expect(linkedWorktrees(repo)).toEqual([]);
+      expect(localBranches(repo)).not.toContain(branch);
+
+      await removeThroughMenu(page, repo.root);
+      await waitForEntries(page, []);
+      expect(projectsInState(session.dataDir)).toEqual([]);
+    });
+  });
+
   test('logs no error and keeps running', async () => {
     const { page } = session;
     expect(await allConsoleErrorsOf(page)).toEqual([]);
@@ -2152,7 +2229,7 @@ describe.each([
   });
 
   // Kills the pty host, so it stays the last test that needs a working one.
-  test('AC4 — survives the pty host being killed, and reports the open session as exited (terminal AC10: the terminal shows [Process ended])', async () => {
+  test.runIf(full)('AC4 — survives the pty host being killed, and reports the open session as exited (terminal AC10: the terminal shows [Process ended])', async () => {
     const { page } = session;
     // The terminal page is open, with a running shell (not in the launchd mode,
     // which keeps the developer's shell out of the tests).
@@ -2185,7 +2262,7 @@ describe.each([
     expect(await consoleErrorsOf(page)).toEqual([]);
   });
 
-  test('AC5 — spawn rejects once the pty host is dead, and the host is not restarted', async () => {
+  test.runIf(full)('AC5 — spawn rejects once the pty host is dead, and the host is not restarted', async () => {
     const { page } = session;
     const attempt = () =>
       page.evaluate(async (options) => {
@@ -2209,7 +2286,7 @@ describe.each([
   // Last of the session on purpose: the refusal must come without any error, and
   // an app that lets the failure through would log one that the "logs no error"
   // checks of the tests above would then report in their place.
-  test('workspaces AC20 — a failing save refuses the add with "Cockpit could not save its data: <error>", lists nothing, leaves state.json as it was and logs no error', async () => {
+  test.runIf(full)('workspaces AC20 — a failing save refuses the add with "Cockpit could not save its data: <error>", lists nothing, leaves state.json as it was and logs no error', async () => {
     const { page } = session;
     const repo = makeLightRepo('ws-save');
     try {
