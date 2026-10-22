@@ -38,6 +38,14 @@ function remove(layout: Layout, target: number): Layout | null {
   return first && second ? { ...layout, first, second } : (first ?? second);
 }
 
+/** The terminal that takes the keyboard when that one closes: the first of its sibling's subtree. */
+function siblingOf(layout: Layout, target: number): number | undefined {
+  if ('terminal' in layout) return undefined;
+  if ('terminal' in layout.first && layout.first.terminal === target) return leaves(layout.second)[0];
+  if ('terminal' in layout.second && layout.second.terminal === target) return leaves(layout.first)[0];
+  return siblingOf(layout.first, target) ?? siblingOf(layout.second, target);
+}
+
 /** The area of each terminal, in percent of the tab's area. */
 function boxes(layout: Layout, box: Box = { left: 0, top: 0, width: 100, height: 100 }): Array<[number, Box]> {
   if ('terminal' in layout) return [[layout.terminal, box]];
@@ -117,7 +125,7 @@ function reduce(state: State, action: Action): State {
       return update(action.tab, (current) => ({
         ...current,
         layout,
-        focused: current.focused === action.terminal ? leaves(layout)[0]! : current.focused,
+        focused: current.focused === action.terminal ? siblingOf(tab.layout, action.terminal)! : current.focused,
       }));
     }
     case 'focus':
