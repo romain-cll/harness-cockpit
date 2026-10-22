@@ -33,7 +33,10 @@ interface Session {
   pid: number;
   /** The folder the app was told to keep its data in, removed on close. */
   dataDir: string;
-  /** `COCKPIT_HOME` the app was launched with: inside `dataDir`, so it goes away with it. */
+  /**
+   * `COCKPIT_HOME` the app was launched with: inside `dataDir`, so it goes away with it. Empty
+   * when the launch left it unset or empty.
+   */
   cockpitHome: string;
   /** Everything the app wrote to stdout and stderr. */
   output(): string;
@@ -57,21 +60,24 @@ interface Session {
 // A test that must start the app twice on the same data folder creates the
 // folder itself, passes it in and removes it afterwards: sessions leave a folder
 // they were given in place.
-// `COCKPIT_HOME` is a folder inside the data folder: the worktrees the app
-// creates live under it and are removed with it, and no test touches the
-// developer's `~/.cockpit`.
+// `COCKPIT_HOME` is a folder inside the data folder: the worktrees and session
+// folders the app creates live under it and are removed with it, and no test
+// touches the developer's `~/.cockpit`. Only a test of the default passes `null`
+// (unset) or `''` (empty), with a `HOME` of its own.
 // The terminal page runs whatever `$SHELL` says: by default `/bin/sh`, which keeps
 // the developer's shell configuration from slowing or breaking the tests.
 function launchEnv(
   background: boolean,
   dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-')),
   base: NodeJS.ProcessEnv = { ...process.env, SHELL: '/bin/sh' },
+  cockpitHome: string | null = join(dataDir, 'cockpit-home'),
 ) {
-  const cockpitHome = join(dataDir, 'cockpit-home');
-  const env = { ...base, COCKPIT_USER_DATA_DIR: dataDir, COCKPIT_HOME: cockpitHome } as Record<string, string>;
+  const env = { ...base, COCKPIT_USER_DATA_DIR: dataDir } as Record<string, string>;
+  if (cockpitHome === null) delete env.COCKPIT_HOME;
+  else env.COCKPIT_HOME = cockpitHome;
   if (background) env.COCKPIT_TEST_BACKGROUND = '1';
   else delete env.COCKPIT_TEST_BACKGROUND;
-  return { dataDir, cockpitHome, env };
+  return { dataDir, cockpitHome: cockpitHome ?? '', env };
 }
 
 // Attaches to a running Electron over the Chrome DevTools Protocol and returns
@@ -162,8 +168,9 @@ async function launchSpawned(
   background: boolean,
   givenDataDir?: string,
   base?: NodeJS.ProcessEnv,
+  givenCockpitHome?: string | null,
 ): Promise<Session> {
-  const { dataDir, cockpitHome, env } = launchEnv(background, givenDataDir, base);
+  const { dataDir, cockpitHome, env } = launchEnv(background, givenDataDir, base, givenCockpitHome);
   // Its own process group, so closing stops Electron and its helpers together.
   const child = spawn(executablePath, ['--remote-debugging-port=0', '--inspect=0', ...args], {
     cwd: appDir,
@@ -2534,8 +2541,6 @@ done
 interface SessionsFixture {
   /** The temporary folder that holds everything below, removed by the test. */
   root: string;
-  /** `$COCKPIT_HOME` for the app. */
-  home: string;
   /** The fake login shell. */
   shell: string;
   /** The environment to launch the app with. */
@@ -2564,12 +2569,11 @@ function makeSessionsFixture(binaries: string[]): SessionsFixture {
   const printed = execFileSync(shell, ['-ilc', 'printf %s "$PATH"'], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
   expect(printed).toBe(`${bin}:/usr/bin:/bin`);
 
-  const home = join(root, 'cockpit-home');
-  return { root, home, shell, env: () => ({ ...process.env, SHELL: shell, COCKPIT_HOME: home }) };
+  return { root, shell, env: () => ({ ...process.env, SHELL: shell }) };
 }
 
-const launchBuiltWith = (env: NodeJS.ProcessEnv, dataDir?: string) =>
-  launchSpawned(createRequire(import.meta.url)('electron') as string, ['.'], true, dataDir, env);
+const launchBuiltWith = (env: NodeJS.ProcessEnv, dataDir?: string, cockpitHome?: string | null) =>
+  launchSpawned(createRequire(import.meta.url)('electron') as string, ['.'], true, dataDir, env, cockpitHome);
 
 const launchPackagedWith = (env: NodeJS.ProcessEnv, dataDir?: string) => launchPackaged({ env, dataDir });
 
@@ -2732,9 +2736,10 @@ describe.each([
     const id = await startSession(page, 'Claude Code', 'Claude Code 1');
     known.claude1.id = id;
 
-    const home = join(fx.home, 'sessions', id);
+    const home = join(session.cockpitHome, 'sessions', id);
     const stub = await readStub(page);
-    expect(stub.cwd).toBe(home);
+    // The stub prints its physical path (`pwd -P`); the temporary folder may sit behind a symlink.
+    expect(stub.cwd).toBe(realpathSync(home));
     expect(stub.argCount).toBe(0);
     expect(stub.args).toBe('');
     expect(stub.term).toBe('xterm-256color');
@@ -2846,7 +2851,7 @@ describe.each([
 
     const entriesBefore = await sessionEntries(page);
     const stateBefore = stateSnapshot(session.dataDir);
-    const foldersBefore = sessionFoldersIn(fx.home);
+    const foldersBefore = sessionFoldersIn(session.cockpitHome);
 
     await openStartMenu(page);
     await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).click({ timeout: UI_TIMEOUT });
@@ -2858,7 +2863,7 @@ describe.each([
 
     expect(await sessionEntries(page)).toEqual(entriesBefore);
     expect(stateSnapshot(session.dataDir)).toEqual(stateBefore);
-    expect(sessionFoldersIn(fx.home)).toEqual(foldersBefore);
+    expect(sessionFoldersIn(session.cockpitHome)).toEqual(foldersBefore);
     expect(existsSync(join(session.dataDir, 'state.json.tmp'))).toBe(false);
   });
 
@@ -2920,11 +2925,7 @@ describe('built app sessions folder when COCKPIT_HOME is unset or empty', () => 
   ])('AC11 — with COCKPIT_HOME %s and HOME=<tmp>, the session folder is <tmp>/.cockpit/sessions/<id>', async (label, value) => {
     const userHome = join(fx.root, `user-home-${label}`);
     mkdirSync(userHome);
-    const env: NodeJS.ProcessEnv = { ...fx.env(), HOME: userHome };
-    if (value === undefined) delete env.COCKPIT_HOME;
-    else env.COCKPIT_HOME = value;
-
-    const session = await launchBuiltWith(env);
+    const session = await launchBuiltWith({ ...fx.env(), HOME: userHome }, undefined, value ?? null);
     try {
       await session.page.getByText(versionLabel).waitFor();
       const id = await startSession(session.page, 'Claude Code', 'Claude Code 1');
@@ -2943,8 +2944,8 @@ describe('built app sessions folder when COCKPIT_HOME is unset or empty', () => 
   });
 });
 
-// Sessions across a restart of the packaged app, on a data folder and a
-// Cockpit home the test creates and removes.
+// Sessions across a restart of the packaged app, on a data folder the test
+// creates and removes; the launch's Cockpit home is inside it.
 describe('packaged app sessions after a restart', () => {
   let fx: SessionsFixture;
   let dataDir: string;

@@ -182,7 +182,7 @@ describe('AC21 — backup when the hard link fails', () => {
       calls.failLink = true;
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-      expect(loadState(dir)).toEqual({ version: 1, projects: [] });
+      expect(loadState(dir)).toEqual({ version: 1, projects: [], sessions: [] });
 
       const found = backups();
       expect(found).toHaveLength(1);
@@ -202,7 +202,7 @@ describe('AC21 — backup when the hard link fails', () => {
     loadState(dir);
     const before = snapshot();
 
-    expect(loadState(dir)).toEqual({ version: 1, projects: [] });
+    expect(loadState(dir)).toEqual({ version: 1, projects: [], sessions: [] });
     expect(snapshot()).toEqual(before);
     expect(backups()).toHaveLength(1);
   });
@@ -218,7 +218,7 @@ describe('AC22 — backup name already taken', () => {
     writeFileSync(taken, 'an older backup');
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    expect(loadState(dir)).toEqual({ version: 1, projects: [] });
+    expect(loadState(dir)).toEqual({ version: 1, projects: [], sessions: [] });
 
     expect(readFileSync(taken, 'utf8')).toBe('an older backup');
     expect(backups().sort()).toEqual([backupNameAt(at), `${backupNameAt(at)}-2`]);
@@ -234,7 +234,7 @@ describe('AC22 — backup name already taken', () => {
     writeFileSync(join(dir, `${backupNameAt(at)}-2`), 'second');
     vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    expect(loadState(dir)).toEqual({ version: 1, projects: [] });
+    expect(loadState(dir)).toEqual({ version: 1, projects: [], sessions: [] });
 
     expect(readFileSync(join(dir, backupNameAt(at)), 'utf8')).toBe('first');
     expect(readFileSync(join(dir, `${backupNameAt(at)}-2`), 'utf8')).toBe('second');
@@ -248,7 +248,7 @@ describe('AC22 — backup name already taken', () => {
     calls.failLink = true;
     vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    expect(loadState(dir)).toEqual({ version: 1, projects: [] });
+    expect(loadState(dir)).toEqual({ version: 1, projects: [], sessions: [] });
 
     expect(readFileSync(join(dir, backupNameAt(at)), 'utf8')).toBe('first');
     expect(readFileSync(join(dir, `${backupNameAt(at)}-2`), 'utf8')).toBe('{not json');
