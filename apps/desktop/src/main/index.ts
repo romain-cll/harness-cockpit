@@ -364,7 +364,8 @@ function startProjects(userData: string): void {
 
 // Sessions outside any project: an agent CLI run in a folder of its own under
 // the Cockpit home, in a pty owned by the window that started it. The sessions
-// are kept in `state.json`; the pty ends with its page, the folder stays.
+// are kept in `state.json`; the pty ends with its page or with the pty host (a start
+// after the host died starts a new one), the folder stays.
 function startSessions(userData: string, { spawnFor, kill }: ReturnType<typeof startPty>): void {
   // Detected on the first call that needs it, never at startup: detecting runs
   // each CLI's `--version`, and an app that never starts a session should not.
