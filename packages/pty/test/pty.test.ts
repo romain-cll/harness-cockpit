@@ -250,15 +250,14 @@ describe('pty host and client', () => {
       c.client.resize(old, 100, 30);
       c.client.kill(old);
     }).not.toThrow();
-    await sleep(300);
 
+    // The new session still has its own size and still answers. Host messages and
+    // output are ordered, so a misrouted write, resize or kill would show by now.
+    c.client.write(fresh, 'stty size\n');
+    await waitForOutput(c, fresh, '24 80');
     expect(c.exitsOf(fresh)).toEqual([]);
     expect(c.output(fresh)).not.toContain('from-old-id');
     expect(c.exitsOf(old)).toHaveLength(1);
-
-    // The new session still has its own size and still answers.
-    c.client.write(fresh, 'stty size\n');
-    await waitForOutput(c, fresh, '24 80');
 
     c.client.kill(fresh);
   });
@@ -275,7 +274,6 @@ describe('pty host and client', () => {
     c.hosts[0]!.emit({ type: 'data', id: old, data: 'late-from-old-host' });
     c.hosts[0]!.emit({ type: 'exit', id: old, exitCode: 0, signal: null });
     c.hosts[0]!.exit();
-    await sleep(300);
 
     expect(c.output(old)).not.toContain('late-from-old-host');
     expect(c.exitsOf(old)).toHaveLength(1);
@@ -299,7 +297,6 @@ describe('pty host and client', () => {
 
     c.die();
     await until(() => c.exitsOf(fresh).length > 0, `the exit of session ${fresh}`);
-    await sleep(200);
 
     expect(c.exitsOf(old)).toEqual([{ exitCode: null, signal: null }]);
     expect(c.exitsOf(fresh)).toEqual([{ exitCode: null, signal: null }]);

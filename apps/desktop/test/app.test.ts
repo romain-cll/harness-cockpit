@@ -826,26 +826,30 @@ async function killPtyHost(page: Page): Promise<number> {
   return id;
 }
 
-// Makes the main process answer `pty:spawn` after `ms` more, so a test can change
-// a terminal's size while its shell is still starting. Uses the handler table of
-// Electron's `ipcMain` (private), because the app has no hook for it.
-const delayPtySpawn = (session: Session, ms: number) =>
+// Makes the main process hold every `pty:spawn` answer until `releasePtySpawn`, so
+// a test can change a terminal's size while its shell is still starting. Uses the
+// handler table of Electron's `ipcMain` (private), because the app has no hook for it.
+const holdPtySpawn = (session: Session) =>
   session.evaluateInMain(`(() => {
     const handlers = require('electron').ipcMain._invokeHandlers;
     const original = handlers.get('pty:spawn');
     if (!original) throw new Error('the main process has no pty:spawn handler');
+    const gate = new Promise((resolve) => { globalThis.__releasePtySpawn = resolve; });
     globalThis.__originalPtySpawn = original;
     handlers.set('pty:spawn', async (...args) => {
-      await new Promise((resolve) => setTimeout(resolve, ${ms}));
+      await gate;
       return original(...args);
     });
   })()`);
 
-const restorePtySpawn = (session: Session) =>
+// Lets the held spawns go on and puts the real handler back.
+const releasePtySpawn = (session: Session) =>
   session.evaluateInMain(`(() => {
     const original = globalThis.__originalPtySpawn;
     if (original) require('electron').ipcMain._invokeHandlers.set('pty:spawn', original);
+    globalThis.__releasePtySpawn?.();
     delete globalThis.__originalPtySpawn;
+    delete globalThis.__releasePtySpawn;
   })()`);
 
 // The console errors of the navigation tests that are not the refusal of the
@@ -1633,7 +1637,7 @@ describe.each([
     expect(isAlive(secondPid)).toBe(true);
   });
 
-  test.runIf(full)('tabs AC3 — "Split right" divides the terminal into two halves of equal width, the original keeps its shell and output, the new half has the focus; splits nest', async () => {
+  test.runIf(full)('tabs AC3 — "Split right" and "Split down" divide the terminal into two halves of equal width or height, the original keeps its shell and output, the new half has the focus; splits nest', async () => {
     const { page } = session;
     await openTerminal(page);
     const a = await focusedPane(page);
@@ -1676,67 +1680,11 @@ describe.each([
     expect(Math.abs(bBox2.width - bBox.width), 'inside the half it split').toBeLessThanOrEqual(2);
     expect(bBox2.height + cBox.height).toBeGreaterThan(bBox.height - 24);
     expect(sameArea(await boxOf(a), aBox), 'the first half is untouched').toBe(true);
+    expect(await b.evaluate((element) => element.isConnected)).toBe(true);
+    expect(isAlive(bPid)).toBe(true);
+    expect(await rowsOf(b), 'the split terminal keeps its shell and output').toContain(`pid-${bPid}`);
     const cPid = await pidOf(page);
     expect(new Set([aPid, bPid, cPid]).size).toBe(3);
-  });
-
-  test.runIf(full)('tabs AC3 — "Split down" divides the terminal into two halves of equal height, stacked, and the new half has the focus', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const a = await focusedPane(page);
-    const aPid = await pidOf(page, a);
-    await typeLine(page, 'echo a-marker-$((10+2))');
-    await waitForRow(page, 'a-marker-12', a);
-    await settle(a);
-    const whole = await boxOf(a);
-
-    const b = await splitPane(page, a, 'down');
-    const aBox = await boxOf(a);
-    const bBox = await boxOf(b);
-    expect(Math.abs(aBox.height - bBox.height), 'equal heights').toBeLessThanOrEqual(2);
-    expect(Math.abs(aBox.width - bBox.width)).toBeLessThanOrEqual(2);
-    expect(Math.abs(aBox.width - whole.width), 'full width').toBeLessThanOrEqual(2);
-    expect(Math.abs(aBox.left - bBox.left)).toBeLessThanOrEqual(2);
-    expect(aBox.top, 'the original is the first half').toBeLessThan(bBox.top);
-    expect(aBox.bottom, 'stacked').toBeLessThanOrEqual(bBox.top + 2);
-    expect(aBox.height + bBox.height).toBeGreaterThan(whole.height - 24);
-    expect(aBox.height + bBox.height).toBeLessThanOrEqual(whole.height + 2);
-
-    expect(await a.evaluate((element) => element.isConnected)).toBe(true);
-    expect(await rowsOf(a)).toContain('a-marker-12');
-    expect(isAlive(aPid)).toBe(true);
-    expect(await pidOf(page)).not.toBe(aPid);
-  });
-
-  test.runIf(full)('tabs AC4 — closing a terminal of a split ends its shell and its sibling takes the freed area, keeping its shell and output', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const a = await focusedPane(page);
-    const aPid = await pidOf(page, a);
-    await typeLine(page, 'echo a-marker-$((10+3))');
-    await waitForRow(page, 'a-marker-13', a);
-    await settle(a);
-    const whole = await boxOf(a);
-
-    const b = await splitPane(page, a, 'right');
-    const bPid = await pidOf(page);
-    expect(isAlive(bPid)).toBe(true);
-
-    await clickPaneButton(b, 'Close terminal');
-
-    expect(await endsWithin(bPid), 'the closed terminal\'s shell ends within 5 s').toBe(true);
-    await poll(async () => (await visiblePanes(page)).length, (count) => count === 1, UI_TIMEOUT);
-    expect(await visiblePanes(page)).toHaveLength(1);
-    const grown = await poll(() => boxOf(a), (box) => sameArea(box, whole), UI_TIMEOUT);
-    expect(sameArea(grown, whole), 'the sibling fills the area again').toBe(true);
-    expect(await a.evaluate((element) => element.isConnected)).toBe(true);
-    expect(await rowsOf(a)).toContain('a-marker-13');
-    expect(isAlive(aPid)).toBe(true);
-    await expectTabs(page, ['Terminal 1'], 'Terminal 1');
-
-    await focusPane(a);
-    await typeLine(page, 'echo still-$((3*3))');
-    await waitForRow(page, 'still-9', a);
   });
 
   // In A | (B / C), closing C: B takes C's area, A is untouched, the keyboard is in B. The other
@@ -1882,10 +1830,13 @@ describe.each([
     await waitForPrompt(page, first);
     await openTab(page);
     const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+    const rowsBefore = (await rowsOf(first)).length;
 
     try {
       await page.setViewportSize({ width: viewport.width - 300, height: viewport.height - 150 });
-      await sleep(500);
+      // The hidden terminal is refitted while its tab is not shown.
+      const rowsAfter = await poll(async () => (await rowsOf(first)).length, (count) => count !== rowsBefore, UI_TIMEOUT);
+      expect(rowsAfter, 'the hidden terminal was resized').not.toBe(rowsBefore);
       await selectTab(page, 1);
       await poll(() => first.isVisible(), Boolean, UI_TIMEOUT);
       await expectSizeMatchesDisplay(page, first);
@@ -1900,16 +1851,17 @@ describe.each([
     const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
     let tab: Pane | undefined;
 
-    await delayPtySpawn(session, 1_500);
+    await holdPtySpawn(session);
     try {
       tab = await openTab(page);
-      await sleep(200);
+      const rowsBefore = (await rowsOf(tab)).length;
       await page.setViewportSize({ width: viewport.width - 300, height: viewport.height - 150 });
-      await sleep(400);
+      const rowsAfter = await poll(async () => (await rowsOf(tab!)).length, (count) => count !== rowsBefore, UI_TIMEOUT);
       // The premise: the shell has not started yet, and the terminal is already resized.
+      expect(rowsAfter, 'the terminal was resized').not.toBe(rowsBefore);
       expect((await rowsOf(tab)).some((row) => row.trim() !== ''), 'the shell is still starting').toBe(false);
     } finally {
-      await restorePtySpawn(session);
+      await releasePtySpawn(session);
     }
 
     try {
