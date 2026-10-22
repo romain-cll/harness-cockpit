@@ -2885,9 +2885,12 @@ describe.each([
     });
   });
 
-  // The host is stopped while the page opens, so the shell's spawn cannot resolve
-  // before the keys are typed: they must be held, then reach the shell in order.
-  test.runIf(full)('terminal AC1 — keys typed before the shell is spawned reach it once the pty host resumes', async () => {
+  // The host is stopped before the terminal page opens, so the spawn of the first
+  // tab's shell cannot resolve while the keys are typed: they must be held, then
+  // reach the shell in order. The first tab of a new visit is the one to use: its
+  // spawn is sent after the SIGSTOP whatever ran before, and it is the terminal
+  // "just opened" of the criterion. It runs before any test that kills the host.
+  test.runIf(full)('early keys AC1 — keys typed into a tab before its shell is spawned reach it once the pty host resumes', async () => {
     const { page } = session;
     // The host's pid, from the parent of a shell it runs (as the host-kill test).
     const id = await spawnShell(page);
@@ -2899,15 +2902,17 @@ describe.each([
     await waitForExit(page, id);
 
     process.kill(hostPid, 'SIGSTOP');
+    let pane: Pane;
     try {
       await openTerminal(page);
+      pane = await focusedPane(page);
       await typeLine(page, 'echo early-$((6*7))');
     } finally {
       process.kill(hostPid, 'SIGCONT');
     }
 
     // The echoed command line shows `$((6*7))`: only the shell prints `early-42`.
-    await waitForRow(page, 'early-42');
+    await waitForRow(page, 'early-42', pane);
   });
 
   // The smoke path of tabs and splits in the dev server and the packaged app (the
