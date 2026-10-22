@@ -1724,6 +1724,20 @@ describe.each([
     await waitForRow(page, 'sibling-42', b);
     expect(await rowsOf(a), 'A did not receive the typed text').not.toContain('sibling-42');
     expect((await rowsOf(a)).join('\n')).not.toContain('echo sibling-');
+
+    // The layout is now A | B. Closing A, the first child, gives the keyboard to B too.
+    const whole: Box = { left: aBox.left, top: slot.top, right: slot.right, bottom: slot.bottom, width: slot.right - aBox.left, height: slot.height };
+    await clickPaneButton(a, 'Close terminal');
+
+    expect(await endsWithin(aPid), 'the first child\'s shell ends within 5 s').toBe(true);
+    await poll(async () => (await visiblePanes(page)).length, (count) => count === 1, UI_TIMEOUT);
+    const whole2 = await poll(() => boxOf(b), (box) => sameArea(box, whole), UI_TIMEOUT);
+    expect(sameArea(whole2, whole), 'B takes the whole area').toBe(true);
+    expect(isAlive(bPid)).toBe(true);
+    const active2 = await poll(() => activePane(page), Boolean, UI_TIMEOUT);
+    expect(await isSamePane(active2!, b), 'B holds the focus after the first child closed').toBe(true);
+    await typeLine(page, 'echo first-closed-$((8*8))');
+    await waitForRow(page, 'first-closed-64', b);
   });
 
   test.runIf(full)('tabs AC5 — closing a tab ends all its shells, selects the tab on its left (the new first one for the first), numbers are not reused, and an empty page offers "New terminal"', async () => {
