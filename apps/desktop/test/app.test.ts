@@ -1970,6 +1970,8 @@ describe.each([
     const { page } = session;
     await openTerminal(page);
     const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+    const hostPid = await ptyHostPid(page);
+    const onePid = await pidOf(page);
     let tab: Pane | undefined;
 
     await holdPtySpawn(session);
@@ -1981,6 +1983,12 @@ describe.each([
       // The premise: the shell has not started yet, and the terminal is already resized.
       expect(rowsAfter, 'the terminal was resized').not.toBe(rowsBefore);
       expect((await rowsOf(tab)).some((row) => row.trim() !== ''), 'the shell is still starting').toBe(false);
+
+      // survive AC5: a tab opened while the spawn is held, then closed before it is released.
+      await openTab(page);
+      await expectTabs(page, ['Terminal 1', 'Terminal 2', 'Terminal 3'], 'Terminal 3');
+      await closeTab(page, 3);
+      await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 2');
     } finally {
       await releasePtySpawn(session);
     }
@@ -1988,6 +1996,16 @@ describe.each([
     try {
       await waitForPrompt(page, tab);
       await expectSizeMatchesDisplay(page, tab);
+      const twoPid = await pidOf(page, tab);
+      // survive AC5: the closed tab's shell, spawned late, does not stay under the pty host.
+      expect(
+        await poll(
+          () => childPidsOf(hostPid).sort((a, b) => a - b),
+          (children) => children.length === 2 && children.includes(onePid) && children.includes(twoPid),
+          5_000,
+        ),
+        'no shell of the closed tab is left under the pty host',
+      ).toEqual([onePid, twoPid].sort((a, b) => a - b));
     } finally {
       await page.setViewportSize(viewport);
     }
@@ -2103,6 +2121,7 @@ describe.each([
       session,
       `async (...args) => { globalThis.__spawnCalls = (globalThis.__spawnCalls ?? 0) + 1; return original(...args); }`,
     );
+    let mark = { errors: 0, output: 0 };
     process.kill(hostPid, 'SIGSTOP');
     try {
       const calls = () => session.evaluateInMain<number>('globalThis.__spawnCalls ?? 0');
@@ -2112,6 +2131,7 @@ describe.each([
       // The main process has received the spawn of the new tab, which the stopped host cannot answer.
       expect(await poll(calls, (count) => count > before, UI_TIMEOUT)).toBeGreaterThan(before);
 
+      mark = await errorMark(session);
       await page.reload();
       await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
     } finally {
@@ -2127,6 +2147,8 @@ describe.each([
       'the only child of the pty host is the shell of the reloaded page',
     ).toEqual([pid]);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+    // The pty:spawn handler does not reject for a page that is gone.
+    expect(session.output().slice(mark.output)).not.toContain('Error occurred in handler');
   });
 
   // The spawn itself fails: the terminal says so, the other tabs go on, and the next spawn works.
