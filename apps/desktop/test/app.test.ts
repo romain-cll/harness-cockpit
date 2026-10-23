@@ -4117,9 +4117,18 @@ describe('sessions: built app', () => {
     await dismissDialogs(page);
   });
 
-  test('AC1, workspace sessions AC13, AC14 — the first "Start session" menu open shows one disabled "Detecting agent CLIs…" item until Claude Code then Codex are listed, and runs each --version once; a second open runs none', async () => {
+  // Detection runs on this first open and takes about 1 s. A start the page calls while it
+  // runs, then a reload, must start nothing once detection ends: `sessions:start` reads the
+  // page's ending count at its entry (the pending-spawn case is `survive AC8` below).
+  test('workspace sessions AC13, AC12 — the first "Start session" menu open shows one disabled "Detecting agent CLIs…" item; a start called and a reload during detection start nothing, no folder, no stored session and no handler error', async () => {
     const { page } = session;
     expect(await sidebarLines(page)).toContain('Sessions');
+    const before = {
+      state: stateSnapshot(session.dataDir),
+      folders: sessionFoldersIn(session.cockpitHome),
+      runs: stubRuns(fx),
+    };
+    expect(before.runs).toEqual([]);
 
     await page.getByRole('button', { name: START_MENU, exact: true }).click({ timeout: UI_TIMEOUT });
     const items = page.getByRole('menuitem');
@@ -4128,16 +4137,36 @@ describe('sessions: built app', () => {
     expect((await items.first().innerText()).trim()).toBe(LOADING_ITEM);
     expect(await items.first().isDisabled()).toBe(true);
 
-    const listed = await poll(
-      async () => (await items.allInnerTexts()).map((text) => text.trim()),
-      (found) => !found.includes(LOADING_ITEM),
-      UI_TIMEOUT,
-    );
-    expect(listed).toEqual(['Claude Code', 'Codex']);
+    // Detection is running: the start waits for it, and the page is reloaded meanwhile.
+    await page.evaluate(() => {
+      void (
+        window as unknown as { api: { sessions: { start(harness: string, size: { cols: number; rows: number }): Promise<unknown> } } }
+      ).api.sessions.start('claude-code', { cols: 80, rows: 24 });
+    });
+    await page.reload();
+    await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
+
+    // The end of AC13: the menu lists the harnesses once detection has ended.
+    await openStartMenu(page);
+    expect((await items.allInnerTexts()).map((text) => text.trim())).toEqual(['Claude Code', 'Codex']);
+    await page.keyboard.press('Escape');
+    await items.first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+
+    // The host answers in order: once it ran a probe shell it has handled a spawn the start would have sent.
+    const hostPid = await ptyHostPid(page);
+    expect(stubPids(fx)).toEqual([]);
+    expect(await poll(() => childPidsOf(hostPid), (children) => children.length === 0, 5_000)).toEqual([]);
+    expect(startRuns(fx)).toEqual([]);
+    expect(sessionFoldersIn(session.cockpitHome)).toEqual(before.folders);
+    expect(stateSnapshot(session.dataDir)).toEqual(before.state);
+    expect(session.output()).not.toContain('Error occurred in handler');
+    expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+  });
+
+  test('AC1, workspace sessions AC14 — the menu lists Claude Code then Codex; each --version ran once, and a second open runs none', async () => {
+    const { page } = session;
     expect(versionRuns(fx)).toEqual(['claude --version', 'codex --version']);
 
-    await page.keyboard.press('Escape');
-    await page.getByRole('menuitem').first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
     await openStartMenu(page);
     expect((await page.getByRole('menuitem').allInnerTexts()).map((text) => text.trim())).toEqual(['Claude Code', 'Codex']);
     await sleep(500);
@@ -4386,7 +4415,7 @@ describe('sessions: built app', () => {
   });
 
   // --- Sessions in a workspace (COCKPIT-28). They run in order on this launch, with the
-  // repository added above; a reload (the last test) ends every running session.
+  // repository added above.
 
   test('workspace sessions AC4 — the Agent select lists None and the detected harnesses; a harness enables Prompt, None disables it again', async () => {
     const { page } = session;
@@ -4621,6 +4650,38 @@ describe('sessions: built app', () => {
     expect(stateSnapshot(session.dataDir)).toEqual(before.state);
   });
 
+  test('workspace sessions AC8 — a project whose folder is gone is refused with "<project path> is not a git repository.", nothing is spawned and the state is unchanged', async () => {
+    const { page } = session;
+    const gone = makeRepo('agent-gone');
+    try {
+      await addRepository(session, gone);
+      // Deleted after it was added: the state still lists it.
+      rmSync(gone.parent, { recursive: true, force: true });
+      const before = {
+        state: stateSnapshot(session.dataDir),
+        folders: sessionFoldersIn(session.cockpitHome),
+        pids: stubPids(fx),
+        runs: stubRuns(fx),
+      };
+
+      expect(await startApi(page, { workspace: { project: gone.root, path: join(gone.parent, 'wt') } })).toEqual({
+        status: 'refused',
+        message: `${gone.root} is not a git repository.`,
+      });
+
+      await sleep(300);
+      expect(stubPids(fx)).toEqual(before.pids);
+      expect(stubRuns(fx)).toEqual(before.runs);
+      expect(sessionFoldersIn(session.cockpitHome)).toEqual(before.folders);
+      expect(stateSnapshot(session.dataDir)).toEqual(before.state);
+
+      await removeThroughMenu(page, gone.root);
+      await poll(() => entryTitles(page), (titles) => !titles.includes(gone.root), UI_TIMEOUT);
+    } finally {
+      rmSync(gone.parent, { recursive: true, force: true });
+    }
+  });
+
   test('workspace sessions AC11 — pty.spawn with a command and no args runs it with no argument; without a command it runs the login shell with -l', async () => {
     const { page } = session;
     const id = await spawnShell(page, { command: join(fx.bin, 'claude'), cols: 80, rows: 24 });
@@ -4685,45 +4746,6 @@ describe('sessions: built app', () => {
       ['Claude Code 1', true],
     ]);
     expect(sessionsInState(session.dataDir)).toEqual(sessionsBefore);
-  });
-
-  // The last one: the reload ends every running session.
-  test('workspace sessions AC12 — a start that waits for a stopped pty host when the page reloads leaves no harness process, no session folder and the state unchanged', async () => {
-    const { page } = session;
-    // The pty host's pid, from a shell's parent.
-    const probe = await spawnShell(page);
-    await ptyWrite(page, probe, 'echo ppid-$PPID\n');
-    await waitForOutput(page, probe, /ppid-\d+/);
-    const hostPid = Number(/ppid-(\d+)/.exec(await outputOf(page, probe))![1]);
-    await ptyKill(page, probe);
-    await waitForExit(page, probe);
-
-    const before = {
-      state: stateSnapshot(session.dataDir),
-      folders: sessionFoldersIn(session.cockpitHome),
-      pids: stubPids(fx),
-    };
-    process.kill(hostPid, 'SIGSTOP');
-    try {
-      await page.evaluate(() => {
-        void (window as unknown as { api: { sessions: { start(harness: string, size: { cols: number; rows: number }): Promise<unknown> } } }).api.sessions.start(
-          'claude-code',
-          { cols: 80, rows: 24 },
-        );
-      });
-      // The folder is made before the spawn request goes to the host, which is stopped.
-      await poll(() => sessionFoldersIn(session.cockpitHome), (found) => found.length > before.folders.length, UI_TIMEOUT);
-      expect(sessionFoldersIn(session.cockpitHome)).toHaveLength(before.folders.length + 1);
-      await page.reload();
-      await page.getByText(versionLabel).waitFor();
-    } finally {
-      process.kill(hostPid, 'SIGCONT');
-    }
-
-    // The host spawns the harness, the main process finds its window gone and rolls back.
-    expect(await poll(() => sessionFoldersIn(session.cockpitHome), (found) => found.length === before.folders.length, 10_000)).toEqual(before.folders);
-    expect(await poll(() => stubPids(fx), (pids) => !pids.some((pid) => !before.pids.includes(pid)), 5_000).then((pids) => pids.filter((pid) => !before.pids.includes(pid)))).toEqual([]);
-    expect(stateSnapshot(session.dataDir)).toEqual(before.state);
   });
 
   test('logs no error and keeps running', async () => {
