@@ -1,34 +1,11 @@
 import { createFileRoute, rootRouteId, useLoaderData } from '@tanstack/react-router';
-import { useEffect, useRef } from 'react';
+import { getSessionTerminal } from '@/components/live-terminals';
 import { PageHeader } from '@/components/page-header';
-import { getSessionTerminal, type SessionTerminal } from '@/components/session-terminals';
+import { Terminal } from '@/components/terminal';
 
 export const Route = createFileRoute('/sessions/$sessionId')({
   component: SessionPage,
 });
-
-// Shows the session's terminal, which lives in the store: its element is moved
-// into the page and moved out again, never disposed.
-function LiveTerminal({ entry }: { entry: SessionTerminal }) {
-  const container = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const { term, fit } = entry;
-    const element = container.current!;
-    if (term.element) element.appendChild(term.element);
-    else term.open(element);
-    fit.fit();
-    term.focus();
-    const observer = new ResizeObserver(() => fit.fit());
-    observer.observe(element);
-    return () => {
-      observer.disconnect();
-      term.element?.remove();
-    };
-  }, [entry]);
-
-  return <div ref={container} className="min-h-0 flex-1 overflow-hidden bg-background px-2 py-1" />;
-}
 
 function SessionPage() {
   const { sessionId } = Route.useParams();
@@ -42,7 +19,9 @@ function SessionPage() {
     <>
       <PageHeader title={session?.name ?? 'Session'} />
       {entry ? (
-        <LiveTerminal entry={entry} />
+        <div className="min-h-0 flex-1">
+          <Terminal live={entry} focused />
+        </div>
       ) : (
         <div className="flex flex-col gap-1 p-4 text-sm">
           {session ? (

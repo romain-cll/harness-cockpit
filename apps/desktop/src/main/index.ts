@@ -166,6 +166,13 @@ async function withSpawnDefaults(request: PtySpawnRequest): Promise<PtySpawnOpti
 // The loaded state, replaced by a new one (and saved) on every change.
 let state: State;
 
+// A shell was spawned for a page that navigated or was destroyed meanwhile.
+class PageGoneError extends Error {
+  constructor() {
+    super('the page that asked for the shell is gone');
+  }
+}
+
 // Terminals live in a utility process, so a pty crash does not take the app down.
 // The client starts it again at the next spawn after it died.
 // Returns what the main process needs to run a terminal of its own.
@@ -173,17 +180,31 @@ function startPty() {
   const pty = createPtyClient(() => utilityProcess.fork(ptyHostPath, [], { serviceName: 'Cockpit Pty Host' }));
   // The window that spawned a session is the one that receives its output.
   const owners = new Map<number, WebContents>();
+  // How many times each page's shells were ended (a navigation, a destroyed page).
+  const endings = new WeakMap<WebContents, number>();
+  const endingsOf = (contents: WebContents) => endings.get(contents) ?? 0;
 
-  // Spawns with the defaults, for the window that will receive the output.
+  // Spawns with the defaults, for the window that will receive the output. A spawn
+  // that resolves after its page navigated or was destroyed (the pty host was busy)
+  // is killed at once: no page is left to own it, and it throws `PageGoneError`.
   const spawnFor = async (contents: WebContents, request: PtySpawnRequest) => {
+    const before = endingsOf(contents);
     const id = await pty.spawn(await withSpawnDefaults(request));
+    if (contents.isDestroyed() || endingsOf(contents) !== before) {
+      pty.kill(id);
+      throw new PageGoneError();
+    }
     owners.set(id, contents);
     return id;
   };
 
   ipcMain.handle('pty:spawn', (event, request: PtySpawnRequest) => {
     if (!isFromApp(event)) throw new Error('pty:spawn refused: unexpected origin');
-    return spawnFor(event.sender, request);
+    // The reply of a page that is gone reaches no one: the handler does not reject for it.
+    return spawnFor(event.sender, request).catch((error: unknown) => {
+      if (error instanceof PageGoneError) return -1;
+      throw error;
+    });
   });
   ipcMain.on('pty:write', (event, id: number, data: string) => {
     if (isFromApp(event)) pty.write(id, data);
@@ -212,6 +233,7 @@ function startPty() {
   // that commits an error page fires `did-fail-load` instead (an aborted
   // navigation, `ERR_ABORTED`, commits nothing and kills nothing).
   const killSessionsOf = (contents: WebContents) => {
+    endings.set(contents, endingsOf(contents) + 1);
     for (const [id, owner] of owners) if (owner === contents) pty.kill(id);
   };
   app.on('web-contents-created', (_event, contents) => {

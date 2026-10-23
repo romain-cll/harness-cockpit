@@ -1,5 +1,6 @@
 import { Columns2Icon, PlusIcon, Rows2Icon, XIcon } from 'lucide-react';
-import { useReducer, type ReactNode } from 'react';
+import { useSyncExternalStore, type ReactNode } from 'react';
+import { closeLiveTerminal, createLiveTerminal, type LiveTerminal } from '@/components/live-terminals';
 import { PageHeader } from '@/components/page-header';
 import { Terminal } from '@/components/terminal';
 import { Button } from '@/components/ui/button';
@@ -133,6 +134,53 @@ function reduce(state: State, action: Action): State {
   }
 }
 
+// The page's state outlives the page: it lives at module level, so leaving the
+// Terminal page and coming back finds the tabs as they were, and only a reload starts
+// over. Numbers and terminal ids therefore count for the page's lifetime.
+let state = initial;
+const listeners = new Set<() => void>();
+// The terminal of each pane, created when the pane first renders.
+const panes = new Map<number, LiveTerminal>();
+
+function subscribe(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => void listeners.delete(listener);
+}
+
+const getState = () => state;
+
+const terminalIds = ({ tabs }: State) => tabs.flatMap((tab) => leaves(tab.layout));
+
+// The terminals an action removes are closed: their shells end.
+function dispatch(action: Action) {
+  const next = reduce(state, action);
+  const kept = new Set(terminalIds(next));
+  for (const id of terminalIds(state)) {
+    const pane = panes.get(id);
+    if (pane && !kept.has(id)) {
+      closeLiveTerminal(pane);
+      panes.delete(id);
+    }
+  }
+  state = next;
+  for (const listener of listeners) listener();
+}
+
+function paneTerminal(id: number): LiveTerminal {
+  let pane = panes.get(id);
+  if (!pane) {
+    const { entry, started } = createLiveTerminal(({ cols, rows }) => window.api.pty.spawn({ cols, rows }));
+    started.catch((error: unknown) => {
+      // The pane may have been closed (its terminal disposed) before the spawn rejected.
+      if (panes.get(id) !== entry) return;
+      entry.term.write(`\r\n[Could not start the shell: ${error instanceof Error ? error.message : error}]`);
+    });
+    pane = entry;
+    panes.set(id, pane);
+  }
+  return pane;
+}
+
 function PaneButton({ label, onClick, children }: { label: string; onClick: () => void; children: ReactNode }) {
   return (
     <Button variant="ghost" size="icon-xs" aria-label={label} onClick={onClick}>
@@ -144,9 +192,9 @@ function PaneButton({ label, onClick, children }: { label: string; onClick: () =
 // The terminal page: tabs in the page header, each tab a tree of split terminals.
 // Every terminal of every tab sits in one flat list keyed by its id and is placed
 // by its box, so splitting, closing a neighbour or switching tab never remounts a
-// terminal (that would end its shell). The terminals of other tabs are hidden.
+// view. The terminals of other tabs are hidden.
 export function TerminalTabs() {
-  const [{ tabs, selected }, dispatch] = useReducer(reduce, initial);
+  const { tabs, selected } = useSyncExternalStore(subscribe, getState);
 
   return (
     <>
@@ -194,7 +242,7 @@ export function TerminalTabs() {
                 style={{ left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%` }}
                 onFocus={() => dispatch({ type: 'focus', tab: tab.number, terminal })}
               >
-                <Terminal focused={shown && tab.focused === terminal} />
+                <Terminal live={paneTerminal(terminal)} focused={shown && tab.focused === terminal} />
                 <div className="absolute top-1 right-3 flex gap-0.5 opacity-0 group-focus-within/pane:opacity-100 group-hover/pane:opacity-100">
                   <PaneButton label="Split right" onClick={() => dispatch({ type: 'split', tab: tab.number, terminal, direction: 'right' })}>
                     <Columns2Icon />
