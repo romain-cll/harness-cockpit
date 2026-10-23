@@ -171,6 +171,8 @@ function paneTerminal(id: number): LiveTerminal {
   if (!pane) {
     const { entry, started } = createLiveTerminal(({ cols, rows }) => window.api.pty.spawn({ cols, rows }));
     started.catch((error: unknown) => {
+      // The pane may have been closed (its terminal disposed) before the spawn rejected.
+      if (panes.get(id) !== entry) return;
       entry.term.write(`\r\n[Could not start the shell: ${error instanceof Error ? error.message : error}]`);
     });
     pane = entry;
