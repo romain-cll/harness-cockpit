@@ -189,8 +189,8 @@ function startPty() {
   // Spawns with the defaults, for the window that will receive the output. A spawn
   // that resolves after its page navigated or was destroyed (the pty host was busy)
   // is killed at once: no page is left to own it, and it throws `PageGoneError`.
-  const spawnFor = async (contents: WebContents, request: PtySpawnRequest) => {
-    const before = endingsOf(contents);
+  // `before` is the page's ending count the caller read when it started waiting.
+  const spawnFor = async (contents: WebContents, request: PtySpawnRequest, before = endingsOf(contents)) => {
     const id = await pty.spawn(await withSpawnDefaults(request));
     if (contents.isDestroyed() || endingsOf(contents) !== before) {
       pty.kill(id);
@@ -246,7 +246,7 @@ function startPty() {
     contents.on('destroyed', () => killSessionsOf(contents));
   });
 
-  return { spawnFor, kill: (id: number) => pty.kill(id) };
+  return { spawnFor, endingsOf, kill: (id: number) => pty.kill(id) };
 }
 
 // Why git could not do what was asked of `path`, in words for the user.
@@ -390,7 +390,7 @@ function startProjects(userData: string): void {
 // the Cockpit home, in a pty owned by the window that started it. The sessions
 // are kept in `state.json`; the pty ends with its page or with the pty host (a start
 // after the host died starts a new one), the folder stays.
-function startSessions(userData: string, { spawnFor, kill }: ReturnType<typeof startPty>): void {
+function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnType<typeof startPty>): void {
   // Detected on the first call that needs it, never at startup: detecting runs
   // each CLI's `--version`, and an app that never starts a session should not.
   let detection: Promise<DetectedHarness[]> | undefined;
@@ -414,6 +414,8 @@ function startSessions(userData: string, { spawnFor, kill }: ReturnType<typeof s
     'sessions:start',
     async (event, harnessId: string, size: { cols: number; rows: number }, options?: StartSessionOptions): Promise<StartSessionResult> => {
       if (!isFromApp(event)) throw new Error('sessions:start refused: unexpected origin');
+      // A page that ends while detection or the worktree check runs starts nothing.
+      const endings = endingsOf(event.sender);
       const harness = harnesses.find(({ id }) => id === harnessId);
       const found = (await detected()).find(({ id }) => id === harnessId);
       if (!harness || !found) return { status: 'refused', message: `${harness?.name ?? harnessId} is not installed.` };
@@ -425,13 +427,16 @@ function startSessions(userData: string, { spawnFor, kill }: ReturnType<typeof s
         const refusal = await checkWorkspace(workspace);
         if (refusal) return refusal;
       }
+      if (endingsOf(event.sender) !== endings) {
+        return { status: 'refused', message: `Could not start ${harness.name}: the page that asked for it is gone` };
+      }
       const id = randomUUID();
       const directory = workspace?.path ?? join(cockpitHome, 'sessions', id);
       const prompt = options?.prompt?.trim() || undefined;
       let ptyId: number | undefined;
       try {
         if (!workspace) mkdirSync(directory, { recursive: true });
-        ptyId = await spawnFor(event.sender, { ...size, command: found.path, args: harness.start(prompt), cwd: directory });
+        ptyId = await spawnFor(event.sender, { ...size, command: found.path, args: harness.start(prompt), cwd: directory }, endings);
         const session = {
           id,
           name: sessionName(state, harness, workspace?.path),
