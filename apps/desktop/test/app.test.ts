@@ -4094,14 +4094,7 @@ describe('sessions: built app', () => {
     }
   });
 
-  test('workspace sessions AC14 — no stub has run at startup', async () => {
-    await session.page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
-    // Nothing to wait for: an absence.
-    await sleep(1000);
-    expect(stubRuns(fx)).toEqual([]);
-  });
-
-  test('workspace sessions AC4 — the New workspace dialog opens with Agent "None" and a disabled Prompt, and runs no --version', async () => {
+  test('workspace sessions AC4, AC14 — the New workspace dialog opens with Agent "None" and a disabled Prompt; no --version ran at startup nor on the dialog open', async () => {
     const { page } = session;
     await addRepository(session, repo);
 
@@ -4111,7 +4104,8 @@ describe('sessions: built app', () => {
     expect(lines).toContain('Prompt');
     expect((await agentSelect(dialog).innerText()).trim()).toBe('None');
     expect(await promptField(dialog).isDisabled()).toBe(true);
-    // Detection waits for the select to open (or a menu): the dialog alone runs nothing.
+    // Detection waits for the select to open (or a menu): neither the startup nor the dialog
+    // ran anything. The log is cumulative, so this one check covers both.
     await sleep(500);
     expect(stubRuns(fx)).toEqual([]);
     await dismissDialogs(page);
