@@ -4555,7 +4555,6 @@ describe('sessions: built app', () => {
       sessions: sessionsInState(session.dataDir),
       folders: sessionFoldersIn(session.cockpitHome),
       pids: stubPids(fx),
-      starts: startRuns(fx).length,
     };
     const blocker = join(session.dataDir, 'state.json.tmp');
     mkdirSync(blocker);
@@ -4574,12 +4573,13 @@ describe('sessions: built app', () => {
       const lines = await poll(() => sidebarLines(page), (found) => found.some((line) => line.startsWith('Could not start Claude Code:')), UI_TIMEOUT);
       const message = lines.find((line) => line.startsWith('Could not start Claude Code:'))!;
       expect(message).toBeTruthy();
+      // Only a save after a successful spawn raises it.
+      expect(message).toContain('EISDIR');
       expect(await isBelowProjectsHeader(page, { text: message })).toBe(true);
       expect(await isBelowSessionsHeader(page, message)).toBe(false);
 
-      // The harness was spawned, then killed by the rollback.
+      // The harness was spawned (the message carries the save error), then killed by the rollback.
       expect(await poll(() => stubPids(fx), (pids) => JSON.stringify(pids) === JSON.stringify(before.pids), 5_000)).toEqual(before.pids);
-      expect(await poll(() => startRuns(fx).length, (count) => count > before.starts, 5_000)).toBeGreaterThan(before.starts);
       expect(sessionsInState(session.dataDir)).toEqual(before.sessions);
       expect(stateSnapshot(session.dataDir)).toEqual(before.state);
       expect(sessionFoldersIn(session.cockpitHome)).toEqual(before.folders);
