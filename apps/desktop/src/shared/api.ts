@@ -5,7 +5,8 @@ export type { PtyExit };
 /**
  * What the renderer sends to start a terminal. Omitted options are filled in by
  * the main process: `command` is the user's `$SHELL` (`/bin/zsh` when unset) run
- * as a login shell, `cwd` the home directory, and `env` the main process's
+ * as a login shell (`-l` is the default shell's only: a `command` without `args`
+ * runs with no argument), `cwd` the home directory, and `env` the login shell's
  * environment with `TERM=xterm-256color` and `COLORTERM=truecolor`.
  */
 export type PtySpawnRequest = Pick<PtySpawnOptions, 'cols' | 'rows'> & Partial<PtySpawnOptions>;
@@ -49,7 +50,10 @@ export type CreateWorkspaceResult = { status: 'created'; workspace: Workspace } 
 /** `dirty`: the workspace has uncommitted changes and was not removed. `branchKept`: its branch is not merged. */
 export type RemoveWorkspaceResult = { status: 'removed'; branchKept: boolean } | { status: 'dirty' } | Refused;
 
-/** A run of an agent CLI in a folder of its own; `harness` is its id in the catalogue. */
+/**
+ * A run of an agent CLI, in a folder of its own or in a workspace's worktree (`directory`);
+ * `harness` is its id in the catalogue.
+ */
 export interface Session {
   id: string;
   name: string;
@@ -57,6 +61,17 @@ export interface Session {
   directory: string;
   /** ISO 8601. */
   createdAt: string;
+  /** The root of the project whose workspace it runs in; absent for a session outside any project. */
+  project?: string;
+}
+
+/**
+ * `workspace`: run in that linked worktree of a project instead of a new folder. `prompt`: the
+ * harness's initial prompt (trimmed; blank means none).
+ */
+export interface StartSessionOptions {
+  workspace?: { project: string; path: string };
+  prompt?: string;
 }
 
 /** A detected agent CLI the user can start a session with. */
@@ -108,14 +123,17 @@ export interface Api {
     /** Removes the worktree, and its branch when merged; `force` removes it with its uncommitted changes. */
     remove(project: string, path: string, options?: { force?: boolean }): Promise<RemoveWorkspaceResult>;
   };
-  /** Agent CLIs run outside any project, in a folder of their own. */
+  /** Agent CLIs, run in a folder of their own outside any project or in a workspace of a project. */
   sessions: {
     /** The detected agent CLIs, in catalogue order. */
     harnesses(): Promise<AvailableHarness[]>;
     /** The stored sessions, newest first. */
     list(): Promise<Session[]>;
-    /** Runs the harness in a new folder, in a pty owned by the calling window. */
-    start(harness: string, size: { cols: number; rows: number }): Promise<StartSessionResult>;
+    /**
+     * Runs the harness in a new folder, or in `options.workspace`, in a pty owned by the calling window.
+     * Refused when the project is not in the app state or the path is not one of its linked worktrees.
+     */
+    start(harness: string, size: { cols: number; rows: number }, options?: StartSessionOptions): Promise<StartSessionResult>;
   };
   /** The `PATH` of the user's login shell, the only part of its environment the renderer sees. */
   getShellPath(): Promise<string>;

@@ -9,17 +9,19 @@ export interface Project {
   path: string;
 }
 
-// A run of an agent CLI in a folder of its own, outside any project.
+// A run of an agent CLI, in a folder of its own outside any project, or in a workspace of a project.
 export interface Session {
   id: string;
   // `<harness name> <n>`, from `sessionName`.
   name: string;
   // The harness's id in `@cockpit/harnesses`.
   harness: string;
-  // Absolute path of the session's folder.
+  // Absolute path of the session's folder, or of the workspace's worktree.
   directory: string;
   // ISO 8601.
   createdAt: string;
+  // The root of the project whose workspace it runs in; absent outside any project.
+  project?: string;
 }
 
 export interface State {
@@ -55,8 +57,8 @@ function isProject(value: unknown): value is Project {
 
 function isSession(value: unknown): value is Session {
   if (typeof value !== 'object' || value === null) return false;
-  const { id, name, harness, directory, createdAt } = value as Record<string, unknown>;
-  return [id, name, harness, directory, createdAt].every((field) => typeof field === 'string');
+  const { id, name, harness, directory, createdAt, project } = value as Record<string, unknown>;
+  return [id, name, harness, directory, createdAt].every((field) => typeof field === 'string') && (project === undefined || typeof project === 'string');
 }
 
 // A file written before projects or sessions existed lacks them: they read as empty.
@@ -106,9 +108,11 @@ export function addSession(state: State, session: Session): State {
   return { ...state, sessions: [...state.sessions, session] };
 }
 
-// `<harness name> <n>`, n being one more than the sessions of that harness so far.
-export function sessionName(state: State, harness: { id: string; name: string }): string {
-  return `${harness.name} ${1 + state.sessions.filter((session) => session.harness === harness.id).length}`;
+// `<harness name> <n>`, n being one more than the sessions of that harness so far
+// in `directory` (a workspace), or outside any project when it is omitted.
+export function sessionName(state: State, harness: { id: string; name: string }, directory?: string): string {
+  const here = (session: Session) => (directory === undefined ? session.project === undefined : session.directory === directory);
+  return `${harness.name} ${1 + state.sessions.filter((session) => session.harness === harness.id && here(session)).length}`;
 }
 
 function readState(file: string): string | undefined {

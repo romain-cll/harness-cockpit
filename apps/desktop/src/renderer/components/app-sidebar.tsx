@@ -25,7 +25,7 @@ export function AppSidebar({ version, projects, sessions }: { version: string; p
           Terminal
         </Link>
       </nav>
-      <Projects projects={projects} />
+      <Projects projects={projects} sessions={sessions} />
       <Sessions sessions={sessions} />
       <footer className="shrink-0 px-4 py-3 text-xs text-muted-foreground">Cockpit {version}</footer>
     </aside>

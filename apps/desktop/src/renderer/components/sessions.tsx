@@ -1,16 +1,29 @@
 import { Link, useRouter } from '@tanstack/react-router';
-import { BotIcon, PlusIcon } from 'lucide-react';
+import { BotIcon } from 'lucide-react';
 import { useState, useSyncExternalStore } from 'react';
-import type { AvailableHarness, Session } from '../../shared/api';
+import type { Session } from '../../shared/api';
 import { getRunningIds, startSession, subscribe } from '@/components/live-terminals';
-import { Button } from '@/components/ui/button';
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { StartSessionMenu } from '@/components/start-session-menu';
 
+// A session's link, with "Ended" unless its agent is running.
+export function SessionLink({ session }: { session: Session }) {
+  const running = useSyncExternalStore(subscribe, getRunningIds);
+  return (
+    <Link
+      to="/sessions/$sessionId"
+      params={{ sessionId: session.id }}
+      className="flex h-8 cursor-default items-center gap-2 rounded-[calc(var(--radius-sm)+2px)] p-2 text-xs hover:bg-sidebar-accent hover:text-sidebar-accent-foreground aria-[current=page]:bg-sidebar-accent aria-[current=page]:font-medium aria-[current=page]:text-sidebar-accent-foreground [&_svg]:size-4 [&_svg]:shrink-0"
+    >
+      <BotIcon />
+      <span className="truncate">{session.name}</span>{' '}
+      {!running.has(session.id) && <span className="ml-auto shrink-0 text-muted-foreground">Ended</span>}
+    </Link>
+  );
+}
+
+// The sessions outside any project; those of a workspace are listed under it.
 export function Sessions({ sessions }: { sessions: Session[] }) {
   const router = useRouter();
-  const running = useSyncExternalStore(subscribe, getRunningIds);
-  // The detected harnesses, fetched each time the menu opens.
-  const [harnesses, setHarnesses] = useState<AvailableHarness[]>();
   // Why the last start was refused; cleared by the next one that succeeds.
   const [message, setMessage] = useState<string>();
 
@@ -29,19 +42,7 @@ export function Sessions({ sessions }: { sessions: Session[] }) {
     <section className="flex max-h-[40%] shrink-0 flex-col gap-px p-2">
       <header className="flex h-7 shrink-0 items-center justify-between pl-2 text-xs text-muted-foreground">
         <h2 className="font-medium">Sessions</h2>
-        <DropdownMenu onOpenChange={(open) => open && void window.api.sessions.harnesses().then(setHarnesses)}>
-          <DropdownMenuTrigger render={<Button variant="ghost" size="icon-xs" aria-label="Start session" />}>
-            <PlusIcon />
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-auto">
-            {harnesses?.map((harness) => (
-              <DropdownMenuItem key={harness.id} onClick={() => void start(harness.id)}>
-                {harness.name}
-              </DropdownMenuItem>
-            ))}
-            {harnesses?.length === 0 && <DropdownMenuItem disabled>No agent CLI found</DropdownMenuItem>}
-          </DropdownMenuContent>
-        </DropdownMenu>
+        <StartSessionMenu label="Start session" onStart={(harness) => void start(harness)} />
       </header>
       {message && (
         <p role="status" className="shrink-0 px-2 py-1 text-xs break-words text-destructive">
@@ -49,19 +50,13 @@ export function Sessions({ sessions }: { sessions: Session[] }) {
         </p>
       )}
       <ul className="flex min-h-0 flex-col gap-px overflow-y-auto">
-        {sessions.map((session) => (
-          <li key={session.id} title={session.directory}>
-            <Link
-              to="/sessions/$sessionId"
-              params={{ sessionId: session.id }}
-              className="flex h-8 cursor-default items-center gap-2 rounded-[calc(var(--radius-sm)+2px)] p-2 text-xs hover:bg-sidebar-accent hover:text-sidebar-accent-foreground aria-[current=page]:bg-sidebar-accent aria-[current=page]:font-medium aria-[current=page]:text-sidebar-accent-foreground [&_svg]:size-4 [&_svg]:shrink-0"
-            >
-              <BotIcon />
-              <span className="truncate">{session.name}</span>{' '}
-              {!running.has(session.id) && <span className="ml-auto shrink-0 text-muted-foreground">Ended</span>}
-            </Link>
-          </li>
-        ))}
+        {sessions
+          .filter((session) => session.project === undefined)
+          .map((session) => (
+            <li key={session.id} title={session.directory}>
+              <SessionLink session={session} />
+            </li>
+          ))}
       </ul>
     </section>
   );

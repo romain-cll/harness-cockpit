@@ -31,7 +31,7 @@ const api: Api = {
   sessions: {
     harnesses: () => ipcRenderer.invoke('sessions:harnesses'),
     list: () => ipcRenderer.invoke('sessions:list'),
-    start: (harness, size) => ipcRenderer.invoke('sessions:start', harness, size),
+    start: (harness, size, options) => ipcRenderer.invoke('sessions:start', harness, size, options),
   },
   getShellPath: () => ipcRenderer.invoke('get-shell-path'),
 };
