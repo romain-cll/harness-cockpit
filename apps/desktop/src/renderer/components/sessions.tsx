@@ -2,7 +2,7 @@ import { Link, useRouter } from '@tanstack/react-router';
 import { BotIcon, PlusIcon } from 'lucide-react';
 import { useState, useSyncExternalStore } from 'react';
 import type { AvailableHarness, Session } from '../../shared/api';
-import { getRunningIds, startSession, subscribe } from '@/components/session-terminals';
+import { getRunningIds, startSession, subscribe } from '@/components/live-terminals';
 import { Button } from '@/components/ui/button';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 

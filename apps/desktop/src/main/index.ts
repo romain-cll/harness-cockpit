@@ -173,10 +173,20 @@ function startPty() {
   const pty = createPtyClient(() => utilityProcess.fork(ptyHostPath, [], { serviceName: 'Cockpit Pty Host' }));
   // The window that spawned a session is the one that receives its output.
   const owners = new Map<number, WebContents>();
+  // How many times each page's shells were ended (a navigation, a destroyed page).
+  const endings = new WeakMap<WebContents, number>();
+  const endingsOf = (contents: WebContents) => endings.get(contents) ?? 0;
 
-  // Spawns with the defaults, for the window that will receive the output.
+  // Spawns with the defaults, for the window that will receive the output. A spawn
+  // that resolves after its page navigated or was destroyed (the pty host was busy)
+  // is killed at once: no page is left to own it, and the caller gets an error.
   const spawnFor = async (contents: WebContents, request: PtySpawnRequest) => {
+    const before = endingsOf(contents);
     const id = await pty.spawn(await withSpawnDefaults(request));
+    if (contents.isDestroyed() || endingsOf(contents) !== before) {
+      pty.kill(id);
+      throw new Error('the page that asked for the shell is gone');
+    }
     owners.set(id, contents);
     return id;
   };
@@ -212,6 +222,7 @@ function startPty() {
   // that commits an error page fires `did-fail-load` instead (an aborted
   // navigation, `ERR_ABORTED`, commits nothing and kills nothing).
   const killSessionsOf = (contents: WebContents) => {
+    endings.set(contents, endingsOf(contents) + 1);
     for (const [id, owner] of owners) if (owner === contents) pty.kill(id);
   };
   app.on('web-contents-created', (_event, contents) => {
