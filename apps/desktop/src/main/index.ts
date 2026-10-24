@@ -38,6 +38,7 @@ import type {
   PtySpawnRequest,
   Refused,
   RemoveWorkspaceResult,
+  StartSessionOptions,
   StartSessionResult,
 } from '../shared/api';
 import ptyHostPath from './pty-host?modulePath';
@@ -151,12 +152,13 @@ function isFromApp({ senderFrame }: Pick<IpcMainEvent, 'senderFrame'>): boolean 
 
 // Fills in what a spawn request leaves out: the user's login-shell environment
 // and the shell it names, run as a login shell as Terminal.app does, in the home
-// directory. Options the renderer passes win.
+// directory. Options the renderer passes win. `-l` belongs to the default shell
+// only: a request with its own `command` and no `args` runs it with no argument.
 async function withSpawnDefaults(request: PtySpawnRequest): Promise<PtySpawnOptions> {
   const env = await shellEnv;
   return {
     command: env.SHELL ?? '/bin/zsh',
-    args: ['-l'],
+    args: request.command === undefined ? ['-l'] : [],
     cwd: homedir(),
     env: { ...env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
     ...request,
@@ -187,8 +189,8 @@ function startPty() {
   // Spawns with the defaults, for the window that will receive the output. A spawn
   // that resolves after its page navigated or was destroyed (the pty host was busy)
   // is killed at once: no page is left to own it, and it throws `PageGoneError`.
-  const spawnFor = async (contents: WebContents, request: PtySpawnRequest) => {
-    const before = endingsOf(contents);
+  // `before` is the page's ending count the caller read when it started waiting.
+  const spawnFor = async (contents: WebContents, request: PtySpawnRequest, before = endingsOf(contents)) => {
     const id = await pty.spawn(await withSpawnDefaults(request));
     if (contents.isDestroyed() || endingsOf(contents) !== before) {
       pty.kill(id);
@@ -244,7 +246,7 @@ function startPty() {
     contents.on('destroyed', () => killSessionsOf(contents));
   });
 
-  return { spawnFor, kill: (id: number) => pty.kill(id) };
+  return { spawnFor, endingsOf, kill: (id: number) => pty.kill(id) };
 }
 
 // Why git could not do what was asked of `path`, in words for the user.
@@ -388,7 +390,7 @@ function startProjects(userData: string): void {
 // the Cockpit home, in a pty owned by the window that started it. The sessions
 // are kept in `state.json`; the pty ends with its page or with the pty host (a start
 // after the host died starts a new one), the folder stays.
-function startSessions(userData: string, { spawnFor, kill }: ReturnType<typeof startPty>): void {
+function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnType<typeof startPty>): void {
   // Detected on the first call that needs it, never at startup: detecting runs
   // each CLI's `--version`, and an app that never starts a session should not.
   let detection: Promise<DetectedHarness[]> | undefined;
@@ -410,26 +412,46 @@ function startSessions(userData: string, { spawnFor, kill }: ReturnType<typeof s
 
   ipcMain.handle(
     'sessions:start',
-    async (event, harnessId: string, size: { cols: number; rows: number }): Promise<StartSessionResult> => {
+    async (event, harnessId: string, size: { cols: number; rows: number }, options?: StartSessionOptions): Promise<StartSessionResult> => {
       if (!isFromApp(event)) throw new Error('sessions:start refused: unexpected origin');
+      // A page that ends while detection or the worktree check runs starts nothing.
+      const endings = endingsOf(event.sender);
       const harness = harnesses.find(({ id }) => id === harnessId);
       const found = (await detected()).find(({ id }) => id === harnessId);
       if (!harness || !found) return { status: 'refused', message: `${harness?.name ?? harnessId} is not installed.` };
 
+      // In a workspace the session runs in the worktree, which is the user's: nothing is created
+      // or removed there. Otherwise it gets a folder of its own, removed if the start fails.
+      const workspace = options?.workspace;
+      if (workspace) {
+        const refusal = await checkWorkspace(workspace);
+        if (refusal) return refusal;
+      }
+      if (endingsOf(event.sender) !== endings) {
+        return { status: 'refused', message: `Could not start ${harness.name}: the page that asked for it is gone` };
+      }
       const id = randomUUID();
-      const directory = join(cockpitHome, 'sessions', id);
+      const directory = workspace?.path ?? join(cockpitHome, 'sessions', id);
+      const prompt = options?.prompt?.trim() || undefined;
       let ptyId: number | undefined;
       try {
-        mkdirSync(directory, { recursive: true });
-        ptyId = await spawnFor(event.sender, { ...size, command: found.path, args: harness.start(), cwd: directory });
-        const session = { id, name: sessionName(state, harness), harness: harness.id, directory, createdAt: new Date().toISOString() };
+        if (!workspace) mkdirSync(directory, { recursive: true });
+        ptyId = await spawnFor(event.sender, { ...size, command: found.path, args: harness.start(prompt), cwd: directory }, endings);
+        const session = {
+          id,
+          name: sessionName(state, harness, workspace?.path),
+          harness: harness.id,
+          directory,
+          createdAt: new Date().toISOString(),
+          ...(workspace && { project: workspace.project }),
+        };
         const next = addSession(state, session);
         saveState(userData, next);
         state = next;
         return { status: 'started', session, ptyId };
       } catch (error) {
         if (ptyId !== undefined) kill(ptyId);
-        rmSync(directory, { recursive: true, force: true });
+        if (!workspace) rmSync(directory, { recursive: true, force: true });
         return {
           status: 'refused',
           message: `Could not start ${harness.name}: ${error instanceof Error ? error.message : String(error)}`,
@@ -437,6 +459,21 @@ function startSessions(userData: string, { spawnFor, kill }: ReturnType<typeof s
       }
     },
   );
+}
+
+// A workspace is a project of the state and one of its linked worktrees (git tells).
+async function checkWorkspace({ project, path }: { project: string; path: string }): Promise<Refused | undefined> {
+  if (!state.projects.some((entry) => entry.path === project)) {
+    return { status: 'refused', message: `${project} is not a project in Cockpit.` };
+  }
+  try {
+    const worktrees = await listWorktrees(project, { env: await shellEnv });
+    if (worktrees.some((worktree) => !worktree.main && worktree.path === path)) return undefined;
+    return { status: 'refused', message: `${path} is not a workspace of ${basename(project)}.` };
+  } catch (error) {
+    if (!(error instanceof WorkspaceError)) throw error;
+    return { status: 'refused', message: describeFailure(error, project) };
+  }
 }
 
 // The app never navigates away from its own page.

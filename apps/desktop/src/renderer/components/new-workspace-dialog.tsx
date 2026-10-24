@@ -1,10 +1,15 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import type { BranchesResult, Project } from '../../shared/api';
+import type { AvailableHarness, BranchesResult, Project, StartSessionResult } from '../../shared/api';
+import { startSession } from '@/components/live-terminals';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Textarea } from '@/components/ui/textarea';
+
+// The Agent select's value for "no session".
+const NO_AGENT = 'none';
 
 export function NewWorkspaceDialog({
   project,
@@ -13,11 +18,16 @@ export function NewWorkspaceDialog({
 }: {
   project: Project;
   onClose: () => void;
-  onCreated: () => Promise<void>;
+  /** Called once the workspace exists; `start` is what starting its session came to, when one was asked. */
+  onCreated: (start?: StartSessionResult) => Promise<void>;
 }) {
   const [branches, setBranches] = useState<BranchesResult>();
   const [name, setName] = useState('');
   const [base, setBase] = useState<string | null>(null);
+  const [agent, setAgent] = useState(NO_AGENT);
+  const [prompt, setPrompt] = useState('');
+  // The detected harnesses, fetched when the Agent select first opens.
+  const [harnesses, setHarnesses] = useState<AvailableHarness[]>();
   // Why the branches could not be listed, or the last creation was refused.
   const [message, setMessage] = useState<string>();
   const [busy, setBusy] = useState(false);
@@ -44,8 +54,15 @@ export function NewWorkspaceDialog({
     setBusy(true);
     try {
       const result = await window.api.workspaces.create(project.path, name.trim(), base);
-      if (result.status === 'refused') setMessage(result.message);
-      else await onCreated();
+      if (result.status === 'refused') {
+        setMessage(result.message);
+      } else {
+        const start =
+          agent === NO_AGENT
+            ? undefined
+            : await startSession(agent, { workspace: { project: project.path, path: result.workspace.path }, prompt });
+        await onCreated(start);
+      }
     } finally {
       setBusy(false);
     }
@@ -91,6 +108,39 @@ export function NewWorkspaceDialog({
                 )}
               </SelectContent>
             </Select>
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="workspace-agent">Agent</Label>
+            <Select
+              value={agent}
+              items={[
+                { value: NO_AGENT, label: 'None' },
+                ...(harnesses ?? []).map((harness) => ({ value: harness.id, label: harness.name })),
+              ]}
+              onValueChange={(value) => setAgent(value ?? NO_AGENT)}
+              onOpenChange={(open) => open && harnesses === undefined && void window.api.sessions.harnesses().then(setHarnesses)}
+            >
+              <SelectTrigger id="workspace-agent" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={NO_AGENT}>None</SelectItem>
+                {harnesses?.map((harness) => (
+                  <SelectItem key={harness.id} value={harness.id}>
+                    {harness.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="workspace-prompt">Prompt</Label>
+            <Textarea
+              id="workspace-prompt"
+              value={prompt}
+              disabled={agent === NO_AGENT}
+              onChange={(event) => setPrompt(event.target.value)}
+            />
           </div>
           {message && (
             <p role="status" className="text-xs break-words text-destructive">

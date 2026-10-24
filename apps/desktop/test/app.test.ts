@@ -467,7 +467,7 @@ const shellOptions: PtySpawnOptions = {
 
 // Spawns a shell through `window.api.pty` from the renderer. The listeners are
 // registered before the spawn, once per page load, so no output is missed.
-function spawnShell(page: Page): Promise<number> {
+function spawnShell(page: Page, options: Partial<PtySpawnOptions> = shellOptions): Promise<number> {
   return page.evaluate((options) => {
     const w = window as unknown as PtyWindow;
     if (!w.api.pty) throw new Error('window.api.pty is not exposed');
@@ -481,8 +481,8 @@ function spawnShell(page: Page): Promise<number> {
       });
       w.__ptyLog = log;
     }
-    return w.api.pty.spawn(options);
-  }, shellOptions);
+    return w.api.pty.spawn(options as PtySpawnOptions);
+  }, options);
 }
 
 const ptyWrite = (page: Page, id: number, data: string) =>
@@ -1143,7 +1143,7 @@ async function menuTriggerOf(page: Page, title: string) {
     const entry = [...document.querySelectorAll('aside [title]')].find((element) => element.getAttribute('title') === title);
     for (let node: Element | null = entry ?? null; node && node.tagName !== 'ASIDE'; node = node.parentElement) {
       const here: Element = node;
-      const triggers = [...here.querySelectorAll('button[aria-haspopup="menu"]')].filter((button) => {
+      const triggers = [...here.querySelectorAll('button[aria-haspopup="menu"][aria-label^="Actions for"]')].filter((button) => {
         const titled = button.closest('[title]');
         return !titled || titled === here || !here.contains(titled) || titled.getAttribute('title') === title;
       });
@@ -1297,7 +1297,7 @@ const expectNoNewErrors = async (session: Session, mark: { errors: number; outpu
 const newWorkspaceDialog = (page: Page, project: TempRepo) =>
   page.getByRole('dialog', { name: `New workspace in ${project.name}` });
 const nameField = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('textbox', { name: 'Name', exact: true });
-const baseSelect = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('combobox');
+const baseSelect = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('combobox', { name: 'Base', exact: true });
 const createButton = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('button', { name: 'Create', exact: true });
 
 async function openNewWorkspaceDialog(page: Page, project: TempRepo) {
@@ -3718,15 +3718,17 @@ describe('built app with no git on the login shell PATH', () => {
 // --- Sessions (COCKPIT-25) ---------------------------------------------------
 
 // A harness that is not a harness: prints what the tests check (working
-// directory, arguments, pid, `$TERM`), then echoes every line it reads and
+// directory, arguments, pid, `$TERM`, `$PATH`), then echoes every line it reads and
 // exits with code 3 on `exit`. `pwd -P` because macOS temporary folders sit
-// behind a symlink (`/var` is `/private/var`).
+// behind a symlink (`/var` is `/private/var`). Its `--version` sleeps 1 s while a
+// `<stub>.slow` file exists (see `slowVersion` in `makeSessionsFixture`).
 const STUB_HARNESS = `#!/bin/sh
-if [ "$1" = "--version" ]; then echo 9.9.9; exit 0; fi
+if [ "$1" = "--version" ]; then [ -e "$0.slow" ] && sleep 1; echo 9.9.9; exit 0; fi
 echo "cwd:$(pwd -P)"
 echo "args:$#:$*"
 echo "pid:$$"
 echo "term:$TERM"
+echo "path:$PATH"
 echo "ready"
 while IFS= read -r line; do
   if [ "$line" = exit ]; then exit 3; fi
@@ -3737,8 +3739,12 @@ done
 interface SessionsFixture {
   /** The temporary folder that holds everything below, removed by the test. */
   root: string;
+  /** The folder of the stubs: the first entry of the login shell's `PATH`. */
+  bin: string;
   /** The fake login shell. */
   shell: string;
+  /** The file the fake login shell appends its arguments to on every run (but its warm-up). */
+  shellLog: string;
   /** The environment to launch the app with. */
   env(): NodeJS.ProcessEnv;
   /** The file the stubs append a line to on every run, when the fixture was made with `log`. */
@@ -3752,7 +3758,11 @@ interface SessionsFixture {
 //
 // With `log`, every stub first appends `<binary> <arguments>` to `runLog`, which
 // is empty once the fixture is ready (its own warm-up runs are not counted).
-function makeSessionsFixture(binaries: string[], { log = false }: { log?: boolean } = {}): SessionsFixture {
+// With `slowVersion`, the stubs' `--version` sleeps 1 s once the fixture is ready.
+function makeSessionsFixture(
+  binaries: string[],
+  { log = false, slowVersion = false }: { log?: boolean; slowVersion?: boolean } = {},
+): SessionsFixture {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-sessions-test-')));
   const bin = join(root, 'bin');
   mkdirSync(bin);
@@ -3766,14 +3776,21 @@ function makeSessionsFixture(binaries: string[], { log = false }: { log?: boolea
     expect(execFileSync(stub, ['--version'], { encoding: 'utf8' }).trim()).toBe('9.9.9');
   }
   const shell = join(root, 'login-shell');
-  writeFileSync(shell, `#!/bin/sh\n[ "$1" = --warmup ] && exit 0\nPATH='${bin}:/usr/bin:/bin' /bin/sh -c "$2"\n`);
+  const shellLog = join(root, 'shell-args.log');
+  writeFileSync(
+    shell,
+    `#!/bin/sh\n[ "$1" = --warmup ] && exit 0\necho "$*" >> '${shellLog}'\nPATH='${bin}:/usr/bin:/bin' /bin/sh -c "$2"\n`,
+  );
   chmodSync(shell, 0o755);
   execFileSync(shell, ['--warmup']);
   const printed = execFileSync(shell, ['-ilc', 'printf %s "$PATH"'], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
   expect(printed).toBe(`${bin}:/usr/bin:/bin`);
   if (log) writeFileSync(runLog, '');
+  if (slowVersion) for (const name of binaries) writeFileSync(join(bin, `${name}.slow`), '');
+  // Its own checks above ran the shell: only what the app makes it run is counted.
+  writeFileSync(shellLog, '');
 
-  return { root, shell, env: () => ({ ...process.env, SHELL: shell }), runLog };
+  return { root, bin, shell, shellLog, env: () => ({ ...process.env, SHELL: shell }), runLog };
 }
 
 const launchBuiltWith = (env: NodeJS.ProcessEnv, dataDir?: string, cockpitHome?: string | null) =>
@@ -3789,6 +3806,8 @@ interface StoredSession {
   harness: string;
   directory: string;
   createdAt: string;
+  /** The repository root, for a session started in a workspace. */
+  project?: string;
 }
 
 const sessionsInState = (dataDir: string): StoredSession[] =>
@@ -3803,11 +3822,18 @@ interface SessionEntry {
   ended: boolean;
 }
 
-// The links of the Sessions section: the name is the first text of the entry,
-// "Ended" is a text of its own.
-const sessionEntries = (page: Page): Promise<SessionEntry[]> =>
-  page.evaluate(() =>
-    [...document.querySelectorAll('aside a[href*="/sessions/"]')].map((link) => {
+// The session links of the Sessions section (the sessions outside any project) or
+// of the workspace at `workspace` (a path), whose sessions are nested under its
+// row in the Projects section: the name is the first text of the entry, "Ended"
+// is a text of its own.
+const sessionLinks = (page: Page, scope: 'sessions' | { workspace: string }): Promise<SessionEntry[]> =>
+  page.evaluate((scope) => {
+    const root =
+      scope === 'sessions'
+        ? [...document.querySelectorAll('aside section')].find((section) => section.querySelector('h2')?.textContent?.trim() === 'Sessions')
+        : [...document.querySelectorAll('aside [title]')].find((element) => element.getAttribute('title') === scope.workspace)?.closest('li');
+    if (!root) return [];
+    return [...root.querySelectorAll('a[href*="/sessions/"]')].map((link) => {
       const entry = link.closest('li') ?? link;
       const texts: string[] = [];
       const walker = document.createTreeWalker(entry, NodeFilter.SHOW_TEXT);
@@ -3820,8 +3846,14 @@ const sessionEntries = (page: Page): Promise<SessionEntry[]> =>
         name: texts[0] ?? '',
         ended: texts.includes('Ended'),
       };
-    }),
-  );
+    });
+  }, scope);
+
+const sessionEntries = (page: Page) => sessionLinks(page, 'sessions');
+
+// Every session link of the sidebar, wherever it is shown.
+const allSessionLinkIds = (page: Page) =>
+  page.evaluate(() => [...document.querySelectorAll('aside a[href*="/sessions/"]')].map((link) => link.getAttribute('href')!.split('/').pop()!));
 
 const waitForSessionEntries = (page: Page, expected: Array<[name: string, ended: boolean]>) =>
   poll(
@@ -3832,23 +3864,34 @@ const waitForSessionEntries = (page: Page, expected: Array<[name: string, ended:
 
 const START_MENU = 'Start session';
 
+const LOADING_ITEM = 'Detecting agent CLIs…';
+
+// Opens the menu and waits until it lists the harnesses (or says there is none).
 async function openStartMenu(page: Page) {
   await page.getByRole('button', { name: START_MENU, exact: true }).click({ timeout: UI_TIMEOUT });
-  await page.getByRole('menuitem').first().waitFor({ timeout: UI_TIMEOUT });
+  await page.getByRole('menuitem').filter({ hasNotText: LOADING_ITEM }).first().waitFor({ timeout: UI_TIMEOUT });
+}
+
+// Waits for the session page of a session other than `previous`.
+async function waitForSessionPage(page: Page, previous: string | undefined, pageName: string): Promise<string> {
+  await page.getByRole('heading', { name: pageName, exact: true }).waitFor({ timeout: UI_TIMEOUT });
+  const id = await poll(() => (sessionIdOf(page) === previous ? undefined : sessionIdOf(page)), Boolean, UI_TIMEOUT);
+  expect(id, `the URL ${page.url()} is /sessions/<id> of a new session`).toBeTruthy();
+  return id!;
 }
 
 // Picks a harness in the "Start session" menu and waits for its session page.
 async function startSession(page: Page, harnessName: string, pageName: string): Promise<string> {
+  const previous = sessionIdOf(page);
   await openStartMenu(page);
   await page.getByRole('menuitem', { name: harnessName, exact: true }).click({ timeout: UI_TIMEOUT });
-  await page.getByRole('heading', { name: pageName, exact: true }).waitFor({ timeout: UI_TIMEOUT });
-  const id = await poll(() => sessionIdOf(page), Boolean, UI_TIMEOUT);
-  expect(id, `the URL ${page.url()} is /sessions/<id>`).toBeTruthy();
-  return id!;
+  return waitForSessionPage(page, previous, pageName);
 }
 
 async function openSessionEntry(page: Page, name: string) {
-  const entry = page.locator('aside a[href*="/sessions/"]', { hasText: new RegExp(`^\\s*${escapeRegExp(name)}(\\s|$)`) });
+  // The Sessions section's links only: a workspace's sessions can bear the same name.
+  const section = page.locator('aside section').filter({ has: page.getByRole('heading', { name: 'Sessions', exact: true }) });
+  const entry = section.locator('a[href*="/sessions/"]', { hasText: new RegExp(`^\\s*${escapeRegExp(name)}(\\s|$)`) });
   await entry.first().click({ timeout: UI_TIMEOUT });
   await page.getByRole('heading', { name, exact: true }).waitFor({ timeout: UI_TIMEOUT });
 }
@@ -3859,6 +3902,7 @@ interface StubFacts {
   args: string;
   pid: number;
   term: string;
+  path: string;
 }
 
 // What the stub printed, read from the terminal once it printed its last line.
@@ -3866,9 +3910,9 @@ interface StubFacts {
 async function readStub(page: Page): Promise<StubFacts> {
   await waitForRow(page, 'ready');
   const text = (await terminalRows(page)).join('');
-  const found = /cwd:(.+?)args:(\d+):(.*?)pid:(\d+)term:(.+?)ready/.exec(text);
+  const found = /cwd:(.+?)args:(\d+):(.*?)pid:(\d+)term:(.+?)path:(.+?)ready/.exec(text);
   if (!found) throw new Error(`The terminal does not show the stub's output:\n${text}`);
-  return { cwd: found[1]!, argCount: Number(found[2]), args: found[3]!, pid: Number(found[4]), term: found[5]! };
+  return { cwd: found[1]!, argCount: Number(found[2]), args: found[3]!, pid: Number(found[4]), term: found[5]!, path: found[6]! };
 }
 
 // Whether the deepest element whose text starts with `text` sits below the
@@ -3904,6 +3948,103 @@ async function expectNoErrors(session: Session) {
   expect(await allConsoleErrorsOf(session.page)).toEqual([]);
 }
 
+// --- Sessions in a workspace (COCKPIT-28) ------------------------------------
+
+const agentSelect = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('combobox', { name: 'Agent', exact: true });
+const promptField = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('textbox', { name: 'Prompt', exact: true });
+
+async function chooseAgent(page: Page, dialog: ReturnType<Page['locator']>, agent: string) {
+  await agentSelect(dialog).click({ timeout: UI_TIMEOUT });
+  await page.getByRole('option', { name: agent, exact: true }).click({ timeout: UI_TIMEOUT });
+  await poll(async () => (await agentSelect(dialog).innerText()).trim(), (value) => value === agent, UI_TIMEOUT);
+}
+
+// Fills the New workspace dialog (base: the preselected one) without clicking "Create".
+async function fillNewWorkspace(
+  page: Page,
+  dialog: ReturnType<Page['locator']>,
+  { name, agent, prompt }: { name: string; agent?: string; prompt?: string },
+) {
+  await poll(() => selectedBase(dialog), (value) => value !== '' && !/select a base/i.test(value), UI_TIMEOUT);
+  await nameField(dialog).fill(name);
+  if (agent) await chooseAgent(page, dialog, agent);
+  if (prompt !== undefined) await promptField(dialog).fill(prompt);
+}
+
+// Creates a workspace with an agent through the dialog and waits for the new session's page.
+async function createWorkspaceWithAgent(
+  page: Page,
+  repo: TempRepo,
+  options: { name: string; agent: string; prompt?: string },
+  pageName: string,
+): Promise<string> {
+  const previous = sessionIdOf(page);
+  const dialog = await openNewWorkspaceDialog(page, repo);
+  await fillNewWorkspace(page, dialog, options);
+  await createButton(dialog).click({ timeout: UI_TIMEOUT });
+  await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
+  return waitForSessionPage(page, previous, pageName);
+}
+
+// Puts the pointer over the page's bottom right corner, away from the sidebar's rows.
+async function moveMouseAway(page: Page) {
+  const [width, height] = await page.evaluate(() => [window.innerWidth, window.innerHeight] as const);
+  await page.mouse.move(width - 2, height - 2);
+}
+
+const startPlusLabel = (workspaceName: string) => `Start session in ${workspaceName}`;
+
+// Hovers the workspace row and opens its "Start session in <name>" menu.
+async function openWorkspaceStartMenu(page: Page, workspacePath: string, workspaceName: string) {
+  await page.getByTitle(workspacePath, { exact: true }).first().hover({ timeout: UI_TIMEOUT });
+  await page.getByRole('button', { name: startPlusLabel(workspaceName), exact: true }).click({ timeout: UI_TIMEOUT });
+  await page.getByRole('menuitem').filter({ hasNotText: LOADING_ITEM }).first().waitFor({ timeout: UI_TIMEOUT });
+}
+
+async function startInWorkspace(page: Page, workspacePath: string, workspaceName: string, harnessName: string, pageName: string) {
+  const previous = sessionIdOf(page);
+  await openWorkspaceStartMenu(page, workspacePath, workspaceName);
+  await page.getByRole('menuitem', { name: harnessName, exact: true }).click({ timeout: UI_TIMEOUT });
+  return waitForSessionPage(page, previous, pageName);
+}
+
+const waitForWorkspaceLinks = (page: Page, workspacePath: string, expected: Array<[name: string, ended: boolean]>) =>
+  poll(
+    async () => (await sessionLinks(page, { workspace: workspacePath })).map((entry) => [entry.name, entry.ended]),
+    (entries) => JSON.stringify(entries) === JSON.stringify(expected),
+    UI_TIMEOUT,
+  );
+
+// The pids of the stubs running as sessions (`pgrep -f` on their path).
+function stubPids(fx: SessionsFixture): number[] {
+  try {
+    return execFileSync('pgrep', ['-f', `${escapeRegExp(fx.bin)}/(claude|codex)`], { encoding: 'utf8' })
+      .split('\n')
+      .filter(Boolean)
+      .map(Number)
+      .sort();
+  } catch {
+    // `pgrep` exits with 1 when nothing matches.
+    return [];
+  }
+}
+
+// The lines of the stubs' run log: `<binary> <arguments>`.
+const stubRuns = (fx: SessionsFixture) => readFileSync(fx.runLog, 'utf8').split('\n').filter(Boolean);
+const versionRuns = (fx: SessionsFixture) => stubRuns(fx).filter((line) => line.endsWith(' --version')).sort();
+const startRuns = (fx: SessionsFixture) => stubRuns(fx).filter((line) => !line.endsWith(' --version'));
+
+const startApi = (page: Page, options: unknown) =>
+  page.evaluate(
+    (options) =>
+      (
+        window as unknown as {
+          api: { sessions: { start(harness: string, size: { cols: number; rows: number }, options: unknown): Promise<unknown> } };
+        }
+      ).api.sessions.start('claude-code', { cols: 80, rows: 24 }, options),
+    options,
+  );
+
 // The full block runs in the built app only (see the split rule in AGENTS.md).
 describe('sessions: built app', () => {
   let fx: SessionsFixture;
@@ -3916,8 +4057,19 @@ describe('sessions: built app', () => {
     claude3: { id: '', pid: 0 },
   };
 
+  // The repository the workspace tests (COCKPIT-28) work in.
+  let repo: TempRepo;
+  // The workspaces they create, and what runs in them.
+  const ws = {
+    fix: { path: '', id: '', pid: 0 },
+    blank: { path: '', id: '', pid: 0 },
+    plus: { path: '', ids: [] as string[], pids: [] as number[] },
+  };
+
   beforeAll(async () => {
-    fx = makeSessionsFixture(['claude', 'codex']);
+    // The stubs log every run, and their `--version` sleeps 1 s (workspace sessions AC13, AC14).
+    fx = makeSessionsFixture(['claude', 'codex'], { log: true, slowVersion: true });
+    repo = makeRepo('agent-ws');
     session = await launchBuiltWith(fx.env());
     await session.page.getByText(versionLabel).waitFor();
   });
@@ -3925,16 +4077,94 @@ describe('sessions: built app', () => {
   afterAll(async () => {
     await session?.close();
     if (fx) rmSync(fx.root, { recursive: true, force: true });
+    if (repo) rmSync(repo.parent, { recursive: true, force: true });
   });
 
-  test('AC1 — the "Start session" menu lists Claude Code then Codex, and nothing else', async () => {
+  // A failing test must not leave a menu or a dialog that blocks the tests after it.
+  // Escape only while something is open (at most 4 times), and wait for it to close. Never
+  // while the keyboard is in a terminal: the Escape would reach its agent.
+  afterEach(async () => {
+    const { page } = session;
+    const overlays = page.locator('[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]');
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const open = await overlays.count();
+      if (open === 0 || (await page.evaluate(() => !!document.activeElement?.closest('.xterm')))) break;
+      await page.keyboard.press('Escape');
+      await poll(() => overlays.count(), (count) => count < open, 1_000);
+    }
+  });
+
+  test('workspace sessions AC4, AC14 — the New workspace dialog opens with Agent "None" and a disabled Prompt; no --version ran at startup nor on the dialog open', async () => {
+    const { page } = session;
+    await addRepository(session, repo);
+
+    const dialog = await openNewWorkspaceDialog(page, repo);
+    const lines = await linesOf(dialog);
+    expect(lines).toContain('Agent');
+    expect(lines).toContain('Prompt');
+    expect((await agentSelect(dialog).innerText()).trim()).toBe('None');
+    expect(await promptField(dialog).isDisabled()).toBe(true);
+    // Detection waits for the select to open (or a menu): neither the startup nor the dialog
+    // ran anything. The log is cumulative, so this one check covers both.
+    await sleep(500);
+    expect(stubRuns(fx)).toEqual([]);
+    await dismissDialogs(page);
+  });
+
+  // Detection runs on this first open and takes about 1 s. A start the page calls while it
+  // runs, then a reload, must start nothing once detection ends: `sessions:start` reads the
+  // page's ending count at its entry (the pending-spawn case is `survive AC8` below).
+  test('workspace sessions AC13, AC12 — the first "Start session" menu open shows one disabled "Detecting agent CLIs…" item; a start called and a reload during detection start nothing, no folder, no stored session and no handler error', async () => {
     const { page } = session;
     expect(await sidebarLines(page)).toContain('Sessions');
+    const before = {
+      state: stateSnapshot(session.dataDir),
+      folders: sessionFoldersIn(session.cockpitHome),
+      runs: stubRuns(fx),
+    };
+    expect(before.runs).toEqual([]);
+
+    await page.getByRole('button', { name: START_MENU, exact: true }).click({ timeout: UI_TIMEOUT });
+    const items = page.getByRole('menuitem');
+    await items.first().waitFor({ timeout: UI_TIMEOUT });
+    expect(await items.count()).toBe(1);
+    expect((await items.first().innerText()).trim()).toBe(LOADING_ITEM);
+    expect(await items.first().isDisabled()).toBe(true);
+
+    // Detection is running: the start waits for it, and the page is reloaded meanwhile.
+    await page.evaluate(() => {
+      void (
+        window as unknown as { api: { sessions: { start(harness: string, size: { cols: number; rows: number }): Promise<unknown> } } }
+      ).api.sessions.start('claude-code', { cols: 80, rows: 24 });
+    });
+    await page.reload();
+    await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
+
+    // The end of AC13: the menu lists the harnesses once detection has ended.
+    await openStartMenu(page);
+    expect((await items.allInnerTexts()).map((text) => text.trim())).toEqual(['Claude Code', 'Codex']);
+    await page.keyboard.press('Escape');
+    await items.first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+
+    // The host answers in order: once it ran a probe shell it has handled a spawn the start would have sent.
+    const hostPid = await ptyHostPid(page);
+    expect(stubPids(fx)).toEqual([]);
+    expect(await poll(() => childPidsOf(hostPid), (children) => children.length === 0, 5_000)).toEqual([]);
+    expect(startRuns(fx)).toEqual([]);
+    expect(sessionFoldersIn(session.cockpitHome)).toEqual(before.folders);
+    expect(stateSnapshot(session.dataDir)).toEqual(before.state);
+    expect(session.output()).not.toContain('Error occurred in handler');
+    expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+  });
+
+  test('AC1, workspace sessions AC14 — the menu lists Claude Code then Codex; each --version ran once, and a second open runs none', async () => {
+    const { page } = session;
+    expect(versionRuns(fx)).toEqual(['claude --version', 'codex --version']);
 
     await openStartMenu(page);
-
-    const items = (await page.getByRole('menuitem').allInnerTexts()).map((text) => text.trim());
-    expect(items).toEqual(['Claude Code', 'Codex']);
+    expect((await page.getByRole('menuitem').allInnerTexts()).map((text) => text.trim())).toEqual(['Claude Code', 'Codex']);
+    await sleep(500);
+    expect(versionRuns(fx)).toEqual(['claude --version', 'codex --version']);
     await page.keyboard.press('Escape');
     await page.getByRole('menuitem').first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
   });
@@ -3962,6 +4192,11 @@ describe('sessions: built app', () => {
       { id, name: 'Claude Code 1', harness: 'claude-code', directory: home, createdAt: expect.any(String) },
     ]);
     expect(new Date(stored[0]!.createdAt).toISOString()).toBe(stored[0]!.createdAt);
+  });
+
+  test('workspace sessions AC14 — a session start runs no --version', async () => {
+    expect(versionRuns(fx)).toEqual(['claude --version', 'codex --version']);
+    expect(startRuns(fx)).toContain('claude ');
   });
 
   test('AC4 — a line typed in the terminal reaches the harness and its answer shows', async () => {
@@ -4173,6 +4408,340 @@ describe('sessions: built app', () => {
     }
   });
 
+  // --- Sessions in a workspace (COCKPIT-28). They run in order on this launch, with the
+  // repository added above.
+
+  test('workspace sessions AC4 — the Agent select lists None and the detected harnesses; a harness enables Prompt, None disables it again', async () => {
+    const { page } = session;
+    const dialog = await openNewWorkspaceDialog(page, repo);
+
+    await agentSelect(dialog).click({ timeout: UI_TIMEOUT });
+    const options = page.getByRole('option');
+    const listed = await poll(
+      async () => (await options.allInnerTexts()).map((text) => text.trim()),
+      (found) => found.length >= 3,
+      UI_TIMEOUT,
+    );
+    expect(listed).toEqual(['None', 'Claude Code', 'Codex']);
+    await page.keyboard.press('Escape');
+    await options.first().waitFor({ state: 'hidden', timeout: UI_TIMEOUT });
+
+    await chooseAgent(page, dialog, 'Claude Code');
+    expect(await promptField(dialog).isEnabled()).toBe(true);
+    await chooseAgent(page, dialog, 'None');
+    expect(await promptField(dialog).isDisabled()).toBe(true);
+    expect(versionRuns(fx)).toEqual(['claude --version', 'codex --version']);
+    await dismissDialogs(page);
+  });
+
+  test('workspace sessions AC5 — Create with Agent Claude Code and Prompt "fix the tests" creates the worktree, opens the session page and runs the harness there with that one argument', async () => {
+    const { page } = session;
+    const foldersBefore = sessionFoldersIn(session.cockpitHome);
+    const id = await createWorkspaceWithAgent(page, repo, { name: 'fix-tests', agent: 'Claude Code', prompt: 'fix the tests' }, 'Claude Code 1');
+    const path = worktreePath(session, repo, 'fix-tests');
+    ws.fix = { path, id, pid: 0 };
+
+    expect(existsSync(join(path, 'README.md'))).toBe(true);
+    expect(linkedWorktrees(repo)).toContainEqual({ path, branch: 'fix-tests' });
+    const stub = await readStub(page);
+    expect(stub.cwd).toBe(path);
+    expect(stub.argCount).toBe(1);
+    expect(stub.args).toBe('fix the tests');
+    expect(isAlive(stub.pid)).toBe(true);
+    ws.fix.pid = stub.pid;
+
+    expect(await waitForWorkspaceLinks(page, path, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+    expect((await sessionEntries(page)).map((entry) => entry.id)).not.toContain(id);
+    const stored = sessionsInState(session.dataDir).find((entry) => entry.id === id);
+    expect(stored).toEqual({
+      id,
+      name: 'Claude Code 1',
+      harness: 'claude-code',
+      directory: path,
+      project: repo.root,
+      createdAt: expect.any(String),
+    });
+    expect(sessionFoldersIn(session.cockpitHome)).toEqual(foldersBefore);
+  });
+
+  test('workspace sessions AC6 — a Prompt of spaces only runs the harness in the new worktree with no argument', async () => {
+    const { page } = session;
+    const id = await createWorkspaceWithAgent(page, repo, { name: 'blank-prompt', agent: 'Claude Code', prompt: '   ' }, 'Claude Code 1');
+    const path = worktreePath(session, repo, 'blank-prompt');
+    ws.blank = { path, id, pid: 0 };
+
+    const stub = await readStub(page);
+    expect(stub.cwd).toBe(path);
+    expect(stub.argCount).toBe(0);
+    expect(stub.args).toBe('');
+    ws.blank.pid = stub.pid;
+    expect(await waitForWorkspaceLinks(page, path, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+  });
+
+  test('workspace sessions AC1 — the "Start session in <workspace>" button shows on hover and on focus next to the "…" button, and opens the harness menu', async () => {
+    const { page } = session;
+    // A workspace made with git itself, listed when the window gains the focus.
+    const path = join(repo.parent, 'wt-plus');
+    gitIn(repo.root, 'worktree', 'add', '--quiet', '-b', 'ws-plus', path, 'main');
+    await dispatchFocus(page);
+    await poll(() => entryTitles(page), (titles) => titles.includes(path), UI_TIMEOUT);
+    ws.plus.path = path;
+
+    const plus = page.getByRole('button', { name: startPlusLabel('ws-plus'), exact: true });
+    const opacity = () => plus.evaluate((button) => getComputedStyle(button).opacity);
+    expect(await plus.count()).toBe(1);
+
+    // Pointer away: hidden.
+    await moveMouseAway(page);
+    expect(await poll(opacity, (value) => value === '0', 2_000)).toBe('0');
+    // Pointer over the row: shown.
+    await page.getByTitle(path, { exact: true }).first().hover({ timeout: UI_TIMEOUT });
+    expect(await poll(opacity, (value) => value === '1', 2_000)).toBe('1');
+    // Next to the "…" button of the row.
+    const dots = await page.getByRole('button', { name: 'Actions for ws-plus', exact: true }).boundingBox();
+    const box = await plus.boundingBox();
+    expect(dots && box).toBeTruthy();
+    expect(Math.abs(box!.y - dots!.y)).toBeLessThan(4);
+    expect(Math.abs(box!.x - dots!.x)).toBeLessThan(40);
+
+    // Keyboard focus: shown with the pointer elsewhere.
+    await moveMouseAway(page);
+    await poll(opacity, (value) => value === '0', 2_000);
+    await page.keyboard.press('Shift');
+    await plus.focus();
+    expect(await poll(opacity, (value) => value === '1', 2_000)).toBe('1');
+    await plus.blur();
+
+    await openWorkspaceStartMenu(page, path, 'ws-plus');
+    expect((await page.getByRole('menuitem').allInnerTexts()).map((text) => text.trim())).toEqual(['Claude Code', 'Codex']);
+    await page.keyboard.press('Escape');
+    await page.getByRole('menuitem').first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+  });
+
+  test('workspace sessions AC2 — picking Claude Code in the menu runs the harness in the worktree with no argument and the login shell PATH, lists it under the workspace and stores it with its project, with no session folder', async () => {
+    const { page } = session;
+    const foldersBefore = sessionFoldersIn(session.cockpitHome);
+
+    const id = await startInWorkspace(page, ws.plus.path, 'ws-plus', 'Claude Code', 'Claude Code 1');
+    ws.plus.ids.push(id);
+
+    const stub = await readStub(page);
+    expect(stub.cwd).toBe(ws.plus.path);
+    expect(stub.argCount).toBe(0);
+    expect(stub.term).toBe('xterm-256color');
+    expect(stub.path).toBe(`${fx.bin}:/usr/bin:/bin`);
+    expect(stub.path).not.toBe(process.env.PATH);
+    expect(isAlive(stub.pid)).toBe(true);
+    ws.plus.pids.push(stub.pid);
+
+    expect(await waitForWorkspaceLinks(page, ws.plus.path, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+    expect((await sessionEntries(page)).map((entry) => entry.id)).not.toContain(id);
+    expect(sessionsInState(session.dataDir).find((entry) => entry.id === id)).toEqual({
+      id,
+      name: 'Claude Code 1',
+      harness: 'claude-code',
+      directory: ws.plus.path,
+      project: repo.root,
+      createdAt: expect.any(String),
+    });
+    expect(sessionFoldersIn(session.cockpitHome)).toEqual(foldersBefore);
+  });
+
+  test('workspace sessions AC3 — sessions are numbered per workspace, newest first, and apart from the Sessions section', async () => {
+    const { page } = session;
+    const id = await startInWorkspace(page, ws.plus.path, 'ws-plus', 'Claude Code', 'Claude Code 2');
+    ws.plus.ids.push(id);
+    ws.plus.pids.push((await readStub(page)).pid);
+
+    expect(await waitForWorkspaceLinks(page, ws.plus.path, [['Claude Code 2', false], ['Claude Code 1', false]])).toEqual([
+      ['Claude Code 2', false],
+      ['Claude Code 1', false],
+    ]);
+    expect((await sessionLinks(page, { workspace: ws.plus.path })).map((entry) => entry.id)).toEqual([id, ws.plus.ids[0]]);
+    // Another workspace keeps its own count.
+    expect((await sessionLinks(page, { workspace: ws.fix.path })).map((entry) => entry.name)).toEqual(['Claude Code 1']);
+
+    // The Sessions header counts the sessions outside any project only.
+    const outside = sessionsInState(session.dataDir).filter((entry) => entry.harness === 'claude-code' && entry.project === undefined);
+    const name = `Claude Code ${outside.length + 1}`;
+    expect(outside.length).toBeGreaterThan(0);
+    const headerId = await startSession(page, 'Claude Code', name);
+    expect((await sessionEntries(page))[0]).toMatchObject({ id: headerId, name });
+    expect(sessionsInState(session.dataDir).find((entry) => entry.id === headerId)?.project).toBeUndefined();
+    expect((await sessionLinks(page, { workspace: ws.plus.path })).map((entry) => entry.name)).toEqual(['Claude Code 2', 'Claude Code 1']);
+  });
+
+  test('workspace sessions AC7 — a save that fails after the spawn keeps the new workspace and its files, shows "Could not start Claude Code: …" under the Projects header, leaves no harness process and the sessions unchanged', async () => {
+    const { page } = session;
+    const before = {
+      state: stateSnapshot(session.dataDir),
+      sessions: sessionsInState(session.dataDir),
+      folders: sessionFoldersIn(session.cockpitHome),
+      pids: stubPids(fx),
+    };
+    const blocker = join(session.dataDir, 'state.json.tmp');
+    mkdirSync(blocker);
+    try {
+      const dialog = await openNewWorkspaceDialog(page, repo);
+      await fillNewWorkspace(page, dialog, { name: 'save-fails', agent: 'Claude Code' });
+      await createButton(dialog).click({ timeout: UI_TIMEOUT });
+      await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
+
+      const path = worktreePath(session, repo, 'save-fails');
+      await poll(() => entryTitles(page), (titles) => titles.includes(path), UI_TIMEOUT);
+      expect(await entryTitles(page)).toContain(path);
+      expect(existsSync(join(path, 'README.md'))).toBe(true);
+      expect(linkedWorktrees(repo)).toContainEqual({ path, branch: 'save-fails' });
+
+      const lines = await poll(() => sidebarLines(page), (found) => found.some((line) => line.startsWith('Could not start Claude Code:')), UI_TIMEOUT);
+      const message = lines.find((line) => line.startsWith('Could not start Claude Code:'))!;
+      expect(message).toBeTruthy();
+      // Only a save after a successful spawn raises it.
+      expect(message).toContain('EISDIR');
+      expect(await isBelowProjectsHeader(page, { text: message })).toBe(true);
+      expect(await isBelowSessionsHeader(page, message)).toBe(false);
+
+      // The harness was spawned (the message carries the save error), then killed by the rollback.
+      expect(await poll(() => stubPids(fx), (pids) => JSON.stringify(pids) === JSON.stringify(before.pids), 5_000)).toEqual(before.pids);
+      expect(sessionsInState(session.dataDir)).toEqual(before.sessions);
+      expect(stateSnapshot(session.dataDir)).toEqual(before.state);
+      expect(sessionFoldersIn(session.cockpitHome)).toEqual(before.folders);
+      expect(statSync(blocker).isDirectory()).toBe(true);
+    } finally {
+      rmSync(blocker, { recursive: true, force: true });
+    }
+  });
+
+  test('workspace sessions AC8 — sessions.start refuses a workspace of an unknown project or a path that is not a linked worktree, and changes nothing', async () => {
+    const { page } = session;
+    const before = {
+      state: stateSnapshot(session.dataDir),
+      folders: sessionFoldersIn(session.cockpitHome),
+      pids: stubPids(fx),
+      runs: stubRuns(fx),
+    };
+    const elsewhere = join(repo.parent, 'not-a-worktree');
+    mkdirSync(elsewhere);
+
+    expect(await startApi(page, { workspace: { project: '/no/such/project', path: '/no/such/project/ws' } })).toEqual({
+      status: 'refused',
+      message: '/no/such/project is not a project in Cockpit.',
+    });
+    expect(await startApi(page, { workspace: { project: repo.root, path: elsewhere } })).toEqual({
+      status: 'refused',
+      message: `${elsewhere} is not a workspace of ${repo.name}.`,
+    });
+    // The main working tree is the project, not a workspace.
+    expect(await startApi(page, { workspace: { project: repo.root, path: repo.root } })).toEqual({
+      status: 'refused',
+      message: `${repo.root} is not a workspace of ${repo.name}.`,
+    });
+
+    await sleep(300);
+    expect(stubPids(fx)).toEqual(before.pids);
+    expect(stubRuns(fx)).toEqual(before.runs);
+    expect(sessionFoldersIn(session.cockpitHome)).toEqual(before.folders);
+    expect(stateSnapshot(session.dataDir)).toEqual(before.state);
+  });
+
+  test('workspace sessions AC8 — a project whose folder is gone is refused with "<project path> is not a git repository.", nothing is spawned and the state is unchanged', async () => {
+    const { page } = session;
+    const gone = makeRepo('agent-gone');
+    try {
+      await addRepository(session, gone);
+      // Deleted after it was added: the state still lists it.
+      rmSync(gone.parent, { recursive: true, force: true });
+      const before = {
+        state: stateSnapshot(session.dataDir),
+        folders: sessionFoldersIn(session.cockpitHome),
+        pids: stubPids(fx),
+        runs: stubRuns(fx),
+      };
+
+      expect(await startApi(page, { workspace: { project: gone.root, path: join(gone.parent, 'wt') } })).toEqual({
+        status: 'refused',
+        message: `${gone.root} is not a git repository.`,
+      });
+
+      await sleep(300);
+      expect(stubPids(fx)).toEqual(before.pids);
+      expect(stubRuns(fx)).toEqual(before.runs);
+      expect(sessionFoldersIn(session.cockpitHome)).toEqual(before.folders);
+      expect(stateSnapshot(session.dataDir)).toEqual(before.state);
+
+      await removeThroughMenu(page, gone.root);
+      await poll(() => entryTitles(page), (titles) => !titles.includes(gone.root), UI_TIMEOUT);
+    } finally {
+      rmSync(gone.parent, { recursive: true, force: true });
+    }
+  });
+
+  test('workspace sessions AC11 — pty.spawn with a command and no args runs it with no argument; without a command it runs the login shell with -l', async () => {
+    const { page } = session;
+    const id = await spawnShell(page, { command: join(fx.bin, 'claude'), cols: 80, rows: 24 });
+    await waitForOutput(page, id, 'ready');
+    expect(await outputOf(page, id)).toContain('args:0:');
+    await ptyKill(page, id);
+    await waitForExit(page, id);
+
+    const loginShellRuns = () => readFileSync(fx.shellLog, 'utf8').split('\n').filter((line) => line === '-l').length;
+    const before = loginShellRuns();
+    const shellId = await spawnShell(page, { cols: 80, rows: 24 });
+    await waitForExit(page, shellId);
+    expect(loginShellRuns()).toBe(before + 1);
+  });
+
+  test('workspace sessions AC9 — deleting a workspace ends its running sessions once the removal succeeds (not at the uncommitted-changes step); the entries go, state.json keeps them', async () => {
+    const { page } = session;
+    expect(ws.fix.path, 'the AC5 test created the workspace').not.toBe('');
+    writeFileSync(join(ws.fix.path, 'notes.txt'), 'untracked\n');
+    expect(isAlive(ws.fix.pid)).toBe(true);
+    const sessionsBefore = sessionsInState(session.dataDir);
+
+    await startDeletion(page, ws.fix.path);
+    const dialog = deleteDialog(page, 'Delete fix-tests?');
+    await dialog.waitFor({ timeout: UI_TIMEOUT });
+    await dialog.getByRole('button', { name: 'Delete', exact: true }).click({ timeout: UI_TIMEOUT });
+    const warning = deleteDialog(page, 'fix-tests has uncommitted changes');
+    await warning.waitFor({ timeout: UI_TIMEOUT });
+    await sleep(500);
+    expect(isAlive(ws.fix.pid), 'the harness runs while the warning is shown').toBe(true);
+    expect(existsSync(ws.fix.path)).toBe(true);
+
+    await warning.getByRole('button', { name: 'Delete anyway', exact: true }).click({ timeout: UI_TIMEOUT });
+    await warning.waitFor({ state: 'hidden', timeout: 15_000 });
+    await poll(() => entryTitles(page), (titles) => !titles.includes(ws.fix.path), UI_TIMEOUT);
+
+    expect(existsSync(ws.fix.path)).toBe(false);
+    expect(await endsWithin(ws.fix.pid)).toBe(true);
+    expect(await allSessionLinkIds(page)).not.toContain(ws.fix.id);
+    expect(sessionsInState(session.dataDir)).toEqual(sessionsBefore);
+    expect(sessionsInState(session.dataDir).map((entry) => entry.id)).toContain(ws.fix.id);
+  });
+
+  test('workspace sessions AC10 — removing the project ends its workspaces\' running sessions and hides them; adding it again lists them as "Ended", and state.json held them throughout', async () => {
+    const { page } = session;
+    const running = [ws.blank.pid, ...ws.plus.pids];
+    for (const pid of running) expect(isAlive(pid)).toBe(true);
+    const sessionsBefore = sessionsInState(session.dataDir);
+
+    await removeThroughMenu(page, repo.root);
+    await poll(() => entryTitles(page), (titles) => !titles.includes(repo.root), UI_TIMEOUT);
+
+    for (const pid of running) expect(await endsWithin(pid)).toBe(true);
+    const shown = await allSessionLinkIds(page);
+    for (const id of [ws.blank.id, ...ws.plus.ids]) expect(shown).not.toContain(id);
+    expect(sessionsInState(session.dataDir)).toEqual(sessionsBefore);
+
+    await addRepository(session, repo);
+    expect(await waitForWorkspaceLinks(page, ws.blank.path, [['Claude Code 1', true]])).toEqual([['Claude Code 1', true]]);
+    expect(await waitForWorkspaceLinks(page, ws.plus.path, [['Claude Code 2', true], ['Claude Code 1', true]])).toEqual([
+      ['Claude Code 2', true],
+      ['Claude Code 1', true],
+    ]);
+    expect(sessionsInState(session.dataDir)).toEqual(sessionsBefore);
+  });
+
   test('logs no error and keeps running', async () => {
     expect(await sidebarLines(session.page)).toContain('Sessions');
     await expectNoErrors(session);
@@ -4213,52 +4782,27 @@ describe('sessions smoke path: dev server', () => {
     expect(stored.map((s) => [s.name, s.directory])).toEqual([['Claude Code 1', home]]);
   });
 
-  test('logs no error and keeps running', async () => {
-    await expectNoErrors(session);
-  });
-});
-
-// Harness detection runs `--version` on each harness: it must not happen at
-// startup (a test launch must never run a real CLI), only when the menu first
-// needs the list, and only once per launch.
-describe('built app harness detection timing', () => {
-  let fx: SessionsFixture;
-  let session: Session;
-
-  beforeAll(async () => {
-    fx = makeSessionsFixture(['claude', 'codex'], { log: true });
-    session = await launchBuiltWith(fx.env());
-    await session.page.getByText(versionLabel).waitFor();
-  });
-
-  afterAll(async () => {
-    await session?.close();
-    if (fx) rmSync(fx.root, { recursive: true, force: true });
-  });
-
-  const runs = () =>
-    readFileSync(fx.runLog, 'utf8')
-      .split('\n')
-      .filter(Boolean)
-      .sort();
-
-  test('AC14 — no stub runs at startup, each runs --version once on the first menu open, none on the next', async () => {
+  test('workspace sessions smoke path — a new workspace with Claude Code and a prompt runs the stub in the worktree with the prompt, lists the session under the workspace and stores it', async () => {
     const { page } = session;
-    await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
-    await sleep(2000);
-    expect(runs()).toEqual([]);
+    const repo = makeRepo('smoke-agent-ws');
+    try {
+      await addRepository(session, repo);
+      const id = await createWorkspaceWithAgent(page, repo, { name: 'smoke-agent', agent: 'Claude Code', prompt: 'fix the tests' }, 'Claude Code 1');
+      const path = worktreePath(session, repo, 'smoke-agent');
 
-    await openStartMenu(page);
-    expect((await page.getByRole('menuitem').allInnerTexts()).map((text) => text.trim())).toEqual(['Claude Code', 'Codex']);
-    expect(runs()).toEqual(['claude --version', 'codex --version']);
+      const stub = await readStub(page);
+      expect(stub.cwd).toBe(path);
+      expect(stub.argCount).toBe(1);
+      expect(stub.args).toBe('fix the tests');
+      expect(await waitForWorkspaceLinks(page, path, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+      const stored = await poll(() => sessionsInState(session.dataDir), (list) => list.some((entry) => entry.id === id), UI_TIMEOUT);
+      expect(stored.find((entry) => entry.id === id)).toMatchObject({ name: 'Claude Code 1', directory: path, project: repo.root });
+    } finally {
+      rmSync(repo.parent, { recursive: true, force: true });
+    }
+  });
 
-    await page.keyboard.press('Escape');
-    await page.getByRole('menuitem').first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
-    await openStartMenu(page);
-    await sleep(500);
-    expect(runs()).toEqual(['claude --version', 'codex --version']);
-
-    await page.keyboard.press('Escape');
+  test('logs no error and keeps running', async () => {
     await expectNoErrors(session);
   });
 });
@@ -4340,14 +4884,18 @@ describe('packaged app sessions after a restart', () => {
   let fx: SessionsFixture;
   let dataDir: string;
 
+  let repo: TempRepo;
+
   beforeEach(() => {
     fx = makeSessionsFixture(['claude', 'codex']);
     dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+    repo = makeRepo('packaged-agent-ws');
   });
 
   afterEach(() => {
     rmSync(fx.root, { recursive: true, force: true });
     rmSync(dataDir, { recursive: true, force: true });
+    rmSync(repo.parent, { recursive: true, force: true });
   });
 
   test('AC9 — sessions of a previous launch are listed as "Ended", newest first, open as ended and leave state.json and their folders alone', async () => {
@@ -4367,12 +4915,24 @@ describe('packaged app sessions after a restart', () => {
 
       await startSession(first.page, 'Codex', 'Codex 1');
       await poll(() => sessionsInState(dataDir), (list) => list.length === 2, UI_TIMEOUT);
+
+      // Workspace sessions smoke path: a new workspace with Claude Code and a prompt.
+      await addRepository(first, repo);
+      const wsId = await createWorkspaceWithAgent(first.page, repo, { name: 'smoke-agent', agent: 'Claude Code', prompt: 'fix the tests' }, 'Claude Code 1');
+      const wsPath = worktreePath(first, repo, 'smoke-agent');
+      const wsStub = await readStub(first.page);
+      expect(wsStub.cwd).toBe(wsPath);
+      expect(wsStub.argCount).toBe(1);
+      expect(wsStub.args).toBe('fix the tests');
+      expect(await waitForWorkspaceLinks(first.page, wsPath, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+      const storedWs = await poll(() => sessionsInState(dataDir), (list) => list.some((entry) => entry.id === wsId), UI_TIMEOUT);
+      expect(storedWs.find((entry) => entry.id === wsId)).toMatchObject({ name: 'Claude Code 1', directory: wsPath, project: repo.root });
       await expectNoErrors(first);
     } finally {
       await first.close();
     }
 
-    const stored = sessionsInState(dataDir);
+    const stored = sessionsInState(dataDir).filter((entry) => entry.project === undefined);
     expect(stored.map((s) => s.name)).toEqual(['Claude Code 1', 'Codex 1']);
     const before = stateSnapshot(dataDir);
 

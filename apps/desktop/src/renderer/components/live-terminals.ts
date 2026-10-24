@@ -1,6 +1,6 @@
 import { FitAddon } from '@xterm/addon-fit';
 import { Terminal as XTerm } from '@xterm/xterm';
-import type { StartSessionResult } from '../../shared/api';
+import type { StartSessionOptions, StartSessionResult } from '../../shared/api';
 import { exitMessage, readTheme } from './terminal';
 
 // A terminal wired to a pty, kept for the page's lifetime so that leaving its page
@@ -60,6 +60,8 @@ export function createLiveTerminal(start: (size: { cols: number; rows: number })
     onPty(id, () => {
       entry.exited = true;
       term.write(`\r\n${exitMessage(exit)}`);
+      offData();
+      offExit();
       publish();
     }),
   );
@@ -128,11 +130,11 @@ export const getSessionTerminal = (id: string) => sessionTerminals.get(id);
 /**
  * Starts the session in the main process and, once it is running, keeps its terminal.
  */
-export async function startSession(harness: string): Promise<StartSessionResult> {
+export async function startSession(harness: string, options?: StartSessionOptions): Promise<StartSessionResult> {
   // What `sessions.start` answered, which the terminal's start cannot return.
   const answer: { result?: StartSessionResult } = {};
   const { entry, started } = createLiveTerminal(async (size) => {
-    const result = await window.api.sessions.start(harness, size);
+    const result = await window.api.sessions.start(harness, size, options);
     answer.result = result;
     if (result.status === 'refused') throw new Error(result.message);
     return result.ptyId;
@@ -148,4 +150,15 @@ export async function startSession(harness: string): Promise<StartSessionResult>
   if (result.status === 'started') sessionTerminals.set(result.session.id, entry);
   publish();
   return result;
+}
+
+/** Ends the running sessions among `ids` (their workspace or project is gone) and drops their terminals. */
+export function endSessions(ids: string[]): void {
+  for (const id of ids) {
+    const entry = sessionTerminals.get(id);
+    if (!entry) continue;
+    closeLiveTerminal(entry);
+    sessionTerminals.delete(id);
+  }
+  publish();
 }

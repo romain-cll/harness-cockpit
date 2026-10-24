@@ -679,3 +679,87 @@ describe('sessions AC3, AC5 — addSession and sessionName', () => {
     expect(state).toEqual({ version: 1, projects: [], sessions: [session()] });
   });
 });
+
+// --- Sessions in a workspace (COCKPIT-28) -----------------------------------
+
+describe('workspace sessions AC3 — sessionName per place', () => {
+  const claude = { id: 'claude-code', name: 'Claude Code' };
+  const repo = '/repo';
+  const wsA = '/home/.cockpit/worktrees/repo-1234abcd/a';
+  const wsB = '/home/.cockpit/worktrees/repo-1234abcd/b';
+  const inWorkspace = (id: string, directory: string, overrides: Partial<Session> = {}) =>
+    session({ id, directory, project: repo, ...overrides });
+
+  test('AC3 — with a directory, only that harness\'s sessions in that directory are counted', () => {
+    const state = {
+      version: 1,
+      projects: [{ path: repo }],
+      sessions: [
+        inWorkspace('1', wsA),
+        inWorkspace('2', wsA, { harness: 'codex', name: 'Codex 1' }),
+        inWorkspace('3', wsB),
+        inWorkspace('4', wsA, { name: 'Claude Code 2' }),
+        session({ id: '5' }),
+      ],
+    };
+
+    expect(sessionName(state, claude, wsA)).toBe('Claude Code 3');
+    expect(sessionName(state, claude, wsB)).toBe('Claude Code 2');
+    expect(sessionName(state, { id: 'codex', name: 'Codex' }, wsA)).toBe('Codex 2');
+    expect(sessionName(state, claude, '/elsewhere')).toBe('Claude Code 1');
+  });
+
+  test('AC3 — without a directory, only the sessions outside any project are counted', () => {
+    const state = {
+      version: 1,
+      projects: [{ path: repo }],
+      sessions: [inWorkspace('1', wsA), inWorkspace('2', wsB), session({ id: '3' })],
+    };
+
+    expect(sessionName(state, claude)).toBe('Claude Code 2');
+    expect(sessionName({ ...state, sessions: [inWorkspace('1', wsA)] }, claude)).toBe('Claude Code 1');
+  });
+});
+
+describe('workspace sessions AC16 — project field', () => {
+  test('AC16 — sessions without project read as outside any project, without rewriting the file', () => {
+    const stored = [session({ id: 'a' }), session({ id: 'b', name: 'Codex 1', harness: 'codex' })];
+    seed(`${JSON.stringify({ version: 1, sessions: stored })}\n`);
+    const before = snapshot();
+
+    const state = loadState(dir);
+
+    expect(state.sessions).toEqual(stored);
+    expect(state.sessions.every((entry) => entry.project === undefined)).toBe(true);
+    expect(snapshot()).toEqual(before);
+    expect(backups()).toEqual([]);
+  });
+
+  test('AC16 — a string project is kept as written, without rewriting the file', () => {
+    const stored = [session({ id: 'a', project: '/repo', directory: '/home/.cockpit/worktrees/repo-1234abcd/a' })];
+    seed(`${JSON.stringify({ version: 1, sessions: stored })}\n`);
+    const before = snapshot();
+
+    expect(loadState(dir).sessions).toEqual(stored);
+    expect(snapshot()).toEqual(before);
+    expect(backups()).toEqual([]);
+  });
+
+  test.each([
+    ['a number', '3'],
+    ['null', 'null'],
+    ['an array', '["/repo"]'],
+    ['an object', '{}'],
+  ])('AC16 — a session whose project is %s sets the file aside', (_name, project) => {
+    const content = `{ "version": 1, "sessions": [{ "id": "a", "name": "Claude Code 1", "harness": "claude-code", "directory": "/d", "createdAt": "2026-10-23T10:00:00.000Z", "project": ${project} }] }\n`;
+    seed(content);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    expect(loadState(dir)).toEqual({ version: 1, projects: [], sessions: [] });
+
+    const found = backups();
+    expect(found).toHaveLength(1);
+    expect(readFileSync(join(dir, found[0]!), 'utf8')).toBe(content);
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1 });
+  });
+});
