@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
@@ -7,6 +7,7 @@ import { basename, dirname, join } from 'node:path';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { WorkspaceError } from '../src/git';
 import {
+  commandsInvocation,
   createWorktree,
   findRepositoryRoot,
   listBranches,
@@ -1194,6 +1195,52 @@ describe('readWorkspaceConfig', () => {
 
     expect(result.setup).toEqual(['bun install']);
     expect(result.env.COCKPIT_WORKSPACE_PATH).toBe(worktree);
+  });
+});
+
+describe('commandsInvocation', () => {
+  // Runs the invocation with the real /bin/sh, as the main process spawns it.
+  function runInvocation(commands: string[], cwd: string) {
+    const { command, args } = commandsInvocation(commands);
+    expect(command).toBe('/bin/sh');
+    const result = spawnSync(command, args, { cwd, encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
+    return { status: result.status, stdout: result.stdout };
+  }
+
+  test('AC3 — runs the commands in order, each preceded by a "$ <command>" line, and exits 0', async () => {
+    const cwd = await tempDir();
+    expect(runInvocation(['echo one', 'echo two'], cwd)).toEqual({
+      status: 0,
+      stdout: '$ echo one\none\n$ echo two\ntwo\n',
+    });
+  });
+
+  test('AC3 — stops at the first failing command and exits with its code', async () => {
+    const cwd = await tempDir();
+    expect(runInvocation(['echo a', 'exit 7', 'echo never'], cwd)).toEqual({
+      status: 7,
+      stdout: '$ echo a\na\n$ exit 7\n',
+    });
+  });
+
+  test('AC3 — each command runs in its own shell: a cd or an export does not carry to the next', async () => {
+    const cwd = await tempDir();
+    expect(runInvocation(['cd /', 'pwd -P', 'export FOO=bar', 'echo "[${FOO-unset}]"'], cwd)).toEqual({
+      status: 0,
+      stdout: `$ cd /\n$ pwd -P\n${cwd}\n$ export FOO=bar\n$ echo "[\${FOO-unset}]"\n[unset]\n`,
+    });
+  });
+
+  test('AC3 — quotes, $ and a newline run as written, and a command holding % or starting with - prints as is', async () => {
+    const cwd = await tempDir();
+    const quoted = `echo 'single "double" $HOME'`;
+    const multiline = 'echo first\necho second';
+    expect(runInvocation([quoted, multiline, 'echo 100%d'], cwd)).toEqual({
+      status: 0,
+      stdout: `$ ${quoted}\nsingle "double" $HOME\n$ ${multiline}\nfirst\nsecond\n$ echo 100%d\n100%d\n`,
+    });
+    // The echoed line is not read as an option or a format by printf (what the shell then does with such a command is not ours to pin).
+    expect(runInvocation(['-bogus'], cwd).stdout.startsWith('$ -bogus\n')).toBe(true);
   });
 });
 
