@@ -1,6 +1,6 @@
 import { FitAddon } from '@xterm/addon-fit';
 import { Terminal as XTerm } from '@xterm/xterm';
-import type { StartSessionOptions, StartSessionResult } from '../../shared/api';
+import type { PtyExit, RunCommandsResult, StartSessionOptions, StartSessionResult } from '../../shared/api';
 import { exitMessage, readTheme } from './terminal';
 
 // A terminal wired to a pty, kept for the page's lifetime so that leaving its page
@@ -34,7 +34,8 @@ function publish() {
 /**
  * A terminal at 80 x 24, fitted when its view shows it, and `started`, which settles
  * once `start` has resolved with the pty id (or rejected: the terminal then takes no
- * more keys). `start` gets the size the pty must have.
+ * more keys). `start` gets the size the pty must have. `exit` resolves with the exit of the
+ * pty (`exitCode: null` when its host died), and never when the terminal is closed first.
  */
 export function createLiveTerminal(start: (size: { cols: number; rows: number }) => Promise<number>) {
   const { pty } = window.api;
@@ -45,6 +46,8 @@ export function createLiveTerminal(start: (size: { cols: number; rows: number })
   live.add(entry);
 
   let ptyId: number | undefined;
+  let resolveExit!: (exit: PtyExit) => void;
+  const exit = new Promise<PtyExit>((resolve) => (resolveExit = resolve));
   let failed = false;
   let closed = false;
 
@@ -56,13 +59,14 @@ export function createLiveTerminal(start: (size: { cols: number; rows: number })
     else if (id === ptyId) apply();
   };
   const offData = pty.onData((id, data) => onPty(id, () => term.write(data)));
-  const offExit = pty.onExit((id, exit) =>
+  const offExit = pty.onExit((id, ptyExit) =>
     onPty(id, () => {
       entry.exited = true;
-      term.write(`\r\n${exitMessage(exit)}`);
+      term.write(`\r\n${exitMessage(ptyExit)}`);
       offData();
       offExit();
       publish();
+      resolveExit(ptyExit);
     }),
   );
 
@@ -109,7 +113,7 @@ export function createLiveTerminal(start: (size: { cols: number; rows: number })
     live.delete(entry);
     term.dispose();
   });
-  return { entry, started };
+  return { entry, started, exit };
 }
 
 /** Ends the terminal's process, or the one a pending start will resolve with, and disposes it. */
@@ -150,6 +154,45 @@ export async function startSession(harness: string, options?: StartSessionOption
   if (result.status === 'started') sessionTerminals.set(result.session.id, entry);
   publish();
   return result;
+}
+
+/**
+ * Runs the `setup` or `teardown` commands of a workspace in a terminal of its own. `none`: the config
+ * holds no such command. `refused`: they could not run (the message says why). Otherwise the terminal
+ * and its `exit`; the caller closes the terminal (which ends the commands if they still run).
+ */
+export async function runWorkspaceCommands(
+  project: string,
+  path: string,
+  which: 'setup' | 'teardown',
+): Promise<{ status: 'none' } | { status: 'refused'; message: string } | { status: 'started'; entry: LiveTerminal; exit: Promise<PtyExit> }> {
+  // What `workspaces.runCommands` answered, which the terminal's start cannot return.
+  const answer: { result?: RunCommandsResult } = {};
+  const { entry, started, exit } = createLiveTerminal(async (size) => {
+    const result = await window.api.workspaces.runCommands(project, path, which, size);
+    answer.result = result;
+    if (result.status !== 'started') throw new Error(result.status === 'refused' ? result.message : 'no commands to run');
+    return result.ptyId;
+  });
+  try {
+    await started;
+  } catch (error) {
+    closeLiveTerminal(entry);
+    if (answer.result?.status === 'none') return { status: 'none' };
+    return { status: 'refused', message: error instanceof Error ? error.message : String(error) };
+  }
+  return { status: 'started', entry, exit };
+}
+
+/**
+ * Whether setup or teardown commands passed. node-pty reports a process killed by a signal as
+ * `exitCode: 0` with the signal set, so the exit code alone does not tell.
+ */
+export const passed = ({ exitCode, signal }: PtyExit) => exitCode === 0 && !signal;
+
+/** The status line of commands that did not pass: their exit code, or that a signal or a pty host death ended them. */
+export function failureLine(what: 'Setup' | 'Teardown', { exitCode, signal }: PtyExit): string {
+  return exitCode === null || signal ? `${what} ended before it finished.` : `${what} failed with exit code ${exitCode}`;
 }
 
 /** Ends the running sessions among `ids` (their workspace or project is gone) and drops their terminals. */

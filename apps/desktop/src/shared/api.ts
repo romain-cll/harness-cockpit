@@ -90,6 +90,12 @@ export type ChangesResult = { status: 'listed'; base: string; files: ChangedFile
 export type DiffResult = { status: 'shown'; diff: FileDiff } | Refused;
 
 /**
+ * `started`: the commands run in the pty `ptyId`, which the calling window owns. `none`: the config
+ * holds no command of that kind.
+ */
+export type RunCommandsResult = { status: 'started'; ptyId: number } | { status: 'none' } | Refused;
+
+/**
  * A run of an agent CLI, in a folder of its own or in a workspace's worktree (`directory`);
  * `harness` is its id in the catalogue.
  */
@@ -181,6 +187,18 @@ export interface Api {
      * project or path that `changes` would refuse is never watched (the function then stops nothing).
      */
     watch(project: string, path: string, listener: () => void): Promise<() => void>;
+
+    /**
+     * Runs the `setup` or `teardown` commands of the repository's `.cockpit/config.json` in the worktree,
+     * in a pty owned by the calling window. Refused when the project is not in the app state, the path is
+     * not one of its linked worktrees, or the config is invalid.
+     */
+    runCommands(
+      project: string,
+      path: string,
+      which: 'setup' | 'teardown',
+      size: { cols: number; rows: number },
+    ): Promise<RunCommandsResult>;
   };
   /** Agent CLIs, run in a folder of their own outside any project or in a workspace of a project. */
   sessions: {

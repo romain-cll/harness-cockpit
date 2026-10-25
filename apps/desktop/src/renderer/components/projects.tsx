@@ -1,6 +1,6 @@
-import { useRouter } from '@tanstack/react-router';
-import { FolderGitIcon, GitBranchIcon, MoreHorizontalIcon, PlusIcon } from 'lucide-react';
-import { useState, type ReactNode } from 'react';
+import { Link, useRouter } from '@tanstack/react-router';
+import { FolderGitIcon, GitBranchIcon, MoreHorizontalIcon, PlusIcon, TerminalIcon } from 'lucide-react';
+import { useState, useSyncExternalStore, type ReactNode } from 'react';
 import type { AppsResult, AvailableApp, OpenWorkspaceResult, Project, Session, StartSessionResult, Workspace } from '../../shared/api';
 import { DeleteWorkspaceDialog } from '@/components/delete-workspace-dialog';
 import { NewWorkspaceDialog } from '@/components/new-workspace-dialog';
@@ -8,6 +8,7 @@ import { endSessions, startSession } from '@/components/live-terminals';
 import { SessionLink } from '@/components/sessions';
 import { StartSessionMenu } from '@/components/start-session-menu';
 import { Button } from '@/components/ui/button';
+import { endSetups, getSetup, subscribe as subscribeToSetups } from '@/components/workspace-setups';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -100,6 +101,27 @@ function OpenItems({ apps, onOpen, onReveal }: { apps?: AppsResult; onOpen: (app
   );
 }
 
+const setupLabels = { running: 'Running', done: 'Done', failed: 'Failed' };
+
+// The list item of a workspace's setup page link, with the state of the setup; nothing when none ran in this window.
+function SetupLink({ path }: { path: string }) {
+  const setup = useSyncExternalStore(subscribeToSetups, () => getSetup(path));
+  if (!setup) return null;
+  return (
+    <li>
+      <Link
+        to="/setup"
+        search={{ path }}
+        className="flex h-8 cursor-default items-center gap-2 rounded-[calc(var(--radius-sm)+2px)] p-2 text-xs hover:bg-sidebar-accent hover:text-sidebar-accent-foreground aria-[current=page]:bg-sidebar-accent aria-[current=page]:font-medium aria-[current=page]:text-sidebar-accent-foreground [&_svg]:size-4 [&_svg]:shrink-0"
+      >
+        <TerminalIcon />
+        <span className="truncate">Setup</span>{' '}
+        <span className="ml-auto shrink-0 text-muted-foreground">{setupLabels[setup.status]}</span>
+      </Link>
+    </li>
+  );
+}
+
 export function Projects({ projects, sessions }: { projects: Project[]; sessions: Session[] }) {
   const router = useRouter();
   // Why the last add or start was refused, or that a deletion kept its branch; cleared by the next add, start or deletion that succeeds.
@@ -123,6 +145,7 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
   async function remove(project: Project) {
     await window.api.projects.remove(project.path);
     endSessions(sessionsIn(project).map(({ id }) => id));
+    endSetups(project.workspaces.map(({ path }) => path));
     await router.invalidate();
   }
 
@@ -199,6 +222,7 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
                       <DropdownMenuItem onClick={() => setDeleting({ project, workspace })}>Delete workspace…</DropdownMenuItem>
                     </Entry>
                     <ul className="flex flex-col gap-px pl-4">
+                      <SetupLink path={workspace.path} />
                       {sessionsIn(project, workspace.path).map((session) => (
                         <li key={session.id}>
                           <SessionLink session={session} />
@@ -231,6 +255,7 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
           onRemoved={async (branchKept) => {
             setMessage(branchKept ? `Branch ${deleting.workspace.branch} was kept: it is not merged.` : undefined);
             endSessions(sessionsIn(deleting.project, deleting.workspace.path).map(({ id }) => id));
+            endSetups([deleting.workspace.path]);
             await router.invalidate();
             setDeleting(undefined);
           }}

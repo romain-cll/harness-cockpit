@@ -330,3 +330,15 @@ export async function readWorkspaceConfig({
     },
   };
 }
+
+/**
+ * The `/bin/sh` invocation that runs `commands` in order, each in a `/bin/sh -c` of its own and
+ * preceded by a `$ <command>` line, and stops at the first failure with its exit code. The commands
+ * are positional arguments of the script, never interpolated into it.
+ */
+export function commandsInvocation(commands: readonly string[]): { command: '/bin/sh'; args: string[] } {
+  return {
+    command: '/bin/sh',
+    args: ['-c', 'for c do printf "$ %s\\n" "$c"; /bin/sh -c "$c" || exit; done', 'sh', ...commands],
+  };
+}

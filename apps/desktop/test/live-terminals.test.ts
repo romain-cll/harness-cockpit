@@ -59,7 +59,11 @@ beforeEach(() => {
 });
 
 interface Store {
-  createLiveTerminal(start: (size: { cols: number; rows: number }) => Promise<number>): { entry: unknown; started: Promise<void> };
+  createLiveTerminal(start: (size: { cols: number; rows: number }) => Promise<number>): {
+    entry: unknown;
+    started: Promise<void>;
+    exit: Promise<{ exitCode: number | null; signal: number | null }>;
+  };
   closeLiveTerminal(entry: unknown): void;
   startSession(harness: string, options?: unknown): Promise<unknown>;
   getSessionTerminal(id: string): unknown;
@@ -110,5 +114,29 @@ describe('AC15 — listeners of a live terminal', () => {
     expect(offExit).toHaveBeenCalledTimes(1);
     expect(() => closeLiveTerminal(entry)).not.toThrow();
     expect(kill).not.toHaveBeenCalled();
+  });
+});
+
+describe('exit of a live terminal', () => {
+  const pending = (promise: Promise<unknown>) =>
+    Promise.race([promise.then(() => 'settled'), new Promise((resolve) => setTimeout(() => resolve('pending'), 0))]);
+
+  test('AC2, AC4–AC9, AC13, AC14 — exit resolves with the exit of its own pty only, a pty host death (exitCode null) included', async () => {
+    const { createLiveTerminal } = await loadStore();
+    const first = createLiveTerminal(async () => 7);
+    const second = createLiveTerminal(async () => 8);
+    await Promise.all([first.started, second.started]);
+    expect(first.exit).toBeInstanceOf(Promise);
+
+    // The exit of another pty is not this one's.
+    exitListeners[0]!(8, { exitCode: 5, signal: null });
+    expect(await pending(first.exit)).toBe('pending');
+
+    exitListeners[0]!(7, { exitCode: 3, signal: null });
+    await expect(first.exit).resolves.toEqual({ exitCode: 3, signal: null });
+
+    expect(await pending(second.exit)).toBe('pending');
+    exitListeners[1]!(8, { exitCode: null, signal: null });
+    await expect(second.exit).resolves.toEqual({ exitCode: null, signal: null });
   });
 });

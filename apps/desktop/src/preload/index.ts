@@ -45,6 +45,7 @@ const api: Api = {
         if (watch === latestWatch) ipcRenderer.send('workspaces:unwatch');
       };
     },
+    runCommands: (project, path, which, size) => ipcRenderer.invoke('workspaces:run-commands', project, path, which, size),
   },
   sessions: {
     harnesses: () => ipcRenderer.invoke('sessions:harnesses'),
