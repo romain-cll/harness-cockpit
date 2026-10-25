@@ -5,6 +5,7 @@ import { checkGit, git, succeeds, WorkspaceError } from './git';
 
 export { WorkspaceError } from './git';
 export type { WorkspaceErrorCode } from './git';
+export * from './changes';
 
 export type GitEnv = { env?: NodeJS.ProcessEnv };
 
@@ -185,6 +186,8 @@ export async function createWorktree({
     const registered = (await findLinked(await list(main, env), path)) !== undefined;
 
     try {
+      // The base a workspace is compared with later; git keeps it next to the branch's own settings.
+      if (base !== undefined) await git(['config', `branch.${branch}.cockpitBase`, base], { cwd: main, env });
       await git(
         base === undefined
           ? ['worktree', 'add', '--', path, branch]
@@ -194,7 +197,10 @@ export async function createWorktree({
     } catch (error) {
       // All or nothing: undo only what this call created. A failing hook leaves the worktree in place.
       if (!registered) await succeeds(['worktree', 'remove', '--force', '--', path], { cwd: main, env });
-      if (!exists) await succeeds(['branch', '-D', '--', branch], { cwd: main, env });
+      if (!exists) {
+        await succeeds(['branch', '-D', '--', branch], { cwd: main, env });
+        await succeeds(['config', '--unset', `branch.${branch}.cockpitBase`], { cwd: main, env });
+      }
       throw error;
     }
     return linkedWorktree(await list(main, env), path);

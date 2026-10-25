@@ -1,6 +1,6 @@
 import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createServer, type AddressInfo } from 'node:net';
 import { homedir, tmpdir, userInfo } from 'node:os';
@@ -3749,6 +3749,11 @@ interface SessionsFixture {
   env(): NodeJS.ProcessEnv;
   /** The file the stubs append a line to on every run, when the fixture was made with `log`. */
   runLog: string;
+  /**
+   * The file the `git` wrapper appends `<working directory> <arguments>` to on every run, when the
+   * fixture was made with `gitLog`.
+   */
+  gitLog: string;
 }
 
 // Stubs named after the given catalogue binaries in a folder of their own, and
@@ -3759,9 +3764,11 @@ interface SessionsFixture {
 // With `log`, every stub first appends `<binary> <arguments>` to `runLog`, which
 // is empty once the fixture is ready (its own warm-up runs are not counted).
 // With `slowVersion`, the stubs' `--version` sleeps 1 s once the fixture is ready.
+// With `gitLog`, `bin` also holds a `git` that appends `<physical working directory> <arguments>`
+// to `gitLog` and runs the real git, so a test sees every git command the app runs.
 function makeSessionsFixture(
   binaries: string[],
-  { log = false, slowVersion = false }: { log?: boolean; slowVersion?: boolean } = {},
+  { log = false, slowVersion = false, gitLog = false }: { log?: boolean; slowVersion?: boolean; gitLog?: boolean } = {},
 ): SessionsFixture {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-sessions-test-')));
   const bin = join(root, 'bin');
@@ -3774,6 +3781,16 @@ function makeSessionsFixture(
     chmodSync(stub, 0o755);
     // macOS scans a new executable the first time it runs.
     expect(execFileSync(stub, ['--version'], { encoding: 'utf8' }).trim()).toBe('9.9.9');
+  }
+  const gitLogFile = join(root, 'git-runs.log');
+  if (gitLog) {
+    const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+    const wrapper = join(bin, 'git');
+    writeFileSync(wrapper, `#!/bin/sh\necho "$(pwd -P) $*" >> '${gitLogFile}'\nexec '${realGit}' "$@"\n`);
+    chmodSync(wrapper, 0o755);
+    // macOS scans a new executable the first time it runs.
+    execFileSync(wrapper, ['--version']);
+    writeFileSync(gitLogFile, '');
   }
   const shell = join(root, 'login-shell');
   const shellLog = join(root, 'shell-args.log');
@@ -3790,7 +3807,7 @@ function makeSessionsFixture(
   // Its own checks above ran the shell: only what the app makes it run is counted.
   writeFileSync(shellLog, '');
 
-  return { root, bin, shell, shellLog, env: () => ({ ...process.env, SHELL: shell }), runLog };
+  return { root, bin, shell, shellLog, env: () => ({ ...process.env, SHELL: shell }), runLog, gitLog: gitLogFile };
 }
 
 const launchBuiltWith = (env: NodeJS.ProcessEnv, dataDir?: string, cockpitHome?: string | null) =>
@@ -4748,6 +4765,594 @@ describe('sessions: built app', () => {
   });
 });
 
+// --- Changes sidebar (COCKPIT-34) --------------------------------------------
+
+const changesToggle = (page: Page) => page.getByRole('button', { name: 'Changes', exact: true });
+
+const PANEL = '[data-test-changes-panel]';
+
+// The right sidebar has no test hook and no role the tests could rely on: it is the element 360 px
+// wide against the window's right edge that shows "Changes". Marks it (and only it) so locators can be
+// scoped to it, and says whether it was found.
+const markChangesPanel = (page: Page) =>
+  page.evaluate((marker) => {
+    for (const marked of document.querySelectorAll(marker)) marked.removeAttribute(marker.slice(1, -1));
+    const panel = [...document.querySelectorAll<HTMLElement>('body *')].find((element) => {
+      const box = element.getBoundingClientRect();
+      return (
+        Math.abs(box.width - 360) <= 1 &&
+        Math.abs(box.right - window.innerWidth) <= 1 &&
+        box.height > 100 &&
+        (element.textContent ?? '').includes('Changes')
+      );
+    });
+    panel?.setAttribute(marker.slice(1, -1), '');
+    return panel !== undefined;
+  }, PANEL);
+
+const panelBox = async (page: Page) => ((await markChangesPanel(page)) ? page.locator(PANEL).boundingBox() : null);
+
+// Runs `read` in the page on the sidebar, `null` when it is not open.
+async function panelEval<T, A>(page: Page, read: (panel: HTMLElement, arg: A) => T, arg: A): Promise<T | null> {
+  if (!(await markChangesPanel(page))) return null;
+  return page
+    .locator(PANEL)
+    .evaluate(read as unknown as (panel: HTMLElement | SVGElement, arg: unknown) => T, arg, { timeout: 2_000 })
+    .catch(() => null);
+}
+
+const panelText = async (page: Page) => (await panelEval(page, (panel) => panel.innerText, null)) ?? '';
+
+const waitForPanelText = (page: Page, matches: (text: string) => boolean, timeout = UI_TIMEOUT) =>
+  poll(() => panelText(page), matches, timeout);
+
+// The sidebar's hunk headers (`@@ … @@`).
+const hunkHeaders = async (page: Page) =>
+  (await panelEval(
+    page,
+    (panel) => {
+      const pattern = /^@@ -\d+(,\d+)? \+\d+(,\d+)? @@/;
+      const text = (element: Element) => (element.textContent ?? '').trim();
+      return [...panel.querySelectorAll('*')]
+        .filter((element) => pattern.test(text(element)) && ![...element.children].some((child) => pattern.test(text(child))))
+        .map(text);
+    },
+    null,
+  )) ?? [];
+
+interface FileRow {
+  /** The row's text, one entry per word, with "−" read as "-". */
+  tokens: string[];
+  /** The computed color of each piece of text of the row, by its text. */
+  colors: Record<string, string>;
+}
+
+// The row of the file list that shows the file name `name`: its text pieces and their colors. The first
+// match in document order is the list's (the diff area comes after it). `others` are the names of the
+// other rows, which tell where the row ends.
+const fileRow = (page: Page, name: string, others: string[]) =>
+  panelEval(
+    page,
+    (panel, { name, others }): { tokens: string[]; colors: Record<string, string> } | null => {
+      const text = (element: Element) => (element.textContent ?? '').trim();
+      const leaves = [...panel.querySelectorAll<HTMLElement>('*')].filter((element) => element.children.length === 0 && text(element) !== '');
+      const shows = (leaf: Element, wanted: string) => text(leaf) === wanted || text(leaf).startsWith(`${wanted} `);
+      const nameLeaf = leaves.find((leaf) => shows(leaf, name));
+      if (!nameLeaf) return null;
+      let row: HTMLElement = nameLeaf;
+      while (row.parentElement && row.parentElement !== panel) {
+        const parent: HTMLElement = row.parentElement;
+        if (others.some((other) => leaves.some((leaf) => parent.contains(leaf) && shows(leaf, other)))) break;
+        row = parent;
+      }
+      const inRow = leaves.filter((leaf) => row.contains(leaf));
+      return {
+        tokens: inRow.flatMap((leaf) => text(leaf).split(/\s+/)).map((token) => token.replace(/−/g, '-')),
+        colors: Object.fromEntries(inRow.map((leaf) => [text(leaf), getComputedStyle(leaf).color])),
+      };
+    },
+    { name, others },
+  ) as Promise<FileRow | null>;
+
+// The names of the files the list shows, with their status letters and counts, for a workspace
+// whose files are `names`.
+const listedNames = async (page: Page, names: string[]) => {
+  const rows = await Promise.all(names.map(async (name) => [name, await fileRow(page, name, names.filter((other) => other !== name))] as const));
+  return rows.filter(([, row]) => row !== null).map(([name]) => name);
+};
+
+interface DiffLineFacts {
+  /** Whether the line or one of its containers is painted with the `--diff-added` token (background or text). */
+  added: boolean;
+  /** The same for `--diff-removed`. */
+  removed: boolean;
+}
+
+// One line of the diff: its text is the line number, the `+`, `-` or space prefix and the content
+// (whitespace ignored, "−" read as "-"). `null` when no element shows it.
+const diffLine = (page: Page, number: number, prefix: '+' | '-' | ' ', content: string) =>
+  panelEval(
+    page,
+    (panel, expected): DiffLineFacts | null => {
+      const normalise = (text: string) => text.replace(/\s+/g, '').replace(/−/g, '-');
+      const token = (name: string, property: 'color' | 'backgroundColor') => {
+        const probe = document.createElement('span');
+        if (property === 'color') probe.style.color = `var(${name})`;
+        else probe.style.backgroundColor = `var(${name})`;
+        document.body.append(probe);
+        const value = getComputedStyle(probe)[property];
+        probe.remove();
+        return value;
+      };
+      const matches = [...panel.querySelectorAll<HTMLElement>('*')].filter((element) => normalise(element.textContent ?? '') === expected);
+      const line = matches.find((element) => !matches.some((other) => other !== element && element.contains(other)));
+      if (!line) return null;
+      const chain: HTMLElement[] = [];
+      for (let node: HTMLElement | null = line; node && node !== panel.parentElement; node = node.parentElement) chain.push(node);
+      // A token the page does not define would resolve to the inherited text color: it paints nothing.
+      const painted = (name: string) =>
+        getComputedStyle(document.documentElement).getPropertyValue(name).trim() !== '' &&
+        chain.some((node) => {
+          const style = getComputedStyle(node);
+          return style.backgroundColor === token(name, 'backgroundColor') || style.color === token(name, 'color');
+        });
+      return { added: painted('--diff-added'), removed: painted('--diff-removed') };
+    },
+    `${number}${prefix === ' ' ? '' : prefix}${content}`.replace(/\s+/g, ''),
+  ) as Promise<DiffLineFacts | null>;
+
+const waitForDiffLine = (page: Page, number: number, prefix: '+' | '-' | ' ', content: string, timeout = UI_TIMEOUT) =>
+  poll(() => diffLine(page, number, prefix, content), (facts) => facts !== null, timeout);
+
+// Opens (or closes) the sidebar through the toggle in the page header and waits for it.
+async function setChangesOpen(page: Page, open: boolean) {
+  const toggle = changesToggle(page);
+  await toggle.waitFor({ timeout: UI_TIMEOUT });
+  if ((await toggle.getAttribute('aria-pressed')) !== String(open)) await toggle.click({ timeout: UI_TIMEOUT });
+  await poll(() => toggle.getAttribute('aria-pressed'), (pressed) => pressed === String(open), UI_TIMEOUT);
+  const found = await poll(() => markChangesPanel(page), (shown) => shown === open, UI_TIMEOUT);
+  expect(found, open ? 'the Changes sidebar opens' : 'the Changes sidebar closes').toBe(open);
+}
+
+// Clicks the file `name` in the sidebar's list.
+async function selectChangedFile(page: Page, name: string) {
+  expect(await markChangesPanel(page)).toBe(true);
+  await page.locator(PANEL).getByText(name, { exact: true }).first().click({ timeout: UI_TIMEOUT });
+}
+
+// Opens a session's page through its link in the left sidebar.
+async function openSessionById(page: Page, id: string) {
+  await page.locator(`a[href="/sessions/${id}"]`).first().click({ timeout: UI_TIMEOUT });
+  await poll(() => sessionIdOf(page), (current) => current === id, UI_TIMEOUT);
+}
+
+// A repository whose files give the sidebar something to show: `a.txt` (20 lines), `c.txt` (3), `d.txt` (10)
+// besides `README.md` and `src/main.ts`.
+function makeChangesRepo(name: string): TempRepo {
+  const repo = makeRepo(name);
+  const numbered = (prefix: string, count: number) => Array.from({ length: count }, (_, index) => `${prefix} ${index + 1}\n`).join('');
+  writeFileSync(join(repo.root, 'a.txt'), numbered('line', 20));
+  writeFileSync(join(repo.root, 'c.txt'), numbered('c', 3));
+  writeFileSync(join(repo.root, 'd.txt'), numbered('d', 10));
+  gitIn(repo.root, 'add', '.');
+  gitIn(repo.root, 'commit', '-m', 'files for the changes sidebar');
+  return repo;
+}
+
+// Every kind of change in a worktree of `makeChangesRepo`, uncommitted: `a.txt` edited in two places
+// (two hunks), `src/main.ts` edited, `c.txt` deleted, `d.txt` renamed to `e.txt`, an untracked `new.txt`, a
+// binary `bin.dat` and a `big.txt` whose diff is over 1 MiB. Listed by path: a.txt, big.txt, bin.dat, c.txt,
+// e.txt, new.txt, src/main.ts.
+const CHANGED_NAMES = ['a.txt', 'big.txt', 'bin.dat', 'c.txt', 'e.txt', 'new.txt', 'main.ts'];
+function writeChanges(worktree: string) {
+  const a = readFileSync(join(worktree, 'a.txt'), 'utf8').replace(/^line 2$/m, 'line two').replace(/^line 18$/m, 'line eighteen');
+  writeFileSync(join(worktree, 'a.txt'), a);
+  writeFileSync(join(worktree, 'src', 'main.ts'), 'export const answer = 42;\n');
+  rmSync(join(worktree, 'c.txt'));
+  renameSync(join(worktree, 'd.txt'), join(worktree, 'e.txt'));
+  writeFileSync(join(worktree, 'new.txt'), 'alpha\nbeta\n');
+  writeFileSync(join(worktree, 'bin.dat'), Buffer.from([0, 1, 2]));
+  writeFileSync(join(worktree, 'big.txt'), `${'x'.repeat(79)}\n`.repeat(15_000));
+}
+
+interface ChangesApi {
+  workspaces: {
+    changes(project: string, path: string): Promise<unknown>;
+    diff(project: string, path: string, file: unknown): Promise<unknown>;
+    watch(project: string, path: string, listener: () => void): (() => void) | Promise<() => void>;
+  };
+}
+type ChangesWindow = Window & { api: ChangesApi; __changedEvents?: number; __stopWatching?: () => void };
+
+const changesApi = (page: Page, method: 'changes' | 'diff', project: string, path: string) =>
+  page.evaluate(
+    ([method, project, path]) => {
+      const { workspaces } = (window as unknown as ChangesWindow).api;
+      return method === 'changes'
+        ? workspaces.changes(project!, path!)
+        : workspaces.diff(project!, path!, { path: 'a.txt', status: 'modified', additions: 1, deletions: 1 });
+    },
+    [method, project, path] as const,
+  );
+
+// Starts `window.api.workspaces.watch` in the page and counts the `changed` events it delivers.
+const startWatching = (page: Page, project: string, path: string) =>
+  page.evaluate(
+    async ([project, path]) => {
+      const w = window as unknown as ChangesWindow;
+      w.__changedEvents = 0;
+      w.__stopWatching = await w.api.workspaces.watch(project!, path!, () => {
+        w.__changedEvents = (w.__changedEvents ?? 0) + 1;
+      });
+    },
+    [project, path] as const,
+  );
+const changedEvents = (page: Page) => page.evaluate(() => (window as unknown as ChangesWindow).__changedEvents ?? 0);
+const stopWatching = (page: Page) => page.evaluate(() => (window as unknown as ChangesWindow).__stopWatching?.());
+
+// The git runs the wrapper logged that mention `folder` (as working directory or argument).
+const gitRunsIn = (fx: SessionsFixture, folder: string) =>
+  readFileSync(fx.gitLog, 'utf8').split('\n').filter((line) => line.includes(folder));
+
+// What the smoke paths check on a workspace page: a file the test writes in the worktree shows in the
+// sidebar's list with its diff.
+async function expectChangesShowNewFile(page: Page, worktree: string) {
+  await setChangesOpen(page, true);
+  writeFileSync(join(worktree, 'smoke-changes.txt'), 'hello from the smoke path\n');
+  await poll(() => listedNames(page, ['smoke-changes.txt']), (names) => names.length === 1, UI_TIMEOUT);
+  expect(await listedNames(page, ['smoke-changes.txt'])).toEqual(['smoke-changes.txt']);
+  expect(await waitForDiffLine(page, 1, '+', 'hello from the smoke path')).not.toBeNull();
+}
+
+describe('changes sidebar: built app', () => {
+  let fx: SessionsFixture;
+  let session: Session;
+  let repo: TempRepo;
+  const A = { path: '', id: '' };
+  const B = { path: '', id: '' };
+
+  beforeAll(async () => {
+    fx = makeSessionsFixture(['claude'], { gitLog: true });
+    repo = makeChangesRepo('changes-ws');
+    session = await launchBuiltWith(fx.env());
+    await session.page.getByText(versionLabel).waitFor();
+    await addRepository(session, repo);
+    // Two workspaces with a running session each (created through the New workspace dialog, which records the base).
+    A.id = await createWorkspaceWithAgent(session.page, repo, { name: 'ws-a', agent: 'Claude Code' }, 'Claude Code 1');
+    A.path = worktreePath(session, repo, 'ws-a');
+    B.id = await createWorkspaceWithAgent(session.page, repo, { name: 'ws-b', agent: 'Claude Code' }, 'Claude Code 1');
+    B.path = worktreePath(session, repo, 'ws-b');
+    writeChanges(A.path);
+  });
+
+  afterAll(async () => {
+    await session?.close();
+    if (fx) rmSync(fx.root, { recursive: true, force: true });
+    if (repo) rmSync(repo.parent, { recursive: true, force: true });
+  });
+
+  test('changes AC9 — the "Changes" toggle docks a 360 px sidebar next to the main area, the terminal refits to the narrower area, and closing it gives the width back', async () => {
+    const { page } = session;
+    await openSessionById(page, A.id);
+    const toggle = changesToggle(page);
+    await toggle.waitFor({ timeout: UI_TIMEOUT });
+    expect(await toggle.getAttribute('aria-pressed')).toBe('false');
+    expect(await markChangesPanel(page)).toBe(false);
+    const screen = page.locator('.xterm-screen:visible').first();
+    await screen.waitFor({ timeout: UI_TIMEOUT });
+    const widthBefore = (await screen.boundingBox())!.width;
+
+    await toggle.click({ timeout: UI_TIMEOUT });
+    expect(await toggle.getAttribute('aria-pressed')).toBe('true');
+    const panel = await poll(() => panelBox(page), Boolean, UI_TIMEOUT);
+    expect(panel, 'a Changes sidebar 360 px wide against the right edge of the window').toBeTruthy();
+    const main = (await page.locator('main').boundingBox())!;
+    expect(Math.abs(panel!.width - 360)).toBeLessThanOrEqual(1);
+    // Docked: the main area ends where the sidebar starts, and both are visible.
+    expect(main.width).toBeGreaterThan(0);
+    expect(main.x + main.width).toBeLessThanOrEqual(panel!.x + 1);
+    expect(Math.abs(main.x + main.width - panel!.x)).toBeLessThanOrEqual(2);
+    const narrower = await poll(
+      async () => (await screen.boundingBox())!.width,
+      (width) => width <= widthBefore - 300,
+      UI_TIMEOUT,
+    );
+    expect(narrower).toBeLessThanOrEqual(widthBefore - 300);
+
+    await toggle.click({ timeout: UI_TIMEOUT });
+    expect(await toggle.getAttribute('aria-pressed')).toBe('false');
+    await poll(() => markChangesPanel(page), (shown) => !shown, UI_TIMEOUT);
+    expect(await markChangesPanel(page)).toBe(false);
+    const restored = await poll(
+      async () => (await screen.boundingBox())!.width,
+      (width) => Math.abs(width - widthBefore) <= 10,
+      UI_TIMEOUT,
+    );
+    expect(Math.abs(restored - widthBefore)).toBeLessThanOrEqual(10);
+  });
+
+  test('changes AC10 — no button and no sidebar on Home, the Terminal page or a session outside any project; back on a workspace page the sidebar shows again, open', async () => {
+    const { page } = session;
+    await setChangesOpen(page, true);
+
+    await goHome(page);
+    expect(await changesToggle(page).count()).toBe(0);
+    expect(await markChangesPanel(page)).toBe(false);
+
+    await goToTerminalPage(page);
+    expect(await changesToggle(page).count()).toBe(0);
+    expect(await markChangesPanel(page)).toBe(false);
+
+    await startSession(page, 'Claude Code', 'Claude Code 1');
+    expect(await changesToggle(page).count()).toBe(0);
+    expect(await markChangesPanel(page)).toBe(false);
+
+    await openSessionById(page, A.id);
+    await changesToggle(page).waitFor({ timeout: UI_TIMEOUT });
+    expect(await changesToggle(page).getAttribute('aria-pressed')).toBe('true');
+    expect(await poll(() => markChangesPanel(page), Boolean, UI_TIMEOUT)).toBe(true);
+    // A reload starts with it closed: see changes AC17 below, which reloads the page.
+  });
+
+  test('changes AC11 — the strip, the file list (letter, name, folder, counts), the first file selected with its diff by hunk, a click selecting another file, and "No changes against main." without changes', async () => {
+    const { page } = session;
+    await openSessionById(page, A.id);
+    await setChangesOpen(page, true);
+
+    const text = (await waitForPanelText(page, (shown) => shown.includes('main.ts'))).replace(/\s+/g, ' ');
+    expect(text).toContain('Changes');
+    expect(text).toContain('against main');
+
+    const row = async (name: string) => {
+      const found = await fileRow(page, name, CHANGED_NAMES.filter((other) => other !== name));
+      expect(found, `a row for ${name}`).not.toBeNull();
+      return found!;
+    };
+    const counts = (found: FileRow) => found.tokens.filter((token) => /^[+-]\d+$/.test(token));
+
+    const a = await row('a.txt');
+    expect(a.tokens[0]).toBe('M');
+    expect(counts(a)).toEqual(['+2', '-2']);
+    const big = await row('big.txt');
+    expect(big.tokens[0]).toBe('A');
+    expect(counts(big)).toEqual(['+15000']);
+    const bin = await row('bin.dat');
+    expect(bin.tokens[0]).toBe('A');
+    expect(counts(bin), 'nothing for a binary file').toEqual([]);
+    const c = await row('c.txt');
+    expect(c.tokens[0]).toBe('D');
+    expect(counts(c)).toEqual(['-3']);
+    const e = await row('e.txt');
+    expect(e.tokens[0]).toBe('R');
+    expect(e.tokens).toContain('d.txt');
+    const created = await row('new.txt');
+    expect(created.tokens[0]).toBe('A');
+    expect(counts(created)).toEqual(['+2']);
+    const main = await row('main.ts');
+    expect(main.tokens[0]).toBe('M');
+    expect(counts(main)).toEqual(['+1', '-1']);
+    const folder = main.tokens.find((token) => /^src\/?$/.test(token));
+    expect(folder, 'the folder of src/main.ts').toBeTruthy();
+    expect(main.colors[folder!]).toBe(await mutedColor(page));
+    // Listed by path.
+    const order = await page.evaluate((names) => {
+      const leaves = [...document.querySelectorAll<HTMLElement>('[data-test-changes-panel] *')].filter((element) => element.children.length === 0);
+      return names.map((name) => leaves.findIndex((leaf) => (leaf.textContent ?? '').trim().startsWith(name)));
+    }, CHANGED_NAMES);
+    expect(order, 'every file is listed, in path order').toEqual([...order].sort((x, y) => x - y));
+    expect(order.every((index) => index >= 0)).toBe(true);
+
+    // The first file is selected: its diff, one block per hunk, each line with one number and its prefix.
+    const headers = await poll(() => hunkHeaders(page), (found) => found.length === 2, UI_TIMEOUT);
+    expect(headers).toHaveLength(2);
+    expect(headers[0]).toContain('@@ -1,5 +1,5 @@');
+    expect(headers[1]).toContain('@@ -15,6 +15,6 @@');
+    expect(await diffLine(page, 1, ' ', 'line 1')).toEqual({ added: false, removed: false });
+    expect(await diffLine(page, 2, '-', 'line 2')).toEqual({ added: false, removed: true });
+    expect(await diffLine(page, 2, '+', 'line two')).toEqual({ added: true, removed: false });
+    expect(await diffLine(page, 3, ' ', 'line 3')).toEqual({ added: false, removed: false });
+    expect(await diffLine(page, 18, '-', 'line 18')).toEqual({ added: false, removed: true });
+    expect(await diffLine(page, 18, '+', 'line eighteen')).toEqual({ added: true, removed: false });
+
+    // Another file: its diff replaces it.
+    await selectChangedFile(page, 'new.txt');
+    const newHeaders = await poll(() => hunkHeaders(page), (found) => found.length === 1, UI_TIMEOUT);
+    expect(newHeaders[0]).toContain('@@ -0,0 +1,2 @@');
+    expect(await waitForDiffLine(page, 1, '+', 'alpha')).toEqual({ added: true, removed: false });
+    expect(await diffLine(page, 2, '+', 'beta')).toEqual({ added: true, removed: false });
+    expect(await diffLine(page, 2, '-', 'line 2')).toBeNull();
+
+    // A workspace without changes.
+    await openSessionById(page, B.id);
+    await waitForPanelText(page, (shown) => shown.includes('No changes against main.'));
+    expect(await panelText(page)).toContain('No changes against main.');
+    expect(await hunkHeaders(page)).toEqual([]);
+    expect(await listedNames(page, CHANGED_NAMES)).toEqual([]);
+  });
+
+  test('changes AC14 — a binary file shows "Binary file" and a diff over 1 MiB "Diff too large to display", with no error logged', async () => {
+    const { page } = session;
+    const mark = await errorMark(session);
+    await openSessionById(page, A.id);
+    await setChangesOpen(page, true);
+    await waitForPanelText(page, (shown) => shown.includes('bin.dat'));
+
+    await selectChangedFile(page, 'bin.dat');
+    await waitForPanelText(page, (shown) => shown.includes('Binary file'));
+    expect(await panelText(page)).toContain('Binary file');
+    expect(await hunkHeaders(page)).toEqual([]);
+
+    await selectChangedFile(page, 'big.txt');
+    await waitForPanelText(page, (shown) => shown.includes('Diff too large to display'));
+    expect(await panelText(page)).toContain('Diff too large to display');
+    expect(await hunkHeaders(page)).toEqual([]);
+
+    await expectNoNewErrors(session, mark);
+  });
+
+  test('changes AC12 — a file written in the worktree appears in the list within 5 s, a line appended to it shows in the diff within 5 s, and removing it takes it out of the list within 5 s', async () => {
+    const { page } = session;
+    await openSessionById(page, B.id);
+    await setChangesOpen(page, true);
+    await waitForPanelText(page, (shown) => shown.includes('No changes against main.'));
+    const file = join(B.path, 'live.txt');
+
+    writeFileSync(file, 'first\n');
+    expect(await poll(() => listedNames(page, ['live.txt']), (names) => names.length === 1, 5_000)).toEqual(['live.txt']);
+    expect(await waitForDiffLine(page, 1, '+', 'first', 5_000)).not.toBeNull();
+
+    appendFileSync(file, 'second\n');
+    expect(await waitForDiffLine(page, 2, '+', 'second', 5_000)).toEqual({ added: true, removed: false });
+
+    rmSync(file);
+    expect(await poll(() => listedNames(page, ['live.txt']), (names) => names.length === 0, 5_000)).toEqual([]);
+    await waitForPanelText(page, (shown) => shown.includes('No changes against main.'), 5_000);
+  });
+
+  test('changes AC13 — opening the page of a session in workspace B lists B\'s changes, not A\'s', async () => {
+    const { page } = session;
+    writeFileSync(join(B.path, 'only-b.txt'), 'b\n');
+    await openSessionById(page, A.id);
+    await setChangesOpen(page, true);
+    await waitForPanelText(page, (shown) => shown.includes('main.ts'));
+    expect(await listedNames(page, ['a.txt', 'only-b.txt'])).toEqual(['a.txt']);
+
+    await openSessionById(page, B.id);
+    const names = await poll(() => listedNames(page, ['a.txt', 'big.txt', 'only-b.txt']), (found) => found.includes('only-b.txt') && !found.includes('a.txt'), UI_TIMEOUT);
+    expect(names).toEqual(['only-b.txt']);
+    expect(await panelText(page)).toContain('against main');
+    rmSync(join(B.path, 'only-b.txt'));
+  });
+
+  test('changes AC5 — through window.api.workspaces.changes, a workspace with no recorded base in a repository with no default base is refused with "No base branch to compare <name> with."', async () => {
+    const { page } = session;
+    const bare = makeRepo('changes-no-base');
+    try {
+      const path = join(bare.parent, 'wt-no-base');
+      gitIn(bare.root, 'worktree', 'add', '--quiet', '-b', 'no-base', path, 'main');
+      // Detached in the main working tree and without origin: nothing to default to.
+      gitIn(bare.root, 'checkout', '--quiet', '--detach');
+      await addRepository(session, bare);
+
+      expect(await changesApi(page, 'changes', bare.root, path)).toEqual({
+        status: 'refused',
+        message: 'No base branch to compare no-base with.',
+      });
+      await removeThroughMenu(page, bare.root);
+      await poll(() => entryTitles(page), (titles) => !titles.includes(bare.root), UI_TIMEOUT);
+    } finally {
+      rmSync(bare.parent, { recursive: true, force: true });
+    }
+  });
+
+  test('changes AC15 — an unknown project or a path that is no linked worktree is refused by changes and diff, and watch sends no event for it', async () => {
+    const { page } = session;
+    await goHome(page);
+    const elsewhere = join(repo.parent, 'not-a-worktree');
+    mkdirSync(elsewhere);
+    const mark = await errorMark(session);
+
+    for (const method of ['changes', 'diff'] as const) {
+      expect(await changesApi(page, method, '/no/such/project', '/no/such/project/ws')).toEqual({
+        status: 'refused',
+        message: '/no/such/project is not a project in Cockpit.',
+      });
+      expect(await changesApi(page, method, repo.root, elsewhere)).toEqual({
+        status: 'refused',
+        message: `${elsewhere} is not a workspace of ${repo.name}.`,
+      });
+      // The main working tree is the project, not a workspace.
+      expect(await changesApi(page, method, repo.root, repo.root)).toEqual({
+        status: 'refused',
+        message: `${repo.root} is not a workspace of ${repo.name}.`,
+      });
+    }
+
+    // The same watch on a real workspace delivers events: the refusals below are not a broken listener.
+    await startWatching(page, repo.root, B.path);
+    writeFileSync(join(B.path, 'watched.txt'), 'x\n');
+    expect(await poll(() => changedEvents(page), (count) => count > 0, 5_000)).toBeGreaterThan(0);
+    await stopWatching(page);
+    rmSync(join(B.path, 'watched.txt'));
+
+    for (const [project, label] of [['/no/such/project', 'unknown project'], [repo.root, 'not a worktree']] as const) {
+      await startWatching(page, project, elsewhere);
+      writeFileSync(join(elsewhere, `${label.replace(' ', '-')}.txt`), 'x\n');
+      await sleep(1_000);
+      expect(await changedEvents(page), `no event for ${label}`).toBe(0);
+      await stopWatching(page);
+    }
+
+    await expectNoNewErrors(session, mark);
+  });
+
+  test('changes AC17 (and AC10 for the reload) — closing the sidebar, leaving for a page without it or reloading stops the watcher: a file written afterwards starts no git command in the worktree; opening the sidebar again lists the changes again', async () => {
+    const { page } = session;
+    await openSessionById(page, A.id);
+    await setChangesOpen(page, true);
+    await waitForPanelText(page, (shown) => shown.includes('main.ts'));
+
+    // Control: with the sidebar open, a write does start git commands in the worktree (the wrapper logs them).
+    const settleGit = async () => {
+      let last = -1;
+      await poll(
+        async () => {
+          const now = gitRunsIn(fx, A.path).length;
+          const stable = now === last;
+          last = now;
+          await sleep(400);
+          return stable;
+        },
+        Boolean,
+        UI_TIMEOUT,
+      );
+    };
+    const runsBefore = gitRunsIn(fx, A.path).length;
+    writeFileSync(join(A.path, 'probe.txt'), 'probe\n');
+    await poll(() => listedNames(page, ['probe.txt']), (names) => names.length === 1, UI_TIMEOUT);
+    expect(gitRunsIn(fx, A.path).length).toBeGreaterThan(runsBefore);
+    rmSync(join(A.path, 'probe.txt'));
+    await poll(() => listedNames(page, ['probe.txt']), (names) => names.length === 0, UI_TIMEOUT);
+
+    // Writes `name`, waits 1 s (5 times the debounce) and returns the git runs in the worktree since `before`.
+    const gitRunsAfterWrite = async (name: string) => {
+      await settleGit();
+      const before = gitRunsIn(fx, A.path).length;
+      writeFileSync(join(A.path, name), 'x\n');
+      await sleep(1_000);
+      return gitRunsIn(fx, A.path).slice(before);
+    };
+
+    // (a) The sidebar is closed.
+    await setChangesOpen(page, false);
+    expect(await gitRunsAfterWrite('after-close.txt')).toEqual([]);
+    await setChangesOpen(page, true);
+    expect(await poll(() => listedNames(page, ['after-close.txt']), (names) => names.length === 1, UI_TIMEOUT)).toEqual(['after-close.txt']);
+
+    // (b) The user is on a page without it.
+    await goHome(page);
+    expect(await gitRunsAfterWrite('after-home.txt')).toEqual([]);
+    await openSessionById(page, A.id);
+    await changesToggle(page).waitFor({ timeout: UI_TIMEOUT });
+    expect(await changesToggle(page).getAttribute('aria-pressed')).toBe('true');
+    expect(await poll(() => listedNames(page, ['after-home.txt']), (names) => names.length === 1, UI_TIMEOUT)).toEqual(['after-home.txt']);
+
+    // (c) The page reloads, and starts with the sidebar closed.
+    await page.reload();
+    await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
+    await changesToggle(page).waitFor({ timeout: UI_TIMEOUT });
+    expect(await changesToggle(page).getAttribute('aria-pressed')).toBe('false');
+    expect(await markChangesPanel(page)).toBe(false);
+    expect(await gitRunsAfterWrite('after-reload.txt')).toEqual([]);
+    await setChangesOpen(page, true);
+    expect(await poll(() => listedNames(page, ['after-reload.txt']), (names) => names.length === 1, UI_TIMEOUT)).toEqual(['after-reload.txt']);
+  });
+
+  test('logs no error and keeps running', async () => {
+    await expectNoErrors(session);
+  });
+});
+
 // One smoke path through the sessions IPC in the dev server: the page, the
 // main process, the pty host and the disk. It needs a launch of its own with
 // the fake login shell that holds the stubs. The packaged app's smoke path is
@@ -4782,7 +5387,7 @@ describe('sessions smoke path: dev server', () => {
     expect(stored.map((s) => [s.name, s.directory])).toEqual([['Claude Code 1', home]]);
   });
 
-  test('workspace sessions smoke path — a new workspace with Claude Code and a prompt runs the stub in the worktree with the prompt, lists the session under the workspace and stores it', async () => {
+  test('workspace sessions smoke path, changes AC16 — a new workspace with Claude Code and a prompt runs the stub in the worktree with the prompt, lists the session under the workspace and stores it, and the Changes sidebar shows a file written in the worktree with its diff', async () => {
     const { page } = session;
     const repo = makeRepo('smoke-agent-ws');
     try {
@@ -4797,6 +5402,8 @@ describe('sessions smoke path: dev server', () => {
       expect(await waitForWorkspaceLinks(page, path, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
       const stored = await poll(() => sessionsInState(session.dataDir), (list) => list.some((entry) => entry.id === id), UI_TIMEOUT);
       expect(stored.find((entry) => entry.id === id)).toMatchObject({ name: 'Claude Code 1', directory: path, project: repo.root });
+      // Changes sidebar (COCKPIT-34 AC16): a file written in the worktree shows with its diff.
+      await expectChangesShowNewFile(page, path);
     } finally {
       rmSync(repo.parent, { recursive: true, force: true });
     }
@@ -4898,7 +5505,7 @@ describe('packaged app sessions after a restart', () => {
     rmSync(repo.parent, { recursive: true, force: true });
   });
 
-  test('AC9 — sessions of a previous launch are listed as "Ended", newest first, open as ended and leave state.json and their folders alone', async () => {
+  test('AC9, changes AC16 — sessions of a previous launch are listed as "Ended", newest first, open as ended and leave state.json and their folders alone (the first launch also runs the Changes sidebar smoke path)', async () => {
     const first = await launchPackagedWith(fx.env(), dataDir);
     try {
       await first.page.getByText(versionLabel).waitFor();
@@ -4927,6 +5534,8 @@ describe('packaged app sessions after a restart', () => {
       expect(await waitForWorkspaceLinks(first.page, wsPath, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
       const storedWs = await poll(() => sessionsInState(dataDir), (list) => list.some((entry) => entry.id === wsId), UI_TIMEOUT);
       expect(storedWs.find((entry) => entry.id === wsId)).toMatchObject({ name: 'Claude Code 1', directory: wsPath, project: repo.root });
+      // Changes sidebar smoke path (COCKPIT-34 AC16): a file written in the worktree shows with its diff.
+      await expectChangesShowNewFile(first.page, wsPath);
       await expectNoErrors(first);
     } finally {
       await first.close();
