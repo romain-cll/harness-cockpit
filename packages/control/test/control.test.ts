@@ -56,6 +56,24 @@ function send(
   });
 }
 
+// A process listens on the path and is killed with SIGKILL, so nothing unlinks the socket.
+async function leaveStaleSocket(socketPath: string) {
+  const child = spawn(
+    process.execPath,
+    ['-e', "require('net').createServer().listen(process.argv[1], () => console.log('listening'))", socketPath],
+    { stdio: ['ignore', 'pipe', 'inherit'] },
+  );
+  closers.push(() => void child.kill('SIGKILL'));
+  await new Promise<void>((resolve, reject) => {
+    child.on('error', reject);
+    child.stdout.on('data', (chunk: Buffer) => chunk.toString().includes('listening') && resolve());
+  });
+  const exited = new Promise((resolve) => child.once('exit', resolve));
+  child.kill('SIGKILL');
+  await exited;
+  expect(statSync(socketPath).isSocket(), 'the stale socket is still there').toBe(true);
+}
+
 const post = (socketPath: string, token: string, body: unknown) =>
   send(socketPath, { authorization: `Bearer ${token}`, body: typeof body === 'string' ? body : JSON.stringify(body) });
 
@@ -226,21 +244,7 @@ describe('an existing path (AC7)', () => {
   test('AC7 — a stale socket (a killed process left it) is replaced, a new token is written and the endpoint listens', async () => {
     const dir = makeFolder();
     const socketPath = join(dir, 'control.sock');
-    // A process listens on the path and is killed with SIGKILL, so nothing unlinks the socket.
-    const child = spawn(
-      process.execPath,
-      ['-e', "require('net').createServer().listen(process.argv[1], () => console.log('listening'))", socketPath],
-      { stdio: ['ignore', 'pipe', 'inherit'] },
-    );
-    closers.push(() => void child.kill('SIGKILL'));
-    await new Promise<void>((resolve, reject) => {
-      child.on('error', reject);
-      child.stdout.on('data', (chunk: Buffer) => chunk.toString().includes('listening') && resolve());
-    });
-    const exited = new Promise((resolve) => child.once('exit', resolve));
-    child.kill('SIGKILL');
-    await exited;
-    expect(statSync(socketPath).isSocket(), 'the stale socket is still there').toBe(true);
+    await leaveStaleSocket(socketPath);
     writeFileSync(join(dir, 'control.token'), 'old-token', { mode: 0o600 });
 
     const handler = vi.fn<Handler>(() => true);
@@ -321,6 +325,21 @@ describe('start failures (AC10)', () => {
 
     chmodSync(dir, 0o700);
     expect(readdirSync(dir)).toEqual([]);
+  });
+
+  // The unlink runs in the probe's error listener: a failure there must reject the start, not
+  // escape as an uncaught exception that leaves the start pending (the app would open no window).
+  test.skipIf(process.getuid?.() === 0)('AC10 — a stale socket that cannot be unlinked (read-only folder) makes the start reject', async () => {
+    const dir = makeFolder();
+    const socketPath = join(dir, 'control.sock');
+    await leaveStaleSocket(socketPath);
+    chmodSync(dir, 0o500);
+
+    await expect(startControlServer({ dir, onSessionEvent: () => true })).rejects.toMatchObject({ code: 'EACCES' });
+
+    chmodSync(dir, 0o700);
+    expect(statSync(socketPath).isSocket()).toBe(true);
+    expect(readdirSync(dir)).toEqual(['control.sock']);
   });
 });
 

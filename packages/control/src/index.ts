@@ -83,7 +83,13 @@ async function clearStaleSocket(socketPath: string): Promise<void> {
     });
     probe.once('error', (error: NodeJS.ErrnoException) => {
       if (error.code !== 'ECONNREFUSED') return reject(error);
-      unlinkSync(socketPath);
+      // A throw here would escape the promise and leave the start pending: it rejects instead.
+      try {
+        unlinkSync(socketPath);
+      } catch (unlinkError) {
+        // Already gone: another start removed it meanwhile.
+        if ((unlinkError as NodeJS.ErrnoException).code !== 'ENOENT') return reject(unlinkError);
+      }
       resolve();
     });
   });
