@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { detectHarnesses, harnesses, type DetectedHarness } from '@cockpit/harnesses';
+import { apps, defaultApplicationDirs, detectApps, LaunchError, openIn, reveal, type App } from '@cockpit/launchers';
 import { createPtyClient, type PtySpawnOptions } from '@cockpit/pty';
 import {
   addProject,
@@ -11,6 +12,7 @@ import {
   loadState,
   NewerStateError,
   ProjectExistsError,
+  rememberApp,
   removeProject,
   saveState,
   sessionName,
@@ -32,9 +34,11 @@ import {
 } from 'electron';
 import type {
   AddProjectResult,
+  AppsResult,
   BranchesResult,
   CreateWorkspaceResult,
   Project,
+  OpenWorkspaceResult,
   PtySpawnRequest,
   Refused,
   RemoveWorkspaceResult,
@@ -62,12 +66,17 @@ const devServerUrl = app.isPackaged ? undefined : process.env.ELECTRON_RENDERER_
 // - COCKPIT_USER_DATA_DIR: the app keeps its data in that folder.
 // - COCKPIT_HOME: where worktrees and session folders live, in `worktrees` and `sessions` under it
 //   (`~/.cockpit` when unset). They are the user's work, not app data, so they stay out of `userData`.
+// - COCKPIT_TEST_APPLICATIONS_DIR: the one folder the editors and terminals are looked up in,
+//   instead of the three applications folders (ignored when empty).
 // - COCKPIT_TEST_BACKGROUND=1: no Dock icon, windows never shown, so a test
 //   launch does not take the user's focus.
 const background = process.env.COCKPIT_TEST_BACKGROUND === '1';
 const userDataDir = process.env.COCKPIT_USER_DATA_DIR;
 const cockpitHome = resolve(process.env.COCKPIT_HOME || join(homedir(), '.cockpit'));
 const worktreesRoot = join(cockpitHome, 'worktrees');
+const applicationDirs = process.env.COCKPIT_TEST_APPLICATIONS_DIR
+  ? [process.env.COCKPIT_TEST_APPLICATIONS_DIR]
+  : defaultApplicationDirs(homedir());
 if (userDataDir) app.setPath('userData', userDataDir);
 if (background && process.platform === 'darwin') app.setActivationPolicy('accessory');
 
@@ -384,6 +393,59 @@ function startProjects(userData: string): void {
         },
       ),
   );
+
+  // The editors and terminals of the catalogue found on this machine, looked up at each call.
+  // The app shown for a kind is the remembered one when detected, else the first detected.
+  ipcMain.handle('workspaces:apps', async (event): Promise<AppsResult> => {
+    if (!isFromApp(event)) throw new Error('workspaces:apps refused: unexpected origin');
+    const detected = await detectApps(applicationDirs);
+    const available = (kind: App['kind']) =>
+      apps.filter((entry) => entry.kind === kind && detected.some(({ id }) => id === entry.id)).map(({ id, name }) => ({ id, name }));
+    const shown = (kind: App['kind']) => {
+      const list = available(kind);
+      return (list.find(({ id }) => id === state[kind]) ?? list[0])?.id ?? null;
+    };
+    return { editors: available('editor'), terminals: available('terminal'), editor: shown('editor'), terminal: shown('terminal') };
+  });
+
+  ipcMain.handle('workspaces:reveal', async (event, project: string, path: string): Promise<OpenWorkspaceResult> => {
+    if (!isFromApp(event)) throw new Error('workspaces:reveal refused: unexpected origin');
+    const refusal = await checkWorkspace({ project, path });
+    if (refusal) return refusal;
+    try {
+      await reveal(path, { env: await shellEnv });
+      return { status: 'opened' };
+    } catch (error) {
+      if (!(error instanceof LaunchError)) throw error;
+      return { status: 'refused', message: `Could not reveal ${path} in the Finder: ${error.message}` };
+    }
+  });
+
+  // Opens the worktree in a detected app by its bundle's path, then remembers the app.
+  ipcMain.handle('workspaces:open', async (event, project: string, path: string, appId: string): Promise<OpenWorkspaceResult> => {
+    if (!isFromApp(event)) throw new Error('workspaces:open refused: unexpected origin');
+    const refusal = await checkWorkspace({ project, path });
+    if (refusal) return refusal;
+    const entry = apps.find(({ id }) => id === appId);
+    const bundle = entry && (await detectApps(applicationDirs)).find(({ id }) => id === entry.id);
+    if (!entry || !bundle) return { status: 'refused', message: `${entry?.name ?? appId} is not installed.` };
+    try {
+      await openIn(bundle.path, path, { env: await shellEnv });
+    } catch (error) {
+      if (!(error instanceof LaunchError)) throw error;
+      return { status: 'refused', message: `Could not open ${path} in ${entry.name}: ${error.message}` };
+    }
+    if (state[entry.kind] === entry.id) return { status: 'opened' };
+    const next = rememberApp(state, entry.kind, entry.id);
+    try {
+      saveState(userData, next);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return { status: 'refused', message: `Cockpit could not save its data: ${reason}` };
+    }
+    state = next;
+    return { status: 'opened' };
+  });
 }
 
 // Sessions outside any project: an agent CLI run in a folder of its own under

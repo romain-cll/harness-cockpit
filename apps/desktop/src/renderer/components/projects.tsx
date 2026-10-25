@@ -1,26 +1,36 @@
 import { useRouter } from '@tanstack/react-router';
 import { FolderGitIcon, GitBranchIcon, MoreHorizontalIcon, PlusIcon } from 'lucide-react';
 import { useState, type ReactNode } from 'react';
-import type { Project, Session, StartSessionResult, Workspace } from '../../shared/api';
+import type { AppsResult, AvailableApp, OpenWorkspaceResult, Project, Session, StartSessionResult, Workspace } from '../../shared/api';
 import { DeleteWorkspaceDialog } from '@/components/delete-workspace-dialog';
 import { NewWorkspaceDialog } from '@/components/new-workspace-dialog';
 import { endSessions, startSession } from '@/components/live-terminals';
 import { SessionLink } from '@/components/sessions';
 import { StartSessionMenu } from '@/components/start-session-menu';
 import { Button } from '@/components/ui/button';
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 
 const rowClass =
   'flex h-8 items-center gap-2 rounded-[calc(var(--radius-sm)+2px)] p-2 text-xs hover:bg-sidebar-accent hover:text-sidebar-accent-foreground [&_svg]:size-4 [&_svg]:shrink-0';
 
 // An entry of the list: its row, and the "…" menu shown on hover and focus, next to the `extra` button
-// (shown the same way, left of it) when there is one.
+// (shown the same way, left of it) when there is one. `onOpenChange` hears the menu open and close.
 function Entry({
   title,
   icon,
   name,
   label,
   extra,
+  onOpenChange,
   children,
 }: {
   title: string;
@@ -28,6 +38,7 @@ function Entry({
   name: string;
   label: string;
   extra?: ReactNode;
+  onOpenChange?: (open: boolean) => void;
   children: ReactNode;
 }) {
   return (
@@ -37,7 +48,7 @@ function Entry({
         <span className="truncate">{name}</span>
       </div>
       {extra}
-      <DropdownMenu>
+      <DropdownMenu onOpenChange={onOpenChange}>
         <DropdownMenuTrigger
           render={
             <Button
@@ -58,12 +69,45 @@ function Entry({
   );
 }
 
+// The items of a workspace's menu that open its worktree: the editor and the terminal shown first,
+// the Finder, and a submenu of each kind listing every detected app.
+function OpenItems({ apps, onOpen, onReveal }: { apps?: AppsResult; onOpen: (app: string) => void; onReveal: () => void }) {
+  if (!apps) return null;
+  const submenu = (kind: 'editor' | 'terminal', list: AvailableApp[]) => (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger>Open in {kind}</DropdownMenuSubTrigger>
+      <DropdownMenuSubContent>
+        {list.map((app) => (
+          <DropdownMenuItem key={app.id} onClick={() => onOpen(app.id)}>
+            {app.name}
+          </DropdownMenuItem>
+        ))}
+        {list.length === 0 && <DropdownMenuItem disabled>No {kind} found</DropdownMenuItem>}
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  );
+  const editor = apps.editors.find(({ id }) => id === apps.editor);
+  const terminal = apps.terminals.find(({ id }) => id === apps.terminal);
+  return (
+    <>
+      {editor && <DropdownMenuItem onClick={() => onOpen(editor.id)}>Open in {editor.name}</DropdownMenuItem>}
+      {terminal && <DropdownMenuItem onClick={() => onOpen(terminal.id)}>Open in {terminal.name}</DropdownMenuItem>}
+      <DropdownMenuItem onClick={onReveal}>Reveal in Finder</DropdownMenuItem>
+      {submenu('editor', apps.editors)}
+      {submenu('terminal', apps.terminals)}
+      <DropdownMenuSeparator />
+    </>
+  );
+}
+
 export function Projects({ projects, sessions }: { projects: Project[]; sessions: Session[] }) {
   const router = useRouter();
   // Why the last add or start was refused, or that a deletion kept its branch; cleared by the next add, start or deletion that succeeds.
   const [message, setMessage] = useState<string>();
   const [creatingIn, setCreatingIn] = useState<Project>();
   const [deleting, setDeleting] = useState<{ project: Project; workspace: Workspace }>();
+  // The editors and terminals found when a workspace's menu last opened.
+  const [apps, setApps] = useState<AppsResult>();
 
   async function add() {
     const result = await window.api.projects.add();
@@ -91,6 +135,11 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
     setMessage(undefined);
     await router.invalidate();
     await router.navigate({ to: '/sessions/$sessionId', params: { sessionId: result.session.id } });
+  }
+
+  // Shows why opening a worktree was refused or failed; a success clears the message.
+  function opened(result: OpenWorkspaceResult) {
+    setMessage(result.status === 'refused' ? result.message : undefined);
   }
 
   return (
@@ -131,6 +180,7 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
                       icon={<GitBranchIcon />}
                       name={workspace.name}
                       label={`Actions for ${workspace.name}`}
+                      onOpenChange={(open) => open && void window.api.workspaces.apps().then(setApps)}
                       extra={
                         <StartSessionMenu
                           label={`Start session in ${workspace.name}`}
@@ -141,6 +191,11 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
                         />
                       }
                     >
+                      <OpenItems
+                        apps={apps}
+                        onOpen={(app) => void window.api.workspaces.open(project.path, workspace.path, app).then(opened)}
+                        onReveal={() => void window.api.workspaces.reveal(project.path, workspace.path).then(opened)}
+                      />
                       <DropdownMenuItem onClick={() => setDeleting({ project, workspace })}>Delete workspace…</DropdownMenuItem>
                     </Entry>
                     <ul className="flex flex-col gap-px pl-4">

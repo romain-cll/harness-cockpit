@@ -27,6 +27,9 @@ const api: Api = {
     branches: (project) => ipcRenderer.invoke('workspaces:branches', project),
     create: (project, name, base) => ipcRenderer.invoke('workspaces:create', project, name, base),
     remove: (project, path, options) => ipcRenderer.invoke('workspaces:remove', project, path, options),
+    apps: () => ipcRenderer.invoke('workspaces:apps'),
+    reveal: (project, path) => ipcRenderer.invoke('workspaces:reveal', project, path),
+    open: (project, path, app) => ipcRenderer.invoke('workspaces:open', project, path, app),
   },
   sessions: {
     harnesses: () => ipcRenderer.invoke('sessions:harnesses'),
