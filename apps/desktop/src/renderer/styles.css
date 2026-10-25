@@ -20,6 +20,8 @@
 
 @theme inline {
   --font-heading: var(--font-sans);
+  --color-diff-added: var(--diff-added);
+  --color-diff-removed: var(--diff-removed);
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -94,6 +96,9 @@
   --sidebar-accent-foreground: oklch(0.205 0 0);
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
+  /* Backgrounds of the added and removed lines of a diff, under the foreground text. */
+  --diff-added: oklch(0.93 0.07 145);
+  --diff-removed: oklch(0.93 0.06 25);
   /* The 16 ANSI colors of the terminal, readable on the page background. */
   --terminal-black: oklch(0.25 0 0);
   --terminal-red: oklch(0.55 0.2 27);
@@ -146,6 +151,8 @@
     --sidebar-accent-foreground: oklch(0.985 0 0);
     --sidebar-border: oklch(1 0 0 / 10%);
     --sidebar-ring: oklch(0.556 0 0);
+    --diff-added: oklch(0.32 0.07 145);
+    --diff-removed: oklch(0.32 0.08 25);
     --terminal-black: oklch(0.45 0 0);
     --terminal-red: oklch(0.7 0.19 25);
     --terminal-green: oklch(0.78 0.18 145);

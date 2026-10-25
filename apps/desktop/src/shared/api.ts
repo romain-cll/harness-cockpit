@@ -50,6 +50,25 @@ export type CreateWorkspaceResult = { status: 'created'; workspace: Workspace } 
 /** `dirty`: the workspace has uncommitted changes and was not removed. `branchKept`: its branch is not merged. */
 export type RemoveWorkspaceResult = { status: 'removed'; branchKept: boolean } | { status: 'dirty' } | Refused;
 
+/** A file of a workspace that differs from its base; the same shape as `@cockpit/workspaces` gives. */
+export interface ChangedFile {
+  path: string;
+  status: 'added' | 'modified' | 'deleted' | 'renamed';
+  /** The previous path of a renamed file. */
+  oldPath?: string;
+  /** `null` for a binary file. */
+  additions: number | null;
+  deletions: number | null;
+}
+
+/** The diff of one file: git's unified diff, or why there is none to show. */
+export type FileDiff = { kind: 'text'; patch: string } | { kind: 'binary' } | { kind: 'tooLarge' };
+
+/** The changes of a workspace against `base`, sorted by path. */
+export type ChangesResult = { status: 'listed'; base: string; files: ChangedFile[] } | Refused;
+
+export type DiffResult = { status: 'shown'; diff: FileDiff } | Refused;
+
 /**
  * A run of an agent CLI, in a folder of its own or in a workspace's worktree (`directory`);
  * `harness` is its id in the catalogue.
@@ -122,6 +141,19 @@ export interface Api {
     create(project: string, name: string, base: string): Promise<CreateWorkspaceResult>;
     /** Removes the worktree, and its branch when merged; `force` removes it with its uncommitted changes. */
     remove(project: string, path: string, options?: { force?: boolean }): Promise<RemoveWorkspaceResult>;
+    /**
+     * The working tree of a workspace (commits, uncommitted edits, untracked files) against its base.
+     * Refused when the path is not a linked worktree of the project, or when there is no base.
+     */
+    changes(project: string, path: string): Promise<ChangesResult>;
+    /** Git's unified diff of one file of `changes`. */
+    diff(project: string, path: string, file: ChangedFile): Promise<DiffResult>;
+    /**
+     * Calls `listener` after the files of the workspace changed (debounced). Resolves once the folder is
+     * watched, with the function that stops it. One watch per window, which the next `watch` replaces; a
+     * project or path that `changes` would refuse is never watched (the function then stops nothing).
+     */
+    watch(project: string, path: string, listener: () => void): Promise<() => void>;
   };
   /** Agent CLIs, run in a folder of their own outside any project or in a workspace of a project. */
   sessions: {

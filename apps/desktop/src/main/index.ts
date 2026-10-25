@@ -17,7 +17,18 @@ import {
   sessionName,
   type State,
 } from '@cockpit/state';
-import { createWorktree, findRepositoryRoot, listBranches, listWorktrees, removeWorktree, WorkspaceError } from '@cockpit/workspaces';
+import {
+  createWorktree,
+  fileDiff,
+  findRepositoryRoot,
+  listBranches,
+  listChanges,
+  listWorktrees,
+  removeWorktree,
+  watchWorktree,
+  WorkspaceError,
+  type Worktree,
+} from '@cockpit/workspaces';
 import {
   app,
   BrowserWindow,
@@ -34,7 +45,10 @@ import {
 import type {
   AddProjectResult,
   BranchesResult,
+  ChangedFile,
+  ChangesResult,
   CreateWorkspaceResult,
+  DiffResult,
   Project,
   PtySpawnRequest,
   Refused,
@@ -398,6 +412,72 @@ function startProjects(userData: string): void {
         },
       ),
   );
+
+  ipcMain.handle('workspaces:changes', (event, project: string, path: string): Promise<ChangesResult> =>
+    forProject<ChangesResult>(event, 'workspaces:changes', project, async () => {
+      const workspace = await findWorkspace({ project, path });
+      if ('status' in workspace) return workspace;
+      try {
+        return { status: 'listed', ...(await listChanges(path, { env: await shellEnv })) };
+      } catch (error) {
+        if (error instanceof WorkspaceError && error.code === 'NO_BASE') {
+          return { status: 'refused', message: `No base branch to compare ${workspaceName(workspace)} with.` };
+        }
+        throw error;
+      }
+    }),
+  );
+
+  ipcMain.handle('workspaces:diff', (event, project: string, path: string, file: ChangedFile): Promise<DiffResult> =>
+    forProject<DiffResult>(event, 'workspaces:diff', project, async () => {
+      const workspace = await findWorkspace({ project, path });
+      if ('status' in workspace) return workspace;
+      return { status: 'shown', diff: await fileDiff(path, file, { env: await shellEnv }) };
+    }),
+  );
+
+  // The worktree each window's page watches, at most one per window. A request is checked against
+  // the state and git before its watcher starts: `requests` counts what the window asked, so that a
+  // check that returns after an unwatch, a newer watch or a navigation starts nothing.
+  const watchers = new Map<WebContents, { close(): void }>();
+  const requests = new WeakMap<WebContents, number>();
+  const unwatch = (contents: WebContents): number => {
+    const request = (requests.get(contents) ?? 0) + 1;
+    requests.set(contents, request);
+    watchers.get(contents)?.close();
+    watchers.delete(contents);
+    return request;
+  };
+  app.on('web-contents-created', (_event, contents) => {
+    contents.on('did-navigate', () => unwatch(contents));
+    contents.on('destroyed', () => unwatch(contents));
+  });
+
+  // Resolves once the folder is watched, or at once when there is nothing to watch.
+  ipcMain.handle('workspaces:watch', async (event, project: string, path: string): Promise<void> => {
+    if (!isFromApp(event)) throw new Error('workspaces:watch refused: unexpected origin');
+    const contents = event.sender;
+    const request = unwatch(contents);
+    try {
+      const workspace = await findWorkspace({ project, path });
+      if ('status' in workspace || requests.get(contents) !== request || contents.isDestroyed()) return;
+      const watcher = await watchWorktree(
+        path,
+        () => {
+          if (!contents.isDestroyed()) contents.send('workspaces:changed');
+        },
+        () => void unwatch(contents),
+      );
+      // The watcher takes a moment to start: the window may have asked for something else since.
+      if (requests.get(contents) === request && !contents.isDestroyed()) watchers.set(contents, watcher);
+      else watcher.close();
+    } catch {
+      // Nothing to watch (git failed, the folder is gone): the page keeps the list it has.
+    }
+  });
+  ipcMain.on('workspaces:unwatch', (event) => {
+    if (isFromApp(event)) unwatch(event.sender);
+  });
 }
 
 // Sessions outside any project: an agent CLI run in a folder of its own under
@@ -438,8 +518,8 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
       // or removed there. Otherwise it gets a folder of its own, removed if the start fails.
       const workspace = options?.workspace;
       if (workspace) {
-        const refusal = await checkWorkspace(workspace);
-        if (refusal) return refusal;
+        const found = await findWorkspace(workspace);
+        if ('status' in found) return found;
       }
       if (endingsOf(event.sender) !== endings) {
         return { status: 'refused', message: `Could not start ${harness.name}: the page that asked for it is gone` };
@@ -479,14 +559,18 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
   );
 }
 
+// What the user calls a workspace: its branch, or its folder name when detached.
+const workspaceName = ({ branch, path }: Worktree) => branch ?? basename(path);
+
 // A workspace is a project of the state and one of its linked worktrees (git tells).
-async function checkWorkspace({ project, path }: { project: string; path: string }): Promise<Refused | undefined> {
+async function findWorkspace({ project, path }: { project: string; path: string }): Promise<Worktree | Refused> {
   if (!state.projects.some((entry) => entry.path === project)) {
     return { status: 'refused', message: `${project} is not a project in Cockpit.` };
   }
   try {
     const worktrees = await listWorktrees(project, { env: await shellEnv });
-    if (worktrees.some((worktree) => !worktree.main && worktree.path === path)) return undefined;
+    const found = worktrees.find((worktree) => !worktree.main && worktree.path === path);
+    if (found) return found;
     return { status: 'refused', message: `${path} is not a workspace of ${basename(project)}.` };
   } catch (error) {
     if (!(error instanceof WorkspaceError)) throw error;

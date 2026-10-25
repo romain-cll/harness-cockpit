@@ -3,6 +3,8 @@
   "compilerOptions": {
     // `page.evaluate` callbacks run in the renderer.
     "lib": ["ES2023", "DOM"],
+    // `diff-view.test.ts` imports a component of the renderer.
+    "jsx": "react-jsx",
     "types": ["node"]
   },
   "include": ["."]

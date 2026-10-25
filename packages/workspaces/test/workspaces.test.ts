@@ -371,6 +371,41 @@ describe('createWorktree arguments', () => {
     expect(git(repo, 'rev-parse', 'existing')).toBe(existingHead);
   });
 
+  test('COCKPIT-34 AC1 — records the base in branch.<name>.cockpitBase', async () => {
+    const repo = await makeRepo();
+    const root = await tempDir();
+
+    await createWorktree({ repo, root, branch: 'feat', base: 'main', env: testEnv });
+
+    expect(git(repo, 'config', '--get', 'branch.feat.cockpitBase')).toBe('main');
+  });
+
+  test('COCKPIT-34 AC2 — a failed creation leaves no branch.<name>.* config behind', async () => {
+    const repo = await makeRepo();
+    const root = await tempDir();
+    const target = join(root, projectDir(repo), 'feat');
+    const listBefore = git(repo, 'worktree', 'list', '--porcelain');
+    const noFeatConfig = () =>
+      expect(() => git(repo, 'config', '--get-regexp', '^branch\\.feat\\.')).toThrow(expect.objectContaining({ status: 1 }));
+
+    // Git refuses before it creates the branch (the folder is taken): `git branch -D` has no
+    // section to drop, so only an explicit unset leaves the config clean.
+    await mkdir(target, { recursive: true });
+    await writeFile(join(target, 'keep.txt'), 'keep me\n');
+    await rejection(createWorktree({ repo, root, branch: 'feat', base: 'main', env: testEnv }));
+    expect(branchExists(repo, 'feat')).toBe(false);
+    noFeatConfig();
+    await rm(target, { recursive: true });
+
+    await failingPostCheckoutHook(repo);
+    await rejection(createWorktree({ repo, root, branch: 'feat', base: 'main', env: testEnv }));
+
+    expect(existsSync(target)).toBe(false);
+    expect(git(repo, 'worktree', 'list', '--porcelain')).toBe(listBefore);
+    expect(branchExists(repo, 'feat')).toBe(false);
+    noFeatConfig();
+  });
+
   test('AC24 — a failed creation on an already registered path leaves the existing worktree intact', async () => {
     const repo = await makeRepo();
     const root = await tempDir();
