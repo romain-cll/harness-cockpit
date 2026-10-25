@@ -4128,10 +4128,17 @@ async function openWorkspaceMenu(page: Page, path: string, expected: string[]) {
 }
 
 // Opens a submenu of the "…" menu (hover, then a click when hover did not open it) and returns its items.
+// A submenu still open from before is closed first (one Escape closes only the submenu): with hover
+// opening, Base UI leaves the parent popup at `pointer-events: none` until the next real mouse move,
+// and a stale submenu would pass for the requested one.
 async function openSubmenu(page: Page, trigger: 'Open in editor' | 'Open in terminal') {
+  const menus = page.getByRole('menu');
+  if ((await menus.count()) > 1) {
+    await page.keyboard.press('Escape');
+    await poll(() => menus.count(), (count) => count === 1, UI_TIMEOUT);
+  }
   const item = page.getByRole('menuitem', { name: trigger, exact: true });
   await item.hover({ timeout: UI_TIMEOUT });
-  const menus = page.getByRole('menu');
   if ((await poll(() => menus.count(), (count) => count >= 2, 2_000)) < 2) {
     await item.click({ timeout: UI_TIMEOUT });
     await poll(() => menus.count(), (count) => count >= 2, UI_TIMEOUT);
