@@ -184,6 +184,17 @@ export async function runWorkspaceCommands(
   return { status: 'started', entry, exit };
 }
 
+/**
+ * Whether setup or teardown commands passed. node-pty reports a process killed by a signal as
+ * `exitCode: 0` with the signal set, so the exit code alone does not tell.
+ */
+export const passed = ({ exitCode, signal }: PtyExit) => exitCode === 0 && !signal;
+
+/** The status line of commands that did not pass: their exit code, or that a signal or a pty host death ended them. */
+export function failureLine(what: 'Setup' | 'Teardown', { exitCode, signal }: PtyExit): string {
+  return exitCode === null || signal ? `${what} ended before it finished.` : `${what} failed with exit code ${exitCode}`;
+}
+
 /** Ends the running sessions among `ids` (their workspace or project is gone) and drops their terminals. */
 export function endSessions(ids: string[]): void {
   for (const id of ids) {

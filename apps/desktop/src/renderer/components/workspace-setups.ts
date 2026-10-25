@@ -1,6 +1,6 @@
 import type { useRouter } from '@tanstack/react-router';
 import type { PtyExit } from '../../shared/api';
-import { closeLiveTerminal, runWorkspaceCommands, startSession, type LiveTerminal } from './live-terminals';
+import { closeLiveTerminal, failureLine, passed, runWorkspaceCommands, startSession, type LiveTerminal } from './live-terminals';
 
 type Router = ReturnType<typeof useRouter>;
 
@@ -71,16 +71,15 @@ async function succeed(router: Router, path: string): Promise<void> {
   await startAgent(router, path, false);
 }
 
-async function finish(router: Router, path: string, terminal: LiveTerminal, { exitCode }: PtyExit): Promise<void> {
+async function finish(router: Router, path: string, terminal: LiveTerminal, exit: PtyExit): Promise<void> {
   const setup = setups.get(path);
   // The setup was run again or ended meanwhile.
   if (setup?.terminal !== terminal) return;
-  if (exitCode === 0) {
+  if (passed(exit)) {
     await succeed(router, path);
     return;
   }
-  const failure = exitCode === null ? 'Setup ended before it finished.' : `Setup failed with exit code ${exitCode}`;
-  set(path, { ...setup, status: 'failed', failure });
+  set(path, { ...setup, status: 'failed', failure: failureLine('Setup', exit) });
 }
 
 // Runs the setup commands in a terminal of the setup, which has none; `initial` is the setup to store

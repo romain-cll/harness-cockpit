@@ -9,7 +9,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
-import { closeLiveTerminal, runWorkspaceCommands, type LiveTerminal } from '@/components/live-terminals';
+import { closeLiveTerminal, failureLine, passed, runWorkspaceCommands, type LiveTerminal } from '@/components/live-terminals';
 import { Terminal } from '@/components/terminal';
 import { Button } from '@/components/ui/button';
 
@@ -60,9 +60,11 @@ export function DeleteWorkspaceDialog({
     }
     shown.current = result.entry;
     setTerminal(result.entry);
-    const { exitCode } = await result.exit;
-    if (exitCode === 0) return true;
-    setMessage(exitCode === null ? 'Teardown ended before it finished.' : `Teardown failed with exit code ${exitCode}`);
+    const exit = await result.exit;
+    // The commands are over: the terminal gives the keyboard back, so Escape closes the dialog (xterm.js would swallow it).
+    result.entry.term.blur();
+    if (passed(exit)) return true;
+    setMessage(failureLine('Teardown', exit));
     return false;
   }
 
