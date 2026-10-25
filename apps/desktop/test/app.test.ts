@@ -3294,6 +3294,27 @@ describe.each([
       expect(await visiblePanes(page)).toHaveLength(0);
     }, 60_000);
 
+    // The two cases run right after a reload test, so the sidebar holds no Setup link before them.
+    test.each([
+      ['no config file', undefined],
+      ['a config without setup commands', { teardown: ['echo only-teardown'] }],
+    ])('AC11 — with %s, Create closes the dialog as before: no setup page opens and no Setup link appears', async (label, config) => {
+      const { page } = session;
+      await goHome(page);
+      if (config) writeConfig(repo, config);
+      else rmSync(join(repo.root, '.cockpit'), { recursive: true, force: true });
+      const name = config ? 'no-setup-teardown-only' : 'no-setup-no-config';
+
+      const path = await createWorkspace(name);
+
+      await waitListed(path);
+      expect(existsSync(path)).toBe(true);
+      expect(new URL(page.url()).pathname, label).not.toBe('/setup');
+      expect(await setupHeading(page, name).count()).toBe(0);
+      expect(await setupLinkStatus(page, path)).toBeNull();
+      expect(await setupLinkCount(page)).toBe(0);
+    });
+
     test('AC13, AC17 — Delete runs the teardown in a terminal of the dialog (shell, order, environment, worktree as cwd), and once it exits 0 the folder, the worktree, the branch and the row go', async () => {
       const { page } = session;
       const record = 'sh "$COCKPIT_ROOT_PATH/record.sh" teardown-env.txt';
@@ -3392,6 +3413,25 @@ describe.each([
       expect(existsSync(path)).toBe(true);
       expect(linkedWorktrees(repo).map((worktree) => worktree.path)).toContain(path);
       expect(localBranches(repo)).toContain('td-cancel');
+      expect(await isListed(path)).toBe(true);
+    });
+
+    test('AC14 — Ctrl+C in the teardown terminal is a failure: "Teardown ended before it finished." with Delete anyway, and the worktree and the row stay', async () => {
+      const { page } = session;
+      writeConfig(repo, { teardown: ['sh "$COCKPIT_ROOT_PATH/waitfor.sh" never-sig-td'] });
+      const path = await addExternal('td-signal');
+
+      const dialog = await confirmDeletion(path);
+      const pid = await startedWaiter(repo, 'never-sig-td');
+      await focusPane(await dialogTerminal(page));
+      await page.keyboard.press('Control+c');
+
+      await dialog.getByText('Teardown ended before it finished.').waitFor({ timeout: UI_TIMEOUT });
+      expect(await endsWithin(pid)).toBe(true);
+      expect(await dialog.getByRole('button', { name: 'Delete anyway', exact: true }).count()).toBe(1);
+      expect(existsSync(path)).toBe(true);
+      expect(linkedWorktrees(repo).map((worktree) => worktree.path)).toContain(path);
+      expect(localBranches(repo)).toContain('td-signal');
       expect(await isListed(path)).toBe(true);
     });
 
@@ -5992,6 +6032,84 @@ describe('sessions: built app', () => {
     expect(startRuns(fx).filter((run) => run === 'claude p8')).toHaveLength(1);
     expect(storedIn(path)).toHaveLength(1);
     expect(await waitForWorkspaceLinks(page, path, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+  }, 60_000);
+
+  // The sidebar list scrolls once it holds this many rows, and its scrollbar then covers the "…" trigger
+  // of the project row (Playwright's click on it hits the list). The tests below open that menu, so they
+  // start from a project without workspaces: removed through the API (the sessions stay in state.json,
+  // hidden), then the list is read again.
+  async function removeAllWorkspaces() {
+    const { page } = session;
+    await page.evaluate(async (project) => {
+      const { api } = globalThis as unknown as {
+        api: {
+          projects: { list(): Promise<{ path: string; workspaces: { path: string }[] }[]> };
+          workspaces: { remove(project: string, path: string, options: { force: boolean }): Promise<unknown> };
+        };
+      };
+      const found = (await api.projects.list()).find((entry) => entry.path === project);
+      for (const workspace of found?.workspaces ?? []) await api.workspaces.remove(project, workspace.path, { force: true });
+    }, repo.root);
+    await dispatchFocus(page);
+    await waitForEntries(page, [repo.root]);
+  }
+
+  test('workspace scripts AC10 — with an agent chosen, a config readWorkspaceConfig refuses starts no session: the setup page shows the message with Retry setup and Start anyway, and once the file is fixed Retry setup starts the session', async () => {
+    const { page } = session;
+    await removeAllWorkspaces();
+    writeConfig(repo, { run: ['bun dev'] });
+    const before = { pids: stubPids(fx), runs: startRuns(fx) };
+
+    const path = await createWorkspaceWithSetup('setup-bad-config', 'p10');
+
+    await setupHeading(page, 'setup-bad-config').waitFor({ timeout: UI_TIMEOUT });
+    const refused = await runCommandsApi(page, repo.root, path, 'setup');
+    expect(refused.status).toBe('refused');
+    expect(refused.message).toContain('config.json');
+    await page.getByText(refused.message!).first().waitFor({ timeout: UI_TIMEOUT });
+    expect(await page.getByText('Setup failed with exit code').count()).toBe(0);
+    expect(await retryButton(page).count()).toBe(1);
+    expect(await startAnywayButton(page).count()).toBe(1);
+    expect(await waitForSetupStatus(page, path, 'Failed')).toBe('Failed');
+    await sleep(300);
+    expect(new URL(page.url()).pathname).toBe('/setup');
+    expectNoSessionStarted(before, path);
+    expect(existsSync(path)).toBe(true);
+    expect(await entryTitles(page)).toContain(path);
+    expect(await sessionLinks(page, { workspace: path })).toEqual([]);
+
+    writeConfig(repo, { setup: ['echo fixed-config'] });
+    await retryButton(page).click({ timeout: UI_TIMEOUT });
+    await waitForSessionPage(page, undefined, 'Claude Code 1');
+    const stub = await readStub(page);
+    expect(stub.cwd).toBe(path);
+    expect(stub.args).toBe('p10');
+    expect(startRuns(fx).filter((run) => run === 'claude p10')).toHaveLength(1);
+    expect(storedIn(path)).toHaveLength(1);
+  }, 60_000);
+
+  test('workspace scripts AC5, AC6 — Ctrl+C in the setup terminal is a failure, not a success: "Setup ended before it finished." with both buttons, and no session starts', async () => {
+    const { page } = session;
+    writeConfig(repo, { setup: ['sh "$COCKPIT_ROOT_PATH/waitfor.sh" never-sig-setup'] });
+    const before = { pids: stubPids(fx), runs: startRuns(fx) };
+
+    const path = await createWorkspaceWithSetup('setup-signal', 'p-signal');
+    await setupHeading(page, 'setup-signal').waitFor({ timeout: UI_TIMEOUT });
+    const pid = await startedWaiter(repo, 'never-sig-setup');
+    await focusTerminal(page);
+    await page.keyboard.press('Control+c');
+
+    await page.getByText('Setup ended before it finished.').waitFor({ timeout: UI_TIMEOUT });
+    expect(await endsWithin(pid)).toBe(true);
+    expect(await page.getByText('Setup finished').count()).toBe(0);
+    expect(await retryButton(page).count()).toBe(1);
+    expect(await startAnywayButton(page).count()).toBe(1);
+    expect(await waitForSetupStatus(page, path, 'Failed')).toBe('Failed');
+    await sleep(300);
+    expect(new URL(page.url()).pathname).toBe('/setup');
+    expectNoSessionStarted(before, path);
+    expect(existsSync(path)).toBe(true);
+    expect(await sessionLinks(page, { workspace: path })).toEqual([]);
   }, 60_000);
 
   test('logs no error and keeps running', async () => {
