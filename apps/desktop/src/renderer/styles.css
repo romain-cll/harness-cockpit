@@ -20,6 +20,9 @@
 
 @theme inline {
   --font-heading: var(--font-sans);
+  --color-status-working: var(--status-working);
+  --color-status-waiting: var(--status-waiting);
+  --color-status-ready: var(--status-ready);
   --color-diff-added: var(--diff-added);
   --color-diff-removed: var(--diff-removed);
   --color-sidebar-ring: var(--sidebar-ring);
@@ -96,6 +99,10 @@
   --sidebar-accent-foreground: oklch(0.205 0 0);
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
+  /* Dots of a session row: working, needs input, ready. */
+  --status-working: oklch(0.75 0.16 75);
+  --status-waiting: oklch(0.6 0.19 260);
+  --status-ready: oklch(0.65 0.17 145);
   /* Backgrounds of the added and removed lines of a diff, under the foreground text. */
   --diff-added: oklch(0.93 0.07 145);
   --diff-removed: oklch(0.93 0.06 25);
@@ -151,6 +158,9 @@
     --sidebar-accent-foreground: oklch(0.985 0 0);
     --sidebar-border: oklch(1 0 0 / 10%);
     --sidebar-ring: oklch(0.556 0 0);
+    --status-working: oklch(0.8 0.15 80);
+    --status-waiting: oklch(0.7 0.16 255);
+    --status-ready: oklch(0.75 0.17 145);
     --diff-added: oklch(0.32 0.07 145);
     --diff-removed: oklch(0.32 0.08 25);
     --terminal-black: oklch(0.45 0 0);

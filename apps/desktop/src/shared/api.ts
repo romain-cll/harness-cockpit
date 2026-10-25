@@ -140,6 +140,9 @@ export interface Session {
  * `workspace`: run in that linked worktree of a project instead of a new folder. `prompt`: the
  * harness's initial prompt (trimmed; blank means none).
  */
+/** What a session's agent reported through its hooks; the values of the control endpoint's events. */
+export type SessionStatus = 'working' | 'waiting' | 'finished';
+
 export interface StartSessionOptions {
   workspace?: { project: string; path: string };
   prompt?: string;
@@ -248,6 +251,12 @@ export interface Api {
      * Refused when the project is not in the app state or the path is not one of its linked worktrees.
      */
     start(harness: string, size: { cols: number; rows: number }, options?: StartSessionOptions): Promise<StartSessionResult>;
+    /** Calls `listener` each time a session of this window reports a status; returns the unsubscribe function. */
+    onStatus(listener: (sessionId: string, status: SessionStatus) => void): () => void;
+    /** Calls `listener` with the id of the session whose notification the user clicked. */
+    onOpen(listener: (sessionId: string) => void): () => void;
+    /** Why session status is off (the control endpoint did not start), or `null` when it is on. */
+    statusOff(): Promise<string | null>;
   };
   /** The `PATH` of the user's login shell, the only part of its environment the renderer sees. */
   getShellPath(): Promise<string>;

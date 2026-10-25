@@ -28,9 +28,11 @@ vi.mock('../src/renderer/components/terminal', () => ({
 
 type DataListener = (id: number, data: string) => void;
 type ExitListener = (id: number, exit: { exitCode: number | null; signal: number | null }) => void;
+type StatusListener = (sessionId: string, status: 'working' | 'waiting' | 'finished') => void;
 
 const dataListeners: DataListener[] = [];
 const exitListeners: ExitListener[] = [];
+const statusListeners: StatusListener[] = [];
 const offData = vi.fn();
 const offExit = vi.fn();
 const kill = vi.fn();
@@ -39,6 +41,7 @@ const start = vi.fn();
 beforeEach(() => {
   dataListeners.length = 0;
   exitListeners.length = 0;
+  statusListeners.length = 0;
   offData.mockClear();
   offExit.mockClear();
   kill.mockClear();
@@ -53,7 +56,7 @@ beforeEach(() => {
         resize() {},
         kill,
       },
-      sessions: { start },
+      sessions: { start, onStatus: (listener: StatusListener) => (statusListeners.push(listener), () => {}) },
     },
   });
 });
@@ -67,6 +70,9 @@ interface Store {
   closeLiveTerminal(entry: unknown): void;
   startSession(harness: string, options?: unknown): Promise<unknown>;
   getSessionTerminal(id: string): unknown;
+  subscribe(listener: () => void): () => void;
+  /** Session id -> accessible name of its dot; a running session that reported nothing has none. */
+  getSessionDots(): ReadonlyMap<string, string>;
 }
 
 // A variable specifier: the test project does not include the app sources, so tsc leaves it alone.
@@ -138,5 +144,85 @@ describe('exit of a live terminal', () => {
     expect(await pending(second.exit)).toBe('pending');
     exitListeners[1]!(8, { exitCode: null, signal: null });
     await expect(second.exit).resolves.toEqual({ exitCode: null, signal: null });
+  });
+});
+
+// The dot of a session row: what its agent last reported while it runs, how it ended once it
+// did. The store holds both (statuses from `sessions.onStatus`, exits from the pty), and publishes
+// them as a map from session id to the dot's accessible name.
+//
+// Interface the tests assume: `getSessionDots()` returns a `ReadonlyMap<string, string>` that is
+// replaced, never mutated, on every change (it is a `useSyncExternalStore` snapshot), and
+// `sessions.onStatus(listener)` calls `listener(sessionId, 'working' | 'waiting' | 'finished')`.
+describe('session dots', () => {
+  beforeEach(() => vi.resetModules());
+
+  const session = (id: string) => ({ id, name: `Claude Code ${id}`, harness: 'claude-code', directory: '/d', createdAt: '2026-10-25T10:00:00.000Z' });
+
+  async function startedStore(...sessions: Array<[id: string, ptyId: number]>) {
+    const store = await loadStore();
+    for (const [id, ptyId] of sessions) {
+      start.mockResolvedValueOnce({ status: 'started', ptyId, session: session(id) });
+      await store.startSession('claude-code');
+    }
+    return store;
+  }
+
+  const report = (sessionId: string, status: 'working' | 'waiting' | 'finished') => {
+    for (const listener of statusListeners) listener(sessionId, status);
+  };
+
+  test('AC9 — a running session that has reported nothing has no dot', async () => {
+    const { getSessionDots } = await startedStore(['s1', 7]);
+
+    expect(getSessionDots().has('s1')).toBe(false);
+  });
+
+  test('AC7 — working, waiting and finished reports give the "Working", "Needs input" and "Ready" dots of that session only, and notify the subscribers', async () => {
+    const { getSessionDots, subscribe } = await startedStore(['s1', 7], ['s2', 8]);
+    const changed = vi.fn();
+    subscribe(changed);
+
+    const seen: Array<string | undefined> = [];
+    for (const status of ['working', 'waiting', 'working', 'finished'] as const) {
+      const before = getSessionDots();
+      report('s1', status);
+      seen.push(getSessionDots().get('s1'));
+      // A snapshot is replaced, never mutated: React compares them by identity.
+      expect(getSessionDots()).not.toBe(before);
+      expect(before.get('s1')).not.toBe(getSessionDots().get('s1'));
+    }
+
+    expect(seen).toEqual(['Working', 'Needs input', 'Working', 'Ready']);
+    expect(getSessionDots().has('s2')).toBe(false);
+    expect(changed).toHaveBeenCalledTimes(4);
+    // Nothing changed since: the same snapshot.
+    expect(getSessionDots()).toBe(getSessionDots());
+  });
+
+  test('AC7 — a report for a session the store does not hold is ignored', async () => {
+    const { getSessionDots } = await startedStore(['s1', 7]);
+
+    expect(() => report('unknown', 'working')).not.toThrow();
+
+    expect(getSessionDots().has('unknown')).toBe(false);
+    expect(getSessionDots().has('s1')).toBe(false);
+  });
+
+  test.each([
+    ['exit code 0', { exitCode: 0, signal: null }, 'Ended'],
+    ['a signal (node-pty gives exit code 0 with it)', { exitCode: 0, signal: 15 }, 'Ended'],
+    ['no exit code (the pty host died)', { exitCode: null, signal: null }, 'Ended'],
+    ['a non-zero exit code', { exitCode: 3, signal: null }, 'Exited 3'],
+  ])('AC8 — %s: its dot is the end dot whatever the session last reported, and the other session keeps its own', async (_label, exit, dot) => {
+    const { getSessionDots } = await startedStore(['s1', 7], ['s2', 8]);
+    report('s1', 'working');
+    report('s2', 'waiting');
+    expect(getSessionDots().get('s1')).toBe('Working');
+
+    for (const listener of exitListeners) listener(7, exit);
+
+    expect(getSessionDots().get('s1')).toBe(dot);
+    expect(getSessionDots().get('s2')).toBe('Needs input');
   });
 });

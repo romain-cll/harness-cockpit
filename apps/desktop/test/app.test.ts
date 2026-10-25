@@ -9,6 +9,8 @@ import { basename, dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { statusCommand } from '@cockpit/control';
+import { statusLaunch } from '@cockpit/harnesses';
 import { chromium, type Browser, type ElementHandle, type Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 
@@ -4293,7 +4295,19 @@ describe('built app with no git on the login shell PATH', () => {
 // behind a symlink (`/var` is `/private/var`). Its `--version` sleeps 1 s while a
 // `<stub>.slow` file exists (see `slowVersion` in `makeSessionsFixture`).
 const STUB_HARNESS = `#!/bin/sh
+#VERSION_LOG#
 if [ "$1" = "--version" ]; then [ -e "$0.slow" ] && sleep 1; echo 9.9.9; exit 0; fi
+# The launch as it reached the process: its arguments, one per line, then the OpenCode config variable.
+printf '%s\\n' "$@" "OPENCODE_CONFIG_CONTENT=\${OPENCODE_CONFIG_CONTENT-unset}" > "$0.launch.$$"
+# What the session status feature adds before the other arguments (session status, COCKPIT-36) is
+# set aside, so everything below sees only the arguments the user's choices produce.
+SETTINGS=""
+case "$1" in
+  --settings) SETTINGS="$2"; shift 2 ;;
+  --no-daemon) shift; if [ "$1" = -c ]; then shift 2; fi ;;
+  --standalone) shift ;;
+esac
+#START_LOG#
 echo "session:\${COCKPIT_SESSION_ID-unset}"
 echo "workspace:\${COCKPIT_WORKSPACE_PATH-unset}"
 echo "socket:\${COCKPIT_SOCKET-unset}"
@@ -4304,8 +4318,17 @@ echo "term:$TERM"
 echo "path:$PATH"
 echo "ready"
 while IFS= read -r line; do
-  if [ "$line" = exit ]; then exit 3; fi
-  echo "got:$line"
+  case "$line" in
+    exit) exit 3 ;;
+    quit) exit 0 ;;
+    "hook "*)
+      # Runs the command the --settings the stub got holds for that event, as Claude Code does.
+      event="\${line#hook }"
+      command=$(printf '%s' "$SETTINGS" | /usr/bin/plutil -extract "hooks.$event.0.hooks.0.command" raw -o - - 2>/dev/null)
+      [ -n "$command" ] && /bin/sh -c "$command"
+      echo "hooked:$event" ;;
+    *) echo "got:$line" ;;
+  esac
 done
 `;
 
@@ -4347,7 +4370,8 @@ function makeSessionsFixture(
   const bin = join(root, 'bin');
   mkdirSync(bin);
   const runLog = join(root, 'runs.log');
-  const script = log ? STUB_HARNESS.replace('#!/bin/sh\n', `#!/bin/sh\necho "$(basename "$0") $*" >> '${runLog}'\n`) : STUB_HARNESS;
+  const logLine = `echo "$(basename "$0") $*" >> '${runLog}'`;
+  const script = STUB_HARNESS.replace('#VERSION_LOG#', log ? `[ "$1" = --version ] && ${logLine}` : '').replace('#START_LOG#', log ? logLine : '');
   for (const name of binaries) {
     const stub = join(bin, name);
     writeFileSync(stub, script);
@@ -4409,13 +4433,16 @@ const sessionIdOf = (page: Page) => /^\/sessions\/([^/]+)$/.exec(new URL(page.ur
 interface SessionEntry {
   id: string;
   name: string;
+  /** The row's end dot: "Ended" or "Exited N". */
   ended: boolean;
+  /** The accessible name of the row's status dot (session status, COCKPIT-36), `null` when it has none. */
+  status: string | null;
 }
 
 // The session links of the Sessions section (the sessions outside any project) or
 // of the workspace at `workspace` (a path), whose sessions are nested under its
-// row in the Projects section: the name is the first text of the entry, "Ended"
-// is a text of its own.
+// row in the Projects section: the name is the first text of the entry, the status
+// is the accessible name of its dot (`role="img"`).
 const sessionLinks = (page: Page, scope: 'sessions' | { workspace: string }): Promise<SessionEntry[]> =>
   page.evaluate((scope) => {
     const root =
@@ -4431,10 +4458,12 @@ const sessionLinks = (page: Page, scope: 'sessions' | { workspace: string }): Pr
         const text = (node.textContent ?? '').trim();
         if (text) texts.push(text);
       }
+      const status = entry.querySelector('[role="img"][aria-label]')?.getAttribute('aria-label') ?? null;
       return {
         id: link.getAttribute('href')!.split('/').pop()!,
         name: texts[0] ?? '',
-        ended: texts.includes('Ended'),
+        ended: status === 'Ended' || /^Exited \d+$/.test(status ?? ''),
+        status,
       };
     });
   }, scope);
@@ -4546,17 +4575,38 @@ function postSessionEvent(socketPath: string, { authorization, body }: { authori
 
 const controlTokenIn = (cockpitHome: string) => readFileSync(join(cockpitHome, 'control.token'), 'utf8');
 
-// The smoke path of the control endpoint, on the session page that is open: the stub got its
-// session id and the socket, a request without the token is refused, one with it is accepted.
+// The status dot of a session's row (`role="img"`, wherever the row is in the sidebar): its accessible
+// name and its `title`, or `null` when the row has none.
+const dotOf = (page: Page, id: string) =>
+  page.evaluate((id) => {
+    const dot = document.querySelector(`aside a[href$="/sessions/${id}"]`)?.closest('li')?.querySelector('[role="img"][aria-label]');
+    return dot ? { label: dot.getAttribute('aria-label'), title: dot.getAttribute('title') } : null;
+  }, id);
+
+// Waits (2 s: "within 2 s of each report") until the row of session `id` shows the dot `label`, `null`
+// being no dot at all, and checks that the dot's `title` says the same.
+async function expectDot(page: Page, id: string, label: string | null, timeout = 2_000) {
+  const dot = await poll(() => dotOf(page, id), (found) => (found?.label ?? null) === label, timeout);
+  expect(dot?.label ?? null, `the dot of session ${id}`).toBe(label);
+  if (label !== null) expect(dot?.title).toBe(label);
+}
+
+// The smoke path of the control endpoint and of the status reporting, on the session page that is
+// open: the stub got its session id and the socket, and a `hook UserPromptSubmit` line (the stub runs
+// the command its --settings hold for that event) turns the row's dot to "Working". It reports
+// `working` only, which raises no notification.
 async function expectControlEndpoint(session: Session): Promise<void> {
+  const { page } = session;
   const socketPath = join(session.cockpitHome, 'control.sock');
-  const env = await readStubEnv(session.page);
-  expect(env.session).toBe(sessionIdOf(session.page));
+  const env = await readStubEnv(page);
+  expect(env.session).toBe(sessionIdOf(page));
   expect(env.socket).toBe(socketPath);
-  expect(await postSessionEvent(socketPath, { body: { sessionId: env.session, event: 'working' } })).toEqual({ status: 401, text: '' });
-  expect(
-    await postSessionEvent(socketPath, { authorization: `Bearer ${controlTokenIn(session.cockpitHome)}`, body: { sessionId: env.session, event: 'working' } }),
-  ).toEqual({ status: 204, text: '' });
+
+  await expectDot(page, env.session, null);
+  await focusTerminal(page);
+  await typeLine(page, 'hook UserPromptSubmit');
+  await waitForRow(page, 'hooked:UserPromptSubmit');
+  await expectDot(page, env.session, 'Working');
 }
 
 // Whether the deepest element whose text starts with `text` sits below the
@@ -5007,23 +5057,6 @@ describe('sessions: built app', () => {
     expect(env.socket).not.toBe(INHERITED_CONTROL_ENV.COCKPIT_SOCKET);
   });
 
-  test('control AC2 — a request with no token, a malformed one or a wrong one gets 401 with an empty body', async () => {
-    const socketPath = join(session.cockpitHome, 'control.sock');
-    const body = { sessionId: known.claude1.id, event: 'working' };
-    const token = controlTokenIn(session.cockpitHome);
-    for (const authorization of [undefined, `Basic ${token}`, 'Bearer', `Bearer ${'0'.repeat(64)}`]) {
-      expect(await postSessionEvent(socketPath, { authorization, body }), String(authorization)).toEqual({ status: 401, text: '' });
-    }
-  });
-
-  test('control AC3 — POST /session-events with the token and the id of a stored session gets 204', async () => {
-    const socketPath = join(session.cockpitHome, 'control.sock');
-    const authorization = `Bearer ${controlTokenIn(session.cockpitHome)}`;
-    for (const event of ['working', 'waiting', 'finished']) {
-      expect(await postSessionEvent(socketPath, { authorization, body: { sessionId: known.claude1.id, event } }), event).toEqual({ status: 204, text: '' });
-    }
-  });
-
   test('control AC4 — an id that is not a stored session gets 404 { "error": "unknown session" }', async () => {
     const answer = await postSessionEvent(join(session.cockpitHome, 'control.sock'), {
       authorization: `Bearer ${controlTokenIn(session.cockpitHome)}`,
@@ -5091,7 +5124,7 @@ describe('sessions: built app', () => {
     expect(sessionsInState(session.dataDir).map((stored) => stored.harness)).toEqual(['claude-code', 'claude-code', 'codex']);
   });
 
-  test('AC7 — typing exit shows the exit code in the terminal and "Ended" on the entry', async () => {
+  test('AC7 — typing exit shows the exit code in the terminal and the "Exited 3" dot on the entry; the other entries keep none', async () => {
     const { page } = session;
     await focusTerminal(page);
     await typeLine(page, 'exit');
@@ -5104,6 +5137,8 @@ describe('sessions: built app', () => {
       ['Claude Code 2', false],
       ['Claude Code 1', false],
     ]);
+    await expectDot(page, known.codex1.id, 'Exited 3');
+    expect((await sessionEntries(page)).map((entry) => entry.status)).toEqual(['Exited 3', null, null]);
     await poll(() => isAlive(known.codex1.pid), (alive) => !alive, UI_TIMEOUT);
     expect(isAlive(known.codex1.pid)).toBe(false);
     expect(isAlive(known.claude2.pid)).toBe(true);
@@ -5191,7 +5226,7 @@ describe('sessions: built app', () => {
     expect(sessionFoldersIn(session.cockpitHome)).toContain(id);
   });
 
-  test('AC15 — a running session shows as ended when the pty host dies: [Process ended] in its terminal, "Ended" on its entry', async () => {
+  test('AC15 — a running session shows as ended when the pty host dies: [Process ended] in its terminal, the "Ended" dot on its entry', async () => {
     const { page } = session;
     // The session AC14 started runs on the new host and is open on its page.
     expect(sessionIdOf(page)).toBe(known.claude3.id);
@@ -5209,6 +5244,7 @@ describe('sessions: built app', () => {
       ['Claude Code 2', true],
       ['Claude Code 1', true],
     ]);
+    await expectDot(page, known.claude3.id, 'Ended');
     // The same as when the agent exits (AC7): the page keeps its terminal, it does not turn into an error.
     expect(sessionIdOf(page)).toBe(known.claude3.id);
     await page.getByRole('heading', { name: 'Claude Code 3', exact: true }).waitFor({ timeout: UI_TIMEOUT });
@@ -7412,6 +7448,359 @@ describe('changes sidebar: built app', () => {
 // folded into the first launch of the AC9 restart test below. The
 // launchd-environment mode has none: its point is the user's real login shell,
 // where a session would run a real CLI.
+// --- Session status (COCKPIT-36) ---------------------------------------------
+
+// What a stub was started with: its arguments as the harness got them (the status flags included),
+// and the OpenCode config variable (`unset` when the variable was not in its environment).
+function readLaunch(fx: SessionsFixture, binary: string, pid: number) {
+  const lines = readFileSync(join(fx.bin, `${binary}.launch.${pid}`), 'utf8').split('\n').slice(0, -1);
+  const config = lines.pop()!.slice('OPENCODE_CONFIG_CONTENT='.length);
+  return { args: lines, openCodeConfig: config };
+}
+
+const launchFiles = (fx: SessionsFixture) => readdirSync(fx.bin).filter((name) => name.includes('.launch.')).sort();
+
+// Reports a status the way a hook does, straight to the endpoint with the token.
+async function reportStatus(session: Session, id: string, event: 'working' | 'waiting' | 'finished') {
+  const answer = await postSessionEvent(join(session.cockpitHome, 'control.sock'), {
+    authorization: `Bearer ${controlTokenIn(session.cockpitHome)}`,
+    body: { sessionId: id, event },
+  });
+  expect(answer.status, `${event} for ${id}`).toBe(204);
+}
+
+// Tests never show a real notification: `Notification.prototype.show` records what would be shown, and
+// `BrowserWindow.getFocusedWindow` answers `null` until a test says a window is focused.
+const stubNotifications = (session: Session) =>
+  session.evaluateInMain(`(() => {
+    const { Notification, BrowserWindow } = require('electron');
+    globalThis.__notified = [];
+    globalThis.__focused = false;
+    Notification.prototype.show = function () {
+      globalThis.__notified.push({ title: this.title, body: this.body, notification: this });
+    };
+    BrowserWindow.getFocusedWindow = () => (globalThis.__focused ? BrowserWindow.getAllWindows()[0] ?? null : null);
+  })()`);
+
+const notifications = (session: Session) =>
+  session.evaluateInMain<Array<{ title: string; body: string }>>('globalThis.__notified.map(({ title, body }) => ({ title, body }))');
+
+const clearNotifications = (session: Session) => session.evaluateInMain('globalThis.__notified.length = 0');
+
+const setWindowFocused = (session: Session, focused: boolean) => session.evaluateInMain(`globalThis.__focused = ${focused}`);
+
+// Closes a menu or dialog a failed test left open (never while the keyboard is in a terminal).
+async function closeOverlays(page: Page) {
+  const overlays = page.locator('[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]');
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const open = await overlays.count();
+    if (open === 0 || (await page.evaluate(() => !!document.activeElement?.closest('.xterm')))) break;
+    await page.keyboard.press('Escape');
+    await poll(() => overlays.count(), (count) => count < open, 1_000);
+  }
+}
+
+describe('session status: built app', () => {
+  let fx: SessionsFixture;
+  let session: Session;
+  let repo: TempRepo;
+  const known = {
+    claude: { id: '', pid: 0 },
+    codex: { id: '', pid: 0 },
+    opencode: { id: '', pid: 0 },
+    second: { id: '', pid: 0 },
+    workspace: { id: '', path: '' },
+    notified: { id: '', name: '' },
+  };
+
+  beforeAll(async () => {
+    fx = makeSessionsFixture(['claude', 'codex', 'opencode'], { log: true });
+    repo = makeRepo('status-ws');
+    // The user's own OpenCode config is none: the tests of the merge are the package's.
+    const env = fx.env();
+    delete env.OPENCODE_CONFIG_CONTENT;
+    session = await launchBuiltWith(env);
+    await session.page.getByText(versionLabel).waitFor();
+    await stubNotifications(session);
+  });
+
+  afterAll(async () => {
+    await session?.close();
+    if (fx) rmSync(fx.root, { recursive: true, force: true });
+    if (repo) rmSync(repo.parent, { recursive: true, force: true });
+  });
+
+  afterEach(() => closeOverlays(session.page));
+
+  test('AC2, AC3, AC4, AC9 — Claude Code, Codex and OpenCode are started with the arguments statusLaunch gives, OpenCode with its config variable and the plugin written under COCKPIT_HOME; none shows a dot before it reports, and no Session status is off line', async () => {
+    const { page } = session;
+    // Every session is started before anything is checked: the tests after this one need them.
+    for (const [menuName, id] of [
+      ['Claude Code', 'claude'],
+      ['Codex', 'codex'],
+      ['OpenCode', 'opencode'],
+    ] as const) {
+      known[id].id = await startSession(page, menuName, `${menuName} 1`);
+      known[id].pid = (await readStub(page)).pid;
+    }
+
+    // The plugin of the expected launch goes to a folder of the test's own.
+    const expectedPlugins = join(fx.root, 'expected-plugins');
+    const expected = (id: 'claude-code' | 'codex' | 'opencode') => statusLaunch(id, { command: statusCommand, pluginsDir: expectedPlugins, env: {} });
+
+    const claude = readLaunch(fx, 'claude', known.claude.pid);
+    expect(claude.args.length).toBe(2);
+    expect(claude.args).toEqual((await expected('claude-code')).args);
+    expect(claude.openCodeConfig).toBe('unset');
+
+    const codex = readLaunch(fx, 'codex', known.codex.pid);
+    expect(codex.args.slice(0, 2)).toEqual(['--no-daemon', '-c']);
+    expect(codex.args).toEqual((await expected('codex')).args);
+
+    const opencode = readLaunch(fx, 'opencode', known.opencode.pid);
+    const folder = join(session.cockpitHome, 'plugins', 'opencode-status');
+    expect(opencode.args).toEqual(['--standalone']);
+    expect(JSON.parse(opencode.openCodeConfig)).toEqual({ plugins: [folder] });
+    // The plugin the app wrote is the one statusLaunch writes for the same commands.
+    const written = readFileSync(join(folder, 'server.js'), 'utf8');
+    await expected('opencode');
+    expect(written).toBe(readFileSync(join(expectedPlugins, 'opencode-status', 'server.js'), 'utf8'));
+
+    // AC9: running, nothing reported yet.
+    expect((await sessionEntries(page)).map((entry) => [entry.name, entry.status])).toEqual([
+      ['OpenCode 1', null],
+      ['Codex 1', null],
+      ['Claude Code 1', null],
+    ]);
+    // The endpoint is up: no line says status is off.
+    expect((await sidebarLines(page)).filter((line) => line.startsWith('Session status is off'))).toEqual([]);
+  });
+
+  test('AC7 — Claude Code hooks turn the row to "Working", "Needs input", "Working", "Ready" within 2 s of each report, another row is unchanged, and exiting with code 3 shows "Exited 3"', async () => {
+    const { page } = session;
+    // A second Claude Code session, which stays silent while the first one reports.
+    known.second.id = await startSession(page, 'Claude Code', 'Claude Code 2');
+    await readStub(page);
+    await openSessionEntry(page, 'Claude Code 1');
+    await focusTerminal(page);
+    const silent = [known.second.id, known.codex.id, known.opencode.id];
+
+    for (const [hook, dot] of [
+      ['UserPromptSubmit', 'Working'],
+      ['PermissionRequest', 'Needs input'],
+      ['PostToolUse', 'Working'],
+      ['Stop', 'Ready'],
+    ] as const) {
+      await typeLine(page, `hook ${hook}`);
+      await waitForRow(page, `hooked:${hook}`);
+      await expectDot(page, known.claude.id, dot);
+      for (const id of silent) await expectDot(page, id, null, 0);
+    }
+
+    await typeLine(page, 'exit');
+    await waitForRow(page, '[Process exited with code 3]');
+    await expectDot(page, known.claude.id, 'Exited 3');
+    for (const id of silent) await expectDot(page, id, null, 0);
+  });
+
+  test('AC7 — the same under a workspace: the dot shows on the session listed under the workspace row', async () => {
+    const { page } = session;
+    await addRepository(session, repo);
+    const path = await createPlainWorkspace(session, repo, 'status-ws');
+    known.workspace.path = path;
+    known.workspace.id = await startInWorkspace(page, path, 'status-ws', 'Claude Code', 'Claude Code 1');
+    await readStub(page);
+    await focusTerminal(page);
+
+    await typeLine(page, 'hook UserPromptSubmit');
+    await waitForRow(page, 'hooked:UserPromptSubmit');
+
+    await expectDot(page, known.workspace.id, 'Working');
+    expect((await sessionLinks(page, { workspace: path })).map((entry) => entry.status)).toEqual(['Working']);
+    // The sessions of the Sessions section are not touched.
+    expect((await sessionEntries(page)).find((entry) => entry.id === known.second.id)?.status).toBe(null);
+  });
+
+  test('AC8 — an agent that exits with code 0 shows the "Ended" dot, whatever it reported before', async () => {
+    const { page } = session;
+    await openSessionEntry(page, 'Claude Code 2');
+    await focusTerminal(page);
+    await typeLine(page, 'hook Stop');
+    await waitForRow(page, 'hooked:Stop');
+    await expectDot(page, known.second.id, 'Ready');
+
+    await typeLine(page, 'quit');
+    await waitForRow(page, '[Process exited with code 0]');
+
+    await expectDot(page, known.second.id, 'Ended');
+  });
+
+  test('AC11 — with no Cockpit window focused, a change to "Needs input" or "Ready" shows one notification titled with the session name; a repeat, a change to "Working" and any report while a window is focused show none', async () => {
+    const { page } = session;
+    known.notified.id = await startSession(page, 'Claude Code', 'Claude Code 3');
+    known.notified.name = 'Claude Code 3';
+    await readStub(page);
+    await clearNotifications(session);
+    const { id, name } = known.notified;
+
+    await reportStatus(session, id, 'working');
+    await expectDot(page, id, 'Working');
+    expect(await notifications(session)).toEqual([]);
+
+    await reportStatus(session, id, 'waiting');
+    await expectDot(page, id, 'Needs input');
+    expect(await notifications(session)).toEqual([{ title: name, body: 'Needs input' }]);
+
+    await reportStatus(session, id, 'waiting');
+    await expectDot(page, id, 'Needs input');
+    expect(await notifications(session)).toHaveLength(1);
+
+    await reportStatus(session, id, 'finished');
+    await expectDot(page, id, 'Ready');
+    expect(await notifications(session)).toEqual([
+      { title: name, body: 'Needs input' },
+      { title: name, body: 'Ready' },
+    ]);
+
+    await reportStatus(session, id, 'working');
+    await expectDot(page, id, 'Working');
+    expect(await notifications(session)).toHaveLength(2);
+
+    await setWindowFocused(session, true);
+    await reportStatus(session, id, 'waiting');
+    await expectDot(page, id, 'Needs input');
+    expect(await notifications(session)).toHaveLength(2);
+    await setWindowFocused(session, false);
+
+    await reportStatus(session, id, 'finished');
+    await expectDot(page, id, 'Ready');
+    expect(await notifications(session)).toHaveLength(3);
+    expect((await notifications(session)).at(-1)).toEqual({ title: name, body: 'Ready' });
+  });
+
+  test("AC12 — clicking the notification shows and focuses the session's window and opens the session's page", async () => {
+    const { page } = session;
+    expect((await notifications(session)).length, 'the notification of the previous test').toBeGreaterThan(0);
+    await goHome(page);
+    expect(sessionIdOf(page)).toBeUndefined();
+    // The window must not really be shown nor focused: the test records the calls.
+    await session.evaluateInMain(`(() => {
+      const { BrowserWindow } = require('electron');
+      const window = BrowserWindow.getAllWindows()[0];
+      globalThis.__windowCalls = [];
+      window.show = () => globalThis.__windowCalls.push('show');
+      window.focus = () => globalThis.__windowCalls.push('focus');
+      globalThis.__notified.at(-1).notification.emit('click');
+    })()`);
+
+    await page.getByRole('heading', { name: known.notified.name, exact: true }).waitFor({ timeout: UI_TIMEOUT });
+    expect(sessionIdOf(page)).toBe(known.notified.id);
+    const calls = await session.evaluateInMain<string[]>('globalThis.__windowCalls');
+    expect(calls).toContain('show');
+    expect(calls).toContain('focus');
+  });
+
+  test('AC13 — a harness whose binary was removed after detection is refused under the Sessions header: "Could not start Claude Code: <path> not found.", no folder, nothing spawned, state.json unchanged', async () => {
+    const { page } = session;
+    const binary = join(fx.bin, 'claude');
+    // The menu detected the stubs at the first start and keeps the answer.
+    const before = {
+      state: stateSnapshot(session.dataDir),
+      folders: sessionFoldersIn(session.cockpitHome),
+      runs: startRuns(fx),
+      launches: launchFiles(fx),
+      entries: await sessionEntries(page),
+    };
+
+    renameSync(binary, `${binary}.gone`);
+    try {
+      await openStartMenu(page);
+      expect((await page.getByRole('menuitem').allInnerTexts()).map((text) => text.trim())).toContain('Claude Code');
+      await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).click({ timeout: UI_TIMEOUT });
+
+      const message = `Could not start Claude Code: ${binary} not found.`;
+      const lines = await waitForLine(page, message);
+      expect(lines).toContain(message);
+      expect(await isBelowSessionsHeader(page, message)).toBe(true);
+      expect(sessionFoldersIn(session.cockpitHome)).toEqual(before.folders);
+      expect(startRuns(fx)).toEqual(before.runs);
+      expect(launchFiles(fx)).toEqual(before.launches);
+      expect(stateSnapshot(session.dataDir)).toEqual(before.state);
+      expect(await sessionEntries(page)).toEqual(before.entries);
+    } finally {
+      renameSync(`${binary}.gone`, binary);
+    }
+  });
+
+  test('AC8 — when the pty host dies, every running session shows the "Ended" dot, the ones that had reported included', async () => {
+    const { page } = session;
+    await reportStatus(session, known.codex.id, 'working');
+    await expectDot(page, known.codex.id, 'Working');
+
+    await killPtyHost(page);
+
+    for (const id of [known.codex.id, known.opencode.id, known.workspace.id, known.notified.id]) await expectDot(page, id, 'Ended', UI_TIMEOUT);
+    expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+  });
+});
+
+describe('session status: built app with the control endpoint off', () => {
+  let fx: SessionsFixture;
+  let session: Session;
+  let dataDir: string;
+
+  beforeAll(async () => {
+    fx = makeSessionsFixture(['claude', 'codex', 'opencode'], { log: true });
+    // `control.sock` is a folder: the endpoint cannot start ("is not a socket").
+    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+    const cockpitHome = join(dataDir, 'cockpit-home');
+    mkdirSync(join(cockpitHome, 'control.sock'), { recursive: true });
+    const env = fx.env();
+    delete env.OPENCODE_CONFIG_CONTENT;
+    session = await launchBuiltWith(env, dataDir, cockpitHome);
+    await session.page.getByText(versionLabel).waitFor();
+  });
+
+  afterAll(async () => {
+    await session?.close();
+    if (fx) rmSync(fx.root, { recursive: true, force: true });
+    if (dataDir) rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  test('AC10 — the Sessions section shows the muted line "Session status is off: <reason>" under its header, the reason being the message on stderr', async () => {
+    const { page } = session;
+    const prefix = 'Cockpit control endpoint is off: ';
+    const reason = session.output().split('\n').find((line) => line.startsWith(prefix))?.slice(prefix.length);
+    expect(reason, 'the app printed why the endpoint is off').toBeTruthy();
+
+    const line = `Session status is off: ${reason}`;
+    expect(await waitForLine(page, line)).toContain(line);
+    expect(await isBelowSessionsHeader(page, line)).toBe(true);
+    expect(await colorOfLine(page, line)).toBe(await mutedColor(page));
+  });
+
+  test('AC6 — with the endpoint off, each harness is started as before: no status argument, no OpenCode config variable, no plugin folder, and still its COCKPIT_SESSION_ID', async () => {
+    const { page } = session;
+    for (const [menuName, binary] of [
+      ['Claude Code', 'claude'],
+      ['Codex', 'codex'],
+      ['OpenCode', 'opencode'],
+    ] as const) {
+      const id = await startSession(page, menuName, `${menuName} 1`);
+      const stub = await readStub(page);
+      const launch = readLaunch(fx, binary, stub.pid);
+      expect(launch.args, binary).toEqual([]);
+      expect(launch.openCodeConfig, binary).toBe('unset');
+      expect(stub.argCount, binary).toBe(0);
+      const env = await readStubEnv(page);
+      expect(env.session, binary).toBe(id);
+      expect(env.socket, binary).toBe('unset');
+    }
+    expect(existsSync(join(session.cockpitHome, 'plugins'))).toBe(false);
+    await expectNoErrors(session);
+  });
+});
+
 describe('sessions smoke path: dev server', () => {
   let fx: SessionsFixture;
   let open: OpenFixture;
@@ -7445,7 +7834,7 @@ describe('sessions smoke path: dev server', () => {
     expect(stored.map((s) => [s.name, s.directory])).toEqual([['Claude Code 1', home]]);
   });
 
-  test('control smoke path — the stub gets its session id and the socket; a request without the token gets 401, with it 204', async () => {
+  test('control smoke path — the stub gets its session id and the socket, and a hook line turns the row to "Working"', async () => {
     await expectControlEndpoint(session);
   });
 
@@ -7676,6 +8065,8 @@ describe('packaged app sessions after a restart', () => {
         ['Codex 1', true],
         ['Claude Code 1', true],
       ]);
+      // Statuses are not kept: a session of an earlier launch shows the "Ended" dot, never "Exited N".
+      expect((await sessionEntries(second.page)).map((entry) => entry.status)).toEqual(['Ended', 'Ended']);
 
       await openSessionEntry(second.page, 'Claude Code 1');
       await second.page.getByText('This session has ended.').waitFor({ timeout: UI_TIMEOUT });

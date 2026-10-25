@@ -3,9 +3,9 @@ import { mkdirSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { startControlServer } from '@cockpit/control';
+import { startControlServer, statusCommand, type SessionEvent } from '@cockpit/control';
 import { createPullRequest, findPullRequest, GitHubError } from '@cockpit/github';
-import { detectHarnesses, harnesses, type DetectedHarness } from '@cockpit/harnesses';
+import { detectHarnesses, harnesses, statusLaunch, type DetectedHarness } from '@cockpit/harnesses';
 import { apps, defaultApplicationDirs, detectApps, LaunchError, openIn, reveal, type App } from '@cockpit/launchers';
 import { createPtyClient, type PtySpawnOptions } from '@cockpit/pty';
 import {
@@ -44,6 +44,7 @@ import {
   dialog,
   ipcMain,
   net,
+  Notification,
   protocol,
   shell,
   utilityProcess,
@@ -70,6 +71,7 @@ import type {
   Refused,
   RemoveWorkspaceResult,
   RunCommandsResult,
+  SessionStatus,
   StartSessionOptions,
   StartSessionResult,
 } from '../shared/api';
@@ -189,6 +191,37 @@ function isFromApp({ senderFrame }: Pick<IpcMainEvent, 'senderFrame'>): boolean 
 
 // The path of `control.sock`, once the control endpoint is up. Unset when it is off.
 let controlSocket: string | undefined;
+// Why the endpoint is off, for the sidebar. Unset when it is up.
+let controlError: string | undefined;
+
+// The window that started each session of this launch, and the last status each one reported.
+const sessionOwners = new Map<string, WebContents>();
+const sessionStatuses = new Map<string, SessionStatus>();
+
+// A harness hook reported `event`. Returns `false` for a session the state does not hold. The
+// owner window is told of a change; a macOS notification is raised for `waiting` and `finished`
+// when no Cockpit window is focused, and clicking it shows the session's window and page.
+function reportSessionStatus({ sessionId, event }: SessionEvent): boolean {
+  const session = state.sessions.find(({ id }) => id === sessionId);
+  if (!session) return false;
+  const owner = sessionOwners.get(sessionId);
+  if (!owner || owner.isDestroyed() || sessionStatuses.get(sessionId) === event) return true;
+
+  sessionStatuses.set(sessionId, event);
+  owner.send('sessions:status', sessionId, event);
+  if (event === 'working' || BrowserWindow.getFocusedWindow()) return true;
+
+  const notification = new Notification({ title: session.name, body: event === 'waiting' ? 'Needs input' : 'Ready' });
+  notification.on('click', () => {
+    if (owner.isDestroyed()) return;
+    const window = BrowserWindow.fromWebContents(owner);
+    window?.show();
+    window?.focus();
+    owner.send('sessions:open', sessionId);
+  });
+  notification.show();
+  return true;
+}
 
 // The environment of a terminal or a session: the login shell's, without the session
 // variables the app itself may have inherited (launched from a Cockpit session), with
@@ -673,6 +706,11 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
   let detection: Promise<DetectedHarness[]> | undefined;
   const detected = () => (detection ??= shellEnv.then((env) => detectHarnesses(env)));
 
+  ipcMain.handle('sessions:status-off', (event) => {
+    if (!isFromApp(event)) throw new Error('sessions:status-off refused: unexpected origin');
+    return controlError ?? null;
+  });
+
   ipcMain.handle('sessions:harnesses', async (event) => {
     if (!isFromApp(event)) throw new Error('sessions:harnesses refused: unexpected origin');
     return (await detected()).map(({ id }) => {
@@ -696,6 +734,8 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
       const harness = harnesses.find(({ id }) => id === harnessId);
       const found = (await detected()).find(({ id }) => id === harnessId);
       if (!harness || !found) return { status: 'refused', message: `${harness?.name ?? harnessId} is not installed.` };
+      // Detected at launch, removed since: nothing is created or spawned.
+      if (!isFile(found.path)) return { status: 'refused', message: `Could not start ${harness.name}: ${found.path} not found.` };
 
       // In a workspace the session runs in the worktree, which is the user's: nothing is created
       // or removed there. Otherwise it gets a folder of its own, removed if the start fails.
@@ -713,11 +753,18 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
       let ptyId: number | undefined;
       try {
         if (!workspace) mkdirSync(directory, { recursive: true });
-        const env = await terminalEnv({
+        let env = await terminalEnv({
           COCKPIT_SESSION_ID: id,
           ...(workspace && { COCKPIT_WORKSPACE_PATH: workspace.path }),
         });
-        ptyId = await spawnFor(event.sender, { ...size, command: found.path, args: harness.start(prompt), cwd: directory, env }, endings);
+        // With the endpoint up the harness is told, through its arguments and environment, to report its status.
+        let args = harness.start(prompt);
+        if (controlSocket) {
+          const status = await statusLaunch(harness.id, { command: statusCommand, pluginsDir: join(cockpitHome, 'plugins'), env });
+          args = [...status.args, ...args];
+          env = status.env as Record<string, string>;
+        }
+        ptyId = await spawnFor(event.sender, { ...size, command: found.path, args, cwd: directory, env }, endings);
         const session = {
           id,
           name: sessionName(state, harness, workspace?.path),
@@ -729,6 +776,7 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
         const next = addSession(state, session);
         saveState(userData, next);
         state = next;
+        sessionOwners.set(id, event.sender);
         return { status: 'started', session, ptyId };
       } catch (error) {
         if (ptyId !== undefined) kill(ptyId);
@@ -809,11 +857,12 @@ void app.whenReady().then(async () => {
   try {
     const control = await startControlServer({
       dir: cockpitHome,
-      onSessionEvent: ({ sessionId }) => state.sessions.some((session) => session.id === sessionId),
+      onSessionEvent: reportSessionStatus,
     });
     controlSocket = control.socketPath;
   } catch (error) {
-    console.error(`Cockpit control endpoint is off: ${error instanceof Error ? error.message : String(error)}`);
+    controlError = error instanceof Error ? error.message : String(error);
+    console.error(`Cockpit control endpoint is off: ${controlError}`);
   }
   const pty = startPty();
   startProjects(userData, pty);
