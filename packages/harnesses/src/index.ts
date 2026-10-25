@@ -6,6 +6,8 @@ import { harnesses, type Harness, type HarnessId } from './catalogue';
 
 export { harnesses } from './catalogue';
 export type { Harness, HarnessId, SessionStore } from './catalogue';
+export { codexTrustHash, openCodePlugin, statusLaunch } from './status';
+export type { StatusEvent, StatusLaunch, StatusLaunchOptions } from './status';
 
 /** A harness found on `PATH`. Serializable, so it can cross IPC. */
 export interface DetectedHarness {

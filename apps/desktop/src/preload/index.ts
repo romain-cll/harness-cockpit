@@ -51,6 +51,9 @@ const api: Api = {
     harnesses: () => ipcRenderer.invoke('sessions:harnesses'),
     list: () => ipcRenderer.invoke('sessions:list'),
     start: (harness, size, options) => ipcRenderer.invoke('sessions:start', harness, size, options),
+    onStatus: (listener) => subscribe('sessions:status', listener),
+    onOpen: (listener) => subscribe('sessions:open', listener),
+    statusOff: () => ipcRenderer.invoke('sessions:status-off'),
   },
   getShellPath: () => ipcRenderer.invoke('get-shell-path'),
 };

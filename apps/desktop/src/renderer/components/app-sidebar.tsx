@@ -4,7 +4,17 @@ import type { Project, Session } from '../../shared/api';
 import { Projects } from '@/components/projects';
 import { Sessions } from '@/components/sessions';
 
-export function AppSidebar({ version, projects, sessions }: { version: string; projects: Project[]; sessions: Session[] }) {
+export function AppSidebar({
+  version,
+  projects,
+  sessions,
+  statusOff,
+}: {
+  version: string;
+  projects: Project[];
+  sessions: Session[];
+  statusOff: string | null;
+}) {
   return (
     <aside className="flex w-64 shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground select-none">
       {/* Draggable strip; on macOS it holds the window controls. */}
@@ -26,7 +36,7 @@ export function AppSidebar({ version, projects, sessions }: { version: string; p
         </Link>
       </nav>
       <Projects projects={projects} sessions={sessions} />
-      <Sessions sessions={sessions} />
+      <Sessions sessions={sessions} statusOff={statusOff} />
       <footer className="shrink-0 px-4 py-3 text-xs text-muted-foreground">Cockpit {version}</footer>
     </aside>
   );

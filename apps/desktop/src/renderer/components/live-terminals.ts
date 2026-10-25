@@ -1,6 +1,6 @@
 import { FitAddon } from '@xterm/addon-fit';
 import { Terminal as XTerm } from '@xterm/xterm';
-import type { PtyExit, RunCommandsResult, StartSessionOptions, StartSessionResult } from '../../shared/api';
+import type { PtyExit, RunCommandsResult, SessionStatus, StartSessionOptions, StartSessionResult } from '../../shared/api';
 import { exitMessage, readTheme } from './terminal';
 
 // A terminal wired to a pty, kept for the page's lifetime so that leaving its page
@@ -12,6 +12,8 @@ export interface LiveTerminal {
   term: XTerm;
   fit: FitAddon;
   exited: boolean;
+  /** How the process ended, once it did. */
+  exit?: PtyExit;
 }
 
 const live = new Set<LiveTerminal>();
@@ -25,11 +27,34 @@ const sessionTerminals = new Map<string, LiveTerminal>();
 const listeners = new Set<() => void>();
 // Replaced, never mutated, so `useSyncExternalStore` sees a stable snapshot.
 let running: ReadonlySet<string> = new Set();
+// What each running session last reported (the accessible name of its dot).
+const statuses = new Map<string, string>();
+// The accessible name of each session's dot: what it last reported while it runs, how it ended once
+// it did; none for a running session that reported nothing. Replaced, never mutated.
+let dots: ReadonlyMap<string, string> = new Map();
+
+const STATUS_DOTS: Record<SessionStatus, string> = { working: 'Working', waiting: 'Needs input', finished: 'Ready' };
+
+// "Exited N" for a non-zero exit code; a signal (node-pty gives exit code 0 with it) and a pty host
+// death (no exit code) are plain ends.
+const endDot = ({ exitCode, signal }: PtyExit) => (exitCode && !signal ? `Exited ${exitCode}` : 'Ended');
 
 function publish() {
   running = new Set([...sessionTerminals].filter(([, { exited }]) => !exited).map(([id]) => id));
+  dots = new Map(
+    [...sessionTerminals].flatMap(([id, { exit }]) => {
+      const dot = exit ? endDot(exit) : statuses.get(id);
+      return dot ? [[id, dot] as const] : [];
+    }),
+  );
   for (const listener of listeners) listener();
 }
+
+window.api.sessions.onStatus((id, status) => {
+  if (!sessionTerminals.has(id)) return;
+  statuses.set(id, STATUS_DOTS[status]);
+  publish();
+});
 
 /**
  * A terminal at 80 x 24, fitted when its view shows it, and `started`, which settles
@@ -62,6 +87,7 @@ export function createLiveTerminal(start: (size: { cols: number; rows: number })
   const offExit = pty.onExit((id, ptyExit) =>
     onPty(id, () => {
       entry.exited = true;
+      entry.exit = ptyExit;
       term.write(`\r\n${exitMessage(ptyExit)}`);
       offData();
       offExit();
@@ -128,6 +154,9 @@ export function subscribe(listener: () => void): () => void {
 
 /** The ids of the sessions whose agent is still running. */
 export const getRunningIds = () => running;
+
+/** The accessible name of each session's dot, by session id. */
+export const getSessionDots = () => dots;
 
 export const getSessionTerminal = (id: string) => sessionTerminals.get(id);
 
@@ -202,6 +231,7 @@ export function endSessions(ids: string[]): void {
     if (!entry) continue;
     closeLiveTerminal(entry);
     sessionTerminals.delete(id);
+    statuses.delete(id);
   }
   publish();
 }

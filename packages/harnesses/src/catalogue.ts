@@ -23,7 +23,8 @@ export interface Harness {
   sessions(env: NodeJS.ProcessEnv): SessionStore;
 }
 
-// Every fact below was checked on 2026-10-20 against the source named next to it.
+// Every fact below was checked on 2026-10-20 against the source named next to it. The flags and
+// events that make a harness report its status are in `status.ts`, with their sources.
 
 // An empty variable counts as unset.
 function home(env: NodeJS.ProcessEnv): string {
