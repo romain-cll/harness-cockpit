@@ -20,12 +20,14 @@ import {
   type State,
 } from '@cockpit/state';
 import {
+  commandsInvocation,
   createWorktree,
   fileDiff,
   findRepositoryRoot,
   listBranches,
   listChanges,
   listWorktrees,
+  readWorkspaceConfig,
   removeWorktree,
   watchWorktree,
   WorkspaceError,
@@ -57,6 +59,7 @@ import type {
   PtySpawnRequest,
   Refused,
   RemoveWorkspaceResult,
+  RunCommandsResult,
   StartSessionOptions,
   StartSessionResult,
 } from '../shared/api';
@@ -307,7 +310,7 @@ async function toProject({ path }: { path: string }): Promise<Project> {
 }
 
 // The projects the user added, kept in `state.json`.
-function startProjects(userData: string): void {
+function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typeof startPty>): void {
   ipcMain.handle('projects:list', (event) => {
     if (!isFromApp(event)) throw new Error('projects:list refused: unexpected origin');
     return Promise.all(state.projects.map(toProject));
@@ -540,6 +543,33 @@ function startProjects(userData: string): void {
   ipcMain.on('workspaces:unwatch', (event) => {
     if (isFromApp(event)) unwatch(event.sender);
   });
+
+  // Runs the setup or teardown commands of a workspace in a pty owned by the calling window, in the
+  // worktree, with the login-shell environment and the variables the config adds.
+  ipcMain.handle(
+    'workspaces:run-commands',
+    (event, project: string, path: string, which: 'setup' | 'teardown', size: { cols: number; rows: number }): Promise<RunCommandsResult> =>
+      forProject<RunCommandsResult>(event, 'workspaces:run-commands', project, async () => {
+        const endings = endingsOf(event.sender);
+        const workspace = await findWorkspace({ project, path });
+        if ('status' in workspace) return workspace;
+        const env = await shellEnv;
+        const config = await readWorkspaceConfig({ repo: project, path, env });
+        if (config[which].length === 0) return { status: 'none' };
+        const { command, args } = commandsInvocation(config[which]);
+        try {
+          const ptyId = await spawnFor(
+            event.sender,
+            { ...size, command, args, cwd: path, env: { ...env, TERM: 'xterm-256color', COLORTERM: 'truecolor', ...config.env } },
+            endings,
+          );
+          return { status: 'started', ptyId };
+        } catch (error) {
+          if (error instanceof PageGoneError) return { status: 'refused', message: error.message };
+          throw error;
+        }
+      }),
+  );
 }
 
 // Sessions outside any project: an agent CLI run in a folder of its own under
@@ -677,7 +707,6 @@ void app.whenReady().then(async () => {
     if (!isFromApp(event)) throw new Error('get-shell-path refused: unexpected origin');
     return (await shellEnv).PATH ?? '';
   });
-  startProjects(userData);
   // A failure leaves the endpoint off: the app runs, and terminals get no `COCKPIT_SOCKET`.
   try {
     const control = await startControlServer({
@@ -688,7 +717,9 @@ void app.whenReady().then(async () => {
   } catch (error) {
     console.error(`Cockpit control endpoint is off: ${error instanceof Error ? error.message : String(error)}`);
   }
-  startSessions(userData, startPty());
+  const pty = startPty();
+  startProjects(userData, pty);
+  startSessions(userData, pty);
 
   createWindow();
 
