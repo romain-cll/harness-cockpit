@@ -1,10 +1,10 @@
 import { execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { WorkspaceError } from '../src/git';
-import { createWorktree, fileDiff, listChanges, watchWorktree } from '../src/index';
+import { branchStatus, commitAll, createWorktree, fileDiff, listChanges, pushBranch, removeWorktree, watchWorktree } from '../src/index';
 
 // COCKPIT-34: the changes of a workspace against its base, the diff of one file, and the
 // watcher. Drives the real git on temporary repositories under os.tmpdir(), with an env that
@@ -272,5 +272,171 @@ describe('watchWorktree', () => {
       watcher.close();
       other.close();
     }
+  });
+});
+
+// COCKPIT-38: commit, push and the state of the branch, against a local bare `origin`. Nothing here
+// reaches a real remote.
+
+/** A bare repository as `origin` of `repo`, holding `main`. */
+async function addOrigin(repo: string): Promise<string> {
+  const origin = join(await tempDir(), 'origin.git');
+  git(repo, 'init', '--bare', '-b', 'main', origin);
+  git(repo, 'remote', 'add', 'origin', origin);
+  git(repo, 'push', '--quiet', 'origin', 'main');
+  git(repo, 'fetch', '--quiet', 'origin');
+  return origin;
+}
+
+/** A workspace `feat` of a repository with a local bare `origin`. */
+async function makeShippableWorkspace(): Promise<{ repo: string; origin: string; worktree: string }> {
+  const repo = await makeRepo();
+  const origin = await addOrigin(repo);
+  const worktree = await makeWorkspace(repo);
+  return { repo, origin, worktree };
+}
+
+const remoteHead = (origin: string, branch: string) => git(origin, 'rev-parse', `refs/heads/${branch}`);
+
+async function commitFile(worktree: string, name: string, message: string): Promise<string> {
+  await writeFile(join(worktree, name), `${name}\n`);
+  git(worktree, 'add', name);
+  git(worktree, 'commit', '-m', message);
+  return git(worktree, 'rev-parse', 'HEAD');
+}
+
+describe('branchStatus', () => {
+  test('AC8 — a fresh workspace has its branch, no upstream, nothing uncommitted and nothing to push', async () => {
+    const { worktree } = await makeShippableWorkspace();
+
+    expect(await branchStatus(worktree, { env: testEnv })).toEqual({
+      branch: 'feat',
+      upstream: null,
+      uncommitted: false,
+      unpushed: false,
+    });
+  });
+
+  test('AC6 — uncommitted is true for an edit, a deletion or an untracked file, and not for a file git ignores', async () => {
+    const { worktree } = await makeShippableWorkspace();
+    await writeFile(join(worktree, 'out.log'), 'ignored\n');
+    expect((await branchStatus(worktree, { env: testEnv })).uncommitted).toBe(false);
+
+    await writeFile(join(worktree, 'brand-new.txt'), 'new\n');
+    expect((await branchStatus(worktree, { env: testEnv })).uncommitted).toBe(true);
+    await rm(join(worktree, 'brand-new.txt'));
+
+    await rm(join(worktree, 'c.txt'));
+    expect((await branchStatus(worktree, { env: testEnv })).uncommitted).toBe(true);
+  });
+
+  test('AC8 — without an upstream, commits beyond the merge-base with the base are unpushed', async () => {
+    const { worktree } = await makeShippableWorkspace();
+    await commitFile(worktree, 'one.txt', 'one');
+
+    expect(await branchStatus(worktree, { env: testEnv })).toMatchObject({ branch: 'feat', upstream: null, unpushed: true });
+  });
+
+  test('AC8 — with an upstream, only the commits the upstream lacks are unpushed', async () => {
+    const { worktree } = await makeShippableWorkspace();
+    await commitFile(worktree, 'one.txt', 'one');
+    await pushBranch(worktree, { env: testEnv });
+    expect(await branchStatus(worktree, { env: testEnv })).toMatchObject({ upstream: 'origin/feat', unpushed: false });
+
+    await commitFile(worktree, 'two.txt', 'two');
+
+    expect(await branchStatus(worktree, { env: testEnv })).toMatchObject({ upstream: 'origin/feat', unpushed: true });
+  });
+});
+
+describe('commitAll', () => {
+  test('AC6 — commits every change in one commit with the message: edits, deletions and untracked files, not the ignored ones', async () => {
+    const { worktree } = await makeShippableWorkspace();
+    const before = git(worktree, 'rev-list', '--count', 'HEAD');
+    await writeFile(join(worktree, 'a.txt'), 'edited\n');
+    await rm(join(worktree, 'c.txt'));
+    await writeFile(join(worktree, 'new.txt'), 'new\n');
+    await writeFile(join(worktree, 'out.log'), 'ignored\n');
+
+    await commitAll(worktree, 'Edit, delete and add', { env: testEnv });
+
+    expect(Number(git(worktree, 'rev-list', '--count', 'HEAD'))).toBe(Number(before) + 1);
+    expect(git(worktree, 'log', '-1', '--format=%B')).toBe('Edit, delete and add');
+    expect(git(worktree, 'status', '--porcelain')).toBe('');
+    expect(git(worktree, 'show', '--name-status', '--format=', 'HEAD').split('\n').sort()).toEqual([
+      'D\tc.txt',
+      'A\tnew.txt',
+      'M\ta.txt',
+    ].sort());
+    expect(git(worktree, 'ls-files', 'out.log')).toBe('');
+  });
+
+  test('AC7 — a failing pre-commit hook rejects GIT_FAILED with its message and creates no commit', async () => {
+    const { repo, worktree } = await makeShippableWorkspace();
+    const hook = join(repo, '.git', 'hooks', 'pre-commit');
+    await writeFile(hook, '#!/bin/sh\necho "hook says no" >&2\nexit 1\n');
+    await chmod(hook, 0o755);
+    const head = git(worktree, 'rev-parse', 'HEAD');
+    await writeFile(join(worktree, 'new.txt'), 'new\n');
+
+    const error = await rejection(commitAll(worktree, 'Will not be made', { env: testEnv }));
+
+    expect(error.code).toBe('GIT_FAILED');
+    expect(error.message).toContain('hook says no');
+    expect(git(worktree, 'rev-parse', 'HEAD')).toBe(head);
+  });
+});
+
+describe('pushBranch', () => {
+  test('AC8 — pushes the branch to origin, the remote ref is HEAD and the upstream is origin/<branch>', async () => {
+    const { origin, worktree } = await makeShippableWorkspace();
+    const head = await commitFile(worktree, 'one.txt', 'one');
+
+    await pushBranch(worktree, { env: testEnv });
+
+    expect(remoteHead(origin, 'feat')).toBe(head);
+    expect(git(worktree, 'rev-parse', '--abbrev-ref', 'feat@{upstream}')).toBe('origin/feat');
+  });
+
+  test('AC9 — a push that is not a fast-forward rejects GIT_FAILED with git\'s refusal and leaves the remote branch as it was (no force)', async () => {
+    const { origin, worktree } = await makeShippableWorkspace();
+    await commitFile(worktree, 'one.txt', 'one');
+    await pushBranch(worktree, { env: testEnv });
+    // Someone else pushes a commit to origin/feat.
+    const other = join(await tempDir(), 'other');
+    git(await tempDir(), 'clone', '--quiet', origin, other);
+    git(other, 'switch', '--quiet', 'feat');
+    const theirs = await commitFile(other, 'theirs.txt', 'theirs');
+    git(other, 'push', '--quiet', 'origin', 'feat');
+    await commitFile(worktree, 'two.txt', 'two');
+
+    const error = await rejection(pushBranch(worktree, { env: testEnv }));
+
+    expect(error.code).toBe('GIT_FAILED');
+    expect(error.message).toMatch(/rejected/);
+    expect(remoteHead(origin, 'feat')).toBe(theirs);
+  });
+
+  test('AC12 — a detached HEAD rejects GIT_FAILED and pushes nothing', async () => {
+    const { origin, worktree } = await makeShippableWorkspace();
+    git(worktree, 'checkout', '--quiet', '--detach');
+    await commitFile(worktree, 'one.txt', 'one');
+
+    const error = await rejection(pushBranch(worktree, { env: testEnv }));
+
+    expect(error.code).toBe('GIT_FAILED');
+    expect(git(origin, 'for-each-ref', '--format=%(refname)')).toBe('refs/heads/main');
+  });
+});
+
+describe('removeWorktree after a pull request merged', () => {
+  test('AC11 — deletes a pushed branch whose commits are not on the base (squash-merge case), as it is merged into its upstream', async () => {
+    const { repo, worktree } = await makeShippableWorkspace();
+    await commitFile(worktree, 'one.txt', 'one');
+    git(worktree, 'push', '--quiet', '--set-upstream', 'origin', 'feat');
+
+    await removeWorktree({ repo, path: worktree, deleteBranch: true, env: testEnv });
+
+    expect(git(repo, 'branch', '--list', 'feat')).toBe('');
   });
 });

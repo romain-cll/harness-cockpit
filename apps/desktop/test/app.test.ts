@@ -6359,8 +6359,173 @@ async function expectChangesShowNewFile(page: Page, worktree: string) {
   expect(await waitForDiffLine(page, 1, '+', 'hello from the smoke path')).not.toBeNull();
 }
 
+// --- Ship a workspace: commit, push, pull request, cleanup (COCKPIT-38) --------
+//
+// The contract of the five new `window.api.workspaces` calls these tests use, beyond the spec's:
+// `status(project, path)`, `commit(project, path, message)`, `push(project, path)`,
+// `pullRequest(project, path)` and `createPullRequest(project, path, title, body)`, each resolving to
+// `{ status: 'refused', message }` on a refusal.
+
+// The git the app runs ignores the developer's configuration (a signing key, a global hook) and has an
+// identity of its own, so a commit made through the sidebar works on any machine.
+const GIT_APP_ENV = {
+  GIT_CONFIG_GLOBAL: '/dev/null',
+  GIT_CONFIG_NOSYSTEM: '1',
+  GIT_AUTHOR_NAME: 'Test',
+  GIT_AUTHOR_EMAIL: 'test@example.com',
+  GIT_COMMITTER_NAME: 'Test',
+  GIT_COMMITTER_EMAIL: 'test@example.com',
+};
+
+const PR_URL = 'https://github.test/acme/app/pull/7';
+
+type PrChecks = 'none' | 'pending' | 'passing' | 'failing' | 'unknown';
+const ROLLUPS: Record<PrChecks, object[]> = {
+  none: [],
+  pending: [{ __typename: 'CheckRun', status: 'IN_PROGRESS', conclusion: '' }],
+  passing: [{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+  failing: [{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'FAILURE' }],
+  unknown: [{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'STALE' }],
+};
+
+// What `gh pr list --json …` prints for one pull request.
+const prJson = ({ state = 'OPEN', checks = 'none', title = 'Fix the bug' }: { state?: string; checks?: PrChecks; title?: string } = {}) =>
+  JSON.stringify([{ number: 7, title, url: PR_URL, state, statusCheckRollup: ROLLUPS[checks] }]);
+
+interface GhFixture {
+  /** The folder whose files set how the stub `gh` answers. */
+  control: string;
+  /** The file the stub appends every run to. */
+  log: string;
+}
+
+// A stub `gh` on the fake login shell's `PATH` (the real one would reach GitHub). Every run is logged
+// (fields separated by US, runs by RS, so a multi-line argument survives): the working directory,
+// GH_PROMPT_DISABLED, then the arguments. `pr list` prints `pr-list` (`[]` without it) after failing as
+// `code` and `stderr` say; `pr create` fails with `create-stderr`, else copies `after-create` over
+// `pr-list` and prints a URL.
+function addGhFixture(fx: SessionsFixture): GhFixture {
+  const control = join(fx.root, 'gh-control');
+  mkdirSync(control);
+  const log = join(fx.root, 'gh.log');
+  const stub = join(fx.bin, 'gh');
+  writeFileSync(
+    stub,
+    `#!/bin/sh
+printf '%s\\037' "$(pwd -P)" "$GH_PROMPT_DISABLED" "$@" >> '${log}'
+printf '\\036' >> '${log}'
+if [ "$1 $2" = "pr create" ]; then
+  if [ -s '${control}/create-stderr' ]; then cat '${control}/create-stderr' >&2; exit 1; fi
+  [ -e '${control}/after-create' ] && cp '${control}/after-create' '${control}/pr-list'
+  echo '${PR_URL}'
+  exit 0
+fi
+[ -s '${control}/stderr' ] && cat '${control}/stderr' >&2
+[ -e '${control}/code' ] && exit "$(cat '${control}/code')"
+if [ -e '${control}/pr-list' ]; then cat '${control}/pr-list'; else echo '[]'; fi
+`,
+  );
+  chmodSync(stub, 0o755);
+  // macOS scans a new executable the first time it runs; the run is not counted.
+  execFileSync(stub, ['--warmup']);
+  writeFileSync(log, '');
+  return { control, log };
+}
+
+// How the stub answers from now on: everything not given is back to the default (`[]`, exit 0).
+function setGh(
+  gh: GhFixture,
+  { list, code, stderr, createStderr, afterCreate }: { list?: string; code?: number; stderr?: string; createStderr?: string; afterCreate?: string } = {},
+) {
+  for (const name of ['pr-list', 'code', 'stderr', 'create-stderr', 'after-create']) rmSync(join(gh.control, name), { force: true });
+  const files = { 'pr-list': list, code: code?.toString(), stderr, 'create-stderr': createStderr, 'after-create': afterCreate };
+  for (const [name, content] of Object.entries(files)) if (content !== undefined) writeFileSync(join(gh.control, name), content);
+}
+
+interface GhRun {
+  cwd: string;
+  /** `GH_PROMPT_DISABLED` as the stub saw it. */
+  prompt: string;
+  args: string[];
+}
+const ghRuns = (gh: GhFixture): GhRun[] =>
+  readFileSync(gh.log, 'utf8')
+    .split('\x1e')
+    .filter(Boolean)
+    .map((run) => {
+      const [cwd, prompt, ...args] = run.split('\x1f').slice(0, -1);
+      return { cwd: cwd!, prompt: prompt!, args };
+    });
+
+// `origin`: a bare repository next to `repo`, holding `main`. Returns its path.
+function addOrigin(repo: TempRepo): string {
+  const origin = join(repo.parent, `${repo.name}-origin.git`);
+  gitIn(repo.parent, 'init', '--quiet', '--bare', '-b', 'main', origin);
+  gitIn(repo.root, 'remote', 'add', 'origin', origin);
+  gitIn(repo.root, 'push', '--quiet', 'origin', 'main');
+  gitIn(repo.root, 'fetch', '--quiet', 'origin');
+  return origin;
+}
+
+// A branch's commit in a bare repository, '' when it has none.
+const remoteRef = (origin: string, branch: string) => {
+  try {
+    return gitIn(origin, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`);
+  } catch {
+    return '';
+  }
+};
+
+const shipButton = (page: Page, name: string) => page.locator(PANEL).getByRole('button', { name, exact: true });
+const commitField = (page: Page) => page.locator(PANEL).getByRole('textbox', { name: 'Commit message', exact: true });
+const prDialog = (page: Page) => page.getByRole('dialog', { name: 'Create pull request' });
+
+// Waits until the sidebar's text satisfies `matches`, and fails when it does not within `timeout`.
+async function waitForShipText(page: Page, matches: (text: string) => boolean, timeout = 5_000) {
+  const text = await waitForPanelText(page, matches, timeout);
+  expect(matches(text), `the sidebar does not show the expected text, it shows:\n${text}`).toBe(true);
+  return text;
+}
+
+// Waits until the sidebar lists exactly `names` among `names` (the files the test wrote or removed).
+async function expectListed(page: Page, names: string[], expected: string[]) {
+  const listed = await poll(() => listedNames(page, names), (found) => JSON.stringify(found) === JSON.stringify(expected), UI_TIMEOUT);
+  expect(listed).toEqual(expected);
+}
+
+// Opens a session's page and its Changes sidebar.
+async function openShip(page: Page, sessionId: string) {
+  await openSessionById(page, sessionId);
+  await setChangesOpen(page, true);
+}
+
+// Types `message` in the commit field and presses "Commit".
+async function commitThroughPanel(page: Page, message: string) {
+  await commitField(page).fill(message);
+  await shipButton(page, 'Commit').click({ timeout: UI_TIMEOUT });
+}
+
+// The smoke path of the dev server and the packaged app, on a workspace page whose Changes sidebar is
+// open with an uncommitted file, in a repository with a local bare `origin`: a pull request the stub
+// answers shows in the sidebar, then a commit and a push reach `origin`.
+async function expectShipSmoke(page: Page, gh: GhFixture, worktree: string, origin: string, branch: string) {
+  setGh(gh, { list: prJson({ checks: 'pending' }) });
+  await dispatchFocus(page);
+  await page.locator(PANEL).getByRole('link', { name: '#7 Fix the bug', exact: true }).waitFor({ timeout: UI_TIMEOUT });
+  await waitForShipText(page, (text) => text.includes('Checks pending'));
+
+  await commitThroughPanel(page, 'Smoke commit');
+  expect(await poll(() => gitIn(worktree, 'log', '-1', '--format=%B'), (subject) => subject === 'Smoke commit', UI_TIMEOUT)).toBe('Smoke commit');
+  expect(gitIn(worktree, 'status', '--porcelain')).toBe('');
+
+  await shipButton(page, 'Push').click({ timeout: UI_TIMEOUT });
+  const head = gitIn(worktree, 'rev-parse', 'HEAD');
+  expect(await poll(() => remoteRef(origin, branch), (ref) => ref === head, UI_TIMEOUT)).toBe(head);
+}
+
 describe('changes sidebar: built app', () => {
   let fx: SessionsFixture;
+  let gh: GhFixture;
   let session: Session;
   let repo: TempRepo;
   const A = { path: '', id: '' };
@@ -6368,8 +6533,10 @@ describe('changes sidebar: built app', () => {
 
   beforeAll(async () => {
     fx = makeSessionsFixture(['claude'], { gitLog: true });
+    // A stub `gh` for the ship section (COCKPIT-38).
+    gh = addGhFixture(fx);
     repo = makeChangesRepo('changes-ws');
-    session = await launchBuiltWith(fx.env());
+    session = await launchBuiltWith({ ...fx.env(), ...GIT_APP_ENV });
     await session.page.getByText(versionLabel).waitFor();
     await addRepository(session, repo);
     // Two workspaces with a running session each (created through the New workspace dialog, which records the base).
@@ -6703,6 +6870,441 @@ describe('changes sidebar: built app', () => {
     expect(await poll(() => listedNames(page, ['after-reload.txt']), (names) => names.length === 1, UI_TIMEOUT)).toEqual(['after-reload.txt']);
   });
 
+  // COCKPIT-38: the ship section of the sidebar. It runs after the tests above, on a project of its own
+  // with a local bare `origin`, a workspace per story, and the stub `gh` of the launch.
+  describe('ship section', () => {
+    let ship: TempRepo;
+    let origin: string;
+    // The workspaces: a pull request opened outside Cockpit, the commit, push and pull request flow, and a
+    // rejected push.
+    const W1 = { path: '', id: '' };
+    const W2 = { path: '', id: '' };
+    const W3 = { path: '', id: '' };
+
+    beforeAll(async () => {
+      ship = makeChangesRepo('ship-ws');
+      writeFileSync(join(ship.root, '.gitignore'), '*.log\n');
+      gitIn(ship.root, 'add', '.gitignore');
+      gitIn(ship.root, 'commit', '-m', 'ignore logs');
+      origin = addOrigin(ship);
+      await addRepository(session, ship);
+      for (const [workspace, name] of [[W1, 'ship-pr'], [W2, 'ship-flow'], [W3, 'ship-reject']] as const) {
+        workspace.id = await createWorkspaceWithAgent(session.page, ship, { name, agent: 'Claude Code' }, 'Claude Code 1');
+        workspace.path = worktreePath(session, ship, name);
+      }
+      setGh(gh);
+    });
+
+    afterAll(() => {
+      if (ship) rmSync(ship.parent, { recursive: true, force: true });
+    });
+
+    // A failing test must not leave a menu or a dialog that blocks the tests after it.
+    afterEach(async () => {
+      const { page } = session;
+      const overlays = page.locator('[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]');
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const shown = await overlays.count();
+        if (shown === 0 || (await page.evaluate(() => !!document.activeElement?.closest('.xterm')))) break;
+        await page.keyboard.press('Escape');
+        await poll(() => overlays.count(), (count) => count < shown, 1_000);
+      }
+    });
+
+    const waitForText = (matches: (text: string) => boolean, timeout = 5_000) => waitForShipText(session.page, matches, timeout);
+
+    test('ship AC1 — a pull request opened outside Cockpit shows "#7 Fix the bug" as a link to its URL, its state and its CI summary, and no "Create pull request" button; each state and summary follows the answer', async () => {
+      const { page } = session;
+      setGh(gh, { list: prJson({ checks: 'pending' }) });
+      await openShip(page, W1.id);
+
+      const link = page.locator(PANEL).getByRole('link', { name: '#7 Fix the bug', exact: true });
+      await link.waitFor({ timeout: UI_TIMEOUT });
+      expect(await link.getAttribute('href')).toBe(PR_URL);
+      const text = await waitForText((shown) => shown.includes('Checks pending'));
+      expect(text).toMatch(/\bOpen\b/);
+      expect(await shipButton(page, 'Create pull request').count()).toBe(0);
+      // Nothing to commit and nothing to push in a fresh workspace.
+      expect(await shipButton(page, 'Push').count()).toBe(0);
+
+      for (const [checks, label] of [['unknown', 'Checks unknown'], ['failing', 'Checks failing'], ['passing', 'Checks passing']] as const) {
+        setGh(gh, { list: prJson({ checks }) });
+        await dispatchFocus(page);
+        await waitForText((shown) => shown.includes(label));
+      }
+      // No check: no summary at all.
+      setGh(gh, { list: prJson({ checks: 'none' }) });
+      await dispatchFocus(page);
+      await waitForText((shown) => !shown.includes('Checks '));
+      expect(await panelText(page)).toMatch(/\bOpen\b/);
+
+      setGh(gh, { list: prJson({ state: 'CLOSED' }) });
+      await dispatchFocus(page);
+      await waitForText((shown) => /\bClosed\b/.test(shown));
+    });
+
+    test('ship AC2 — clicking the pull request link opens its URL in the system browser and the window stays on its page', async () => {
+      const { page } = session;
+      await session.evaluateInMain(`(() => {
+        const { shell } = require('electron');
+        const opened = (globalThis.__openedExternally = []);
+        const stub = async (url) => { opened.push(url); };
+        shell.openExternal = stub;
+        if (shell.openExternal !== stub) throw new Error('shell.openExternal cannot be replaced');
+      })()`);
+      setGh(gh, { list: prJson({ checks: 'passing' }) });
+      await openShip(page, W1.id);
+      await dispatchFocus(page);
+      const link = page.locator(PANEL).getByRole('link', { name: '#7 Fix the bug', exact: true });
+      await link.waitFor({ timeout: UI_TIMEOUT });
+      const url = page.url();
+
+      await link.click({ timeout: UI_TIMEOUT });
+
+      const opened = await poll(() => session.evaluateInMain<string[]>('globalThis.__openedExternally'), (urls) => urls.length > 0, UI_TIMEOUT);
+      expect(opened).toEqual([PR_URL]);
+      expect(page.url()).toBe(url);
+      expect(await markChangesPanel(page)).toBe(true);
+    });
+
+    test('ship AC3, AC4 — a change in the worktree reads no pull request, the window gaining focus does (within 5 s), and no gh runs while the sidebar is closed, left or reloaded', async () => {
+      const { page } = session;
+      setGh(gh, { list: prJson({ checks: 'passing' }) });
+      await openShip(page, W1.id);
+      await dispatchFocus(page);
+      await waitForText((shown) => shown.includes('Checks passing'));
+
+      // The pull request merged meanwhile; a file written in the worktree must not read it.
+      setGh(gh, { list: prJson({ state: 'MERGED', checks: 'passing' }) });
+      const before = ghRuns(gh).length;
+      writeFileSync(join(W1.path, 'tick.txt'), 'x\n');
+      await expectListed(page, ['tick.txt'], ['tick.txt']);
+      await sleep(1_000);
+      expect(ghRuns(gh)).toHaveLength(before);
+      expect(await panelText(page)).toMatch(/\bOpen\b/);
+
+      await dispatchFocus(page);
+      await waitForText((shown) => /\bMerged\b/.test(shown));
+      rmSync(join(W1.path, 'tick.txt'));
+
+      // Closed, then reloaded: a write starts no gh run.
+      await setChangesOpen(page, false);
+      const runs = ghRuns(gh).length;
+      writeFileSync(join(W1.path, 'closed.txt'), 'x\n');
+      await sleep(1_000);
+      expect(ghRuns(gh)).toHaveLength(runs);
+
+      await page.reload();
+      await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
+      await changesToggle(page).waitFor({ timeout: UI_TIMEOUT });
+      expect(await markChangesPanel(page)).toBe(false);
+      writeFileSync(join(W1.path, 'reloaded.txt'), 'x\n');
+      await sleep(1_000);
+      expect(ghRuns(gh)).toHaveLength(runs);
+      rmSync(join(W1.path, 'closed.txt'));
+      rmSync(join(W1.path, 'reloaded.txt'));
+    });
+
+    test('ship AC5 — gh not installed, not logged in or failing shows its message and no "Create pull request" button', async () => {
+      const { page } = session;
+      setGh(gh, { code: 4, stderr: 'authentication required\n' });
+      await openShip(page, W1.id);
+      await waitForText((shown) => shown.includes('gh is not logged in. Run gh auth login in a terminal.'));
+      expect(await shipButton(page, 'Create pull request').count()).toBe(0);
+
+      setGh(gh, { code: 1, stderr: '  boom\n\n' });
+      await dispatchFocus(page);
+      await waitForText((shown) => shown.includes('Could not read the pull request: boom'));
+      expect(await shipButton(page, 'Create pull request').count()).toBe(0);
+
+      const stub = join(fx.bin, 'gh');
+      renameSync(stub, `${stub}.away`);
+      try {
+        setGh(gh);
+        await dispatchFocus(page);
+        await waitForText((shown) => shown.includes('The GitHub CLI (gh) is not installed.'));
+        expect(await shipButton(page, 'Create pull request').count()).toBe(0);
+      } finally {
+        renameSync(`${stub}.away`, stub);
+      }
+
+      await dispatchFocus(page);
+      await waitForText((shown) => !shown.includes('gh)') && !shown.includes('Could not read'));
+    });
+
+    test('ship AC6, AC5 — Commit puts every change in one commit with the trimmed message, clears the field and is disabled while the message is blank or nothing is uncommitted, with gh failing', async () => {
+      const { page } = session;
+      setGh(gh, { code: 1, stderr: 'boom' });
+      await openShip(page, W2.id);
+      await waitForText((shown) => shown.includes('Could not read the pull request: boom'));
+      const head = gitIn(W2.path, 'rev-parse', 'HEAD');
+      writeFileSync(join(W2.path, 'a.txt'), 'edited\n');
+      rmSync(join(W2.path, 'c.txt'));
+      writeFileSync(join(W2.path, 'new.txt'), 'new\n');
+      writeFileSync(join(W2.path, 'ignored.log'), 'ignored\n');
+      await expectListed(page, ['new.txt'], ['new.txt']);
+
+      const commit = shipButton(page, 'Commit');
+      expect(await commit.isDisabled()).toBe(true);
+      await commitField(page).fill('   ');
+      expect(await commit.isDisabled()).toBe(true);
+
+      await commitThroughPanel(page, '  Edit, delete and add  ');
+
+      await poll(() => gitIn(W2.path, 'rev-parse', 'HEAD'), (now) => now !== head, UI_TIMEOUT);
+      expect(gitIn(W2.path, 'rev-list', '--count', `${head}..HEAD`)).toBe('1');
+      expect(gitIn(W2.path, 'log', '-1', '--format=%B')).toBe('Edit, delete and add');
+      expect(gitIn(W2.path, 'status', '--porcelain')).toBe('');
+      expect(gitIn(W2.path, 'show', '--name-status', '--format=', 'HEAD').split('\n').sort()).toEqual(['A\tnew.txt', 'D\tc.txt', 'M\ta.txt']);
+      expect(gitIn(W2.path, 'ls-files', 'ignored.log')).toBe('');
+      expect(await poll(() => commitField(page).inputValue(), (value) => value === '', UI_TIMEOUT)).toBe('');
+      // Nothing is uncommitted any more: a message does not enable the button.
+      await commitField(page).fill('Nothing left');
+      await poll(() => commit.isDisabled(), Boolean, UI_TIMEOUT);
+      expect(await commit.isDisabled()).toBe(true);
+      await commitField(page).fill('');
+    });
+
+    test('ship AC7 — a failing pre-commit hook shows "Could not commit: …" with git\'s message, creates no commit and keeps the message in the field', async () => {
+      const { page } = session;
+      const hook = join(ship.root, '.git', 'hooks', 'pre-commit');
+      writeFileSync(hook, '#!/bin/sh\necho "hook says no" >&2\nexit 1\n');
+      chmodSync(hook, 0o755);
+      try {
+        const head = gitIn(W2.path, 'rev-parse', 'HEAD');
+        writeFileSync(join(W2.path, 'second.txt'), 'second\n');
+        await expectListed(page, ['second.txt'], ['second.txt']);
+
+        await commitThroughPanel(page, 'Add the second file');
+
+        const text = await waitForText((shown) => /Could not commit: [\s\S]*hook says no/.test(shown));
+        expect(text).toMatch(/Could not commit: [\s\S]*hook says no/);
+        expect(gitIn(W2.path, 'rev-parse', 'HEAD')).toBe(head);
+        expect(await commitField(page).inputValue()).toBe('Add the second file');
+      } finally {
+        rmSync(hook, { force: true });
+      }
+      // The message was kept: pressing Commit again, the hook gone, commits.
+      await shipButton(page, 'Commit').click({ timeout: UI_TIMEOUT });
+      expect(await poll(() => gitIn(W2.path, 'log', '-1', '--format=%B'), (subject) => subject === 'Add the second file', UI_TIMEOUT)).toBe('Add the second file');
+      expect(gitIn(W2.path, 'status', '--porcelain')).toBe('');
+    });
+
+    test('ship AC10 — with gh ready and no pull request, "Create pull request" is disabled with "Push the branch first." while the branch is not pushed', async () => {
+      const { page } = session;
+      setGh(gh);
+      await dispatchFocus(page);
+      const create = shipButton(page, 'Create pull request');
+      await create.waitFor({ timeout: UI_TIMEOUT });
+      expect(await create.isDisabled()).toBe(true);
+      expect(await panelText(page)).toContain('Push the branch first.');
+      await shipButton(page, 'Push').waitFor({ timeout: UI_TIMEOUT });
+    });
+
+    test('ship AC8 — Push runs git push --set-upstream origin <branch> (never forced), origin has the branch at HEAD, the upstream is origin/<branch> and the button goes', async () => {
+      const { page } = session;
+      expect(remoteRef(origin, 'ship-flow')).toBe('');
+
+      await shipButton(page, 'Push').click({ timeout: UI_TIMEOUT });
+
+      const head = gitIn(W2.path, 'rev-parse', 'HEAD');
+      expect(await poll(() => remoteRef(origin, 'ship-flow'), (ref) => ref === head, UI_TIMEOUT)).toBe(head);
+      expect(gitIn(W2.path, 'rev-parse', '--abbrev-ref', 'ship-flow@{upstream}')).toBe('origin/ship-flow');
+      await poll(() => shipButton(page, 'Push').count(), (count) => count === 0, UI_TIMEOUT);
+      expect(await shipButton(page, 'Push').count()).toBe(0);
+      const pushes = gitRunsIn(fx, W2.path).filter((line) => line.startsWith(`${W2.path} push`));
+      expect(pushes).toEqual([`${W2.path} push --set-upstream origin ship-flow`]);
+      // Whatever git ran in the whole launch: no push is forced.
+      const everyPush = readFileSync(fx.gitLog, 'utf8').split('\n').filter((line) => / push( |$)/.test(line));
+      expect(everyPush.length).toBeGreaterThan(0);
+      for (const line of everyPush) expect(line).not.toMatch(/--force|--force-with-lease| -f( |$)| \+/);
+    });
+
+    test('ship AC10 — "Create pull request" opens a dialog into the base with the title of HEAD\'s commit focused; a failing gh shows its message and keeps it open; Create runs gh pr create and shows the pull request', async () => {
+      const { page } = session;
+      const create = shipButton(page, 'Create pull request');
+      expect(await poll(() => create.isDisabled(), (disabled) => !disabled, UI_TIMEOUT)).toBe(false);
+      expect(await panelText(page)).not.toContain('Push the branch first.');
+
+      await create.click({ timeout: UI_TIMEOUT });
+      const dialog = prDialog(page);
+      await dialog.waitFor({ timeout: UI_TIMEOUT });
+      expect(await dialog.innerText()).toContain('into main');
+      const title = dialog.getByRole('textbox', { name: 'Title', exact: true });
+      const description = dialog.getByRole('textbox', { name: 'Description', exact: true });
+      const createButtonOfDialog = dialog.getByRole('button', { name: 'Create', exact: true });
+      expect(await title.inputValue()).toBe('Add the second file');
+      expect(await poll(() => title.evaluate((field) => field === document.activeElement), Boolean, UI_TIMEOUT)).toBe(true);
+      expect(await description.inputValue()).toBe('');
+
+      await title.fill('   ');
+      expect(await createButtonOfDialog.isDisabled()).toBe(true);
+      await title.fill('  Ship the flow  ');
+      await description.fill('Line 1\nLine 2');
+      expect(await createButtonOfDialog.isDisabled()).toBe(false);
+
+      setGh(gh, { createStderr: '  gh: GraphQL: boom\n\n' });
+      await createButtonOfDialog.click({ timeout: UI_TIMEOUT });
+      expect(await waitForDialogLine(dialog, (line) => line === 'Could not create the pull request: gh: GraphQL: boom')).toHaveLength(1);
+      expect(await dialog.isVisible()).toBe(true);
+
+      setGh(gh, { afterCreate: prJson({ title: 'Ship the flow', checks: 'pending' }) });
+      await createButtonOfDialog.click({ timeout: UI_TIMEOUT });
+      await dialog.waitFor({ state: 'hidden', timeout: UI_TIMEOUT });
+
+      const link = page.locator(PANEL).getByRole('link', { name: '#7 Ship the flow', exact: true });
+      await link.waitFor({ timeout: 5_000 });
+      expect(await link.getAttribute('href')).toBe(PR_URL);
+      await waitForText((shown) => shown.includes('Checks pending'));
+      expect(await shipButton(page, 'Create pull request').count()).toBe(0);
+      const creates = ghRuns(gh).filter((run) => run.args[0] === 'pr' && run.args[1] === 'create');
+      const args = ['pr', 'create', '--base', 'main', '--head', 'ship-flow', '--title', 'Ship the flow', '--body', 'Line 1\nLine 2'];
+      expect(creates).toEqual([
+        { cwd: W2.path, prompt: '1', args },
+        { cwd: W2.path, prompt: '1', args },
+      ]);
+    });
+
+    test('ship AC11 — once the pull request is merged, "Delete workspace…" opens the Delete dialog; confirming removes the worktree, the branch and the row, and the session page has no Changes button', async () => {
+      const { page } = session;
+      setGh(gh, { list: prJson({ title: 'Ship the flow', state: 'MERGED', checks: 'passing' }) });
+      await dispatchFocus(page);
+      await waitForText((shown) => /\bMerged\b/.test(shown));
+
+      await shipButton(page, 'Delete workspace…').click({ timeout: UI_TIMEOUT });
+      const dialog = deleteDialog(page, 'Delete ship-flow?');
+      await dialog.waitFor({ timeout: UI_TIMEOUT });
+      await dialog.getByRole('button', { name: 'Delete', exact: true }).click({ timeout: UI_TIMEOUT });
+
+      await poll(() => existsSync(W2.path), (exists) => !exists, UI_TIMEOUT);
+      expect(existsSync(W2.path)).toBe(false);
+      expect(localBranches(ship)).not.toContain('ship-flow');
+      expect(await poll(() => entryTitles(page), (titles) => !titles.includes(W2.path), UI_TIMEOUT)).not.toContain(W2.path);
+      expect(await sidebarLines(page)).not.toContain('Branch ship-flow was kept: it is not merged.');
+      expect(await allSessionLinkIds(page)).not.toContain(W2.id);
+      await poll(() => changesToggle(page).count(), (count) => count === 0, UI_TIMEOUT);
+      expect(await changesToggle(page).count()).toBe(0);
+      expect(await markChangesPanel(page)).toBe(false);
+    });
+
+    test('ship AC9 — a push git refuses (origin has a commit the worktree lacks) shows "Could not push <branch>: …", leaves origin as it was and keeps "Push"', async () => {
+      const { page } = session;
+      const git = (cwd: string, ...args: string[]) => gitIn(cwd, ...args);
+      writeFileSync(join(W3.path, 'one.txt'), 'one\n');
+      git(W3.path, 'add', 'one.txt');
+      git(W3.path, 'commit', '-m', 'one');
+      git(W3.path, 'push', '--quiet', '--set-upstream', 'origin', 'ship-reject');
+      // Someone else pushes to origin/ship-reject, then the worktree commits on its own.
+      const other = join(ship.parent, 'other-clone');
+      git(ship.parent, 'clone', '--quiet', origin, other);
+      git(other, 'switch', '--quiet', 'ship-reject');
+      writeFileSync(join(other, 'theirs.txt'), 'theirs\n');
+      git(other, 'add', 'theirs.txt');
+      git(other, 'commit', '-m', 'theirs');
+      git(other, 'push', '--quiet', 'origin', 'ship-reject');
+      const theirs = remoteRef(origin, 'ship-reject');
+      writeFileSync(join(W3.path, 'two.txt'), 'two\n');
+      git(W3.path, 'add', 'two.txt');
+      git(W3.path, 'commit', '-m', 'two');
+
+      setGh(gh);
+      await openShip(page, W3.id);
+      await shipButton(page, 'Push').click({ timeout: UI_TIMEOUT });
+
+      const text = await waitForText((shown) => /Could not push ship-reject: [\s\S]*rejected/.test(shown));
+      expect(text).toMatch(/Could not push ship-reject: /);
+      expect(remoteRef(origin, 'ship-reject')).toBe(theirs);
+      expect(await shipButton(page, 'Push').count()).toBe(1);
+    });
+
+    test('ship AC12 — the new window.api.workspaces calls refuse an unknown project, a path that is not a linked worktree, a blank message or title, and a detached HEAD with the messages of the spec, run nothing, and reject from another origin', async () => {
+      const { page } = session;
+      await setChangesOpen(page, false);
+      await goHome(page);
+      setGh(gh);
+      const branch = join(ship.parent, 'wt-api');
+      const clean = join(ship.parent, 'wt-api-clean');
+      const detached = join(ship.parent, 'wt-api-detached');
+      gitIn(ship.root, 'worktree', 'add', '--quiet', '-b', 'ship-api', branch, 'main');
+      gitIn(ship.root, 'worktree', 'add', '--quiet', '-b', 'ship-api-clean', clean, 'main');
+      gitIn(ship.root, 'worktree', 'add', '--quiet', '--detach', detached, 'main');
+      writeFileSync(join(branch, 'dirty.txt'), 'dirty\n');
+      const elsewhere = join(ship.parent, 'not-a-worktree');
+      mkdirSync(elsewhere);
+
+      const call = (method: string, args: unknown[]) =>
+        page.evaluate(
+          ([method, args]) =>
+            (window as unknown as { api: { workspaces: Record<string, (...args: unknown[]) => Promise<unknown>> } }).api.workspaces[method as string]!(
+              ...(args as unknown[]),
+            ),
+          [method, args] as const,
+        );
+      const refused = (message: string) => ({ status: 'refused', message });
+      const gitLines = () => readFileSync(fx.gitLog, 'utf8').split('\n').filter(Boolean).length;
+      const headsBefore = [branch, clean, detached].map((path) => gitIn(path, 'rev-parse', 'HEAD'));
+      const originBefore = gitIn(origin, 'for-each-ref');
+      const ghBefore = ghRuns(gh).length;
+      const gitBefore = gitLines();
+
+      const extra: Record<string, unknown[]> = { status: [], commit: ['A message'], push: [], pullRequest: [], createPullRequest: ['A title', 'A body'] };
+      for (const [method, args] of Object.entries(extra)) {
+        expect(await call(method, ['/no/such/project', '/no/such/project/ws', ...args]), `${method}: unknown project`).toEqual(
+          refused('/no/such/project is not a project in Cockpit.'),
+        );
+        expect(await call(method, [ship.root, elsewhere, ...args]), `${method}: not a worktree`).toEqual(refused(`${elsewhere} is not a workspace of ${ship.name}.`));
+        expect(await call(method, [ship.root, ship.root, ...args]), `${method}: main working tree`).toEqual(refused(`${ship.root} is not a workspace of ${ship.name}.`));
+      }
+      expect(await call('commit', [ship.root, branch, '   '])).toEqual(refused('Write a commit message.'));
+      expect(await call('commit', [ship.root, clean, 'A message'])).toEqual(refused('Nothing to commit.'));
+      expect(await call('createPullRequest', [ship.root, clean, '   ', ''])).toEqual(refused('Write a title.'));
+      expect(await call('push', [ship.root, detached])).toEqual(refused('wt-api-detached has no branch.'));
+      expect(await call('createPullRequest', [ship.root, detached, 'A title', ''])).toEqual(refused('wt-api-detached has no branch.'));
+
+      // Nothing ran: no commit, push or pull request, no gh run, the dirty file still uncommitted.
+      expect(ghRuns(gh)).toHaveLength(ghBefore);
+      const ran = readFileSync(fx.gitLog, 'utf8').split('\n').filter(Boolean).slice(gitBefore);
+      expect(ran.filter((line) => ['add', 'commit', 'push'].includes(line.split(' ')[1]!))).toEqual([]);
+      expect([branch, clean, detached].map((path) => gitIn(path, 'rev-parse', 'HEAD'))).toEqual(headsBefore);
+      expect(gitIn(branch, 'status', '--porcelain')).toBe('?? dirty.txt');
+      expect(gitIn(origin, 'for-each-ref')).toBe(originBefore);
+
+      // From another origin the handlers reject.
+      const origins = await session.evaluateInMain<Record<string, string>>(`(async () => {
+        const handlers = require('electron').ipcMain._invokeHandlers;
+        const calls = {
+          'workspaces:status': [${JSON.stringify(ship.root)}, ${JSON.stringify(clean)}],
+          'workspaces:commit': [${JSON.stringify(ship.root)}, ${JSON.stringify(branch)}, 'A message'],
+          'workspaces:push': [${JSON.stringify(ship.root)}, ${JSON.stringify(clean)}],
+          'workspaces:pull-request': [${JSON.stringify(ship.root)}, ${JSON.stringify(clean)}],
+          'workspaces:create-pull-request': [${JSON.stringify(ship.root)}, ${JSON.stringify(clean)}, 'A title', ''],
+        };
+        const results = {};
+        for (const [channel, args] of Object.entries(calls)) {
+          const handler = handlers.get(channel);
+          if (!handler) { results[channel] = 'no handler'; continue; }
+          try {
+            await handler({ senderFrame: { url: 'https://example.com/' }, sender: null }, ...args);
+            results[channel] = 'resolved';
+          } catch {
+            results[channel] = 'rejected';
+          }
+        }
+        return results;
+      })()`);
+      expect(origins).toEqual({
+        'workspaces:status': 'rejected',
+        'workspaces:commit': 'rejected',
+        'workspaces:push': 'rejected',
+        'workspaces:pull-request': 'rejected',
+        'workspaces:create-pull-request': 'rejected',
+      });
+      expect(ghRuns(gh)).toHaveLength(ghBefore);
+      expect(gitIn(branch, 'status', '--porcelain')).toBe('?? dirty.txt');
+      expect(gitIn(origin, 'for-each-ref')).toBe(originBefore);
+    });
+  });
+
   test('logs no error and keeps running', async () => {
     await expectNoErrors(session);
   });
@@ -6717,12 +7319,15 @@ describe('changes sidebar: built app', () => {
 describe('sessions smoke path: dev server', () => {
   let fx: SessionsFixture;
   let open: OpenFixture;
+  let gh: GhFixture;
   let session: Session;
 
   beforeAll(async () => {
     fx = makeSessionsFixture(['claude']);
     open = addOpenFixture(fx);
-    session = await launchDevWith(open.env());
+    // A stub `gh` for the ship section (COCKPIT-38).
+    gh = addGhFixture(fx);
+    session = await launchDevWith({ ...open.env(), ...GIT_APP_ENV });
     await session.page.getByText(versionLabel).waitFor();
   });
 
@@ -6751,6 +7356,7 @@ describe('sessions smoke path: dev server', () => {
   test('workspace sessions smoke path, changes AC16 — a new workspace with Claude Code and a prompt runs the stub in the worktree with the prompt, lists the session under the workspace and stores it, and the Changes sidebar shows a file written in the worktree with its diff', async () => {
     const { page } = session;
     const repo = makeRepo('smoke-agent-ws');
+    const origin = addOrigin(repo);
     try {
       await addRepository(session, repo);
       const id = await createWorkspaceWithAgent(page, repo, { name: 'smoke-agent', agent: 'Claude Code', prompt: 'fix the tests' }, 'Claude Code 1');
@@ -6765,6 +7371,8 @@ describe('sessions smoke path: dev server', () => {
       expect(stored.find((entry) => entry.id === id)).toMatchObject({ name: 'Claude Code 1', directory: path, project: repo.root });
       // Changes sidebar (COCKPIT-34 AC16): a file written in the worktree shows with its diff.
       await expectChangesShowNewFile(page, path);
+      // Ship section (COCKPIT-38): the stub's pull request shows, then a commit and a push reach origin.
+      await expectShipSmoke(page, gh, path, origin, 'smoke-agent');
     } finally {
       rmSync(repo.parent, { recursive: true, force: true });
     }
@@ -6894,13 +7502,18 @@ describe('packaged app sessions after a restart', () => {
   let dataDir: string;
 
   let repo: TempRepo;
+  let origin: string;
   let open: OpenFixture;
+  let gh: GhFixture;
 
   beforeEach(() => {
     fx = makeSessionsFixture(['claude', 'codex']);
     open = addOpenFixture(fx);
+    // A stub `gh` for the ship section (COCKPIT-38).
+    gh = addGhFixture(fx);
     dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
     repo = makeRepo('packaged-agent-ws');
+    origin = addOrigin(repo);
   });
 
   afterEach(() => {
@@ -6909,8 +7522,8 @@ describe('packaged app sessions after a restart', () => {
     rmSync(repo.parent, { recursive: true, force: true });
   });
 
-  test('AC9, changes AC16 — sessions of a previous launch are listed as "Ended", newest first, open as ended and leave state.json and their folders alone (the first launch also runs the Changes sidebar and open-workspace smoke paths)', async () => {
-    const first = await launchPackagedWith(open.env(), dataDir);
+  test('AC9, changes AC16 — sessions of a previous launch are listed as "Ended", newest first, open as ended and leave state.json and their folders alone (the first launch also runs the Changes sidebar, ship section and open-workspace smoke paths)', async () => {
+    const first = await launchPackagedWith({ ...open.env(), ...GIT_APP_ENV }, dataDir);
     try {
       await first.page.getByText(versionLabel).waitFor();
       // The packaged app's sessions smoke path: the stub runs in a new folder
@@ -6949,6 +7562,8 @@ describe('packaged app sessions after a restart', () => {
 
       // Changes sidebar smoke path (COCKPIT-34 AC16): a file written in the worktree shows with its diff.
       await expectChangesShowNewFile(first.page, wsPath);
+      // Ship section smoke path (COCKPIT-38): the stub's pull request shows, then a commit and a push reach origin.
+      await expectShipSmoke(first.page, gh, wsPath, origin, 'smoke-agent');
       await expectNoErrors(first);
     } finally {
       await first.close();
