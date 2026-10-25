@@ -1,4 +1,5 @@
 import { createFileRoute, rootRouteId, useLoaderData } from '@tanstack/react-router';
+import { ChangesToggle, workspaceOf } from '@/components/changes-panel';
 import { getSessionTerminal } from '@/components/live-terminals';
 import { PageHeader } from '@/components/page-header';
 import { Terminal } from '@/components/terminal';
@@ -9,7 +10,7 @@ export const Route = createFileRoute('/sessions/$sessionId')({
 
 function SessionPage() {
   const { sessionId } = Route.useParams();
-  const { sessions } = useLoaderData({ from: rootRouteId });
+  const { sessions, projects } = useLoaderData({ from: rootRouteId });
   const session = sessions.find(({ id }) => id === sessionId);
   // The store holds the terminals of this page's lifetime only: any other
   // session, a previous launch's or one that a reload ended, has ended.
@@ -17,7 +18,7 @@ function SessionPage() {
 
   return (
     <>
-      <PageHeader title={session?.name ?? 'Session'} />
+      <PageHeader title={session?.name ?? 'Session'}>{workspaceOf(session, projects) && <ChangesToggle />}</PageHeader>
       {entry ? (
         <div className="min-h-0 flex-1">
           <Terminal live={entry} focused />

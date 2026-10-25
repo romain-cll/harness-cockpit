@@ -8,6 +8,9 @@ function subscribe<Args extends unknown[]>(channel: string, listener: (...args: 
   return () => void ipcRenderer.removeListener(channel, handler);
 }
 
+// The newest `workspaces.watch`: the main process keeps one watcher per window.
+let latestWatch = 0;
+
 const api: Api = {
   getVersion: () => ipcRenderer.invoke('get-version'),
   pty: {
@@ -27,6 +30,18 @@ const api: Api = {
     branches: (project) => ipcRenderer.invoke('workspaces:branches', project),
     create: (project, name, base) => ipcRenderer.invoke('workspaces:create', project, name, base),
     remove: (project, path, options) => ipcRenderer.invoke('workspaces:remove', project, path, options),
+    changes: (project, path) => ipcRenderer.invoke('workspaces:changes', project, path),
+    diff: (project, path, file) => ipcRenderer.invoke('workspaces:diff', project, path, file),
+    watch: async (project, path, listener) => {
+      const watch = ++latestWatch;
+      const unsubscribe = subscribe('workspaces:changed', listener);
+      await ipcRenderer.invoke('workspaces:watch', project, path);
+      return () => {
+        unsubscribe();
+        // A stop that comes after a newer watch began must not end that one.
+        if (watch === latestWatch) ipcRenderer.send('workspaces:unwatch');
+      };
+    },
   },
   sessions: {
     harnesses: () => ipcRenderer.invoke('sessions:harnesses'),

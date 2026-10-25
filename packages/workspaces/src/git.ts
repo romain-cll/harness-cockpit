@@ -13,6 +13,7 @@ export type WorkspaceErrorCode =
   | 'DIRTY_WORKTREE'
   | 'BRANCH_NOT_MERGED'
   | 'INVALID_CONFIG'
+  | 'NO_BASE'
   | 'GIT_MISSING'
   | 'GIT_TOO_OLD'
   | 'GIT_FAILED';
@@ -31,15 +32,17 @@ export class WorkspaceError extends Error {
 export interface GitOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  /** Overrides the default stdout buffer of `execFile`. */
+  maxBuffer?: number;
 }
 
 /**
  * Runs git without a shell and resolves to its stdout. Every failure is `GIT_FAILED`, a missing
  * executable included: with a `cwd`, ENOENT also means the folder is missing.
  */
-export async function git(args: string[], { cwd, env }: GitOptions = {}): Promise<string> {
+export async function git(args: string[], { cwd, env, maxBuffer }: GitOptions = {}): Promise<string> {
   try {
-    const { stdout } = await execFileAsync('git', args, { cwd, env });
+    const { stdout } = await execFileAsync('git', args, { cwd, env, ...(maxBuffer === undefined ? {} : { maxBuffer }) });
     return stdout;
   } catch (error) {
     const failure = error as NodeJS.ErrnoException & { stderr?: string };
