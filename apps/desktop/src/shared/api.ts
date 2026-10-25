@@ -89,6 +89,32 @@ export type ChangesResult = { status: 'listed'; base: string; files: ChangedFile
 
 export type DiffResult = { status: 'shown'; diff: FileDiff } | Refused;
 
+/** The pull request of a workspace's branch; the same shape as `@cockpit/github` gives. */
+export interface PullRequest {
+  number: number;
+  title: string;
+  url: string;
+  state: 'open' | 'closed' | 'merged';
+  checks: 'none' | 'pending' | 'passing' | 'failing' | 'unknown';
+}
+
+/**
+ * Where a workspace's branch stands: `uncommitted` changes to commit, `unpushed` commits to push.
+ * `subject` is the first line of HEAD's commit.
+ */
+export type BranchStatusResult =
+  | { status: 'read'; branch: string | null; upstream: string | null; uncommitted: boolean; unpushed: boolean; subject: string }
+  | Refused;
+
+export type CommitResult = { status: 'committed' } | Refused;
+
+export type PushResult = { status: 'pushed' } | Refused;
+
+/** `pullRequest` is `null` when the branch has none; `refused` carries why `gh` could not tell. */
+export type PullRequestResult = { status: 'read'; pullRequest: PullRequest | null } | Refused;
+
+export type CreatePullRequestResult = { status: 'created'; pullRequest: PullRequest } | Refused;
+
 /**
  * `started`: the commands run in the pty `ptyId`, which the calling window owns. `none`: the config
  * holds no command of that kind.
@@ -199,6 +225,17 @@ export interface Api {
       which: 'setup' | 'teardown',
       size: { cols: number; rows: number },
     ): Promise<RunCommandsResult>;
+
+    /** Where the workspace's branch stands against its upstream. Refused like `changes`. */
+    status(project: string, path: string): Promise<BranchStatusResult>;
+    /** Commits every change of the worktree (`git add -A`, `git commit`) with the message, trimmed. */
+    commit(project: string, path: string, message: string): Promise<CommitResult>;
+    /** Runs `git push --set-upstream origin <branch>`, never forced. */
+    push(project: string, path: string): Promise<PushResult>;
+    /** The newest pull request of the branch, read with `gh`; refused with why when `gh` cannot tell. */
+    pullRequest(project: string, path: string): Promise<PullRequestResult>;
+    /** Opens a pull request of the branch into the workspace's base with `gh pr create`. */
+    createPullRequest(project: string, path: string, title: string, body: string): Promise<CreatePullRequestResult>;
   };
   /** Agent CLIs, run in a folder of their own outside any project or in a workspace of a project. */
   sessions: {

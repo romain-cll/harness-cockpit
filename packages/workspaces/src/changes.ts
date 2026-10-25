@@ -155,6 +155,57 @@ export async function fileDiff(worktree: string, file: ChangedFile, { env }: Git
   return { kind: 'text', patch };
 }
 
+export interface BranchStatus {
+  /** The short branch name, `null` on a detached HEAD. */
+  branch: string | null;
+  /** The upstream as `origin/feat`, `null` when the branch has none. */
+  upstream: string | null;
+  /** Whether the worktree has a change to commit: edits, deletions, untracked files not ignored. */
+  uncommitted: boolean;
+  /** Whether HEAD has commits the upstream lacks, or, without an upstream, commits beyond the merge-base with the base. */
+  unpushed: boolean;
+}
+
+/** The state of a worktree's branch against its upstream; `NO_BASE` when it has no upstream and no base either. */
+export async function branchStatus(worktree: string, { env }: GitEnv = {}): Promise<BranchStatus> {
+  await checkGit(env);
+  const branch = await output(['symbolic-ref', '--quiet', '--short', 'HEAD'], worktree, env);
+  const upstream = await output(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'], worktree, env);
+  const since = upstream ?? (await resolveBase(worktree, env)).mergeBase;
+  const [status, ahead] = await Promise.all([
+    git(['status', '--porcelain'], { cwd: worktree, env }),
+    git(['rev-list', '--count', `${since}..HEAD`], { cwd: worktree, env }),
+  ]);
+  return { branch, upstream, uncommitted: status.trim() !== '', unpushed: Number(ahead) > 0 };
+}
+
+/** The subject (first line) of HEAD's commit. */
+export async function headSubject(worktree: string, { env }: GitEnv = {}): Promise<string> {
+  await checkGit(env);
+  return (await git(['log', '-1', '--format=%s'], { cwd: worktree, env })).trim();
+}
+
+/** Commits every change of the worktree in one commit: `git add -A`, then `git commit -m <message>`. */
+export async function commitAll(worktree: string, message: string, { env }: GitEnv = {}): Promise<void> {
+  await checkGit(env);
+  await git(['add', '-A'], { cwd: worktree, env });
+  await git(['commit', '-m', message], { cwd: worktree, env });
+}
+
+/**
+ * Pushes the worktree's branch with `git push --set-upstream origin <branch>`, never forced. A
+ * detached HEAD is `GIT_FAILED`; so is a refusal by the remote, with git's message.
+ */
+export async function pushBranch(worktree: string, { env }: GitEnv = {}): Promise<void> {
+  await checkGit(env);
+  const branch = await output(['symbolic-ref', '--quiet', '--short', 'HEAD'], worktree, env);
+  if (branch === null) throw new WorkspaceError('GIT_FAILED', `${worktree} has no branch`);
+  await git(['push', '--set-upstream', 'origin', branch], {
+    cwd: worktree,
+    env: { ...(env ?? process.env), GIT_TERMINAL_PROMPT: '0' },
+  });
+}
+
 /**
  * Resolves once the files under `path` are being watched (recursive `fs.watch`, FSEvents-backed on
  * macOS), then calls `onChange` once they stopped changing for 200 ms. `onError` gets a watcher
