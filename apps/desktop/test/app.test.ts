@@ -6521,6 +6521,21 @@ async function expectShipSmoke(page: Page, gh: GhFixture, worktree: string, orig
   await shipButton(page, 'Push').click({ timeout: UI_TIMEOUT });
   const head = gitIn(worktree, 'rev-parse', 'HEAD');
   expect(await poll(() => remoteRef(origin, branch), (ref) => ref === head, UI_TIMEOUT)).toBe(head);
+  // `origin` holds the commit before the app's `git push --set-upstream` has finished writing in the
+  // repository's `.git` (the remote-tracking ref, its reflog, the upstream in `.git/config`). Return
+  // only once the push is done locally, so a caller removing the repository never races it.
+  const pushedLocally = () => {
+    try {
+      return (
+        gitIn(worktree, 'rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`) === head &&
+        gitIn(worktree, 'config', '--get', `branch.${branch}.remote`) === 'origin' &&
+        gitIn(worktree, 'config', '--get', `branch.${branch}.merge`) === `refs/heads/${branch}`
+      );
+    } catch {
+      return false;
+    }
+  };
+  expect(await poll(pushedLocally, Boolean, UI_TIMEOUT), 'the push finished locally: tracking ref and upstream set').toBe(true);
 }
 
 describe('changes sidebar: built app', () => {

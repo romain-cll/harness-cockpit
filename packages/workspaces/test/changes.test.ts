@@ -501,13 +501,22 @@ describe('watchWorktree on the git metadata', () => {
 
   test('AC13 — branchStatus and listChanges on a settled worktree call nothing, even with a stale index, and a commit still does', async () => {
     const { worktree } = await makeShippableWorkspace();
-    // A tracked file with the same content and another mtime: a plain `git status` would refresh the
-    // index and write it, which the watcher on the gitdir would see again and again.
-    const stale = join(worktree, 'a.txt');
-    await writeFile(stale, await readFile(stale));
-    await utimes(stale, new Date(1_600_000_000_000), new Date(1_600_000_000_000));
     const { changed, close } = await watched(worktree);
     try {
+      // A tracked file with the same content and another mtime: a plain `git status` would refresh the
+      // index and write it, which the watcher on the gitdir would see again and again. The write is
+      // made under the watch and waited for until it stops reporting, so a late event of it (slow
+      // runner) cannot land in the window below: only events caused by the reads could fail it.
+      const stale = join(worktree, 'a.txt');
+      await writeFile(stale, await readFile(stale));
+      await utimes(stale, new Date(1_600_000_000_000), new Date(1_600_000_000_000));
+      await vi.waitFor(() => expect(changed).toHaveBeenCalled(), { timeout: 5_000 });
+      for (let calls = -1; calls !== changed.mock.calls.length; ) {
+        calls = changed.mock.calls.length;
+        await new Promise((resolve) => setTimeout(resolve, 600));
+      }
+      changed.mockClear();
+
       for (let round = 0; round < 3; round++) {
         await branchStatus(worktree, { env: testEnv });
         await listChanges(worktree, { env: testEnv });
