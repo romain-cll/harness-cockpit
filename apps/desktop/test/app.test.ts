@@ -7219,7 +7219,8 @@ describe('changes sidebar: built app', () => {
 
       await poll(() => existsSync(W2.path), (exists) => !exists, UI_TIMEOUT);
       expect(existsSync(W2.path)).toBe(false);
-      expect(localBranches(ship)).not.toContain('ship-flow');
+      // The app deletes the branch in a git call after the folder is gone.
+      expect(await poll(() => localBranches(ship), (branches) => !branches.includes('ship-flow'), UI_TIMEOUT)).not.toContain('ship-flow');
       expect(await poll(() => entryTitles(page), (titles) => !titles.includes(W2.path), UI_TIMEOUT)).not.toContain(W2.path);
       expect(await sidebarLines(page)).not.toContain('Branch ship-flow was kept: it is not merged.');
       expect(await allSessionLinkIds(page)).not.toContain(W2.id);
