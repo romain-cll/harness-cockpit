@@ -12,6 +12,7 @@ export type WorkspaceErrorCode =
   | 'INVALID_BRANCH_NAME'
   | 'DIRTY_WORKTREE'
   | 'BRANCH_NOT_MERGED'
+  | 'INVALID_CONFIG'
   | 'GIT_MISSING'
   | 'GIT_TOO_OLD'
   | 'GIT_FAILED';
