@@ -46,6 +46,12 @@ const api: Api = {
       };
     },
     runCommands: (project, path, which, size) => ipcRenderer.invoke('workspaces:run-commands', project, path, which, size),
+    status: (project, path) => ipcRenderer.invoke('workspaces:status', project, path),
+    commit: (project, path, message) => ipcRenderer.invoke('workspaces:commit', project, path, message),
+    push: (project, path) => ipcRenderer.invoke('workspaces:push', project, path),
+    pullRequest: (project, path) => ipcRenderer.invoke('workspaces:pull-request', project, path),
+    createPullRequest: (project, path, title, body) =>
+      ipcRenderer.invoke('workspaces:create-pull-request', project, path, title, body),
   },
   sessions: {
     harnesses: () => ipcRenderer.invoke('sessions:harnesses'),

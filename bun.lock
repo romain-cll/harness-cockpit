@@ -27,6 +27,7 @@
       "devDependencies": {
         "@base-ui/react": "^1.9.0",
         "@cockpit/control": "workspace:*",
+        "@cockpit/github": "workspace:*",
         "@cockpit/harnesses": "workspace:*",
         "@cockpit/launchers": "workspace:*",
         "@cockpit/pty": "workspace:*",
@@ -60,6 +61,14 @@
     },
     "packages/control": {
       "name": "@cockpit/control",
+      "version": "0.0.0",
+      "devDependencies": {
+        "@types/node": "^24.19.2",
+        "vitest": "^5.0.5",
+      },
+    },
+    "packages/github": {
+      "name": "@cockpit/github",
       "version": "0.0.0",
       "devDependencies": {
         "@types/node": "^24.19.2",
@@ -186,6 +195,8 @@
     "@cockpit/control": ["@cockpit/control@workspace:packages/control"],
 
     "@cockpit/desktop": ["@cockpit/desktop@workspace:apps/desktop"],
+
+    "@cockpit/github": ["@cockpit/github@workspace:packages/github"],
 
     "@cockpit/harnesses": ["@cockpit/harnesses@workspace:packages/harnesses"],
 

@@ -14,6 +14,7 @@ const read = (...parts: string[]) => readFileSync(join(repoRoot, ...parts), 'utf
 const workspaces = [
   'apps/desktop',
   'packages/control',
+  'packages/github',
   'packages/harnesses',
   'packages/launchers',
   'packages/pty',

@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { startControlServer } from '@cockpit/control';
+import { createPullRequest, findPullRequest, GitHubError } from '@cockpit/github';
 import { detectHarnesses, harnesses, type DetectedHarness } from '@cockpit/harnesses';
 import { apps, defaultApplicationDirs, detectApps, LaunchError, openIn, reveal, type App } from '@cockpit/launchers';
 import { createPtyClient, type PtySpawnOptions } from '@cockpit/pty';
@@ -20,13 +21,17 @@ import {
   type State,
 } from '@cockpit/state';
 import {
+  branchStatus,
   commandsInvocation,
+  commitAll,
   createWorktree,
   fileDiff,
   findRepositoryRoot,
+  headSubject,
   listBranches,
   listChanges,
   listWorktrees,
+  pushBranch,
   readWorkspaceConfig,
   removeWorktree,
   watchWorktree,
@@ -50,13 +55,18 @@ import type {
   AddProjectResult,
   AppsResult,
   BranchesResult,
+  BranchStatusResult,
   ChangedFile,
   ChangesResult,
+  CommitResult,
+  CreatePullRequestResult,
   CreateWorkspaceResult,
   DiffResult,
   Project,
   OpenWorkspaceResult,
   PtySpawnRequest,
+  PullRequestResult,
+  PushResult,
   Refused,
   RemoveWorkspaceResult,
   RunCommandsResult,
@@ -501,6 +511,86 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
     }),
   );
 
+  ipcMain.handle('workspaces:status', (event, project: string, path: string): Promise<BranchStatusResult> =>
+    forProject<BranchStatusResult>(event, 'workspaces:status', project, async () => {
+      const workspace = await findWorkspace({ project, path });
+      if ('status' in workspace) return workspace;
+      const env = await shellEnv;
+      return { status: 'read', ...(await branchStatus(path, { env })), subject: await headSubject(path, { env }) };
+    }),
+  );
+
+  ipcMain.handle('workspaces:commit', (event, project: string, path: string, message: string): Promise<CommitResult> =>
+    forProject<CommitResult>(
+      event,
+      'workspaces:commit',
+      project,
+      async () => {
+        const workspace = await findWorkspace({ project, path });
+        if ('status' in workspace) return workspace;
+        if (message.trim() === '') return { status: 'refused', message: 'Write a commit message.' };
+        const env = await shellEnv;
+        if (!(await branchStatus(path, { env })).uncommitted) return { status: 'refused', message: 'Nothing to commit.' };
+        await commitAll(path, message.trim(), { env });
+        return { status: 'committed' };
+      },
+      (error) => (error.code === 'GIT_FAILED' ? { status: 'refused', message: `Could not commit: ${error.message}` } : undefined),
+    ),
+  );
+
+  ipcMain.handle('workspaces:push', (event, project: string, path: string): Promise<PushResult> =>
+    forProject<PushResult>(event, 'workspaces:push', project, async () => {
+      const workspace = await findWorkspace({ project, path });
+      if ('status' in workspace) return workspace;
+      if (workspace.branch === null) return { status: 'refused', message: `${workspaceName(workspace)} has no branch.` };
+      try {
+        await pushBranch(path, { env: await shellEnv });
+      } catch (error) {
+        if (!(error instanceof WorkspaceError) || error.code !== 'GIT_FAILED') throw error;
+        return { status: 'refused', message: `Could not push ${workspace.branch}: ${error.message}` };
+      }
+      return { status: 'pushed' };
+    }),
+  );
+
+  ipcMain.handle('workspaces:pull-request', (event, project: string, path: string): Promise<PullRequestResult> =>
+    forProject<PullRequestResult>(event, 'workspaces:pull-request', project, async () => {
+      const workspace = await findWorkspace({ project, path });
+      if ('status' in workspace) return workspace;
+      if (workspace.branch === null) return { status: 'read', pullRequest: null };
+      try {
+        return { status: 'read', pullRequest: await findPullRequest(path, workspace.branch, { env: await shellEnv }) };
+      } catch (error) {
+        if (!(error instanceof GitHubError)) throw error;
+        return { status: 'refused', message: describeReadFailure(error) };
+      }
+    }),
+  );
+
+  ipcMain.handle(
+    'workspaces:create-pull-request',
+    (event, project: string, path: string, title: string, body: string): Promise<CreatePullRequestResult> =>
+      forProject<CreatePullRequestResult>(event, 'workspaces:create-pull-request', project, async () => {
+        const workspace = await findWorkspace({ project, path });
+        if ('status' in workspace) return workspace;
+        if (title.trim() === '') return { status: 'refused', message: 'Write a title.' };
+        if (workspace.branch === null) return { status: 'refused', message: `${workspaceName(workspace)} has no branch.` };
+        const env = await shellEnv;
+        const { base } = await listChanges(path, { env });
+        try {
+          const pullRequest = await createPullRequest(
+            path,
+            { base: base.replace(/^origin\//, ''), head: workspace.branch, title: title.trim(), body },
+            { env },
+          );
+          return { status: 'created', pullRequest };
+        } catch (error) {
+          if (!(error instanceof GitHubError)) throw error;
+          return { status: 'refused', message: `Could not create the pull request: ${error.message}` };
+        }
+      }),
+  );
+
   // The worktree each window's page watches, at most one per window. A request is checked against
   // the state and git before its watcher starts: `requests` counts what the window asked, so that a
   // check that returns after an unwatch, a newer watch or a navigation starts nothing.
@@ -532,6 +622,7 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
           if (!contents.isDestroyed()) contents.send('workspaces:changed');
         },
         () => void unwatch(contents),
+        { env: await shellEnv },
       );
       // The watcher takes a moment to start: the window may have asked for something else since.
       if (requests.get(contents) === request && !contents.isDestroyed()) watchers.set(contents, watcher);
@@ -649,6 +740,13 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
       }
     },
   );
+}
+
+// Why `gh` could not read a pull request, as shown in the Changes sidebar.
+function describeReadFailure(error: GitHubError): string {
+  if (error.code === 'GH_MISSING') return 'The GitHub CLI (gh) is not installed.';
+  if (error.code === 'GH_UNAUTHENTICATED') return 'gh is not logged in. Run gh auth login in a terminal.';
+  return `Could not read the pull request: ${error.message}`;
 }
 
 // What the user calls a workspace: its branch, or its folder name when detached.
