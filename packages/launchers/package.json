@@ -1,0 +1,19 @@
+{
+  "name": "@cockpit/launchers",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Catalogue and detection of the editors and terminal apps Cockpit can open a workspace in",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "oxlint"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "vitest": "^5.0.5"
+  }
+}

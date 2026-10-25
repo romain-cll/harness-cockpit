@@ -15,6 +15,7 @@ const workspaces = [
   'apps/desktop',
   'packages/control',
   'packages/harnesses',
+  'packages/launchers',
   'packages/pty',
   'packages/shell-env',
   'packages/state',

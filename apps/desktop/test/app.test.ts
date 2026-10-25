@@ -4120,6 +4120,150 @@ const startApi = (page: Page, options: unknown) =>
     options,
   );
 
+// --- Open a workspace in an editor, a terminal or the Finder (COCKPIT-33) -----
+
+interface OpenFixture {
+  /** The folder `COCKPIT_TEST_APPLICATIONS_DIR` points at: it holds the fake bundles. */
+  apps: string;
+  /** The file the stub `open` appends one line to per run: its arguments, tab-separated. */
+  log: string;
+  /** The folder whose `code` and `stderr` files set how the stub `open` ends. */
+  control: string;
+  /** The launch environment: the fixture's, plus the applications folder. */
+  env(): NodeJS.ProcessEnv;
+}
+
+const OPEN_BUNDLES = ['Visual Studio Code.app', 'Cursor.app', 'Terminal.app', 'Ghostty.app'];
+
+// A stub `open` first on the fake login shell's `PATH` (the real one would open real apps on
+// the developer's screen) and an applications folder of empty fake bundles: Zed, iTerm2 and
+// Warp are not detected.
+function addOpenFixture(fx: SessionsFixture): OpenFixture {
+  const apps = join(fx.root, 'Applications');
+  mkdirSync(apps);
+  for (const bundle of OPEN_BUNDLES) mkdirSync(join(apps, bundle));
+  const log = join(fx.root, 'open.log');
+  const control = join(fx.root, 'open-control');
+  mkdirSync(control);
+  const stub = join(fx.bin, 'open');
+  writeFileSync(
+    stub,
+    `#!/bin/sh
+printf '%s\\t' "$@" >> '${log}'
+echo >> '${log}'
+[ -s '${control}/stderr' ] && cat '${control}/stderr' >&2
+[ -e '${control}/code' ] && exit "$(cat '${control}/code')"
+exit 0
+`,
+  );
+  chmodSync(stub, 0o755);
+  // macOS scans a new executable the first time it runs; the run is not counted.
+  execFileSync(stub, ['--warmup']);
+  writeFileSync(log, '');
+  return { apps, log, control, env: () => ({ ...fx.env(), COCKPIT_TEST_APPLICATIONS_DIR: apps }) };
+}
+
+// The runs of the stub `open`, one array of arguments each.
+const openRuns = (open: OpenFixture): string[][] =>
+  readFileSync(open.log, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => line.split('\t').slice(0, -1));
+
+const waitForOpenRuns = (open: OpenFixture, count: number) =>
+  poll(() => openRuns(open), (runs) => runs.length >= count, UI_TIMEOUT);
+
+// How the next runs of the stub `open` end: exit code and stderr (none for a success).
+function setOpenOutcome(open: OpenFixture, { code, stderr }: { code?: number; stderr?: string } = {}) {
+  rmSync(join(open.control, 'code'), { force: true });
+  rmSync(join(open.control, 'stderr'), { force: true });
+  if (code !== undefined) writeFileSync(join(open.control, 'code'), String(code));
+  if (stderr !== undefined) writeFileSync(join(open.control, 'stderr'), stderr);
+}
+
+const rememberedApps = (dataDir: string) => {
+  const { editor, terminal } = JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')) as { editor?: unknown; terminal?: unknown };
+  return { editor, terminal };
+};
+
+// The text of the items of the menu that is open, trimmed. The first menu is the "…" menu; a
+// submenu opened from it is the last.
+const trimmed = (texts: string[]) => texts.map((text) => text.trim());
+const topLevelItems = async (page: Page) => trimmed(await page.getByRole('menu').first().getByRole('menuitem').allInnerTexts());
+
+// Opens the "…" menu of the workspace at `path` and waits until the items above "Delete workspace…"
+// are exactly `expected` (in any order), "Delete workspace…" being last.
+async function openWorkspaceMenu(page: Page, path: string, expected: string[]) {
+  await openMenu(page, path);
+  const wanted = [...expected].sort();
+  const shown = (items: string[]) => items.at(-1) === 'Delete workspace…' && JSON.stringify(items.slice(0, -1).sort()) === JSON.stringify(wanted);
+  const items = await poll(() => topLevelItems(page), shown, UI_TIMEOUT);
+  expect(items.at(-1), 'the app items sit above "Delete workspace…"').toBe('Delete workspace…');
+  expect(items.slice(0, -1).sort()).toEqual(wanted);
+}
+
+// Opens a submenu of the "…" menu (hover, then a click when hover did not open it) and returns its items.
+// A submenu still open from before is closed first (one Escape closes only the submenu): with hover
+// opening, Base UI leaves the parent popup at `pointer-events: none` until the next real mouse move,
+// and a stale submenu would pass for the requested one.
+async function openSubmenu(page: Page, trigger: 'Open in editor' | 'Open in terminal') {
+  const menus = page.getByRole('menu');
+  if ((await menus.count()) > 1) {
+    await page.keyboard.press('Escape');
+    await poll(() => menus.count(), (count) => count === 1, UI_TIMEOUT);
+  }
+  const item = page.getByRole('menuitem', { name: trigger, exact: true });
+  await item.hover({ timeout: UI_TIMEOUT });
+  if ((await poll(() => menus.count(), (count) => count >= 2, 2_000)) < 2) {
+    await item.click({ timeout: UI_TIMEOUT });
+    await poll(() => menus.count(), (count) => count >= 2, UI_TIMEOUT);
+  }
+  return menus.last().getByRole('menuitem');
+}
+
+const submenuTexts = async (page: Page, trigger: 'Open in editor' | 'Open in terminal') =>
+  trimmed(await (await openSubmenu(page, trigger)).allInnerTexts());
+
+async function pickInSubmenu(page: Page, trigger: 'Open in editor' | 'Open in terminal', app: string) {
+  const items = await openSubmenu(page, trigger);
+  await items.filter({ hasText: new RegExp(`^\\s*${escapeRegExp(app)}\\s*$`) }).first().click({ timeout: UI_TIMEOUT });
+}
+
+// Escape until no menu is open (a submenu takes one Escape of its own).
+async function closeMenus(page: Page) {
+  const menus = page.getByRole('menu');
+  for (let attempt = 0; attempt < 4 && (await menus.count()) > 0; attempt++) {
+    await page.keyboard.press('Escape');
+    await poll(() => menus.count(), (count) => count === 0, 500);
+  }
+  expect(await menus.count()).toBe(0);
+}
+
+const pickTopItem = (page: Page, name: string) => page.getByRole('menuitem', { name, exact: true }).click({ timeout: UI_TIMEOUT });
+
+// The whole menu of a workspace when every fake bundle is there and nothing is remembered.
+const FIRST_MENU = ['Open in Visual Studio Code', 'Open in Terminal', 'Reveal in Finder', 'Open in editor', 'Open in terminal'];
+
+const workspacesApi = (page: Page, call: 'reveal' | 'open', args: unknown[]) =>
+  page.evaluate(
+    ([call, args]) =>
+      (window as unknown as { api: { workspaces: Record<string, (...args: unknown[]) => Promise<unknown>> } }).api.workspaces[call]!(...args),
+    [call, args] as const,
+  );
+
+// Creates a workspace without an agent through the dialog and waits until it is listed.
+async function createPlainWorkspace(session: Session, repo: TempRepo, name: string): Promise<string> {
+  const { page } = session;
+  const dialog = await openNewWorkspaceDialog(page, repo);
+  await fillNewWorkspace(page, dialog, { name });
+  await createButton(dialog).click({ timeout: UI_TIMEOUT });
+  await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
+  const path = worktreePath(session, repo, name);
+  await poll(() => entryTitles(page), (titles) => titles.includes(path), UI_TIMEOUT);
+  expect(await entryTitles(page)).toContain(path);
+  return path;
+}
+
 // The full block runs in the built app only (see the split rule in AGENTS.md).
 describe('sessions: built app', () => {
   let fx: SessionsFixture;
@@ -4134,6 +4278,8 @@ describe('sessions: built app', () => {
 
   // The repository the workspace tests (COCKPIT-28) work in.
   let repo: TempRepo;
+  // The stub `open` and the applications folder of the open workspace tests (COCKPIT-33).
+  let open: OpenFixture;
   // The workspaces they create, and what runs in them.
   const ws = {
     fix: { path: '', id: '', pid: 0 },
@@ -4144,9 +4290,11 @@ describe('sessions: built app', () => {
   beforeAll(async () => {
     // The stubs log every run, and their `--version` sleeps 1 s (workspace sessions AC13, AC14).
     fx = makeSessionsFixture(['claude', 'codex'], { log: true, slowVersion: true });
+    // A stub `open` and fake editor and terminal bundles (open workspace, COCKPIT-33).
+    open = addOpenFixture(fx);
     repo = makeRepo('agent-ws');
     // The app itself is launched with the three control variables set, as when it runs from a session's terminal.
-    session = await launchBuiltWith({ ...fx.env(), ...INHERITED_CONTROL_ENV });
+    session = await launchBuiltWith({ ...open.env(), ...INHERITED_CONTROL_ENV });
     await session.page.getByText(versionLabel).waitFor();
   });
 
@@ -4885,6 +5033,273 @@ describe('sessions: built app', () => {
     expect(sessionsInState(session.dataDir)).toEqual(sessionsBefore);
   });
 
+  // --- Open a workspace in an editor, a terminal or the Finder (COCKPIT-33). They run in
+  // order on this launch, with the repository added above and a workspace of their own. The
+  // fake bundles are Visual Studio Code, Cursor, Terminal and Ghostty.
+
+  const launcher = { path: '' };
+  const bundle = (name: string) => join(open.apps, `${name}.app`);
+  const restoreBundles = () => {
+    for (const name of OPEN_BUNDLES) mkdirSync(join(open.apps, name), { recursive: true });
+  };
+  const messagesShown = async (page: Page) =>
+    (await sidebarLines(page)).filter((line) => /^Could not (open|reveal) |^Cockpit could not save its data/.test(line));
+
+  test('open workspace AC1 — the workspace menu lists, above "Delete workspace…", the editor and the terminal shown, "Reveal in Finder" and the two submenus of the detected apps only; opening it runs nothing', async () => {
+    const { page } = session;
+    launcher.path = await createPlainWorkspace(session, repo, 'open-in');
+    const stateBefore = stateSnapshot(session.dataDir);
+
+    // Nothing remembered: the first detected editor and terminal in catalogue order are shown.
+    await openWorkspaceMenu(page, launcher.path, FIRST_MENU);
+    expect(await submenuTexts(page, 'Open in editor')).toEqual(['Visual Studio Code', 'Cursor']);
+    expect(await submenuTexts(page, 'Open in terminal')).toEqual(['Terminal', 'Ghostty']);
+    for (const item of await page.getByRole('menu').last().getByRole('menuitem').all()) expect(await item.isDisabled()).toBe(false);
+
+    expect(openRuns(open)).toEqual([]);
+    expect(stateSnapshot(session.dataDir)).toEqual(stateBefore);
+    expect(rememberedApps(session.dataDir)).toEqual({ editor: undefined, terminal: undefined });
+  });
+
+  test('open workspace AC3 — "Reveal in Finder" runs open -R <worktree path>', async () => {
+    const { page } = session;
+    await openWorkspaceMenu(page, launcher.path, FIRST_MENU);
+    await pickTopItem(page, 'Reveal in Finder');
+
+    expect(await waitForOpenRuns(open, 1)).toEqual([['-R', launcher.path]]);
+    await sleep(300);
+    expect(openRuns(open)).toEqual([['-R', launcher.path]]);
+    expect(await messagesShown(page)).toEqual([]);
+  });
+
+  test('open workspace AC4, AC5 — "Open in <name>" and the submenu items run open -a <bundle path> <worktree path>; an app opened with nothing remembered is remembered', async () => {
+    const { page } = session;
+    await openWorkspaceMenu(page, launcher.path, FIRST_MENU);
+    await pickTopItem(page, 'Open in Visual Studio Code');
+    await waitForOpenRuns(open, 2);
+    expect(openRuns(open).at(-1)).toEqual(['-a', bundle('Visual Studio Code'), launcher.path]);
+    // AC5: nothing was remembered, so the app opened differs from it.
+    expect((await poll(() => rememberedApps(session.dataDir), ({ editor }) => editor !== undefined, UI_TIMEOUT)).editor).toBe('vscode');
+
+    await openWorkspaceMenu(page, launcher.path, ['Open in Visual Studio Code', 'Open in Terminal', 'Reveal in Finder', 'Open in editor', 'Open in terminal']);
+    await pickInSubmenu(page, 'Open in editor', 'Cursor');
+    await waitForOpenRuns(open, 3);
+    expect(openRuns(open).at(-1)).toEqual(['-a', bundle('Cursor'), launcher.path]);
+    await poll(() => rememberedApps(session.dataDir), ({ editor }) => editor === 'cursor', UI_TIMEOUT);
+
+    await openWorkspaceMenu(page, launcher.path, ['Open in Cursor', 'Open in Terminal', 'Reveal in Finder', 'Open in editor', 'Open in terminal']);
+    await pickInSubmenu(page, 'Open in terminal', 'Ghostty');
+    await waitForOpenRuns(open, 4);
+    expect(openRuns(open).at(-1)).toEqual(['-a', bundle('Ghostty'), launcher.path]);
+    await poll(() => rememberedApps(session.dataDir), ({ terminal }) => terminal === 'ghostty', UI_TIMEOUT);
+    expect(await messagesShown(page)).toEqual([]);
+  });
+
+  test('open workspace AC5 — the apps opened last are in state.json and shown by the next menu; one already remembered writes nothing', async () => {
+    const { page } = session;
+    expect(await poll(() => rememberedApps(session.dataDir), ({ terminal }) => terminal === 'ghostty', UI_TIMEOUT)).toEqual({
+      editor: 'cursor',
+      terminal: 'ghostty',
+    });
+    await openWorkspaceMenu(page, launcher.path, ['Open in Cursor', 'Open in Ghostty', 'Reveal in Finder', 'Open in editor', 'Open in terminal']);
+
+    // A different editor replaces the remembered one, and the menu shows it next.
+    await pickInSubmenu(page, 'Open in editor', 'Visual Studio Code');
+    await waitForOpenRuns(open, 5);
+    expect(await poll(() => rememberedApps(session.dataDir), ({ editor }) => editor === 'vscode', UI_TIMEOUT)).toEqual({
+      editor: 'vscode',
+      terminal: 'ghostty',
+    });
+    await openWorkspaceMenu(page, launcher.path, ['Open in Visual Studio Code', 'Open in Ghostty', 'Reveal in Finder', 'Open in editor', 'Open in terminal']);
+
+    // The remembered app again: the run happens, the file is not written.
+    const before = stateSnapshot(session.dataDir);
+    await pickTopItem(page, 'Open in Visual Studio Code');
+    await waitForOpenRuns(open, 6);
+    expect(openRuns(open).at(-1)).toEqual(['-a', bundle('Visual Studio Code'), launcher.path]);
+    await sleep(500);
+    expect(stateSnapshot(session.dataDir)).toEqual(before);
+
+    // Back to Cursor for the tests below.
+    await openWorkspaceMenu(page, launcher.path, ['Open in Visual Studio Code', 'Open in Ghostty', 'Reveal in Finder', 'Open in editor', 'Open in terminal']);
+    await pickInSubmenu(page, 'Open in editor', 'Cursor');
+    await waitForOpenRuns(open, 7);
+    expect(await poll(() => rememberedApps(session.dataDir), ({ editor }) => editor === 'cursor', UI_TIMEOUT)).toEqual({
+      editor: 'cursor',
+      terminal: 'ghostty',
+    });
+  });
+
+  test('open workspace AC6 — a remembered editor that is no longer detected is replaced in the menu by the first detected one, absent from its submenu, and stays in state.json', async () => {
+    const { page } = session;
+    rmSync(bundle('Cursor'), { recursive: true });
+    try {
+      const before = stateSnapshot(session.dataDir);
+      await openWorkspaceMenu(page, launcher.path, ['Open in Visual Studio Code', 'Open in Ghostty', 'Reveal in Finder', 'Open in editor', 'Open in terminal']);
+      expect(await submenuTexts(page, 'Open in editor')).toEqual(['Visual Studio Code']);
+
+      expect(stateSnapshot(session.dataDir)).toEqual(before);
+      expect(rememberedApps(session.dataDir).editor).toBe('cursor');
+    } finally {
+      restoreBundles();
+    }
+    // Detected again, the remembered editor is shown again.
+    await closeMenus(page);
+    await openWorkspaceMenu(page, launcher.path, ['Open in Cursor', 'Open in Ghostty', 'Reveal in Finder', 'Open in editor', 'Open in terminal']);
+  });
+
+  test('open workspace AC2 — with no detected editor (or terminal) the menu has no "Open in <name>" for it and its submenu holds one disabled "No editor found" ("No terminal found"); "Reveal in Finder" stays', async () => {
+    const { page } = session;
+    try {
+      // No editor: the terminal side is untouched.
+      rmSync(bundle('Visual Studio Code'), { recursive: true });
+      rmSync(bundle('Cursor'), { recursive: true });
+      await openWorkspaceMenu(page, launcher.path, ['Open in Ghostty', 'Reveal in Finder', 'Open in editor', 'Open in terminal']);
+      const noEditor = await openSubmenu(page, 'Open in editor');
+      expect(trimmed(await noEditor.allInnerTexts())).toEqual(['No editor found']);
+      expect(await noEditor.first().isDisabled()).toBe(true);
+      expect(await submenuTexts(page, 'Open in terminal')).toEqual(['Terminal', 'Ghostty']);
+      await closeMenus(page);
+
+      // No terminal either.
+      rmSync(bundle('Terminal'), { recursive: true });
+      rmSync(bundle('Ghostty'), { recursive: true });
+      await openWorkspaceMenu(page, launcher.path, ['Reveal in Finder', 'Open in editor', 'Open in terminal']);
+      const noTerminal = await openSubmenu(page, 'Open in terminal');
+      expect(trimmed(await noTerminal.allInnerTexts())).toEqual(['No terminal found']);
+      expect(await noTerminal.first().isDisabled()).toBe(true);
+      await noTerminal.first().click({ force: true, timeout: UI_TIMEOUT }).catch(() => {});
+      await sleep(300);
+      expect(openRuns(open)).toHaveLength(7);
+    } finally {
+      restoreBundles();
+    }
+  });
+
+  test('open workspace AC9 — reveal and open refuse a project that is not in Cockpit, a path that is not a linked worktree and an app that is not detected, run nothing, and reject from another origin', async () => {
+    const { page } = session;
+    const runs = openRuns(open);
+    const stateBefore = stateSnapshot(session.dataDir);
+    const elsewhere = join(repo.parent, 'not-a-worktree');
+    mkdirSync(elsewhere, { recursive: true });
+    const noProject = (project: string) => ({ status: 'refused', message: `${project} is not a project in Cockpit.` });
+    const noWorkspace = (path: string) => ({ status: 'refused', message: `${path} is not a workspace of ${repo.name}.` });
+
+    expect(await workspacesApi(page, 'reveal', ['/no/such/project', '/no/such/project/ws'])).toEqual(noProject('/no/such/project'));
+    expect(await workspacesApi(page, 'open', ['/no/such/project', '/no/such/project/ws', 'cursor'])).toEqual(noProject('/no/such/project'));
+    expect(await workspacesApi(page, 'reveal', [repo.root, elsewhere])).toEqual(noWorkspace(elsewhere));
+    expect(await workspacesApi(page, 'open', [repo.root, elsewhere, 'cursor'])).toEqual(noWorkspace(elsewhere));
+    // The main working tree is the project, not a workspace.
+    expect(await workspacesApi(page, 'reveal', [repo.root, repo.root])).toEqual(noWorkspace(repo.root));
+    expect(await workspacesApi(page, 'open', [repo.root, repo.root, 'cursor'])).toEqual(noWorkspace(repo.root));
+    // An app of the catalogue that is not detected, and an id outside it.
+    expect(await workspacesApi(page, 'open', [repo.root, launcher.path, 'zed'])).toEqual({ status: 'refused', message: 'Zed is not installed.' });
+    expect(await workspacesApi(page, 'open', [repo.root, launcher.path, 'nope'])).toEqual({ status: 'refused', message: 'nope is not installed.' });
+
+    // From another origin the handlers reject.
+    const origins = await session.evaluateInMain<Record<string, string>>(`(async () => {
+      const handlers = require('electron').ipcMain._invokeHandlers;
+      const calls = {
+        'workspaces:apps': [],
+        'workspaces:reveal': [${JSON.stringify(repo.root)}, ${JSON.stringify(launcher.path)}],
+        'workspaces:open': [${JSON.stringify(repo.root)}, ${JSON.stringify(launcher.path)}, 'cursor'],
+      };
+      const results = {};
+      for (const [channel, args] of Object.entries(calls)) {
+        const handler = handlers.get(channel);
+        if (!handler) { results[channel] = 'no handler'; continue; }
+        try {
+          await handler({ senderFrame: { url: 'https://example.com/' }, sender: null }, ...args);
+          results[channel] = 'resolved';
+        } catch {
+          results[channel] = 'rejected';
+        }
+      }
+      return results;
+    })()`);
+    expect(origins).toEqual({ 'workspaces:apps': 'rejected', 'workspaces:reveal': 'rejected', 'workspaces:open': 'rejected' });
+
+    await sleep(300);
+    expect(openRuns(open)).toEqual(runs);
+    expect(stateSnapshot(session.dataDir)).toEqual(stateBefore);
+    expect(await messagesShown(page)).toEqual([]);
+  });
+
+  test('open workspace AC8 — a run that exits non-zero shows "Could not open … in <app>: <reason>" or "Could not reveal … in the Finder: <reason>" in the Projects message slot, remembers nothing, and the next success clears it', async () => {
+    const { page } = session;
+    const menu = ['Open in Cursor', 'Open in Ghostty', 'Reveal in Finder', 'Open in editor', 'Open in terminal'];
+    const stateBefore = stateSnapshot(session.dataDir);
+    expect(rememberedApps(session.dataDir)).toEqual({ editor: 'cursor', terminal: 'ghostty' });
+
+    // The stderr, trimmed. Another editor than the remembered one: it must not be remembered.
+    setOpenOutcome(open, { code: 3, stderr: '  Unable to find application\n\n' });
+    await openWorkspaceMenu(page, launcher.path, menu);
+    await pickInSubmenu(page, 'Open in editor', 'Visual Studio Code');
+    const openMessage = `Could not open ${launcher.path} in Visual Studio Code: Unable to find application`;
+    await waitForLine(page, openMessage);
+    expect(await isBelowProjectsHeader(page, { text: openMessage })).toBe(true);
+    expect(await messagesShown(page)).toEqual([openMessage]);
+    await sleep(300);
+    expect(stateSnapshot(session.dataDir)).toEqual(stateBefore);
+    await openWorkspaceMenu(page, launcher.path, menu);
+
+    // Empty stderr: the exit code. The next refusal replaces the message.
+    setOpenOutcome(open, { code: 5 });
+    await pickTopItem(page, 'Reveal in Finder');
+    const revealMessage = `Could not reveal ${launcher.path} in the Finder: open exited with code 5`;
+    await waitForLine(page, revealMessage);
+    expect(await messagesShown(page)).toEqual([revealMessage]);
+
+    // A reveal that succeeds clears it.
+    setOpenOutcome(open);
+    await openWorkspaceMenu(page, launcher.path, menu);
+    await pickTopItem(page, 'Reveal in Finder');
+    await poll(() => messagesShown(page), (found) => found.length === 0, UI_TIMEOUT);
+    expect(await messagesShown(page)).toEqual([]);
+
+    // An open that fails with an empty stderr, then an open that succeeds.
+    setOpenOutcome(open, { code: 2 });
+    await openWorkspaceMenu(page, launcher.path, menu);
+    await pickTopItem(page, 'Open in Ghostty');
+    await waitForLine(page, `Could not open ${launcher.path} in Ghostty: open exited with code 2`);
+    setOpenOutcome(open);
+    await openWorkspaceMenu(page, launcher.path, menu);
+    await pickTopItem(page, 'Open in Cursor');
+    await poll(() => messagesShown(page), (found) => found.length === 0, UI_TIMEOUT);
+    expect(await messagesShown(page)).toEqual([]);
+
+    expect(stateSnapshot(session.dataDir)).toEqual(stateBefore);
+    expect(rememberedApps(session.dataDir)).toEqual({ editor: 'cursor', terminal: 'ghostty' });
+  });
+
+  // A folder named `state.json.tmp` makes `saveState` fail after the run succeeded.
+  test('open workspace AC10 — when the run succeeds and the save fails, the Projects message slot shows "Cockpit could not save its data: …", state.json is unchanged and so is the remembered app', async () => {
+    const { page } = session;
+    const menu = ['Open in Cursor', 'Open in Ghostty', 'Reveal in Finder', 'Open in editor', 'Open in terminal'];
+    setOpenOutcome(open);
+    const runs = openRuns(open).length;
+    const blocker = join(session.dataDir, 'state.json.tmp');
+    mkdirSync(blocker);
+    try {
+      const stateBefore = stateSnapshot(session.dataDir);
+      await openWorkspaceMenu(page, launcher.path, menu);
+      await pickInSubmenu(page, 'Open in editor', 'Visual Studio Code');
+
+      const lines = await poll(() => messagesShown(page), (found) => found.length > 0, UI_TIMEOUT);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatch(/^Cockpit could not save its data: .*EISDIR/);
+      expect(await isBelowProjectsHeader(page, { text: lines[0]! })).toBe(true);
+      expect(openRuns(open)).toHaveLength(runs + 1);
+      expect(stateSnapshot(session.dataDir)).toEqual(stateBefore);
+      expect(statSync(blocker).isDirectory()).toBe(true);
+    } finally {
+      rmSync(blocker, { recursive: true, force: true });
+    }
+
+    // The remembered editor in memory is still Cursor.
+    await openWorkspaceMenu(page, launcher.path, menu);
+  });
+
   test('logs no error and keeps running', async () => {
     expect(await sidebarLines(session.page)).toContain('Sessions');
     await expectNoErrors(session);
@@ -5489,11 +5904,13 @@ describe('changes sidebar: built app', () => {
 // where a session would run a real CLI.
 describe('sessions smoke path: dev server', () => {
   let fx: SessionsFixture;
+  let open: OpenFixture;
   let session: Session;
 
   beforeAll(async () => {
     fx = makeSessionsFixture(['claude']);
-    session = await launchDevWith(fx.env());
+    open = addOpenFixture(fx);
+    session = await launchDevWith(open.env());
     await session.page.getByText(versionLabel).waitFor();
   });
 
@@ -5536,6 +5953,23 @@ describe('sessions smoke path: dev server', () => {
       expect(stored.find((entry) => entry.id === id)).toMatchObject({ name: 'Claude Code 1', directory: path, project: repo.root });
       // Changes sidebar (COCKPIT-34 AC16): a file written in the worktree shows with its diff.
       await expectChangesShowNewFile(page, path);
+    } finally {
+      rmSync(repo.parent, { recursive: true, force: true });
+    }
+  });
+
+  test('open workspace smoke path — "Open in editor" then Cursor runs open -a <Cursor.app> <worktree> and stores editor "cursor"', async () => {
+    const { page } = session;
+    const repo = makeRepo('smoke-open-ws');
+    try {
+      await addRepository(session, repo);
+      const path = await createPlainWorkspace(session, repo, 'smoke-open');
+
+      await openWorkspaceMenu(page, path, FIRST_MENU);
+      await pickInSubmenu(page, 'Open in editor', 'Cursor');
+
+      expect(await waitForOpenRuns(open, 1)).toEqual([['-a', join(open.apps, 'Cursor.app'), path]]);
+      expect((await poll(() => rememberedApps(session.dataDir), ({ editor }) => editor !== undefined, UI_TIMEOUT)).editor).toBe('cursor');
     } finally {
       rmSync(repo.parent, { recursive: true, force: true });
     }
@@ -5648,9 +6082,11 @@ describe('packaged app sessions after a restart', () => {
   let dataDir: string;
 
   let repo: TempRepo;
+  let open: OpenFixture;
 
   beforeEach(() => {
     fx = makeSessionsFixture(['claude', 'codex']);
+    open = addOpenFixture(fx);
     dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
     repo = makeRepo('packaged-agent-ws');
   });
@@ -5661,8 +6097,8 @@ describe('packaged app sessions after a restart', () => {
     rmSync(repo.parent, { recursive: true, force: true });
   });
 
-  test('AC9, changes AC16 — sessions of a previous launch are listed as "Ended", newest first, open as ended and leave state.json and their folders alone (the first launch also runs the Changes sidebar smoke path)', async () => {
-    const first = await launchPackagedWith(fx.env(), dataDir);
+  test('AC9, changes AC16 — sessions of a previous launch are listed as "Ended", newest first, open as ended and leave state.json and their folders alone (the first launch also runs the Changes sidebar and open-workspace smoke paths)', async () => {
+    const first = await launchPackagedWith(open.env(), dataDir);
     try {
       await first.page.getByText(versionLabel).waitFor();
       // The packaged app's sessions smoke path: the stub runs in a new folder
@@ -5692,6 +6128,13 @@ describe('packaged app sessions after a restart', () => {
       expect(await waitForWorkspaceLinks(first.page, wsPath, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
       const storedWs = await poll(() => sessionsInState(dataDir), (list) => list.some((entry) => entry.id === wsId), UI_TIMEOUT);
       expect(storedWs.find((entry) => entry.id === wsId)).toMatchObject({ name: 'Claude Code 1', directory: wsPath, project: repo.root });
+
+      // Open workspace smoke path: "Open in editor" then Cursor.
+      await openWorkspaceMenu(first.page, wsPath, FIRST_MENU);
+      await pickInSubmenu(first.page, 'Open in editor', 'Cursor');
+      expect(await waitForOpenRuns(open, 1)).toEqual([['-a', join(open.apps, 'Cursor.app'), wsPath]]);
+      expect((await poll(() => rememberedApps(dataDir), ({ editor }) => editor !== undefined, UI_TIMEOUT)).editor).toBe('cursor');
+
       // Changes sidebar smoke path (COCKPIT-34 AC16): a file written in the worktree shows with its diff.
       await expectChangesShowNewFile(first.page, wsPath);
       await expectNoErrors(first);

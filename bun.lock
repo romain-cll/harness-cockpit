@@ -28,6 +28,7 @@
         "@base-ui/react": "^1.9.0",
         "@cockpit/control": "workspace:*",
         "@cockpit/harnesses": "workspace:*",
+        "@cockpit/launchers": "workspace:*",
         "@cockpit/pty": "workspace:*",
         "@cockpit/shell-env": "workspace:*",
         "@cockpit/state": "workspace:*",
@@ -67,6 +68,14 @@
     },
     "packages/harnesses": {
       "name": "@cockpit/harnesses",
+      "version": "0.0.0",
+      "devDependencies": {
+        "@types/node": "^24.19.2",
+        "vitest": "^5.0.5",
+      },
+    },
+    "packages/launchers": {
+      "name": "@cockpit/launchers",
       "version": "0.0.0",
       "devDependencies": {
         "@types/node": "^24.19.2",
@@ -179,6 +188,8 @@
     "@cockpit/desktop": ["@cockpit/desktop@workspace:apps/desktop"],
 
     "@cockpit/harnesses": ["@cockpit/harnesses@workspace:packages/harnesses"],
+
+    "@cockpit/launchers": ["@cockpit/launchers@workspace:packages/launchers"],
 
     "@cockpit/plane-sync": ["@cockpit/plane-sync@workspace:.github/scripts/plane-sync"],
 

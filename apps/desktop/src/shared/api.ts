@@ -50,6 +50,26 @@ export type CreateWorkspaceResult = { status: 'created'; workspace: Workspace } 
 /** `dirty`: the workspace has uncommitted changes and was not removed. `branchKept`: its branch is not merged. */
 export type RemoveWorkspaceResult = { status: 'removed'; branchKept: boolean } | { status: 'dirty' } | Refused;
 
+/** An editor or a terminal app found on this machine. */
+export interface AvailableApp {
+  id: string;
+  name: string;
+}
+
+/**
+ * The detected apps, in catalogue order. `editor` and `terminal` are the ids of the ones to show
+ * first: the remembered app when it is detected, else the first detected, else `null`.
+ */
+export interface AppsResult {
+  editors: AvailableApp[];
+  terminals: AvailableApp[];
+  editor: string | null;
+  terminal: string | null;
+}
+
+/** `refused` carries the message to show the user, a failed run included. */
+export type OpenWorkspaceResult = { status: 'opened' } | Refused;
+
 /** A file of a workspace that differs from its base; the same shape as `@cockpit/workspaces` gives. */
 export interface ChangedFile {
   path: string;
@@ -141,6 +161,13 @@ export interface Api {
     create(project: string, name: string, base: string): Promise<CreateWorkspaceResult>;
     /** Removes the worktree, and its branch when merged; `force` removes it with its uncommitted changes. */
     remove(project: string, path: string, options?: { force?: boolean }): Promise<RemoveWorkspaceResult>;
+    /** The detected editors and terminals, looked up at each call. */
+    apps(): Promise<AppsResult>;
+    /** Shows the worktree in the Finder. Refused when the path is not a linked worktree of the project. */
+    reveal(project: string, path: string): Promise<OpenWorkspaceResult>;
+    /** Opens the worktree in the detected app `app`, and remembers it as the editor or terminal shown first. */
+    open(project: string, path: string, app: string): Promise<OpenWorkspaceResult>;
+
     /**
      * The working tree of a workspace (commits, uncommitted edits, untracked files) against its base.
      * Refused when the path is not a linked worktree of the project, or when there is no base.

@@ -28,6 +28,9 @@ export interface State {
   version: number;
   projects: Project[];
   sessions: Session[];
+  // The ids (in `@cockpit/launchers`) of the editor and the terminal opened last; absent until one is.
+  editor?: string;
+  terminal?: string;
 }
 
 // `state.json` was written by a newer version of the app: it is left untouched.
@@ -64,7 +67,9 @@ function isSession(value: unknown): value is Session {
 // A file written before projects or sessions existed lacks them: they read as empty.
 function isState(value: unknown): value is Omit<State, 'projects' | 'sessions'> & { projects?: unknown; sessions?: unknown } {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-  const { version, projects, sessions } = value as { version?: unknown; projects?: unknown; sessions?: unknown };
+  const { version, projects, sessions, editor, terminal } = value as Record<string, unknown>;
+  if (editor !== undefined && typeof editor !== 'string') return false;
+  if (terminal !== undefined && typeof terminal !== 'string') return false;
   if (projects !== undefined && !(Array.isArray(projects) && projects.every(isProject))) return false;
   if (sessions !== undefined && !(Array.isArray(sessions) && sessions.every(isSession))) return false;
   return typeof version === 'number' && Number.isInteger(version) && version > 0;
@@ -102,6 +107,10 @@ export function addProject(state: State, path: string): State {
 
 export function removeProject(state: State, path: string): State {
   return { ...state, projects: state.projects.filter((project) => project.path !== path) };
+}
+
+export function rememberApp(state: State, kind: 'editor' | 'terminal', id: string): State {
+  return { ...state, [kind]: id };
 }
 
 export function addSession(state: State, session: Session): State {

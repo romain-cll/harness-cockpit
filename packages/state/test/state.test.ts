@@ -8,6 +8,7 @@ import {
   loadState,
   NewerStateError,
   ProjectExistsError,
+  rememberApp,
   removeProject,
   saveState,
   sessionName,
@@ -761,5 +762,106 @@ describe('workspace sessions AC16 — project field', () => {
     expect(found).toHaveLength(1);
     expect(readFileSync(join(dir, found[0]!), 'utf8')).toBe(content);
     expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1 });
+  });
+});
+
+describe('open workspace AC7 — remembered editor and terminal', () => {
+  test('AC7 — editor and terminal are read as written, without rewriting the file', () => {
+    seed(`${JSON.stringify({ version: 1, editor: 'cursor', terminal: 'ghostty' })}\n`);
+    const before = snapshot();
+
+    expect(loadState(dir)).toEqual({ version: 1, projects: [], sessions: [], editor: 'cursor', terminal: 'ghostty' });
+    expect(snapshot()).toEqual(before);
+    expect(backups()).toEqual([]);
+  });
+
+  test('AC7 — absent, they read as none, without rewriting the file', () => {
+    seed(`${JSON.stringify({ version: 1, projects: [] })}\n`);
+    const before = snapshot();
+
+    const state = loadState(dir);
+
+    expect(state.editor).toBeUndefined();
+    expect(state.terminal).toBeUndefined();
+    expect(snapshot()).toEqual(before);
+    expect(backups()).toEqual([]);
+  });
+
+  test('AC7 — one of the two alone is valid', () => {
+    seed(`${JSON.stringify({ version: 1, terminal: 'iterm2' })}\n`);
+    const state = loadState(dir);
+    expect(state.terminal).toBe('iterm2');
+    expect(state.editor).toBeUndefined();
+    expect(backups()).toEqual([]);
+  });
+
+  test.each([
+    ['editor', 'a number', '3'],
+    ['editor', 'null', 'null'],
+    ['editor', 'an array', '["cursor"]'],
+    ['editor', 'an object', '{}'],
+    ['editor', 'a boolean', 'true'],
+    ['terminal', 'a number', '3'],
+    ['terminal', 'null', 'null'],
+    ['terminal', 'an array', '["ghostty"]'],
+    ['terminal', 'an object', '{}'],
+    ['terminal', 'a boolean', 'false'],
+  ])('AC7 — a %s that is %s sets the file aside', (field, _name, value) => {
+    const content = `{ "version": 1, "${field}": ${value} }\n`;
+    seed(content);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    expect(loadState(dir)).toEqual({ version: 1, projects: [], sessions: [] });
+
+    const found = backups();
+    expect(found).toHaveLength(1);
+    expect(readFileSync(join(dir, found[0]!), 'utf8')).toBe(content);
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1 });
+  });
+
+  test('AC5 — saveState writes the remembered apps and they load back as the same state, without a rewrite', () => {
+    mkdirSync(dir, { recursive: true });
+    const state = { version: 1, projects: [{ path: '/repo' }], sessions: [], editor: 'zed', terminal: 'warp' };
+    saveState(dir, state);
+    const before = snapshot();
+
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual(state);
+    expect(loadState(dir)).toEqual(state);
+    expect(snapshot()).toEqual(before);
+  });
+
+  test('AC5 — saveState writes an app only when it is set', () => {
+    mkdirSync(dir, { recursive: true });
+    saveState(dir, { version: 1, projects: [], sessions: [], editor: 'cursor' });
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1, projects: [], sessions: [], editor: 'cursor' });
+
+    saveState(dir, { version: 1, projects: [], sessions: [] });
+    const written = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+    expect(Object.keys(written)).not.toContain('editor');
+    expect(Object.keys(written)).not.toContain('terminal');
+  });
+});
+
+describe('open workspace AC5 — rememberApp', () => {
+  const base = { version: 1, projects: [{ path: '/repo' }], sessions: [session()] };
+
+  test('AC5 — remembers an editor and leaves the given state and the other fields alone', () => {
+    const state = { ...base };
+    const next = rememberApp(state, 'editor', 'cursor');
+
+    expect(next).toEqual({ ...base, editor: 'cursor' });
+    expect(next).not.toBe(state);
+    expect(state).toEqual(base);
+    expect(next.terminal).toBeUndefined();
+  });
+
+  test('AC5 — remembers a terminal without touching the editor', () => {
+    const next = rememberApp({ ...base, editor: 'zed' }, 'terminal', 'ghostty');
+    expect(next).toEqual({ ...base, editor: 'zed', terminal: 'ghostty' });
+  });
+
+  test('AC5 — replaces the app remembered before', () => {
+    const next = rememberApp({ ...base, editor: 'vscode', terminal: 'terminal' }, 'editor', 'cursor');
+    expect(next).toEqual({ ...base, editor: 'cursor', terminal: 'terminal' });
   });
 });
