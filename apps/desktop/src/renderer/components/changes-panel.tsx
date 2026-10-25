@@ -106,6 +106,8 @@ export function ChangesPanel({ project: projectEntry, workspace }: { project: Pr
     reload.current = refresh;
     refresh();
     const stopping = workspaces.watch(project, path, refresh);
+    // A change made while the watch was starting is never reported: read once more when it is live.
+    void stopping.then(() => current && refresh(), () => {});
     return () => {
       current = false;
       void stopping.then((stop) => stop(), () => {});

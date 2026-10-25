@@ -235,11 +235,15 @@ export async function removeWorktree({
   ) {
     throw new WorkspaceError('DIRTY_WORKTREE', `worktree has uncommitted changes: ${worktree.path}`);
   }
+  // A branch deleted by hand while checked out is still reported by the worktree: nothing to delete.
+  // Asked before the removal, so the branch goes right after the folder.
+  const branchExists =
+    deleteBranch && worktree.branch !== null
+      ? await succeeds(['rev-parse', '--verify', '--quiet', `refs/heads/${worktree.branch}`], { cwd: main, env })
+      : false;
   await git(['worktree', 'remove', ...(force ? ['--force'] : []), '--', worktree.path], { cwd: main, env });
 
-  if (!deleteBranch || worktree.branch === null) return;
-  // A branch deleted by hand while checked out is still reported by the worktree: nothing to delete.
-  if (!(await succeeds(['rev-parse', '--verify', '--quiet', `refs/heads/${worktree.branch}`], { cwd: main, env }))) return;
+  if (!branchExists || worktree.branch === null) return;
   if (!(await succeeds(['branch', '-d', '--', worktree.branch], { cwd: main, env }))) {
     throw new WorkspaceError('BRANCH_NOT_MERGED', `branch is not merged: ${worktree.branch}`);
   }

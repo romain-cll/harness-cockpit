@@ -622,6 +622,7 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
           if (!contents.isDestroyed()) contents.send('workspaces:changed');
         },
         () => void unwatch(contents),
+        { env: await shellEnv },
       );
       // The watcher takes a moment to start: the window may have asked for something else since.
       if (requests.get(contents) === request && !contents.isDestroyed()) watchers.set(contents, watcher);
