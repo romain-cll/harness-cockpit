@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test, vi } from 'vitest';
@@ -426,6 +426,100 @@ describe('pushBranch', () => {
 
     expect(error.code).toBe('GIT_FAILED');
     expect(git(origin, 'for-each-ref', '--format=%(refname)')).toBe('refs/heads/main');
+  });
+});
+
+// COCKPIT-38 AC13: commits, pushes and fetches made outside the app reach the watcher through the
+// worktree's gitdir, the common dir's `refs/remotes` and its `packed-refs`. Each test runs the git
+// command that must be seen from the place where it writes nothing else the watcher already watched:
+// a fetch and a pack-refs from the main repository (their FETCH_HEAD is not the worktree's).
+describe('watchWorktree on the git metadata', () => {
+  /** Calls `onChange` counts: the watcher runs on `worktree` and is closed by the test's end. */
+  async function watched(worktree: string) {
+    const changed = vi.fn();
+    const watcher = await watchWorktree(worktree, changed);
+    return { changed, close: () => watcher.close() };
+  }
+
+  test('AC13 — a git commit made in the worktree calls onChange', async () => {
+    const { worktree } = await makeShippableWorkspace();
+    await writeFile(join(worktree, 'a.txt'), 'edited\n');
+    const { changed, close } = await watched(worktree);
+    try {
+      git(worktree, 'commit', '-q', '-am', 'edit a');
+
+      await vi.waitFor(() => expect(changed).toHaveBeenCalled(), { timeout: 5_000 });
+    } finally {
+      close();
+    }
+  });
+
+  test('AC13 — a git push -u origin <branch> made in the worktree calls onChange', async () => {
+    const { worktree } = await makeShippableWorkspace();
+    await commitFile(worktree, 'one.txt', 'one');
+    const { changed, close } = await watched(worktree);
+    try {
+      git(worktree, 'push', '-q', '-u', 'origin', 'feat');
+
+      await vi.waitFor(() => expect(changed).toHaveBeenCalled(), { timeout: 5_000 });
+    } finally {
+      close();
+    }
+  });
+
+  test('AC13 — a git fetch that updates refs/remotes calls onChange', async () => {
+    const { repo, origin, worktree } = await makeShippableWorkspace();
+    const other = join(await tempDir(), 'other');
+    git(await tempDir(), 'clone', '--quiet', origin, other);
+    await commitFile(other, 'theirs.txt', 'theirs');
+    git(other, 'push', '--quiet', 'origin', 'main');
+    const { changed, close } = await watched(worktree);
+    try {
+      git(repo, 'fetch', '--quiet', 'origin');
+
+      await vi.waitFor(() => expect(changed).toHaveBeenCalled(), { timeout: 5_000 });
+    } finally {
+      close();
+    }
+  });
+
+  test('AC13 — a git pack-refs --all that rewrites packed-refs calls onChange', async () => {
+    const { repo, worktree } = await makeShippableWorkspace();
+    // Every remote ref is packed already, and a loose local branch is the one left to pack: the rewrite
+    // of packed-refs is then the only change in the watched places.
+    git(repo, 'pack-refs', '--all');
+    git(repo, 'branch', 'extra');
+    const { changed, close } = await watched(worktree);
+    try {
+      git(repo, 'pack-refs', '--all');
+
+      await vi.waitFor(() => expect(changed).toHaveBeenCalled(), { timeout: 5_000 });
+    } finally {
+      close();
+    }
+  });
+
+  test('AC13 — branchStatus and listChanges on a settled worktree call nothing, even with a stale index, and a commit still does', async () => {
+    const { worktree } = await makeShippableWorkspace();
+    // A tracked file with the same content and another mtime: a plain `git status` would refresh the
+    // index and write it, which the watcher on the gitdir would see again and again.
+    const stale = join(worktree, 'a.txt');
+    await writeFile(stale, await readFile(stale));
+    await utimes(stale, new Date(1_600_000_000_000), new Date(1_600_000_000_000));
+    const { changed, close } = await watched(worktree);
+    try {
+      for (let round = 0; round < 3; round++) {
+        await branchStatus(worktree, { env: testEnv });
+        await listChanges(worktree, { env: testEnv });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect(changed).not.toHaveBeenCalled();
+
+      git(worktree, 'commit', '-q', '--allow-empty', '-m', 'an empty commit');
+      await vi.waitFor(() => expect(changed).toHaveBeenCalled(), { timeout: 5_000 });
+    } finally {
+      close();
+    }
   });
 });
 

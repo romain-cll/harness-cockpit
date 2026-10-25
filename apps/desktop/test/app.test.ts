@@ -6880,6 +6880,8 @@ describe('changes sidebar: built app', () => {
     const W1 = { path: '', id: '' };
     const W2 = { path: '', id: '' };
     const W3 = { path: '', id: '' };
+    // A workspace whose commit and push are made outside the section (AC13).
+    const W4 = { path: '', id: '' };
 
     beforeAll(async () => {
       ship = makeChangesRepo('ship-ws');
@@ -6888,7 +6890,7 @@ describe('changes sidebar: built app', () => {
       gitIn(ship.root, 'commit', '-m', 'ignore logs');
       origin = addOrigin(ship);
       await addRepository(session, ship);
-      for (const [workspace, name] of [[W1, 'ship-pr'], [W2, 'ship-flow'], [W3, 'ship-reject']] as const) {
+      for (const [workspace, name] of [[W1, 'ship-pr'], [W2, 'ship-flow'], [W3, 'ship-reject'], [W4, 'ship-outside']] as const) {
         workspace.id = await createWorkspaceWithAgent(session.page, ship, { name, agent: 'Claude Code' }, 'Claude Code 1');
         workspace.path = worktreePath(session, ship, name);
       }
@@ -6941,6 +6943,9 @@ describe('changes sidebar: built app', () => {
       setGh(gh, { list: prJson({ state: 'CLOSED' }) });
       await dispatchFocus(page);
       await waitForText((shown) => /\bClosed\b/.test(shown));
+      // AC10: a branch with only closed pull requests can have a new one.
+      await shipButton(page, 'Create pull request').waitFor({ timeout: UI_TIMEOUT });
+      expect(await shipButton(page, 'Create pull request').count()).toBe(1);
     });
 
     test('ship AC2 — clicking the pull request link opens its URL in the system browser and the window stays on its page', async () => {
@@ -7041,6 +7046,31 @@ describe('changes sidebar: built app', () => {
 
       await dispatchFocus(page);
       await waitForText((shown) => !shown.includes('gh)') && !shown.includes('Could not read'));
+    });
+
+    test('ship AC3 — after a commit and after a push succeed, the pull request is read again and the section shows its new state within 5 s, with no window focus', async () => {
+      const { page } = session;
+      try {
+        setGh(gh);
+        await openShip(page, W1.id);
+        await shipButton(page, 'Create pull request').waitFor({ timeout: UI_TIMEOUT });
+        writeFileSync(join(W1.path, 'after-actions.txt'), 'x\n');
+        await expectListed(page, ['after-actions.txt'], ['after-actions.txt']);
+
+        // A pull request opens meanwhile: nothing reads it until the commit succeeds.
+        setGh(gh, { list: prJson({ title: 'After the commit', checks: 'pending' }) });
+        await commitThroughPanel(page, 'Commit then read');
+        await page.locator(PANEL).getByRole('link', { name: '#7 After the commit', exact: true }).waitFor({ timeout: 5_000 });
+        await waitForText((shown) => shown.includes('Checks pending'));
+
+        // It merges meanwhile: nothing reads it until the push succeeds.
+        setGh(gh, { list: prJson({ title: 'After the commit', state: 'MERGED', checks: 'passing' }) });
+        await shipButton(page, 'Push').click({ timeout: UI_TIMEOUT });
+        await waitForText((shown) => /\bMerged\b/.test(shown));
+        expect(await shipButton(page, 'Delete workspace…').count()).toBe(1);
+      } finally {
+        setGh(gh);
+      }
     });
 
     test('ship AC6, AC5 — Commit puts every change in one commit with the trimmed message, clears the field and is disabled while the message is blank or nothing is uncommitted, with gh failing', async () => {
@@ -7226,6 +7256,45 @@ describe('changes sidebar: built app', () => {
       expect(text).toMatch(/Could not push ship-reject: /);
       expect(remoteRef(origin, 'ship-reject')).toBe(theirs);
       expect(await shipButton(page, 'Push').count()).toBe(1);
+    });
+
+    test('ship AC13 — a commit then a push made outside the section (in the worktree, as its terminal would) update it within 5 s with no window focus, and once it settled no git runs in the worktree', async () => {
+      const { page } = session;
+      setGh(gh);
+      writeFileSync(join(W4.path, 'a.txt'), 'edited outside\n');
+      await openShip(page, W4.id);
+      await expectListed(page, ['a.txt'], ['a.txt']);
+      const create = shipButton(page, 'Create pull request');
+      await create.waitFor({ timeout: UI_TIMEOUT });
+      const commit = shipButton(page, 'Commit');
+      await commitField(page).fill('Typed, not pressed');
+      expect(await poll(() => commit.isDisabled(), (disabled) => !disabled, UI_TIMEOUT)).toBe(false);
+      expect(await shipButton(page, 'Push').count()).toBe(0);
+
+      // The commit: "Push" shows and "Commit" is disabled (nothing is uncommitted any more).
+      gitIn(W4.path, 'commit', '-q', '-am', 'Committed in the terminal');
+      await shipButton(page, 'Push').waitFor({ timeout: 5_000 });
+      expect(await poll(() => commit.isDisabled(), Boolean, 5_000)).toBe(true);
+      expect(await create.isDisabled()).toBe(true);
+
+      // The push: "Push" goes and "Create pull request" is enabled.
+      gitIn(W4.path, 'push', '-q', '-u', 'origin', 'ship-outside');
+      expect(await poll(() => shipButton(page, 'Push').count(), (count) => count === 0, 5_000)).toBe(0);
+      expect(await poll(() => create.isDisabled(), (disabled) => !disabled, 5_000)).toBe(false);
+      expect(await panelText(page)).not.toContain('Push the branch first.');
+
+      // Reading the state writes nothing under the gitdir, so it does not start itself again: within
+      // the time to settle, there is a second with no git run in the worktree.
+      const quiet = await poll(
+        async () => {
+          const before = gitRunsIn(fx, W4.path).length;
+          await sleep(1_000);
+          return gitRunsIn(fx, W4.path).length === before;
+        },
+        Boolean,
+        UI_TIMEOUT,
+      );
+      expect(quiet, 'git keeps running in the worktree').toBe(true);
     });
 
     test('ship AC12 — the new window.api.workspaces calls refuse an unknown project, a path that is not a linked worktree, a blank message or title, and a detached HEAD with the messages of the spec, run nothing, and reject from another origin', async () => {
