@@ -6969,40 +6969,51 @@ describe('changes sidebar: built app', () => {
 
     test('ship AC3, AC4 — a change in the worktree reads no pull request, the window gaining focus does (within 5 s), and no gh runs while the sidebar is closed, left or reloaded', async () => {
       const { page } = session;
-      setGh(gh, { list: prJson({ checks: 'passing' }) });
-      await openShip(page, W1.id);
-      await dispatchFocus(page);
-      await waitForText((shown) => shown.includes('Checks passing'));
+      const leftovers = ['tick.txt', 'closed.txt', 'reloaded.txt'];
+      try {
+        // The previous test left "Checks passing" on screen, so each wait below is for an answer the
+        // page does not show yet. Once the newest read shows "pending", an earlier read (the page
+        // opening, the first focus) has returned or was dropped, and the log holds every run of them.
+        setGh(gh, { list: prJson({ checks: 'failing' }) });
+        await openShip(page, W1.id);
+        await dispatchFocus(page);
+        await waitForText((shown) => shown.includes('Checks failing'));
+        setGh(gh, { list: prJson({ checks: 'pending' }) });
+        await dispatchFocus(page);
+        await waitForText((shown) => shown.includes('Checks pending'));
 
-      // The pull request merged meanwhile; a file written in the worktree must not read it.
-      setGh(gh, { list: prJson({ state: 'MERGED', checks: 'passing' }) });
-      const before = ghRuns(gh).length;
-      writeFileSync(join(W1.path, 'tick.txt'), 'x\n');
-      await expectListed(page, ['tick.txt'], ['tick.txt']);
-      await sleep(1_000);
-      expect(ghRuns(gh)).toHaveLength(before);
-      expect(await panelText(page)).toMatch(/\bOpen\b/);
+        // The pull request merged meanwhile; a file written in the worktree must not read it.
+        setGh(gh, { list: prJson({ state: 'MERGED', checks: 'passing' }) });
+        const before = ghRuns(gh).length;
+        writeFileSync(join(W1.path, 'tick.txt'), 'x\n');
+        await expectListed(page, ['tick.txt'], ['tick.txt']);
+        await sleep(1_000);
+        expect(ghRuns(gh)).toHaveLength(before);
+        expect(await panelText(page)).toMatch(/\bOpen\b/);
 
-      await dispatchFocus(page);
-      await waitForText((shown) => /\bMerged\b/.test(shown));
-      rmSync(join(W1.path, 'tick.txt'));
+        await dispatchFocus(page);
+        await waitForText((shown) => /\bMerged\b/.test(shown));
+        rmSync(join(W1.path, 'tick.txt'));
 
-      // Closed, then reloaded: a write starts no gh run.
-      await setChangesOpen(page, false);
-      const runs = ghRuns(gh).length;
-      writeFileSync(join(W1.path, 'closed.txt'), 'x\n');
-      await sleep(1_000);
-      expect(ghRuns(gh)).toHaveLength(runs);
+        // Closed, then reloaded: a write starts no gh run.
+        await setChangesOpen(page, false);
+        const runs = ghRuns(gh).length;
+        writeFileSync(join(W1.path, 'closed.txt'), 'x\n');
+        await sleep(1_000);
+        expect(ghRuns(gh)).toHaveLength(runs);
 
-      await page.reload();
-      await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
-      await changesToggle(page).waitFor({ timeout: UI_TIMEOUT });
-      expect(await markChangesPanel(page)).toBe(false);
-      writeFileSync(join(W1.path, 'reloaded.txt'), 'x\n');
-      await sleep(1_000);
-      expect(ghRuns(gh)).toHaveLength(runs);
-      rmSync(join(W1.path, 'closed.txt'));
-      rmSync(join(W1.path, 'reloaded.txt'));
+        await page.reload();
+        await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
+        await changesToggle(page).waitFor({ timeout: UI_TIMEOUT });
+        expect(await markChangesPanel(page)).toBe(false);
+        writeFileSync(join(W1.path, 'reloaded.txt'), 'x\n');
+        await sleep(1_000);
+        expect(ghRuns(gh)).toHaveLength(runs);
+      } finally {
+        // A failure must leave neither a file in the worktree nor an answer of this test to the next one.
+        for (const name of leftovers) rmSync(join(W1.path, name), { force: true });
+        setGh(gh);
+      }
     });
 
     test('ship AC5 — gh not installed, not logged in or failing shows its message and no "Create pull request" button', async () => {
