@@ -1,0 +1,19 @@
+{
+  "name": "@cockpit/control",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The local control endpoint: an authenticated HTTP server on a Unix socket",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "oxlint"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "vitest": "^5.0.5"
+  }
+}
