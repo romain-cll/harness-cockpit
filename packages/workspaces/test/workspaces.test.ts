@@ -1,12 +1,19 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { WorkspaceError } from '../src/git';
-import { createWorktree, findRepositoryRoot, listBranches, listWorktrees, removeWorktree } from '../src/index';
+import {
+  createWorktree,
+  findRepositoryRoot,
+  listBranches,
+  listWorktrees,
+  readWorkspaceConfig,
+  removeWorktree,
+} from '../src/index';
 
 // Drives the real git on temporary repositories and roots under os.tmpdir(),
 // with an env that ignores the user's global and system git config.
@@ -925,6 +932,233 @@ describe('git availability', () => {
       const error = await rejection(call());
       expect(['GIT_MISSING', 'GIT_TOO_OLD'], name).not.toContain(error.code);
     }
+  });
+});
+
+describe('readWorkspaceConfig', () => {
+  const rwc = (repo: string, path: string, env: NodeJS.ProcessEnv = testEnv) =>
+    readWorkspaceConfig({ repo, path, env });
+
+  async function writeConfig(repo: string, content: string): Promise<string> {
+    await mkdir(join(repo, '.cockpit'), { recursive: true });
+    const file = join(repo, '.cockpit', 'config.json');
+    await writeFile(file, content);
+    return file;
+  }
+
+  test('AC1 — returns the commands of the file, in order, with the three variables', async () => {
+    const repo = await makeRepo();
+    const setup = ['cp "$COCKPIT_ROOT_PATH/.env" .env', 'bun install'];
+    const teardown = ['docker compose down'];
+    await writeConfig(repo, JSON.stringify({ setup, teardown }));
+    const worktree = await addWorktree(repo, 'login', 'feature/login');
+
+    const result = await rwc(repo, worktree);
+
+    expect(result).toEqual({
+      setup,
+      teardown,
+      env: {
+        COCKPIT_ROOT_PATH: repo,
+        COCKPIT_WORKSPACE_PATH: worktree,
+        COCKPIT_WORKSPACE_NAME: 'feature/login',
+      },
+    });
+    // `repo` may be the linked worktree itself.
+    expect(await rwc(worktree, worktree)).toEqual(result);
+  });
+
+  test.each([
+    ['setup only', { setup: ['bun install'] }, { setup: ['bun install'], teardown: [] }],
+    ['teardown only', { teardown: ['x'] }, { setup: [], teardown: ['x'] }],
+    ['empty object', {}, { setup: [], teardown: [] }],
+  ])('AC2 — a key absent from the file is [] (%s)', async (_name, content, expected) => {
+    const repo = await makeRepo();
+    await writeConfig(repo, JSON.stringify(content));
+    const worktree = await addWorktree(repo, 'topic', 'topic');
+
+    const result = await rwc(repo, worktree);
+
+    expect(result.setup).toEqual(expected.setup);
+    expect(result.teardown).toEqual(expected.teardown);
+  });
+
+  test('AC3 — a detached HEAD is named after the basename of the worktree folder', async () => {
+    const repo = await makeRepo();
+    const worktree = await addWorktree(repo, 'detached-folder', 'to-detach');
+    git(worktree, 'checkout', '--detach');
+
+    const { env } = await rwc(repo, worktree);
+
+    expect(env.COCKPIT_WORKSPACE_NAME).toBe('detached-folder');
+  });
+
+  test('AC4 — no config file resolves to empty lists and creates nothing', async () => {
+    const repo = await makeRepo();
+    const worktree = await addWorktree(repo, 'topic', 'topic');
+    const before = [readdirSync(repo).sort(), readdirSync(worktree).sort()];
+
+    const result = await rwc(repo, worktree);
+
+    expect(result).toEqual({
+      setup: [],
+      teardown: [],
+      env: { COCKPIT_ROOT_PATH: repo, COCKPIT_WORKSPACE_PATH: worktree, COCKPIT_WORKSPACE_NAME: 'topic' },
+    });
+    expect(existsSync(join(repo, '.cockpit'))).toBe(false);
+    expect(existsSync(join(worktree, '.cockpit'))).toBe(false);
+    expect([readdirSync(repo).sort(), readdirSync(worktree).sort()]).toEqual(before);
+  });
+
+  test('AC5 — the main working tree decides, not the worktree checkout', async () => {
+    const repo = await makeRepo();
+    await writeConfig(repo, JSON.stringify({ setup: ['from-main'], teardown: ['bye-main'] }));
+    const worktree = await addWorktree(repo, 'topic', 'topic');
+    await writeConfig(worktree, JSON.stringify({ setup: ['from-worktree'], teardown: ['bye-worktree'] }));
+    git(worktree, 'add', '.cockpit/config.json');
+    git(worktree, 'commit', '-m', 'config');
+
+    const result = await rwc(repo, worktree);
+
+    expect(result.setup).toEqual(['from-main']);
+    expect(result.teardown).toEqual(['bye-main']);
+  });
+
+  test('AC5 — a config only in the worktree is ignored', async () => {
+    const repo = await makeRepo();
+    const worktree = await addWorktree(repo, 'topic', 'topic');
+    await writeConfig(worktree, JSON.stringify({ setup: ['from-worktree'], teardown: ['bye-worktree'] }));
+    git(worktree, 'add', '.cockpit/config.json');
+    git(worktree, 'commit', '-m', 'config');
+
+    const result = await rwc(repo, worktree);
+
+    expect(result.setup).toEqual([]);
+    expect(result.teardown).toEqual([]);
+  });
+
+  test('AC6 — a file that is not valid JSON is INVALID_CONFIG naming the file', async () => {
+    const repo = await makeRepo();
+    const file = await writeConfig(repo, '{"setup": [');
+    const worktree = await addWorktree(repo, 'topic', 'topic');
+
+    const error = await rejection(rwc(repo, worktree));
+
+    expect(error.code).toBe('INVALID_CONFIG');
+    expect(error.message).toContain(file);
+  });
+
+  test.each([
+    ['a top-level array', '[]', undefined],
+    ['a top-level null', 'null', undefined],
+    ['a top-level string', '"setup"', undefined],
+    ['setup as a string', '{"setup": "bun install"}', 'setup'],
+    ['teardown holding a number', '{"teardown": [1]}', 'teardown'],
+    ['setup holding an empty string', '{"setup": [""]}', 'setup'],
+    ['setup holding whitespace', '{"setup": ["   "]}', 'setup'],
+    ['an unknown key', '{"setpu": ["bun install"]}', 'setpu'],
+    ['the run key', '{"run": ["bun dev"]}', 'run'],
+  ])('AC7 — %s is INVALID_CONFIG naming the file and the key', async (_name, content, key) => {
+    const repo = await makeRepo();
+    const file = await writeConfig(repo, content);
+    const worktree = await addWorktree(repo, 'topic', 'topic');
+
+    const error = await rejection(rwc(repo, worktree));
+
+    expect(error.code).toBe('INVALID_CONFIG');
+    expect(error.message).toContain(file);
+    if (key) expect(error.message).toContain(key);
+  });
+
+  test('AC8 — a folder named config.json is INVALID_CONFIG with EISDIR and is left as it was', async () => {
+    const repo = await makeRepo();
+    const file = join(repo, '.cockpit', 'config.json');
+    await mkdir(file, { recursive: true });
+    const worktree = await addWorktree(repo, 'topic', 'topic');
+
+    const error = await rejection(rwc(repo, worktree));
+
+    expect(error.code).toBe('INVALID_CONFIG');
+    expect(error.message).toContain(file);
+    expect(error.message).toContain('EISDIR');
+    expect(statSync(file).isDirectory()).toBe(true);
+    expect(readdirSync(file)).toEqual([]);
+  });
+
+  // Root ignores permission bits.
+  test.skipIf(process.getuid?.() === 0)(
+    'AC8 — a file without read permission is INVALID_CONFIG with EACCES and is left as it was',
+    async () => {
+      const repo = await makeRepo();
+      const file = await writeConfig(repo, '{"setup": ["x"]}');
+      await chmod(file, 0o000);
+      const worktree = await addWorktree(repo, 'topic', 'topic');
+
+      try {
+        const error = await rejection(rwc(repo, worktree));
+
+        expect(error.code).toBe('INVALID_CONFIG');
+        expect(error.message).toContain(file);
+        expect(error.message).toContain('EACCES');
+        expect(statSync(file).mode & 0o777).toBe(0);
+      } finally {
+        await chmod(file, 0o644);
+      }
+      expect(await readFile(file, 'utf8')).toBe('{"setup": ["x"]}');
+    },
+  );
+
+  test('AC9 — the main working tree or a stray folder is GIT_FAILED, even with an invalid config', async () => {
+    const repo = await makeRepo();
+    await writeConfig(repo, '{"setup": [');
+    const stray = await tempDir();
+
+    for (const path of [repo, stray]) {
+      const error = await rejection(rwc(repo, path));
+      expect(error.code, path).toBe('GIT_FAILED');
+      expect(error.message, path).toContain(`not a linked worktree: ${path}`);
+    }
+  });
+
+  test('AC9 — a repo outside any repository is NOT_A_REPOSITORY', async () => {
+    const folder = await tempDir();
+    const error = await rejection(rwc(folder, folder));
+    expect(error.code).toBe('NOT_A_REPOSITORY');
+  });
+
+  test('AC9 — a PATH without git is GIT_MISSING', async () => {
+    const repo = await makeRepo();
+    const worktree = await addWorktree(repo, 'topic', 'topic');
+    const env = { ...testEnv, PATH: await tempDir() };
+
+    const error = await rejection(rwc(repo, worktree, env));
+
+    expect(error.code).toBe('GIT_MISSING');
+  });
+
+  test('AC10 — runs no command of the config', async () => {
+    const repo = await makeRepo();
+    const marker = join(await tempDir(), 'marker');
+    await writeConfig(repo, JSON.stringify({ setup: [`touch ${marker}`], teardown: [`touch ${marker}`] }));
+    const worktree = await addWorktree(repo, 'topic', 'topic');
+
+    const result = await rwc(repo, worktree);
+
+    expect(result.setup).toEqual([`touch ${marker}`]);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test('AC11 — a worktree path given through a symbolic link resolves to the path git reports', async () => {
+    const repo = await makeRepo();
+    await writeConfig(repo, JSON.stringify({ setup: ['bun install'] }));
+    const worktree = await addWorktree(repo, 'topic', 'topic');
+    const link = join(await tempDir(), 'link');
+    await symlink(worktree, link);
+
+    const result = await rwc(repo, link);
+
+    expect(result.setup).toEqual(['bun install']);
+    expect(result.env.COCKPIT_WORKSPACE_PATH).toBe(worktree);
   });
 });
 
