@@ -1,7 +1,8 @@
 import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { request as httpRequest } from 'node:http';
 import { createServer, type AddressInfo } from 'node:net';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -3724,6 +3725,9 @@ describe('built app with no git on the login shell PATH', () => {
 // `<stub>.slow` file exists (see `slowVersion` in `makeSessionsFixture`).
 const STUB_HARNESS = `#!/bin/sh
 if [ "$1" = "--version" ]; then [ -e "$0.slow" ] && sleep 1; echo 9.9.9; exit 0; fi
+echo "session:\${COCKPIT_SESSION_ID-unset}"
+echo "workspace:\${COCKPIT_WORKSPACE_PATH-unset}"
+echo "socket:\${COCKPIT_SOCKET-unset}"
 echo "cwd:$(pwd -P)"
 echo "args:$#:$*"
 echo "pid:$$"
@@ -3915,6 +3919,60 @@ async function readStub(page: Page): Promise<StubFacts> {
   return { cwd: found[1]!, argCount: Number(found[2]), args: found[3]!, pid: Number(found[4]), term: found[5]!, path: found[6]! };
 }
 
+interface StubEnv {
+  session: string;
+  workspace: string;
+  socket: string;
+}
+
+// The control variables the stub printed (`unset` when the variable is not in its environment).
+async function readStubEnv(page: Page): Promise<StubEnv> {
+  await waitForRow(page, 'ready');
+  const text = (await terminalRows(page)).join('');
+  const found = /session:(.*?)workspace:(.*?)socket:(.*?)cwd:/.exec(text);
+  if (!found) throw new Error(`The terminal does not show the stub's control variables:\n${text}`);
+  return { session: found[1]!, workspace: found[2]!, socket: found[3]! };
+}
+
+// --- Control endpoint (COCKPIT-31) -------------------------------------------
+
+// Values the app is launched with to prove that neither a terminal nor a session inherits them.
+const INHERITED_CONTROL_ENV = {
+  COCKPIT_SESSION_ID: 'sentinel-session-id',
+  COCKPIT_WORKSPACE_PATH: '/sentinel/workspace',
+  COCKPIT_SOCKET: '/sentinel/control.sock',
+};
+
+// What a client (a hook) sees of `POST /session-events` on the app's socket.
+function postSessionEvent(socketPath: string, { authorization, body }: { authorization?: string; body: unknown }) {
+  return new Promise<{ status: number; text: string }>((resolve, reject) => {
+    const headers: Record<string, string> = {};
+    if (authorization !== undefined) headers.authorization = authorization;
+    const req = httpRequest({ socketPath, method: 'POST', path: '/session-events', headers }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => resolve({ status: res.statusCode!, text: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('error', reject);
+    req.end(JSON.stringify(body));
+  });
+}
+
+const controlTokenIn = (cockpitHome: string) => readFileSync(join(cockpitHome, 'control.token'), 'utf8');
+
+// The smoke path of the control endpoint, on the session page that is open: the stub got its
+// session id and the socket, a request without the token is refused, one with it is accepted.
+async function expectControlEndpoint(session: Session): Promise<void> {
+  const socketPath = join(session.cockpitHome, 'control.sock');
+  const env = await readStubEnv(session.page);
+  expect(env.session).toBe(sessionIdOf(session.page));
+  expect(env.socket).toBe(socketPath);
+  expect(await postSessionEvent(socketPath, { body: { sessionId: env.session, event: 'working' } })).toEqual({ status: 401, text: '' });
+  expect(
+    await postSessionEvent(socketPath, { authorization: `Bearer ${controlTokenIn(session.cockpitHome)}`, body: { sessionId: env.session, event: 'working' } }),
+  ).toEqual({ status: 204, text: '' });
+}
+
 // Whether the deepest element whose text starts with `text` sits below the
 // "Sessions" header of the sidebar.
 const isBelowSessionsHeader = (page: Page, text: string) =>
@@ -4070,7 +4128,8 @@ describe('sessions: built app', () => {
     // The stubs log every run, and their `--version` sleeps 1 s (workspace sessions AC13, AC14).
     fx = makeSessionsFixture(['claude', 'codex'], { log: true, slowVersion: true });
     repo = makeRepo('agent-ws');
-    session = await launchBuiltWith(fx.env());
+    // The app itself is launched with the three control variables set, as when it runs from a session's terminal.
+    session = await launchBuiltWith({ ...fx.env(), ...INHERITED_CONTROL_ENV });
     await session.page.getByText(versionLabel).waitFor();
   });
 
@@ -4192,6 +4251,64 @@ describe('sessions: built app', () => {
       { id, name: 'Claude Code 1', harness: 'claude-code', directory: home, createdAt: expect.any(String) },
     ]);
     expect(new Date(stored[0]!.createdAt).toISOString()).toBe(stored[0]!.createdAt);
+  });
+
+  test('control AC1 — control.sock and control.token sit in COCKPIT_HOME, both with mode 0600, the token being 64 lowercase hex characters and nothing else', () => {
+    const socketPath = join(session.cockpitHome, 'control.sock');
+    const tokenPath = join(session.cockpitHome, 'control.token');
+    expect(statSync(socketPath).isSocket()).toBe(true);
+    expect(statSync(socketPath).mode & 0o777).toBe(0o600);
+    expect(statSync(tokenPath).isFile()).toBe(true);
+    expect(statSync(tokenPath).mode & 0o777).toBe(0o600);
+    expect(readFileSync(tokenPath, 'utf8')).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test('control AC8, AC9 — a session outside any project gets its own id and the socket, no workspace path, and not the values the app inherited', async () => {
+    const env = await readStubEnv(session.page);
+    expect(env.session).toBe(known.claude1.id);
+    expect(env.socket).toBe(join(session.cockpitHome, 'control.sock'));
+    expect(env.workspace).toBe('unset');
+    expect(sessionsInState(session.dataDir)[0]!.id).toBe(env.session);
+    expect(Object.values(env)).not.toContain(INHERITED_CONTROL_ENV.COCKPIT_SESSION_ID);
+    expect(env.socket).not.toBe(INHERITED_CONTROL_ENV.COCKPIT_SOCKET);
+  });
+
+  test('control AC2 — a request with no token, a malformed one or a wrong one gets 401 with an empty body', async () => {
+    const socketPath = join(session.cockpitHome, 'control.sock');
+    const body = { sessionId: known.claude1.id, event: 'working' };
+    const token = controlTokenIn(session.cockpitHome);
+    for (const authorization of [undefined, `Basic ${token}`, 'Bearer', `Bearer ${'0'.repeat(64)}`]) {
+      expect(await postSessionEvent(socketPath, { authorization, body }), String(authorization)).toEqual({ status: 401, text: '' });
+    }
+  });
+
+  test('control AC3 — POST /session-events with the token and the id of a stored session gets 204', async () => {
+    const socketPath = join(session.cockpitHome, 'control.sock');
+    const authorization = `Bearer ${controlTokenIn(session.cockpitHome)}`;
+    for (const event of ['working', 'waiting', 'finished']) {
+      expect(await postSessionEvent(socketPath, { authorization, body: { sessionId: known.claude1.id, event } }), event).toEqual({ status: 204, text: '' });
+    }
+  });
+
+  test('control AC4 — an id that is not a stored session gets 404 { "error": "unknown session" }', async () => {
+    const answer = await postSessionEvent(join(session.cockpitHome, 'control.sock'), {
+      authorization: `Bearer ${controlTokenIn(session.cockpitHome)}`,
+      body: { sessionId: randomUUID(), event: 'working' },
+    });
+    expect(answer.status).toBe(404);
+    expect(JSON.parse(answer.text)).toEqual({ error: 'unknown session' });
+  });
+
+  test('control AC9 — a shell of the terminal page gets COCKPIT_SOCKET and neither a session id nor a workspace path, whatever the app inherited', async () => {
+    const { page } = session;
+    // No `env` in the request: the main process fills in the default environment.
+    const id = await spawnShell(page, { command: '/bin/sh', cols: 80, rows: 24 });
+    await ptyWrite(page, id, `printf 'sock=<%s> sid=<%s> ws=<%s>\\n' "\${COCKPIT_SOCKET-unset}" "\${COCKPIT_SESSION_ID-unset}" "\${COCKPIT_WORKSPACE_PATH-unset}"\n`);
+    await waitForOutput(page, id, /sock=<[^%>][^>]*> sid=<[^>]*> ws=<[^>]*>/);
+    const printed = /sock=<([^%>][^>]*)> sid=<([^>]*)> ws=<([^>]*)>/.exec(await outputOf(page, id))!;
+    expect(printed.slice(1)).toEqual([join(session.cockpitHome, 'control.sock'), 'unset', 'unset']);
+    await ptyKill(page, id);
+    await waitForExit(page, id);
   });
 
   test('workspace sessions AC14 — a session start runs no --version', async () => {
@@ -4547,6 +4664,15 @@ describe('sessions: built app', () => {
     expect(sessionFoldersIn(session.cockpitHome)).toEqual(foldersBefore);
   });
 
+  test('control AC8, AC9 — a session started in a workspace gets its id, the socket and the worktree path stored as its directory', async () => {
+    const env = await readStubEnv(session.page);
+    const stored = sessionsInState(session.dataDir).find((entry) => entry.id === ws.plus.ids[0])!;
+    expect(env.session).toBe(ws.plus.ids[0]);
+    expect(env.workspace).toBe(stored.directory);
+    expect(env.workspace).toBe(ws.plus.path);
+    expect(env.socket).toBe(join(session.cockpitHome, 'control.sock'));
+  });
+
   test('workspace sessions AC3 — sessions are numbered per workspace, newest first, and apart from the Sessions section', async () => {
     const { page } = session;
     const id = await startInWorkspace(page, ws.plus.path, 'ws-plus', 'Claude Code', 'Claude Code 2');
@@ -4745,6 +4871,8 @@ describe('sessions: built app', () => {
   test('logs no error and keeps running', async () => {
     expect(await sidebarLines(session.page)).toContain('Sessions');
     await expectNoErrors(session);
+    // The endpoint started: the "off" line belongs to the launch that provokes it.
+    expect(session.output()).not.toContain('Cockpit control endpoint is off');
   });
 });
 
@@ -4782,6 +4910,10 @@ describe('sessions smoke path: dev server', () => {
     expect(stored.map((s) => [s.name, s.directory])).toEqual([['Claude Code 1', home]]);
   });
 
+  test('control smoke path — the stub gets its session id and the socket; a request without the token gets 401, with it 204', async () => {
+    await expectControlEndpoint(session);
+  });
+
   test('workspace sessions smoke path — a new workspace with Claude Code and a prompt runs the stub in the worktree with the prompt, lists the session under the workspace and stores it', async () => {
     const { page } = session;
     const repo = makeRepo('smoke-agent-ws');
@@ -4810,16 +4942,36 @@ describe('sessions smoke path: dev server', () => {
 describe('built app without any agent CLI on the login shell PATH', () => {
   let fx: SessionsFixture;
   let session: Session;
+  let dataDir: string;
 
   beforeAll(async () => {
     fx = makeSessionsFixture([]);
-    session = await launchBuiltWith(fx.env());
+    // COCKPIT_HOME is a regular file: the control endpoint cannot start (control endpoint AC10).
+    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+    const cockpitHome = join(dataDir, 'cockpit-home');
+    writeFileSync(cockpitHome, 'a file, not a folder');
+    session = await launchBuiltWith(fx.env(), dataDir, cockpitHome);
     await session.page.getByText(versionLabel).waitFor();
   });
 
   afterAll(async () => {
     await session?.close();
     if (fx) rmSync(fx.root, { recursive: true, force: true });
+    if (dataDir) rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  test('control AC10 — with COCKPIT_HOME a regular file the window opens, stderr gets one "Cockpit control endpoint is off: " line and a terminal shell has no COCKPIT_SOCKET', async () => {
+    const { page } = session;
+    expect(session.isRunning()).toBe(true);
+    expect(session.output().split('\n').filter((line) => line.startsWith('Cockpit control endpoint is off: ')).length).toBe(1);
+    expect(statSync(session.cockpitHome).isFile()).toBe(true);
+
+    const id = await spawnShell(page, { command: '/bin/sh', cols: 80, rows: 24 });
+    await ptyWrite(page, id, `printf 'sock=<%s>\\n' "\${COCKPIT_SOCKET-unset}"\n`);
+    await waitForOutput(page, id, 'sock=<unset>');
+    await ptyKill(page, id);
+    await waitForExit(page, id);
+    await expectNoErrors(session);
   });
 
   test('AC2 — the "Start session" menu shows one disabled item "No agent CLI found"', async () => {
@@ -4856,9 +5008,9 @@ describe('built app sessions folder when COCKPIT_HOME is unset or empty', () => 
   test.each([
     ['unset', undefined],
     ['empty', ''],
-  ])('AC11 — with COCKPIT_HOME %s and HOME=<tmp>, the session folder is <tmp>/.cockpit/sessions/<id>', async (label, value) => {
-    const userHome = join(fx.root, `user-home-${label}`);
-    mkdirSync(userHome);
+  ])('AC11 — with COCKPIT_HOME %s and HOME=<tmp>, the session folder is <tmp>/.cockpit/sessions/<id>', async (_label, value) => {
+    // A short folder: the socket path is limited to 103 bytes on macOS (`<fx.root>/…` would exceed it).
+    const userHome = realpathSync(mkdtempSync(join(tmpdir(), 'ck-')));
     const session = await launchBuiltWith({ ...fx.env(), HOME: userHome }, undefined, value ?? null);
     try {
       await session.page.getByText(versionLabel).waitFor();
@@ -4867,6 +5019,9 @@ describe('built app sessions folder when COCKPIT_HOME is unset or empty', () => 
 
       expect((await readStub(session.page)).cwd).toBe(directory);
       expect(statSync(directory).isDirectory()).toBe(true);
+      // Control endpoint AC11: the socket is <HOME>/.cockpit/control.sock.
+      expect(statSync(join(userHome, '.cockpit', 'control.sock')).isSocket()).toBe(true);
+      expect((await readStubEnv(session.page)).socket).toBe(join(userHome, '.cockpit', 'control.sock'));
       const stored = await poll(() => sessionsInState(session.dataDir), (list) => list.length > 0, UI_TIMEOUT);
       expect(stored.map((s) => s.directory)).toEqual([directory]);
       // Nothing went to the developer's own Cockpit home.
@@ -4874,6 +5029,7 @@ describe('built app sessions folder when COCKPIT_HOME is unset or empty', () => 
       await expectNoErrors(session);
     } finally {
       await session.close();
+      rmSync(userHome, { recursive: true, force: true });
     }
   });
 });
@@ -4912,6 +5068,8 @@ describe('packaged app sessions after a restart', () => {
       expect(await waitForSessionEntries(first.page, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
       const storedFirst = await poll(() => sessionsInState(dataDir), (list) => list.length > 0, UI_TIMEOUT);
       expect(storedFirst.map((s) => [s.name, s.directory])).toEqual([['Claude Code 1', home]]);
+      // Control endpoint smoke path.
+      await expectControlEndpoint(first);
 
       await startSession(first.page, 'Codex', 'Codex 1');
       await poll(() => sessionsInState(dataDir), (list) => list.length === 2, UI_TIMEOUT);
