@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, realpath } from 'node:fs/promises';
+import { mkdir, readFile, realpath } from 'node:fs/promises';
 import { basename, isAbsolute, join } from 'node:path';
 import { checkGit, git, succeeds, WorkspaceError } from './git';
 
@@ -237,4 +237,90 @@ export async function removeWorktree({
   if (!(await succeeds(['branch', '-d', '--', worktree.branch], { cwd: main, env }))) {
     throw new WorkspaceError('BRANCH_NOT_MERGED', `branch is not merged: ${worktree.branch}`);
   }
+}
+
+export interface WorkspaceConfig {
+  /** Shell commands to run, in order, in the new worktree. */
+  setup: string[];
+  /** Shell commands to run, in order, in the worktree before it is removed. */
+  teardown: string[];
+  /** The variables to add to the environment the commands run in. */
+  env: {
+    COCKPIT_ROOT_PATH: string;
+    COCKPIT_WORKSPACE_PATH: string;
+    COCKPIT_WORKSPACE_NAME: string;
+  };
+}
+
+/** Throws `INVALID_CONFIG` unless `value` is `{ setup?: string[], teardown?: string[] }` with non-blank commands. */
+function parseConfig(value: unknown, file: string): Pick<WorkspaceConfig, 'setup' | 'teardown'> {
+  const invalid = (reason: string) => new WorkspaceError('INVALID_CONFIG', `invalid config ${file}: ${reason}`);
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw invalid('expected an object');
+  const config: Pick<WorkspaceConfig, 'setup' | 'teardown'> = { setup: [], teardown: [] };
+  for (const [key, commands] of Object.entries(value)) {
+    if (key !== 'setup' && key !== 'teardown') throw invalid(`unknown key "${key}"`);
+    if (!Array.isArray(commands)) throw invalid(`"${key}" must be an array of commands`);
+    if (!commands.every((command) => typeof command === 'string' && command.trim() !== '')) {
+      throw invalid(`"${key}" must hold only non-empty strings`);
+    }
+    config[key] = commands;
+  }
+  return config;
+}
+
+/**
+ * The setup and teardown commands that `<main working tree>/.cockpit/config.json` declares for the
+ * linked worktree `path`, with the variables to run them with. The file is
+ * `{ "setup": string[], "teardown": string[] }`, both keys optional, no other key. It is read from
+ * the main working tree only, never from the worktree; a missing file means no commands, and one that
+ * cannot be read or is invalid is `INVALID_CONFIG`. The caller runs the commands in order, in the
+ * worktree, with `env` added to its environment: nothing is run here.
+ */
+export async function readWorkspaceConfig({
+  repo,
+  path,
+  env,
+}: {
+  repo: string;
+  path: string;
+} & GitEnv): Promise<WorkspaceConfig> {
+  await checkGit(env);
+  const worktrees = await list(repo, env);
+  const worktree = await linkedWorktree(worktrees, path);
+  const main = worktrees[0]!.path;
+  const file = join(main, '.cockpit', 'config.json');
+
+  let text: string | undefined;
+  try {
+    text = await readFile(file, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      const failure = error as NodeJS.ErrnoException;
+      throw new WorkspaceError('INVALID_CONFIG', `cannot read config ${file}: ${failure.code ?? failure.message}`, {
+        cause: error,
+      });
+    }
+  }
+
+  let commands: Pick<WorkspaceConfig, 'setup' | 'teardown'> = { setup: [], teardown: [] };
+  if (text !== undefined) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (error) {
+      throw new WorkspaceError('INVALID_CONFIG', `config ${file} is not valid JSON: ${(error as Error).message}`, {
+        cause: error,
+      });
+    }
+    commands = parseConfig(parsed, file);
+  }
+
+  return {
+    ...commands,
+    env: {
+      COCKPIT_ROOT_PATH: main,
+      COCKPIT_WORKSPACE_PATH: worktree.path,
+      COCKPIT_WORKSPACE_NAME: worktree.branch ?? basename(worktree.path),
+    },
+  };
 }
