@@ -1,7 +1,8 @@
 import { GitCompareIcon } from 'lucide-react';
-import { useEffect, useState, useSyncExternalStore } from 'react';
-import type { ChangedFile, ChangesResult, FileDiff, Project, Session } from '../../shared/api';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import type { BranchStatusResult, ChangedFile, ChangesResult, FileDiff, Project, Session, Workspace } from '../../shared/api';
 import { DiffView } from '@/components/diff-view';
+import { ShipSection } from '@/components/ship-section';
 import { Button } from '@/components/ui/button';
 
 // Whether the sidebar is open: kept for the page's lifetime, so going to a page without a
@@ -26,7 +27,7 @@ export function workspaceOf(session: Session | undefined, projects: Project[]) {
   if (!session?.project) return undefined;
   const project = projects.find(({ path }) => path === session.project);
   const workspace = project?.workspaces.find(({ path }) => path === session.directory);
-  return project && workspace ? { project: project.path, path: workspace.path } : undefined;
+  return project && workspace ? { project, workspace } : undefined;
 }
 
 /** The "Changes" button of a workspace page's header. */
@@ -71,8 +72,13 @@ function FileRow({ file, selected, onSelect }: { file: ChangedFile; selected: bo
  * selected one. It reads again when the main process says the worktree changed, and watches only
  * while it is mounted.
  */
-export function ChangesPanel({ project, path }: { project: string; path: string }) {
+export function ChangesPanel({ project: projectEntry, workspace }: { project: Project; workspace: Workspace }) {
+  const { path: project } = projectEntry;
+  const { path } = workspace;
   const [changes, setChanges] = useState<ChangesResult>();
+  const [status, setStatus] = useState<BranchStatusResult>();
+  // Reads the list and the git status again; set by the effect that watches the worktree.
+  const reload = useRef(() => {});
   const [selectedPath, setSelectedPath] = useState<string>();
   const [shown, setShown] = useState<{ path: string; diff: FileDiff }>();
 
@@ -81,6 +87,10 @@ export function ChangesPanel({ project, path }: { project: string; path: string 
     let current = true;
     let latest = 0;
     const refresh = () => {
+      workspaces.status(project, path).then(
+        (result) => current && setStatus(result),
+        () => {},
+      );
       const request = ++latest;
       workspaces.changes(project, path).then(
         (result) => {
@@ -93,8 +103,11 @@ export function ChangesPanel({ project, path }: { project: string; path: string 
         },
       );
     };
+    reload.current = refresh;
     refresh();
     const stopping = workspaces.watch(project, path, refresh);
+    // A change made while the watch was starting is never reported: read once more when it is live.
+    void stopping.then(() => current && refresh(), () => {});
     return () => {
       current = false;
       void stopping.then((stop) => stop(), () => {});
@@ -126,6 +139,7 @@ export function ChangesPanel({ project, path }: { project: string; path: string 
         <h2 className="font-heading text-sm font-medium">Changes</h2>
         {changes?.status === 'listed' && <span className="truncate text-xs text-muted-foreground">against {changes.base}</span>}
       </header>
+      <ShipSection project={projectEntry} workspace={workspace} changes={changes} status={status} onShipped={() => reload.current()} />
       {changes?.status === 'refused' && <p className="p-3 text-xs text-muted-foreground">{changes.message}</p>}
       {changes?.status === 'listed' && files.length === 0 && (
         <p className="p-3 text-xs text-muted-foreground">No changes against {changes.base}.</p>

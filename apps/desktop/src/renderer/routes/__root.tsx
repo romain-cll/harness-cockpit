@@ -41,7 +41,7 @@ function RootLayout() {
       <main className="flex min-w-0 flex-1 flex-col">
         <Outlet />
       </main>
-      {changesOpen && workspace && <ChangesPanel key={workspace.path} project={workspace.project} path={workspace.path} />}
+      {changesOpen && workspace && <ChangesPanel key={workspace.workspace.path} project={workspace.project} workspace={workspace.workspace} />}
     </div>
   );
 }

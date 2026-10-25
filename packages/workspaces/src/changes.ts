@@ -1,4 +1,4 @@
-import { watch } from 'node:fs';
+import { existsSync, watch, type FSWatcher } from 'node:fs';
 import { copyFile, mkdtemp, rm, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -155,41 +155,127 @@ export async function fileDiff(worktree: string, file: ChangedFile, { env }: Git
   return { kind: 'text', patch };
 }
 
+export interface BranchStatus {
+  /** The short branch name, `null` on a detached HEAD. */
+  branch: string | null;
+  /** The upstream as `origin/feat`, `null` when the branch has none. */
+  upstream: string | null;
+  /** Whether the worktree has a change to commit: edits, deletions, untracked files not ignored. */
+  uncommitted: boolean;
+  /** Whether HEAD has commits the upstream lacks, or, without an upstream, commits beyond the merge-base with the base. */
+  unpushed: boolean;
+}
+
+/** The state of a worktree's branch against its upstream; `NO_BASE` when it has no upstream and no base either. */
+export async function branchStatus(worktree: string, { env }: GitEnv = {}): Promise<BranchStatus> {
+  await checkGit(env);
+  const branch = await output(['symbolic-ref', '--quiet', '--short', 'HEAD'], worktree, env);
+  const upstream = await output(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'], worktree, env);
+  const since = upstream ?? (await resolveBase(worktree, env)).mergeBase;
+  const [status, ahead] = await Promise.all([
+    git(['--no-optional-locks', 'status', '--porcelain'], { cwd: worktree, env }),
+    git(['rev-list', '--count', `${since}..HEAD`], { cwd: worktree, env }),
+  ]);
+  return { branch, upstream, uncommitted: status.trim() !== '', unpushed: Number(ahead) > 0 };
+}
+
+/** The subject (first line) of HEAD's commit. */
+export async function headSubject(worktree: string, { env }: GitEnv = {}): Promise<string> {
+  await checkGit(env);
+  return (await git(['log', '-1', '--format=%s'], { cwd: worktree, env })).trim();
+}
+
+/** Commits every change of the worktree in one commit: `git add -A`, then `git commit -m <message>`. */
+export async function commitAll(worktree: string, message: string, { env }: GitEnv = {}): Promise<void> {
+  await checkGit(env);
+  await git(['add', '-A'], { cwd: worktree, env });
+  await git(['commit', '-m', message], { cwd: worktree, env });
+}
+
 /**
- * Resolves once the files under `path` are being watched (recursive `fs.watch`, FSEvents-backed on
- * macOS), then calls `onChange` once they stopped changing for 200 ms. `onError` gets a watcher
+ * Pushes the worktree's branch with `git push --set-upstream origin <branch>`, never forced. A
+ * detached HEAD is `GIT_FAILED`; so is a refusal by the remote, with git's message.
+ */
+export async function pushBranch(worktree: string, { env }: GitEnv = {}): Promise<void> {
+  await checkGit(env);
+  const branch = await output(['symbolic-ref', '--quiet', '--short', 'HEAD'], worktree, env);
+  if (branch === null) throw new WorkspaceError('GIT_FAILED', `${worktree} has no branch`);
+  await git(['push', '--set-upstream', 'origin', branch], {
+    cwd: worktree,
+    env: { ...(env ?? process.env), GIT_TERMINAL_PROMPT: '0' },
+  });
+}
+
+/**
+ * The git metadata a commit, a push or a fetch changes, besides the files of the worktree: its gitdir
+ * (HEAD, the index, its reflog), the common dir's `refs/remotes` (recursive) and its `packed-refs`
+ * (a file of the common dir, so the common dir is watched without recursion and filtered on the name).
+ * Empty when `path` is not in a repository.
+ */
+async function gitWatchTargets(path: string, env?: NodeJS.ProcessEnv) {
+  try {
+    const [gitDir, commonDir] = (
+      await git(['rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir'], { cwd: path, env })
+    )
+      .trim()
+      .split('\n');
+    return [
+      { dir: gitDir!, recursive: true },
+      { dir: join(commonDir!, 'refs', 'remotes'), recursive: true },
+      { dir: commonDir!, recursive: false, name: 'packed-refs' },
+    ];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Resolves once the files under `path` and the git metadata of its repository (see `gitWatchTargets`)
+ * are being watched (recursive `fs.watch`, FSEvents-backed on macOS), then calls `onChange` once they
+ * stopped changing for 200 ms. A git folder that does not exist is not watched. `onError` gets a watcher
  * failure, after which no event comes.
  */
 export async function watchWorktree(
   path: string,
   onChange: () => void,
   onError?: (error: Error) => void,
+  { env }: GitEnv = {},
 ): Promise<{ close(): void }> {
   let timer: NodeJS.Timeout | undefined;
   let live = false;
-  let reported!: () => void;
-  const first = new Promise<void>((resolve) => (reported = resolve));
-  const watcher = watch(path, { recursive: true }, () => {
-    if (!live) return reported();
-    clearTimeout(timer);
-    timer = setTimeout(onChange, DEBOUNCE_MS);
-  });
+  const targets = [{ dir: path, recursive: true, name: undefined }, ...(await gitWatchTargets(path, env))].filter(
+    (target, index, all) => all.findIndex(({ dir }) => dir === target.dir) === index && (index === 0 || existsSync(target.dir)),
+  );
+  const watchers: FSWatcher[] = [];
   const close = () => {
     clearTimeout(timer);
-    watcher.close();
+    for (const watcher of watchers) watcher.close();
   };
-  watcher.on('error', (error) => {
-    close();
-    onError?.(error);
+  // Each watcher reports its first event, which says its stream is running.
+  const firsts = targets.map(({ dir, recursive, name }) => {
+    let reported!: () => void;
+    const first = new Promise<void>((resolve) => (reported = resolve));
+    const watcher = watch(dir, { recursive }, (_event, filename) => {
+      if (!live) return reported();
+      if (name !== undefined && filename !== name) return;
+      clearTimeout(timer);
+      timer = setTimeout(onChange, DEBOUNCE_MS);
+    });
+    watcher.on('error', (error) => {
+      close();
+      onError?.(error);
+    });
+    watchers.push(watcher);
+    return { dir, first };
   });
 
   // FSEvents starts its stream after `watch` returns, and a change made before is never reported:
-  // touch the folder until the stream reports it, and let the events of the touches die down.
+  // touch the folders until every stream reports it, and let the events of the touches die down.
   const probe = setInterval(() => {
     const now = new Date();
-    void utimes(path, now, now).catch(() => {});
+    for (const { dir } of firsts) void utimes(dir, now, now).catch(() => {});
   }, PROBE_MS);
-  await Promise.race([first, sleep(PROBE_TIMEOUT_MS)]);
+  await Promise.race([Promise.all(firsts.map(({ first }) => first)), sleep(PROBE_TIMEOUT_MS)]);
   clearInterval(probe);
   await sleep(SETTLE_MS);
   live = true;

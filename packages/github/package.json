@@ -1,0 +1,19 @@
+{
+  "name": "@cockpit/github",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The pull request of a branch, read and created through the GitHub CLI",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "oxlint"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "vitest": "^5.0.5"
+  }
+}

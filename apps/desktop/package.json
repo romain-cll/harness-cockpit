@@ -20,6 +20,7 @@
   "devDependencies": {
     "@base-ui/react": "^1.9.0",
     "@cockpit/control": "workspace:*",
+    "@cockpit/github": "workspace:*",
     "@cockpit/harnesses": "workspace:*",
     "@cockpit/launchers": "workspace:*",
     "@cockpit/pty": "workspace:*",

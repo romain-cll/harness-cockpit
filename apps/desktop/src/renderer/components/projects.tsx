@@ -20,6 +20,24 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 
+// The workspace whose Delete dialog is open. Module-level so that the Changes sidebar can open it
+// (`requestDeleteWorkspace`) as the workspace's "…" menu does.
+let deletion: { project: Project; workspace: Workspace } | undefined;
+const deletingListeners = new Set<() => void>();
+
+function setDeleting(next: typeof deletion) {
+  deletion = next;
+  for (const listener of deletingListeners) listener();
+}
+
+function subscribeDeleting(listener: () => void) {
+  deletingListeners.add(listener);
+  return () => void deletingListeners.delete(listener);
+}
+
+/** Opens the Delete workspace dialog of `workspace`. */
+export const requestDeleteWorkspace = (project: Project, workspace: Workspace) => setDeleting({ project, workspace });
+
 const rowClass =
   'flex h-8 items-center gap-2 rounded-[calc(var(--radius-sm)+2px)] p-2 text-xs hover:bg-sidebar-accent hover:text-sidebar-accent-foreground [&_svg]:size-4 [&_svg]:shrink-0';
 
@@ -127,7 +145,7 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
   // Why the last add or start was refused, or that a deletion kept its branch; cleared by the next add, start or deletion that succeeds.
   const [message, setMessage] = useState<string>();
   const [creatingIn, setCreatingIn] = useState<Project>();
-  const [deleting, setDeleting] = useState<{ project: Project; workspace: Workspace }>();
+  const deleting = useSyncExternalStore(subscribeDeleting, () => deletion);
   // The editors and terminals found when a workspace's menu last opened.
   const [apps, setApps] = useState<AppsResult>();
 
