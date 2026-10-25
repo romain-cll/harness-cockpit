@@ -3,6 +3,7 @@ import { mkdirSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { startControlServer } from '@cockpit/control';
 import { detectHarnesses, harnesses, type DetectedHarness } from '@cockpit/harnesses';
 import { createPtyClient, type PtySpawnOptions } from '@cockpit/pty';
 import {
@@ -150,17 +151,30 @@ function isFromApp({ senderFrame }: Pick<IpcMainEvent, 'senderFrame'>): boolean 
   return senderFrame !== null && originOf(senderFrame.url) === appOrigin;
 }
 
+// The path of `control.sock`, once the control endpoint is up. Unset when it is off.
+let controlSocket: string | undefined;
+
+// The environment of a terminal or a session: the login shell's, without the session
+// variables the app itself may have inherited (launched from a Cockpit session), with
+// `COCKPIT_SOCKET` when the endpoint is up and `extra` on top (a session's own variables).
+async function terminalEnv(extra: Record<string, string> = {}): Promise<Record<string, string>> {
+  const env = { ...(await shellEnv) };
+  for (const name of ['COCKPIT_SESSION_ID', 'COCKPIT_WORKSPACE_PATH', 'COCKPIT_SOCKET']) delete env[name];
+  if (controlSocket) env.COCKPIT_SOCKET = controlSocket;
+  return { ...env, TERM: 'xterm-256color', COLORTERM: 'truecolor', ...extra };
+}
+
 // Fills in what a spawn request leaves out: the user's login-shell environment
 // and the shell it names, run as a login shell as Terminal.app does, in the home
 // directory. Options the renderer passes win. `-l` belongs to the default shell
 // only: a request with its own `command` and no `args` runs it with no argument.
 async function withSpawnDefaults(request: PtySpawnRequest): Promise<PtySpawnOptions> {
-  const env = await shellEnv;
+  const env = await terminalEnv();
   return {
     command: env.SHELL ?? '/bin/zsh',
     args: request.command === undefined ? ['-l'] : [],
     cwd: homedir(),
-    env: { ...env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
+    env,
     ...request,
   };
 }
@@ -436,7 +450,11 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
       let ptyId: number | undefined;
       try {
         if (!workspace) mkdirSync(directory, { recursive: true });
-        ptyId = await spawnFor(event.sender, { ...size, command: found.path, args: harness.start(prompt), cwd: directory }, endings);
+        const env = await terminalEnv({
+          COCKPIT_SESSION_ID: id,
+          ...(workspace && { COCKPIT_WORKSPACE_PATH: workspace.path }),
+        });
+        ptyId = await spawnFor(event.sender, { ...size, command: found.path, args: harness.start(prompt), cwd: directory, env }, endings);
         const session = {
           id,
           name: sessionName(state, harness, workspace?.path),
@@ -489,7 +507,7 @@ app.on('window-all-closed', () => {
 
 // Never `await` this at the top level: Electron emits `ready` only once this
 // ES module has finished evaluating, so the app would wait forever.
-void app.whenReady().then(() => {
+void app.whenReady().then(async () => {
   const userData = app.getPath('userData');
   try {
     state = loadState(userData);
@@ -514,6 +532,16 @@ void app.whenReady().then(() => {
     return (await shellEnv).PATH ?? '';
   });
   startProjects(userData);
+  // A failure leaves the endpoint off: the app runs, and terminals get no `COCKPIT_SOCKET`.
+  try {
+    const control = await startControlServer({
+      dir: cockpitHome,
+      onSessionEvent: ({ sessionId }) => state.sessions.some((session) => session.id === sessionId),
+    });
+    controlSocket = control.socketPath;
+  } catch (error) {
+    console.error(`Cockpit control endpoint is off: ${error instanceof Error ? error.message : String(error)}`);
+  }
   startSessions(userData, startPty());
 
   createWindow();
