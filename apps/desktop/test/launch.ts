@@ -65,9 +65,10 @@ export interface Session {
 // folders the app creates live under it and are removed with it, and no test
 // touches the developer's `~/.cockpit`. Only a test of the default passes `null`
 // (unset) or `''` (empty), with a `HOME` of its own.
-// COCKPIT-61: a `null` data dir leaves `COCKPIT_USER_DATA_DIR` unset (an unpackaged app then keeps
-// its `userData` in `<HOME>/.cockpit-dev/<folder>/user-data`, so the test needs a `HOME` of its
-// own); the data folder is then made only so the session has a folder to report and to remove.
+// COCKPIT-61: a `null` data dir leaves `COCKPIT_USER_DATA_DIR` unset and `''` sets it empty (an
+// unpackaged app then keeps its `userData` in `<HOME>/.cockpit-dev/<folder>/user-data`, so the test
+// needs a `HOME` of its own); the data folder is then made only so the session has a folder to
+// report and to remove.
 // The terminal page runs whatever `$SHELL` says: by default `/bin/sh`, which keeps
 // the developer's shell configuration from slowing or breaking the tests.
 export function launchEnv(
@@ -76,10 +77,11 @@ export function launchEnv(
   base: NodeJS.ProcessEnv = { ...process.env, SHELL: '/bin/sh' },
   givenCockpitHome?: string | null,
 ) {
-  const dataDir = givenDataDir ?? makeTestDir('d-');
+  const dataDir = givenDataDir || makeTestDir('d-');
   const cockpitHome = givenCockpitHome === undefined ? join(dataDir, 'h') : givenCockpitHome;
   const env = { ...base, COCKPIT_USER_DATA_DIR: dataDir } as Record<string, string>;
   if (givenDataDir === null) delete env.COCKPIT_USER_DATA_DIR;
+  else if (givenDataDir === '') env.COCKPIT_USER_DATA_DIR = '';
   if (cockpitHome === null) delete env.COCKPIT_HOME;
   else env.COCKPIT_HOME = cockpitHome;
   if (background) env.COCKPIT_TEST_BACKGROUND = '1';
@@ -289,7 +291,7 @@ export async function launchSpawned(
   child.stdout.on('data', (chunk) => (output += chunk));
   child.stderr.on('data', (chunk) => (output += chunk));
   const removeDataDir = () => {
-    if (givenDataDir === undefined || givenDataDir === null) rmSync(dataDir, { recursive: true, force: true });
+    if (!givenDataDir) rmSync(dataDir, { recursive: true, force: true });
   };
 
   try {

@@ -7473,11 +7473,11 @@ describe('built app default folders when COCKPIT_HOME and COCKPIT_USER_DATA_DIR 
   test.each([
     ['unset', undefined],
     ['empty', ''],
-  ])('AC1, AC4, AC5 — with COCKPIT_HOME %s, COCKPIT_USER_DATA_DIR unset and HOME=<tmp>, the unpackaged app puts the session folder in <tmp>/.cockpit-dev/<folder>/sessions/<id>, the socket next to it, state.json in <folder>/user-data, and nothing else under <tmp>/.cockpit-dev nor under <tmp>/.cockpit', async (_label, value) => {
+  ])('AC1, AC4, AC5 — with COCKPIT_HOME and COCKPIT_USER_DATA_DIR both %s and HOME=<tmp>, the unpackaged app puts the session folder in <tmp>/.cockpit-dev/<folder>/sessions/<id>, the socket next to it, state.json in <folder>/user-data, and nothing else under <tmp>/.cockpit-dev nor under <tmp>/.cockpit', async (_label, value) => {
     // A short folder: the socket path is limited to 103 bytes on macOS (`<fx.root>/…` would exceed it).
     const devFolder = await devFolderOfThisWorktree();
     const userHome = realpathSync(makeTestDir('u'));
-    const session = await launchBuiltWith({ ...fx.env(), HOME: userHome }, null, value ?? null);
+    const session = await launchBuiltWith({ ...fx.env(), HOME: userHome }, value ?? null, value ?? null);
     try {
       await session.page.getByText(versionLabel).waitFor();
       const id = await startSession(session.page, 'Claude Code', 'Claude Code 1');
