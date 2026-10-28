@@ -1,12 +1,13 @@
 {
-  "name": "@cockpit/pty",
+  "name": "@cockpit/daemon",
   "version": "0.0.0",
   "private": true,
-  "description": "node-pty host (utility process side) and client (main process side)",
+  "description": "The background process that owns every pty, its server and its client",
   "type": "module",
+  "sideEffects": false,
   "exports": {
-    ".": "./src/client.ts",
-    "./host": "./src/host.ts"
+    ".": "./src/index.ts",
+    "./scrollback": "./src/scrollback.ts"
   },
   "scripts": {
     "test": "vitest run",
@@ -18,6 +19,8 @@
   },
   "devDependencies": {
     "@types/node": "^24.19.2",
+    "@xterm/addon-serialize": "^0.14.0",
+    "@xterm/headless": "^6.0.0",
     "vitest": "^5.0.5"
   }
 }

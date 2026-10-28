@@ -18,6 +18,8 @@ const api: Api = {
     write: (id, data) => ipcRenderer.send('pty:write', id, data),
     resize: (id, cols, rows) => ipcRenderer.send('pty:resize', id, cols, rows),
     kill: (id) => ipcRenderer.send('pty:kill', id),
+    list: () => ipcRenderer.invoke('pty:list'),
+    attach: (id) => ipcRenderer.invoke('pty:attach', id),
     onData: (listener) => subscribe('pty:data', listener),
     onExit: (listener) => subscribe('pty:exit', listener),
   },
@@ -59,7 +61,11 @@ const api: Api = {
     start: (harness, size, options) => ipcRenderer.invoke('sessions:start', harness, size, options),
     onStatus: (listener) => subscribe('sessions:status', listener),
     onOpen: (listener) => subscribe('sessions:open', listener),
-    statusOff: () => ipcRenderer.invoke('sessions:status-off'),
+  },
+  daemon: {
+    status: () => ipcRenderer.invoke('daemon:status'),
+    retry: () => ipcRenderer.invoke('daemon:retry'),
+    showLog: () => ipcRenderer.invoke('daemon:show-log'),
   },
   getShellPath: () => ipcRenderer.invoke('get-shell-path'),
 };

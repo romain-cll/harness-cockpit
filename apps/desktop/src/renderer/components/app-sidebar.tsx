@@ -1,20 +1,19 @@
 import { Link } from '@tanstack/react-router';
 import { HouseIcon, SquareTerminalIcon } from 'lucide-react';
-import type { Project, Session } from '../../shared/api';
+import type { DaemonStatus, Project, Session } from '../../shared/api';
 import { Projects } from '@/components/projects';
 import { Sessions } from '@/components/sessions';
-import { StatusOffAlert } from '@/components/status-off-alert';
 
 export function AppSidebar({
   version,
   projects,
   sessions,
-  statusOff,
+  daemon,
 }: {
   version: string;
   projects: Project[];
   sessions: Session[];
-  statusOff: string | null;
+  daemon: DaemonStatus;
 }) {
   return (
     <aside className="flex w-64 shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground select-none">
@@ -36,9 +35,8 @@ export function AppSidebar({
           Terminal
         </Link>
       </nav>
-      {statusOff !== null && <StatusOffAlert reason={statusOff} />}
       <Projects projects={projects} sessions={sessions} />
-      <Sessions sessions={sessions} />
+      <Sessions sessions={sessions} daemon={daemon} />
       <footer className="shrink-0 px-4 py-3 text-xs text-muted-foreground">Cockpit {version}</footer>
     </aside>
   );

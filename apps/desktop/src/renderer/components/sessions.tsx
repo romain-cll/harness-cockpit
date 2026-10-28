@@ -1,7 +1,8 @@
 import { Link, useRouter } from '@tanstack/react-router';
 import { BotIcon } from 'lucide-react';
 import { useState, useSyncExternalStore } from 'react';
-import type { Session } from '../../shared/api';
+import type { DaemonStatus, Session } from '../../shared/api';
+import { useRetrying } from '@/components/daemon-down';
 import { getRunningIds, getSessionDots, startSession, subscribe } from '@/components/live-terminals';
 import { StartSessionMenu } from '@/components/start-session-menu';
 
@@ -41,8 +42,9 @@ export function SessionLink({ session }: { session: Session }) {
 }
 
 // The sessions outside any project; those of a workspace are listed under it.
-export function Sessions({ sessions }: { sessions: Session[] }) {
+export function Sessions({ sessions, daemon }: { sessions: Session[]; daemon: DaemonStatus }) {
   const router = useRouter();
+  const retrying = useRetrying();
   // Why the last start was refused; cleared by the next one that succeeds.
   const [message, setMessage] = useState<string>();
 
@@ -63,6 +65,9 @@ export function Sessions({ sessions }: { sessions: Session[] }) {
         <h2 className="font-medium">Sessions</h2>
         <StartSessionMenu label="Start session" onStart={(harness) => void start(harness)} />
       </header>
+      {daemon.status === 'down' && !retrying && (
+        <p className="shrink-0 px-2 py-1 text-xs break-words text-muted-foreground">{`Cockpit's background service could not start: ${daemon.reason}`}</p>
+      )}
       {message && (
         <p role="status" className="shrink-0 px-2 py-1 text-xs break-words text-destructive">
           {message}

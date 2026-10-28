@@ -1,6 +1,17 @@
-import type { PtyExit, PtySpawnOptions } from '@cockpit/pty';
+/** `exitCode` and `signal` are `null` when the daemon died while the process was running. */
+export interface PtyExit {
+  exitCode: number | null;
+  signal: number | null;
+}
 
-export type { PtyExit };
+export interface PtySpawnOptions {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+  cols: number;
+  rows: number;
+}
 
 /**
  * What the renderer sends to start a terminal. Omitted options are filled in by
@@ -10,6 +21,33 @@ export type { PtyExit };
  * environment with `TERM=xterm-256color` and `COLORTERM=truecolor`.
  */
 export type PtySpawnRequest = Pick<PtySpawnOptions, 'cols' | 'rows'> & Partial<PtySpawnOptions>;
+
+/** A terminal the daemon is running that the page can show again; `status` is what its session last reported. */
+export interface ListedTerminal {
+  id: number;
+  kind: 'shell' | 'session';
+  cwd: string;
+  cols: number;
+  rows: number;
+  sessionId?: string;
+  workspace?: string;
+  status?: SessionStatus;
+}
+
+/**
+ * A terminal's screen as the daemon holds it, scrollback included, at the pty's size. `seq` is the
+ * sequence number of the last chunk of output the screen covers: the output events that follow
+ * carry a higher one.
+ */
+export interface AttachedTerminal {
+  cols: number;
+  rows: number;
+  screen: string;
+  seq: number;
+}
+
+/** Whether the background service that runs the terminals is up; `log` says whether its log file exists. */
+export type DaemonStatus = { status: 'running' } | { status: 'down'; reason: string; log: boolean };
 
 /** A linked git worktree of a project; `name` is its branch, or its folder name when detached. */
 export interface Workspace {
@@ -140,7 +178,7 @@ export interface Session {
  * `workspace`: run in that linked worktree of a project instead of a new folder. `prompt`: the
  * harness's initial prompt (trimmed; blank means none).
  */
-/** What a session's agent reported through its hooks; the values of the control endpoint's events. */
+/** What a session's agent reported through its hooks; the values of the daemon's session events. */
 export type SessionStatus = 'working' | 'waiting' | 'finished';
 
 export interface StartSessionOptions {
@@ -165,19 +203,22 @@ export type StartSessionResult = { status: 'started'; session: Session; ptyId: n
 export interface Api {
   /** The app version, from `package.json`. */
   getVersion(): Promise<string>;
-  /** Pseudo-terminals, which run in a utility process. */
+  /** Pseudo-terminals, which run in the daemon and outlive the page and the app. */
   pty: {
     /**
-     * Resolves to the session id. The pty host restarts at the next spawn after it
-     * died, and ids are never reused; rejects only when the host dies while the
-     * spawn waits for it.
+     * Resolves to the terminal's id. The daemon starts again at the next spawn after it died, and
+     * ids are never reused; rejects with the reason when the daemon cannot start.
      */
     spawn(request: PtySpawnRequest): Promise<number>;
+    /** The shells and sessions the daemons are running, in creation order. Setup and teardown runs are not listed. */
+    list(): Promise<ListedTerminal[]>;
+    /** Makes the calling window the terminal's owner and answers its screen. */
+    attach(id: number): Promise<AttachedTerminal>;
     write(id: number, data: string): void;
     resize(id: number, cols: number, rows: number): void;
     kill(id: number): void;
-    /** Each listener registration returns its unsubscribe function. */
-    onData(listener: (id: number, data: string) => void): () => void;
+    /** Each listener registration returns its unsubscribe function. `seq` numbers a terminal's chunks of output. */
+    onData(listener: (id: number, data: string, seq: number) => void): () => void;
     onExit(listener: (id: number, exit: PtyExit) => void): () => void;
   };
   /** Git repositories the user works in, kept in the app state. */
@@ -255,8 +296,14 @@ export interface Api {
     onStatus(listener: (sessionId: string, status: SessionStatus) => void): () => void;
     /** Calls `listener` with the id of the session whose notification the user clicked. */
     onOpen(listener: (sessionId: string) => void): () => void;
-    /** Why session status is off (the control endpoint did not start), or `null` when it is on. */
-    statusOff(): Promise<string | null>;
+  };
+  /** The background service that runs the terminals and the sessions. */
+  daemon: {
+    status(): Promise<DaemonStatus>;
+    /** Starts the service again after it could not start, and answers its new status. */
+    retry(): Promise<DaemonStatus>;
+    /** Opens the service's log file. */
+    showLog(): Promise<void>;
   };
   /** The `PATH` of the user's login shell, the only part of its environment the renderer sees. */
   getShellPath(): Promise<string>;
