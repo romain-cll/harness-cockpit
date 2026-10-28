@@ -1,14 +1,13 @@
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { accessSync, appendFileSync, chmodSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { request as httpRequest } from 'node:http';
 import { homedir, userInfo } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
-import { statusCommand } from '@cockpit/daemon';
 import { statusLaunch } from '@cockpit/harnesses';
 import { type ElementHandle, type Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest';
@@ -4213,16 +4212,36 @@ async function expectDot(page: Page, id: string, label: string | null, timeout =
   if (label !== null) expect(dot?.title).toBe(label);
 }
 
+// The `cockpit` CLI the hooks run (COCKPIT-56): `apps/cli/dist/cockpit` when the app runs from the
+// repository (the dev server, the built app), `Contents/Resources/bin/cockpit` in the packaged app.
+const REPOSITORY_CLI = resolve(appDir, '..', 'cli', 'dist', 'cockpit');
+const PACKAGED_CLI = () => join(packagedAppDir(), 'Contents/Resources/bin/cockpit');
+
+// The command of a hook in the `--settings` the stub got, which names `cli` as its program.
+const hookCommandsOf = (fx: SessionsFixture, binary: string, pid: number) => {
+  const settings = JSON.parse(readLaunch(fx, binary, pid).args[1]!) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> };
+  return Object.fromEntries(Object.entries(settings.hooks).map(([name, groups]) => [name, groups[0]!.hooks[0]!.command]));
+};
+
+const singleQuoted = (path: string) => `'${path.replaceAll("'", "'\\''")}'`;
+
 // The smoke path of the control endpoint and of the status reporting, on the session page that is
 // open: the stub got its session id and the socket, and a `hook UserPromptSubmit` line (the stub runs
 // the command its --settings hold for that event) turns the row's dot to "Working". It reports
 // `working` only, which raises no notification.
-async function expectControlEndpoint(session: Session): Promise<void> {
+async function expectControlEndpoint(session: Session, fx: SessionsFixture, cli: string): Promise<void> {
   const { page } = session;
   const socketPath = daemonSocketIn(session.cockpitHome);
   const env = await readStubEnv(page);
   expect(env.session).toBe(sessionIdOf(page));
   expect(env.socket).toBe(socketPath);
+
+  // COCKPIT-56: the CLI exists and runs, and the hooks the stub got name it (and no curl).
+  accessSync(cli, constants.X_OK);
+  const hooks = hookCommandsOf(fx, 'claude', (await readStub(page)).pid);
+  expect(hooks.UserPromptSubmit).toBe(`${singleQuoted(cli)} status working`);
+  expect(hooks.Stop).toBe(`${singleQuoted(cli)} status finished`);
+  expect(Object.values(hooks).join('\n')).not.toContain('curl');
 
   await expectDot(page, env.session, null);
   await focusTerminal(page);
@@ -7117,7 +7136,7 @@ describe('session status: built app', () => {
 
   afterEach(() => closeOverlays(session.page));
 
-  test('AC2, AC3, AC4, AC9, single instance AC8 — Claude Code, Codex and OpenCode are started with the arguments statusLaunch gives, OpenCode with its config variable and the plugin written under COCKPIT_HOME; none shows a dot before it reports', async () => {
+  test('AC2, AC3, AC4, AC9, single instance AC8, cli-status AC7 — Claude Code, Codex and OpenCode are started with the arguments statusLaunch gives, OpenCode with its config variable and the plugin written under COCKPIT_HOME; none shows a dot before it reports', async () => {
     const { page } = session;
     // Every session is started before anything is checked: the tests after this one need them.
     for (const [menuName, id] of [
@@ -7131,12 +7150,17 @@ describe('session status: built app', () => {
 
     // The plugin of the expected launch goes to a folder of the test's own.
     const expectedPlugins = join(fx.root, 'expected-plugins');
-    const expected = (id: 'claude-code' | 'codex' | 'opencode') => statusLaunch(id, { command: statusCommand, pluginsDir: expectedPlugins, env: {} });
+    const expected = (id: 'claude-code' | 'codex' | 'opencode') => statusLaunch(id, { cli: REPOSITORY_CLI, pluginsDir: expectedPlugins, env: {} });
 
     const claude = readLaunch(fx, 'claude', known.claude.pid);
     expect(claude.args.length).toBe(2);
     expect(claude.args).toEqual((await expected('claude-code')).args);
     expect(claude.openCodeConfig).toBe('unset');
+    // COCKPIT-56 AC7: the hooks name the compiled CLI of the repository, which exists, and no curl.
+    accessSync(REPOSITORY_CLI, constants.X_OK);
+    const hooks = hookCommandsOf(fx, 'claude', known.claude.pid);
+    expect(Object.keys(hooks).length).toBeGreaterThan(0);
+    for (const command of Object.values(hooks)) expect(command.startsWith(`${singleQuoted(REPOSITORY_CLI)} status `), command).toBe(true);
 
     const codex = readLaunch(fx, 'codex', known.codex.pid);
     expect(codex.args.slice(0, 2)).toEqual(['--no-daemon', '-c']);
@@ -7150,6 +7174,9 @@ describe('session status: built app', () => {
     const written = readFileSync(join(folder, 'server.js'), 'utf8');
     await expected('opencode');
     expect(written).toBe(readFileSync(join(expectedPlugins, 'opencode-status', 'server.js'), 'utf8'));
+    // AC7: it names the compiled CLI too, and nothing the apps start holds curl.
+    expect(written).toContain(REPOSITORY_CLI);
+    expect(JSON.stringify([claude.args, codex.args, opencode.args, written])).not.toContain('curl');
 
     // AC9: running, nothing reported yet.
     expect((await sessionEntries(page)).map((entry) => [entry.name, entry.status])).toEqual([
@@ -7362,8 +7389,8 @@ describe('sessions smoke path: dev server', () => {
     expect(stored.map((s) => [s.name, s.directory])).toEqual([['Claude Code 1', home]]);
   });
 
-  test('control smoke path — the stub gets its session id and the socket, and a hook line turns the row to "Working"', async () => {
-    await expectControlEndpoint(session);
+  test('control smoke path, AC8 — the stub gets its session id and the socket, its hooks name apps/cli/dist/cockpit, and a hook line turns the row to "Working"', async () => {
+    await expectControlEndpoint(session, fx, REPOSITORY_CLI);
   });
 
   test('workspace sessions smoke path, changes AC16 — a new workspace with Claude Code and a prompt runs the stub in the worktree with the prompt, lists the session under the workspace and stores it, and the Changes sidebar shows a file written in the worktree with its diff', async () => {
@@ -7783,8 +7810,8 @@ describe('packaged app sessions after a restart', () => {
       expect(await waitForSessionEntries(first.page, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
       const storedFirst = await poll(() => sessionsInState(dataDir), (list) => list.length > 0, UI_TIMEOUT);
       expect(storedFirst.map((s) => [s.name, s.directory])).toEqual([['Claude Code 1', home]]);
-      // Control endpoint smoke path.
-      await expectControlEndpoint(first);
+      // Control endpoint smoke path (COCKPIT-56 AC8: the CLI is in the bundle).
+      await expectControlEndpoint(first, fx, PACKAGED_CLI());
 
       await startSession(first.page, 'Codex', 'Codex 1');
       await poll(() => sessionsInState(dataDir), (list) => list.length === 2, UI_TIMEOUT);

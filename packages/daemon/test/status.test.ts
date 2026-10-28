@@ -1,12 +1,11 @@
-import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { describe, expect, test } from 'vitest';
-import { daemonFiles, SESSION_EVENTS, statusCommand } from '../src/index';
+import { daemonFiles, SESSION_EVENTS } from '../src/index';
 import { collectUncaught, connectTo, listenFake, makeHome, registerCleanup, send, sendOrError, shellOptions, startDaemon, UNAUTHORIZED, until } from './helpers';
 
-// The session-events endpoint of the daemon (the control endpoint's rules, moved) and the
-// shell line a harness hook runs against it.
+// The session-events endpoint of the daemon (the control endpoint's rules, moved). The client a
+// harness hook runs against it is the `cockpit` CLI (`cli.test.ts`).
 
 registerCleanup();
 
@@ -150,43 +149,5 @@ describe('a server that answers 401 and closes before the body is written (AC17)
       else expect(['EPIPE', 'ECONNRESET']).toContain(outcome.error.code);
     }
     expect(uncaught).toEqual([]);
-  });
-});
-
-interface Run {
-  code: number | null;
-  stdout: string;
-  stderr: string;
-}
-
-function runStatus(event: (typeof SESSION_EVENTS)[number], env: Record<string, string>): Promise<Run> {
-  return new Promise((resolve) => {
-    execFile('/bin/sh', ['-c', statusCommand(event)], { env: { PATH: process.env.PATH ?? '/usr/bin:/bin', ...env } }, (error, stdout, stderr) => {
-      const code = error ? ((error as NodeJS.ErrnoException & { code?: number }).code as number | undefined) : 0;
-      resolve({ code: code ?? null, stdout, stderr });
-    });
-  });
-}
-
-describe('statusCommand', () => {
-  test.each(SESSION_EVENTS)('AC13 — run by /bin/sh -c with COCKPIT_SOCKET (the daemon\'s .sock) and the session id, the daemon receives %s and the command exits 0 with no output', async (event) => {
-    const { files, connection, sessionId } = await start();
-
-    const run = await runStatus(event, { COCKPIT_SOCKET: files.socket, COCKPIT_SESSION_ID: sessionId });
-
-    expect(run).toEqual({ code: 0, stdout: '', stderr: '' });
-    await until(() => connection.statuses.length === 1, 'the status event');
-    expect(connection.statuses).toEqual([{ sessionId, event }]);
-  });
-
-  test('AC13 — with COCKPIT_SOCKET unset, with no listener (the daemon is gone) or with an unknown session it exits 0, prints nothing and sends no event', async () => {
-    const { files, connection, sessionId, daemon } = await start();
-
-    expect(await runStatus('working', { COCKPIT_SESSION_ID: sessionId })).toEqual({ code: 0, stdout: '', stderr: '' });
-    expect(await runStatus('finished', { COCKPIT_SOCKET: files.socket, COCKPIT_SESSION_ID: 'nobody' })).toEqual({ code: 0, stdout: '', stderr: '' });
-    expect(connection.statuses).toEqual([]);
-
-    await daemon.close();
-    expect(await runStatus('waiting', { COCKPIT_SOCKET: files.socket, COCKPIT_SESSION_ID: sessionId })).toEqual({ code: 0, stdout: '', stderr: '' });
   });
 });
