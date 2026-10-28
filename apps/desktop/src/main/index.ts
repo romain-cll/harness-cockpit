@@ -95,19 +95,25 @@ const devServerUrl = app.isPackaged ? undefined : process.env.ELECTRON_RENDERER_
 // only change where the data lives and whether windows are shown.
 // - COCKPIT_USER_DATA_DIR: the app keeps its data in that folder.
 // - COCKPIT_HOME: where worktrees and session folders live, in `worktrees` and `sessions` under it
-//   (`~/.cockpit` when unset). They are the user's work, not app data, so they stay out of `userData`.
+//   (`~/.cockpit` when unset and packaged, `~/.cockpit-dev` when not, so a development build never
+//   shares the installed app's control endpoint). They are the user's work, not app data, so they
+//   stay out of `userData`.
 // - COCKPIT_TEST_APPLICATIONS_DIR: the one folder the editors and terminals are looked up in,
 //   instead of the three applications folders (ignored when empty).
 // - COCKPIT_TEST_BACKGROUND=1: no Dock icon, windows never shown, so a test
 //   launch does not take the user's focus.
 const background = process.env.COCKPIT_TEST_BACKGROUND === '1';
 const userDataDir = process.env.COCKPIT_USER_DATA_DIR;
-const cockpitHome = resolve(process.env.COCKPIT_HOME || join(homedir(), '.cockpit'));
+const cockpitHome = resolve(process.env.COCKPIT_HOME || join(homedir(), app.isPackaged ? '.cockpit' : '.cockpit-dev'));
 const worktreesRoot = join(cockpitHome, 'worktrees');
 const applicationDirs = process.env.COCKPIT_TEST_APPLICATIONS_DIR
   ? [process.env.COCKPIT_TEST_APPLICATIONS_DIR]
   : defaultApplicationDirs(homedir());
 if (userDataDir) app.setPath('userData', userDataDir);
+// After `setPath`: Electron ties the lock to the userData folder. A second launch on the same folder
+// exits at once; the running app gets `second-instance`.
+const hasLock = app.requestSingleInstanceLock();
+if (!hasLock) app.exit(0);
 if (background && process.platform === 'darwin') app.setActivationPolicy('accessory');
 
 protocol.registerSchemesAsPrivileged([
@@ -830,6 +836,7 @@ app.on('window-all-closed', () => {
 // Never `await` this at the top level: Electron emits `ready` only once this
 // ES module has finished evaluating, so the app would wait forever.
 void app.whenReady().then(async () => {
+  if (!hasLock) return;
   const userData = app.getPath('userData');
   try {
     state = loadState(userData);
@@ -872,5 +879,18 @@ void app.whenReady().then(async () => {
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+
+  // A second launch on this userData folder brings the app to the front, or opens a window as `activate` does.
+  app.on('second-instance', () => {
+    const [window] = BrowserWindow.getAllWindows();
+    if (!window) {
+      createWindow();
+      return;
+    }
+    if (window.isMinimized()) window.restore();
+    window.show();
+    window.focus();
+    if (process.platform === 'darwin') app.focus({ steal: true });
   });
 });
