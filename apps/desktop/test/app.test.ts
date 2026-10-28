@@ -7467,7 +7467,8 @@ describe('built app sessions folder when COCKPIT_HOME is unset or empty', () => 
   ])('single instance AC5 — with COCKPIT_HOME %s and HOME=<tmp>, the unpackaged app puts the session folder in <tmp>/.cockpit-dev/sessions/<id> and nothing under <tmp>/.cockpit', async (_label, value) => {
     // A short folder: the socket path is limited to 103 bytes on macOS (`<fx.root>/…` would exceed it).
     const userHome = realpathSync(mkdtempSync(join(tmpdir(), 'ck-')));
-    const session = await launchBuiltWith({ ...fx.env(), HOME: userHome }, undefined, value ?? null);
+    // A short build id keeps `<HOME>/.cockpit-dev/daemon-1-<build>.sock` under that limit (a 12-hex build would exceed it).
+    const session = await launchBuiltWith({ ...fx.env(), HOME: userHome, COCKPIT_TEST_DAEMON_BUILD: 'h' }, undefined, value ?? null);
     try {
       await session.page.getByText(versionLabel).waitFor();
       const id = await startSession(session.page, 'Claude Code', 'Claude Code 1');

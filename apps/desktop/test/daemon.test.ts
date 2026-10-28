@@ -179,11 +179,12 @@ async function expectScreen(page: Page, pattern: RegExp, timeout = 15_000) {
   return text;
 }
 
-async function typeLine(page: Page, text: string) {
-  const terminal = page.locator('.xterm:visible').first();
+// `nth` picks one of the visible terminals (a split tab shows several); the first by default.
+async function typeLine(page: Page, text: string, nth = 0) {
+  const terminal = page.locator('.xterm:visible').nth(nth);
   await terminal.waitFor({ state: 'visible', timeout: UI_TIMEOUT });
   await terminal.click({ timeout: UI_TIMEOUT });
-  await page.locator('.xterm:visible .xterm-helper-textarea').first().focus({ timeout: UI_TIMEOUT });
+  await page.locator('.xterm:visible .xterm-helper-textarea').nth(nth).focus({ timeout: UI_TIMEOUT });
   await page.keyboard.type(text);
   await page.keyboard.press('Enter');
 }
@@ -198,9 +199,9 @@ const tabNames = (page: Page) => page.getByRole('tab').evaluateAll((tabs) => tab
 const selectTab = (page: Page, name: string) => page.getByRole('tab', { name, exact: true }).click({ timeout: UI_TIMEOUT });
 
 // The pid a shell prints (`echo pid-$$`), typed in the terminal that is shown.
-async function shellPid(page: Page): Promise<number> {
+async function shellPid(page: Page, nth = 0): Promise<number> {
   const marker = Math.random().toString(36).slice(2, 6);
-  await typeLine(page, `echo pid${marker}-$$`);
+  await typeLine(page, `echo pid${marker}-$$`, nth);
   const screen = await expectScreen(page, new RegExp(`^pid${marker}-\\d+$`, 'm'));
   return Number(new RegExp(`^pid${marker}-(\\d+)$`, 'm').exec(screen)![1]);
 }
@@ -439,9 +440,9 @@ describe('daemon: built app', () => {
     await page.locator('.xterm:visible').first().hover({ timeout: UI_TIMEOUT });
     await page.locator('button[aria-label="Split right"]:visible').first().click({ force: true, timeout: UI_TIMEOUT });
     await poll(() => page.locator('.xterm:visible').count(), (count) => count === 2, UI_TIMEOUT);
-    const splitPane = page.locator('.xterm:visible').nth(1);
-    await splitPane.click({ timeout: UI_TIMEOUT });
-    const splitPid = await shellPid(page);
+    // The pane that owns the split shell is the second visible terminal.
+    const splitPid = await shellPid(page, 1);
+    expect(splitPid).not.toBe(known.shells[0]);
 
     await page.reload();
     await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
@@ -608,7 +609,7 @@ describe('daemon: built app, the daemon cannot start', () => {
   const failureView = (page: Page) => page.getByText("Cockpit's background service could not start", { exact: true });
   const SUBTITLE = 'Terminals and agents run in this service. Your projects and workspaces are untouched.';
 
-  test('AC10 — COCKPIT_HOME a regular file: the window opens; stderr names the path; /terminal and a session page show the failure view; the Sessions section says so; spawn and sessions.start are refused with the reason; projects and workspaces still work', async () => {
+  test('AC10 — COCKPIT_HOME a regular file: the window opens; stderr names the path; /terminal and a session page show the failure view; the Sessions section says so; spawn and sessions.start are refused with the reason; projects can still be added and removed', async () => {
     const fx = makeFixture();
     const home = join(dataDir, 'h');
     writeFileSync(home, 'a file, not a folder');
@@ -636,11 +637,12 @@ describe('daemon: built app, the daemon cannot start', () => {
       expect(started.message).toContain(reason);
       expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).sessions ?? []).toEqual([]);
 
-      // Projects and workspaces are untouched.
+      // Projects can still be added and removed (worktrees need the home folder, so no workspace is made).
       await stubPicker(session, repo.root);
       expect((await page.evaluate(() => (window as unknown as ApiWindow).api.projects!.add!())).status).toBe('added');
-      const created = await page.evaluate((root) => (window as unknown as ApiWindow).api.workspaces!.create!(root, 'still-works', 'main'), repo.root);
-      expect(created.status).toBe('created');
+      expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).projects.map((p: { path: string }) => p.path)).toEqual([repo.root]);
+      await page.evaluate((root) => (window as unknown as ApiWindow).api.projects!.remove!(root), repo.root);
+      expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).projects ?? []).toEqual([]);
       expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
     } finally {
       rmSync(fx.root, { recursive: true, force: true });
@@ -668,6 +670,29 @@ describe('daemon: built app, the daemon cannot start', () => {
       await session.evaluateInMain(`(() => { globalThis.__opened = []; require('electron').shell.openPath = async (path) => { globalThis.__opened.push(path); return ''; }; })()`);
       await page.getByRole('button', { name: 'Show log', exact: true }).click({ timeout: UI_TIMEOUT });
       expect(await poll(() => session!.evaluateInMain<string[]>('globalThis.__opened'), (opened) => opened.length > 0, UI_TIMEOUT)).toEqual([join(home, `daemon-1-${build}.log`)]);
+
+      // Projects and workspaces are untouched: the home folder exists, so a worktree can be made and deleted.
+      repo ??= makeRepoWithSetup();
+      await stubPicker(session, repo.root);
+      expect((await page.evaluate(() => (window as unknown as ApiWindow).api.projects!.add!())).status).toBe('added');
+      const created = await page.evaluate((root) => (window as unknown as ApiWindow).api.workspaces!.create!(root, 'still-works', 'main'), repo.root);
+      expect(created.status).toBe('created');
+      const worktree = await poll(
+        () =>
+          page.evaluate(
+            async (root) =>
+              ((await (window as unknown as ApiWindow).api.projects!.list!()) as Array<{ path: string; workspaces: Array<{ path: string; name: string }> }>)
+                .find((project) => project.path === root)
+                ?.workspaces.find((workspace) => workspace.name === 'still-works')?.path,
+            repo.root,
+          ),
+        Boolean,
+        UI_TIMEOUT,
+      );
+      expect(existsSync(worktree!)).toBe(true);
+      const removed = await page.evaluate(([root, path]) => (window as unknown as ApiWindow).api.workspaces!.remove!(root, path, {}), [repo.root, worktree!] as const);
+      expect(removed.status).toBe('removed');
+      expect(existsSync(worktree!)).toBe(false);
 
       // The cause remains: the view stays.
       await page.getByRole('button', { name: 'Try again', exact: true }).click({ timeout: UI_TIMEOUT });
