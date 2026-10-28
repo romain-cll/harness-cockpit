@@ -92,6 +92,7 @@ import type {
   StartSessionResult,
 } from '../shared/api';
 import daemonPath from './daemon?modulePath';
+import { devFolderName } from './dev-folder';
 import { shellEnv } from './shell-env';
 
 // The built renderer is served from a custom protocol rather than `file://`,
@@ -109,19 +110,23 @@ const devServerUrl = app.isPackaged ? undefined : process.env.ELECTRON_RENDERER_
 // ignored once packaged because it would change the code the app runs, they are
 // honoured in the packaged app too: the packaged-app test needs them, and they
 // only change where the data lives and whether windows are shown.
-// - COCKPIT_USER_DATA_DIR: the app keeps its data in that folder.
+// - COCKPIT_USER_DATA_DIR: the app keeps its data in that folder (Electron's default when packaged,
+//   `~/.cockpit-dev/<folder>/user-data` when not, see COCKPIT_HOME).
 // - COCKPIT_HOME: where worktrees and session folders live, in `worktrees` and `sessions` under it,
-//   and the daemon's files (`~/.cockpit` when unset and packaged, `~/.cockpit-dev` when not, so a
-//   development build never shares the installed app's daemon). They are the user's work, not app
-//   data, so they stay out of `userData`.
+//   and the daemon's files (`~/.cockpit` when unset and packaged; `~/.cockpit-dev/<folder>` when not,
+//   `<folder>` being `devFolderName` of the worktree root, so a development build never shares the
+//   installed app's daemon, nor another worktree's). They are the user's work, not app data, so they
+//   stay out of `userData`.
 // - COCKPIT_TEST_DAEMON_BUILD: replaces the daemon's build when non-empty, so a test can play an update.
 // - COCKPIT_TEST_APPLICATIONS_DIR: the one folder the editors and terminals are looked up in,
 //   instead of the three applications folders (ignored when empty).
 // - COCKPIT_TEST_BACKGROUND=1: no Dock icon, windows never shown, so a test
 //   launch does not take the user's focus.
 const background = process.env.COCKPIT_TEST_BACKGROUND === '1';
-const userDataDir = process.env.COCKPIT_USER_DATA_DIR;
-const cockpitHome = resolve(process.env.COCKPIT_HOME || join(homedir(), app.isPackaged ? '.cockpit' : '.cockpit-dev'));
+// What an unpackaged build defaults both folders to, whichever variable is set.
+const devHome = app.isPackaged ? undefined : join(homedir(), '.cockpit-dev', devFolderName(resolve(app.getAppPath(), '../..')));
+const userDataDir = process.env.COCKPIT_USER_DATA_DIR || (devHome && join(devHome, 'user-data'));
+const cockpitHome = resolve(process.env.COCKPIT_HOME || devHome || join(homedir(), '.cockpit'));
 const worktreesRoot = join(cockpitHome, 'worktrees');
 const applicationDirs = process.env.COCKPIT_TEST_APPLICATIONS_DIR
   ? [process.env.COCKPIT_TEST_APPLICATIONS_DIR]
