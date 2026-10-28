@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { chromium, type Browser, type Page } from 'playwright-core';
-import { makeTestDir } from './run-root';
+import { makeTestDir, runRoot } from './run-root';
 
 // Launching the app the ways it runs (the dev server, the built app, the packaged app) and
 // stopping it, shared by the test files of this folder. See `app.test.ts` for what each launch is for.
@@ -65,15 +65,21 @@ export interface Session {
 // folders the app creates live under it and are removed with it, and no test
 // touches the developer's `~/.cockpit`. Only a test of the default passes `null`
 // (unset) or `''` (empty), with a `HOME` of its own.
+// COCKPIT-61: a `null` data dir leaves `COCKPIT_USER_DATA_DIR` unset (an unpackaged app then keeps
+// its `userData` in `<HOME>/.cockpit-dev/<folder>/user-data`, so the test needs a `HOME` of its
+// own); the data folder is then made only so the session has a folder to report and to remove.
 // The terminal page runs whatever `$SHELL` says: by default `/bin/sh`, which keeps
 // the developer's shell configuration from slowing or breaking the tests.
 export function launchEnv(
   background: boolean,
-  dataDir = makeTestDir('d-'),
+  givenDataDir: string | null = makeTestDir('d-'),
   base: NodeJS.ProcessEnv = { ...process.env, SHELL: '/bin/sh' },
-  cockpitHome: string | null = join(dataDir, 'h'),
+  givenCockpitHome?: string | null,
 ) {
+  const dataDir = givenDataDir ?? makeTestDir('d-');
+  const cockpitHome = givenCockpitHome === undefined ? join(dataDir, 'h') : givenCockpitHome;
   const env = { ...base, COCKPIT_USER_DATA_DIR: dataDir } as Record<string, string>;
+  if (givenDataDir === null) delete env.COCKPIT_USER_DATA_DIR;
   if (cockpitHome === null) delete env.COCKPIT_HOME;
   else env.COCKPIT_HOME = cockpitHome;
   if (background) env.COCKPIT_TEST_BACKGROUND = '1';
@@ -116,11 +122,22 @@ export async function killDaemonsIn(...homes: Array<string | undefined>): Promis
 }
 
 // The folders a launch's daemons live in: its COCKPIT_HOME, or, when that is unset or empty, the
-// `.cockpit` and `.cockpit-dev` of a temporary HOME.
+// `.cockpit` and `.cockpit-dev` of a temporary HOME (a folder of the test run, or of the temporary
+// directory), and the per-worktree folders of that `.cockpit-dev` (COCKPIT-61).
 export function daemonHomesOf(env: Record<string, string>, cockpitHome: string): string[] {
   if (cockpitHome) return [cockpitHome];
   const home = env.HOME;
-  return home && (home.startsWith(tmpdir()) || home.startsWith(realpathSync(tmpdir()))) ? [join(home, '.cockpit'), join(home, '.cockpit-dev')] : [];
+  if (!home || !(home.startsWith(runRoot()) || home.startsWith(tmpdir()) || home.startsWith(realpathSync(tmpdir())))) return [];
+  const dev = join(home, '.cockpit-dev');
+  let folders: string[] = [];
+  try {
+    folders = readdirSync(dev, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => join(dev, entry.name));
+  } catch {
+    // No dev folder.
+  }
+  return [join(home, '.cockpit'), dev, ...folders];
 }
 
 // The daemon's socket in a Cockpit home (`daemon-1-<build>.sock`), and the token next to it.
@@ -256,7 +273,7 @@ export async function launchSpawned(
   executablePath: string,
   args: string[],
   background: boolean,
-  givenDataDir?: string,
+  givenDataDir?: string | null,
   base?: NodeJS.ProcessEnv,
   givenCockpitHome?: string | null,
 ): Promise<Session> {
@@ -272,7 +289,7 @@ export async function launchSpawned(
   child.stdout.on('data', (chunk) => (output += chunk));
   child.stderr.on('data', (chunk) => (output += chunk));
   const removeDataDir = () => {
-    if (givenDataDir === undefined) rmSync(dataDir, { recursive: true, force: true });
+    if (givenDataDir === undefined || givenDataDir === null) rmSync(dataDir, { recursive: true, force: true });
   };
 
   try {
@@ -344,11 +361,16 @@ export function freePort(): Promise<number> {
 }
 
 // Runs the `dev` script as a developer would, then attaches over the Chrome
-// DevTools Protocol.
-export async function launchDev(base?: NodeJS.ProcessEnv): Promise<Session> {
+// DevTools Protocol. `null` for the data folder or the home leaves `COCKPIT_USER_DATA_DIR` or
+// `COCKPIT_HOME` unset (COCKPIT-61).
+export async function launchDev(
+  base?: NodeJS.ProcessEnv,
+  givenDataDir?: string | null,
+  givenCockpitHome?: string | null,
+): Promise<Session> {
   const port = await freePort();
   const inspectPort = await freePort();
-  const { dataDir, cockpitHome, env } = launchEnv(true, undefined, base);
+  const { dataDir, cockpitHome, env } = launchEnv(true, givenDataDir, base, givenCockpitHome);
   // Its own process group, so closing stops the dev server and Electron with it.
   // electron-vite ignores `--inspect 0` (0 is falsy for it): a free port instead.
   const dev = spawn('bun', ['run', 'dev', '--remoteDebuggingPort', String(port), '--inspect', String(inspectPort)], {
