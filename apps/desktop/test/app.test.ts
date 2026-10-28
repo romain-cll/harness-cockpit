@@ -3498,6 +3498,30 @@ describe.each([
       for (const folder of folders) rmSync(folder.parent, { recursive: true, force: true });
     });
 
+    test.runIf(mode === 'dev server')(
+      'single instance smoke path (AC1, AC2) — a second `bun run dev` on the same data folder exits with code 0 and the running app shows and focuses its window',
+      async () => {
+        await stubFocus(session);
+        await clearFocusCalls(session);
+        const before = stateSnapshot(session.dataDir);
+        const env = launchEnv(true, session.dataDir, { ...process.env, SHELL: '/bin/sh' }, session.cockpitHome).env;
+
+        const second = await runSecondLaunch(
+          'bun',
+          ['run', 'dev', '--remoteDebuggingPort', String(await freePort()), '--inspect', String(await freePort())],
+          env,
+          60_000,
+        );
+
+        expect(second.exit, `the second dev launch exited (output: ${second.output})`).toEqual({ code: 0, signal: null });
+        expect([...new Set(await frontCalls(session))].sort()).toEqual(FRONT_CALLS);
+        expect(stateSnapshot(session.dataDir)).toEqual(before);
+        expect(session.isRunning()).toBe(true);
+        expect(front.pids.has(session.pid)).toBe(false);
+      },
+      120_000,
+    );
+
     test('smoke path (a) — projects: a repository added through the picker is listed and stored, then removed through the "…" menu and left on disk', async () => {
       const { page } = session;
       const repo = makeRepo('smoke-project');
@@ -7532,7 +7556,7 @@ describe('session status: built app', () => {
 
   afterEach(() => closeOverlays(session.page));
 
-  test('AC2, AC3, AC4, AC9 — Claude Code, Codex and OpenCode are started with the arguments statusLaunch gives, OpenCode with its config variable and the plugin written under COCKPIT_HOME; none shows a dot before it reports, and no Session status is off line', async () => {
+  test('AC2, AC3, AC4, AC9, single instance AC8 — Claude Code, Codex and OpenCode are started with the arguments statusLaunch gives, OpenCode with its config variable and the plugin written under COCKPIT_HOME; none shows a dot before it reports, and the sidebar shows no "Status icons are off" alert', async () => {
     const { page } = session;
     // Every session is started before anything is checked: the tests after this one need them.
     for (const [menuName, id] of [
@@ -7572,8 +7596,9 @@ describe('session status: built app', () => {
       ['Codex 1', null],
       ['Claude Code 1', null],
     ]);
-    // The endpoint is up: no line says status is off.
-    expect((await sidebarLines(page)).filter((line) => line.startsWith('Session status is off'))).toEqual([]);
+    // The endpoint is up: no alert says status is off (single instance AC8).
+    expect(await page.locator('aside [role="alert"]').count()).toBe(0);
+    expect((await sidebarLines(page)).filter((line) => line.includes('Status icons are off'))).toEqual([]);
   });
 
   test('AC7 — Claude Code hooks turn the row to "Working", "Needs input", "Working", "Ready" within 2 s of each report, another row is unchanged, and exiting with code 3 shows "Exited 3"', async () => {
@@ -7767,16 +7792,47 @@ describe('session status: built app with the control endpoint off', () => {
     if (dataDir) rmSync(dataDir, { recursive: true, force: true });
   });
 
-  test('AC10 — the Sessions section shows the muted line "Session status is off: <reason>" under its header, the reason being the message on stderr', async () => {
+  test('single instance AC7 — the sidebar shows, between the nav and the Projects header, an alert with a triangle-alert icon, the title "Status icons are off" in the --status-working color, the stderr reason and "Fix it, then restart Cockpit." in the muted color, and the Sessions section no longer shows "Session status is off"', async () => {
     const { page } = session;
     const prefix = 'Cockpit control endpoint is off: ';
     const reason = session.output().split('\n').find((line) => line.startsWith(prefix))?.slice(prefix.length);
     expect(reason, 'the app printed why the endpoint is off').toBeTruthy();
 
-    const line = `Session status is off: ${reason}`;
-    expect(await waitForLine(page, line)).toContain(line);
-    expect(await isBelowSessionsHeader(page, line)).toBe(true);
-    expect(await colorOfLine(page, line)).toBe(await mutedColor(page));
+    const alert = page.locator('aside [role="alert"]');
+    await alert.waitFor({ timeout: UI_TIMEOUT });
+    expect(await alert.count()).toBe(1);
+    const lines = (await alert.innerText()).split('\n').map((line) => line.trim()).filter(Boolean);
+    expect(lines).toEqual(['Status icons are off', reason, 'Fix it, then restart Cockpit.']);
+    expect(await alert.locator('svg.lucide-triangle-alert').count()).toBe(1);
+
+    // Between the Home/Terminal nav and the Projects header.
+    const placed = await page.evaluate(() => {
+      const aside = document.querySelector('aside')!;
+      const alertBox = aside.querySelector('[role="alert"]')!.getBoundingClientRect();
+      const navBox = aside.querySelector('nav')!.getBoundingClientRect();
+      const all = [...aside.querySelectorAll('*')] as HTMLElement[];
+      const titled = all.filter((element) => (element.textContent ?? '').trim() === 'Projects');
+      const header = titled.find((element) => !titled.some((other) => other !== element && element.contains(other)))!;
+      const headerBox = header.getBoundingClientRect();
+      return { belowNav: alertBox.top >= navBox.bottom - 1, aboveProjects: alertBox.bottom <= headerBox.top + 1 };
+    });
+    expect(placed).toEqual({ belowNav: true, aboveProjects: true });
+
+    const working = await page.evaluate(() => {
+      const probe = document.createElement('span');
+      probe.style.color = 'var(--status-working)';
+      document.body.append(probe);
+      const color = getComputedStyle(probe).color;
+      probe.remove();
+      return color;
+    });
+    const muted = await mutedColor(page);
+    expect(working).not.toBe(muted);
+    expect(await colorOfLine(page, 'Status icons are off'), 'the title').toBe(working);
+    expect(await colorOfLine(page, reason!), 'the reason').toBe(muted);
+    expect(await colorOfLine(page, 'Fix it, then restart Cockpit.'), 'the hint').toBe(muted);
+
+    expect((await sidebarLines(page)).filter((line) => line.startsWith('Session status is off'))).toEqual([]);
   });
 
   test('AC6 — with the endpoint off, each harness is started as before: no status argument, no OpenCode config variable, no plugin folder, and still its COCKPIT_SESSION_ID', async () => {
@@ -7954,20 +8010,22 @@ describe('built app sessions folder when COCKPIT_HOME is unset or empty', () => 
   test.each([
     ['unset', undefined],
     ['empty', ''],
-  ])('AC11 — with COCKPIT_HOME %s and HOME=<tmp>, the session folder is <tmp>/.cockpit/sessions/<id>', async (_label, value) => {
+  ])('single instance AC5 — with COCKPIT_HOME %s and HOME=<tmp>, the unpackaged app puts the session folder in <tmp>/.cockpit-dev/sessions/<id> and nothing under <tmp>/.cockpit', async (_label, value) => {
     // A short folder: the socket path is limited to 103 bytes on macOS (`<fx.root>/…` would exceed it).
     const userHome = realpathSync(mkdtempSync(join(tmpdir(), 'ck-')));
     const session = await launchBuiltWith({ ...fx.env(), HOME: userHome }, undefined, value ?? null);
     try {
       await session.page.getByText(versionLabel).waitFor();
       const id = await startSession(session.page, 'Claude Code', 'Claude Code 1');
-      const directory = join(userHome, '.cockpit', 'sessions', id);
+      const directory = join(userHome, '.cockpit-dev', 'sessions', id);
 
       expect((await readStub(session.page)).cwd).toBe(directory);
       expect(statSync(directory).isDirectory()).toBe(true);
-      // Control endpoint AC11: the socket is <HOME>/.cockpit/control.sock.
-      expect(statSync(join(userHome, '.cockpit', 'control.sock')).isSocket()).toBe(true);
-      expect((await readStubEnv(session.page)).socket).toBe(join(userHome, '.cockpit', 'control.sock'));
+      // Control endpoint AC11, now for an unpackaged app: the socket is <HOME>/.cockpit-dev/control.sock.
+      expect(statSync(join(userHome, '.cockpit-dev', 'control.sock')).isSocket()).toBe(true);
+      expect((await readStubEnv(session.page)).socket).toBe(join(userHome, '.cockpit-dev', 'control.sock'));
+      // The installed app's home is left alone.
+      expect(existsSync(join(userHome, '.cockpit'))).toBe(false);
       const stored = await poll(() => sessionsInState(session.dataDir), (list) => list.length > 0, UI_TIMEOUT);
       expect(stored.map((s) => s.directory)).toEqual([directory]);
       // Nothing went to the developer's own Cockpit home.
@@ -7977,6 +8035,252 @@ describe('built app sessions folder when COCKPIT_HOME is unset or empty', () => 
       await session.close();
       rmSync(userHome, { recursive: true, force: true });
     }
+  });
+});
+
+// --- Single instance (COCKPIT-54) ----------------------------------------------
+
+interface SecondLaunch {
+  exit: { code: number | null; signal: NodeJS.Signals | null } | 'timeout';
+  /** Everything the second process wrote to stdout and stderr. */
+  output: string;
+  elapsedMs: number;
+}
+
+// Starts the app a second time with the environment of a running one and waits for it to exit. It
+// takes no debugging port: a second launch is expected to leave before it opens a window. A launch
+// that is still running after `timeout` ms is stopped and reported as `'timeout'`.
+async function runSecondLaunch(command: string, args: string[], env: NodeJS.ProcessEnv, timeout = 10_000): Promise<SecondLaunch> {
+  const child = spawn(command, args, { cwd: appDir, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = '';
+  child.stdout.on('data', (chunk) => (output += chunk));
+  child.stderr.on('data', (chunk) => (output += chunk));
+  const started = Date.now();
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
+    child.once('exit', (code, signal) => resolve({ code, signal })),
+  );
+  const exit = await Promise.race([exited, sleep(timeout).then(() => 'timeout' as const)]);
+  const elapsedMs = Date.now() - started;
+  if (exit === 'timeout') await stopGroup(child);
+  else await waitForGroupGone(child.pid!);
+  // Lets the last chunks arrive after the exit.
+  await sleep(200);
+  return { exit, output, elapsedMs };
+}
+
+// Replaces the focus calls of the running app's window and of `app` with recorders, so a second
+// launch never takes the user's focus. `isMinimized` answers what `setMinimized` says.
+const stubFocus = (session: Session) =>
+  session.evaluateInMain(`(() => {
+    const { app, BrowserWindow } = require('electron');
+    const calls = (globalThis.__focusCalls = []);
+    globalThis.__minimized = false;
+    const window = BrowserWindow.getAllWindows()[0];
+    window.show = () => void calls.push('show');
+    window.focus = () => void calls.push('focus');
+    window.restore = () => void calls.push('restore');
+    window.isMinimized = () => globalThis.__minimized;
+    app.focus = (options) => void calls.push('app.focus ' + JSON.stringify(options));
+  })()`);
+
+const focusCalls = (session: Session) => session.evaluateInMain<string[]>('globalThis.__focusCalls.slice()');
+const clearFocusCalls = (session: Session) => session.evaluateInMain('globalThis.__focusCalls.length = 0');
+const setMinimized = (session: Session, minimized: boolean) => session.evaluateInMain(`globalThis.__minimized = ${minimized}`);
+const windowCount = (session: Session) => session.evaluateInMain<number>(`require('electron').BrowserWindow.getAllWindows().length`);
+
+// What a second launch must leave alone in the running app's folders.
+const filesOfRunningApp = (session: Session) => {
+  const socket = join(session.cockpitHome, 'control.sock');
+  return {
+    state: stateSnapshot(session.dataDir),
+    socketInode: statSync(socket).ino,
+    token: readFileSync(join(session.cockpitHome, 'control.token'), 'utf8'),
+  };
+};
+
+// The socket still answers 401 to a request without the token.
+async function expectSocketAnswers401(session: Session) {
+  const answer = await postSessionEvent(join(session.cockpitHome, 'control.sock'), { body: { sessionId: randomUUID(), event: 'working' } });
+  expect(answer).toEqual({ status: 401, text: '' });
+}
+
+// A second launch on the running app's folders: exits 0 within 10 s, prints no error, opens no
+// window, leaves state.json, control.sock and control.token alone, and the first process runs on.
+async function expectSecondLaunchLeaves(session: Session, launch: () => Promise<SecondLaunch>) {
+  const before = filesOfRunningApp(session);
+  const second = await launch();
+  expect(second.exit, `the second launch exited (output: ${second.output})`).toEqual({ code: 0, signal: null });
+  expect(second.elapsedMs).toBeLessThan(10_000);
+  expect(second.output).not.toMatch(MAIN_PROCESS_ERROR);
+  expect(second.output).not.toContain('Cockpit control endpoint is off: ');
+  expect(filesOfRunningApp(session)).toEqual(before);
+  await expectSocketAnswers401(session);
+  expect(await windowCount(session)).toBe(1);
+  expect(session.isRunning()).toBe(true);
+  expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+}
+
+// The calls the running app made to bring its window to the front, once the second launch has
+// reached it.
+const frontCalls = (session: Session) => poll(() => focusCalls(session), (calls) => calls.includes('show'), 5_000);
+
+const FRONT_CALLS = ['app.focus {"steal":true}', 'focus', 'show'];
+
+describe('single instance: built app', () => {
+  let session: Session;
+  let dataDir: string;
+  let front: ReturnType<typeof watchFrontmost>;
+  const electron: string = createRequire(import.meta.url)('electron');
+  const secondLaunch = (timeout?: number) =>
+    runSecondLaunch(
+      electron,
+      ['--remote-debugging-port=0', '--inspect=0', '.'],
+      launchEnv(true, dataDir, { ...process.env, SHELL: '/bin/sh' }, session.cockpitHome).env,
+      timeout,
+    );
+
+  beforeAll(async () => {
+    front = watchFrontmost();
+    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+    session = await launchBuiltWith({ ...process.env, SHELL: '/bin/sh' }, dataDir);
+    await session.page.getByText(versionLabel).waitFor();
+    await stubFocus(session);
+  });
+
+  afterAll(async () => {
+    await front?.stop();
+    await session?.close();
+    if (dataDir) rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  test('AC1 — a second launch on the same userData folder exits with code 0 within 10 s, prints no error, opens no window and leaves state.json, control.sock and control.token untouched while the first process keeps running', async () => {
+    await expectSecondLaunchLeaves(session, () => secondLaunch());
+  });
+
+  test('AC2 — a second launch makes the running app show its window, focus it and activate the app, without restoring a window that is not minimized', async () => {
+    await clearFocusCalls(session);
+    await setMinimized(session, false);
+
+    await secondLaunch();
+
+    const calls = await frontCalls(session);
+    expect([...new Set(calls)].sort()).toEqual(FRONT_CALLS);
+    expect(calls).not.toContain('restore');
+  });
+
+  test('AC2 — a minimized window is restored before it is shown', async () => {
+    await clearFocusCalls(session);
+    await setMinimized(session, true);
+
+    await secondLaunch();
+
+    const calls = await frontCalls(session);
+    expect(calls).toContain('restore');
+    expect(calls.indexOf('restore')).toBeLessThan(calls.indexOf('show'));
+    expect([...new Set(calls)].sort()).toEqual(['app.focus {"steal":true}', 'focus', 'restore', 'show']);
+    await setMinimized(session, false);
+    // The stubbed calls never took the user's focus: the app was not frontmost at any time.
+    expect(front.pids.has(session.pid)).toBe(false);
+  });
+
+  test('AC4 — two launches with their own userData folders and COCKPIT_HOME, started together, both render the home page and neither prints that the control endpoint is off', async () => {
+    const [one, two] = await Promise.all([launchBuilt(), launchBuilt()]);
+    try {
+      for (const other of [one, two]) {
+        await other.page.getByText(versionLabel).waitFor();
+        await other.page.getByRole('heading', { name: 'Home' }).waitFor();
+        expect(other.output()).not.toContain('Cockpit control endpoint is off: ');
+        expect(other.output()).not.toMatch(MAIN_PROCESS_ERROR);
+      }
+      expect(one.dataDir).not.toBe(two.dataDir);
+    } finally {
+      await Promise.all([one.close(), two.close()]);
+    }
+  });
+
+  // Last: it destroys the window the other tests stubbed.
+  test('AC3 — with no window open, a second launch opens one new window that loads the home page', async () => {
+    await session.evaluateInMain(`require('electron').BrowserWindow.getAllWindows().forEach((window) => window.destroy())`);
+    expect(await windowCount(session)).toBe(0);
+    expect(session.isRunning()).toBe(true);
+
+    const second = await secondLaunch();
+    expect(second.exit).toEqual({ code: 0, signal: null });
+
+    expect(await poll(() => windowCount(session), (count) => count === 1, 5_000)).toBe(1);
+    const loaded = await poll(
+      () => session.evaluateInMain<{ url: string; loading: boolean }>(`(() => {
+        const { webContents } = require('electron').BrowserWindow.getAllWindows()[0];
+        return { url: webContents.getURL(), loading: webContents.isLoading() };
+      })()`),
+      ({ url, loading }) => url !== '' && !loading,
+      10_000,
+    );
+    const url = new URL(loaded.url);
+    // `URL.origin` is "null" for a custom protocol: rebuild it.
+    expect(`${url.protocol}//${url.host}`).toBe('app://renderer');
+    expect(url.pathname).toBe('/');
+    expect(loaded.loading).toBe(false);
+    expect(await windowCount(session)).toBe(1);
+    expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+  });
+});
+
+describe('single instance: packaged app', () => {
+  let session: Session;
+  let dataDir: string;
+  let userHome: string;
+  let front: ReturnType<typeof watchFrontmost>;
+  let env: NodeJS.ProcessEnv;
+
+  beforeAll(async () => {
+    front = watchFrontmost();
+    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+    // A short folder: the socket path is limited to 103 bytes on macOS.
+    userHome = realpathSync(mkdtempSync(join(tmpdir(), 'ck-')));
+    env = { ...process.env, SHELL: '/bin/sh', HOME: userHome };
+    // COCKPIT_HOME unset: the packaged app's default home.
+    session = await launchSpawned(join(packagedAppDir(), 'Contents/MacOS/Cockpit'), [], true, dataDir, env, null);
+    await session.page.getByText(versionLabel).waitFor();
+    await stubFocus(session);
+  });
+
+  afterAll(async () => {
+    await front?.stop();
+    await session?.close();
+    if (dataDir) rmSync(dataDir, { recursive: true, force: true });
+    if (userHome) rmSync(userHome, { recursive: true, force: true });
+  });
+
+  test('AC6 — with COCKPIT_HOME unset and HOME=<tmp>, the control socket is <tmp>/.cockpit/control.sock and <tmp>/.cockpit-dev does not exist', () => {
+    expect(statSync(join(userHome, '.cockpit', 'control.sock')).isSocket()).toBe(true);
+    expect(existsSync(join(userHome, '.cockpit-dev'))).toBe(false);
+    expect(session.output()).not.toContain('Cockpit control endpoint is off: ');
+  });
+
+  test('AC1, AC2 smoke path — a second launch of the packaged app exits with code 0 and leaves the files alone, and the running app shows and focuses its window', async () => {
+    const second = () =>
+      runSecondLaunch(
+        join(packagedAppDir(), 'Contents/MacOS/Cockpit'),
+        ['--remote-debugging-port=0', '--inspect=0'],
+        launchEnv(true, dataDir, env, null).env,
+      );
+    // The running app's home is <HOME>/.cockpit, not a folder inside the data folder.
+    const home = join(userHome, '.cockpit');
+    const files = () => ({ state: stateSnapshot(dataDir), socketInode: statSync(join(home, 'control.sock')).ino, token: readFileSync(join(home, 'control.token'), 'utf8') });
+    const before = files();
+    await clearFocusCalls(session);
+
+    const launched = await second();
+
+    expect(launched.exit, `the second launch exited (output: ${launched.output})`).toEqual({ code: 0, signal: null });
+    expect(launched.elapsedMs).toBeLessThan(10_000);
+    expect(launched.output).not.toMatch(MAIN_PROCESS_ERROR);
+    expect(files()).toEqual(before);
+    expect([...new Set(await frontCalls(session))].sort()).toEqual(FRONT_CALLS);
+    expect(await windowCount(session)).toBe(1);
+    expect(session.isRunning()).toBe(true);
+    expect(front.pids.has(session.pid)).toBe(false);
   });
 });
 
