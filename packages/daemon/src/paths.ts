@@ -52,7 +52,7 @@ export async function clearStaleSocket(socketPath: string): Promise<void> {
     const probe = connect(socketPath);
     probe.once('connect', () => {
       probe.destroy();
-      reject(new Error(`another Cockpit holds ${socketPath}`));
+      reject(new Error(`another daemon holds ${socketPath}`));
     });
     probe.once('error', (error: NodeJS.ErrnoException) => {
       if (error.code !== 'ECONNREFUSED') return reject(error);

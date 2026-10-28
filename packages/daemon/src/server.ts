@@ -33,7 +33,8 @@ interface Connection extends Subscriber {
 
 /**
  * Listens on `daemon-<protocol>-<build>.sock` (HTTP over a Unix socket) with a fresh token in
- * the `.token` next to it. `POST /session-events` takes the harness hooks' reports; `GET /attach`
+ * the `.token` next to it, written once it listens: of two daemons started together the one that
+ * does not get the socket gives up without touching a file. `POST /session-events` takes the harness hooks' reports; `GET /attach`
  * upgrades to a stream of JSON lines that a client drives the terminals with. Rejects, touching
  * nothing, when another daemon holds the socket or the path is not a socket.
  */
@@ -43,9 +44,6 @@ export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon>
   await clearStaleSocket(files.socket);
 
   const token = randomBytes(32).toString('hex');
-  const temporaryPath = `${files.token}.tmp`;
-  writeFileSync(temporaryPath, token, { mode: 0o600 });
-  renameSync(temporaryPath, files.token);
 
   const connections = new Set<Connection>();
   // A daemon of another build asked for: it keeps its terminals and exits when the last one ends.
@@ -153,13 +151,19 @@ export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon>
   }
 
   await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
+    const fail = (error: NodeJS.ErrnoException) =>
+      reject(error.code === 'EADDRINUSE' ? new Error(`another daemon holds ${files.socket}`) : error);
+    server.once('error', fail);
     server.listen(files.socket, () => {
-      server.off('error', reject);
+      server.off('error', fail);
       resolve();
     });
   });
   chmodSync(files.socket, 0o600);
+  // A client that connects before this reads the token of an earlier daemon, or none, and tries again.
+  const temporaryPath = `${files.token}.tmp`;
+  writeFileSync(temporaryPath, token, { mode: 0o600 });
+  renameSync(temporaryPath, files.token);
   writeFileSync(files.pid, String(process.pid));
 
   function close(): Promise<void> {

@@ -1,5 +1,5 @@
-import { readFileSync } from 'node:fs';
-import { request } from 'node:http';
+import { readFileSync, statSync } from 'node:fs';
+import { request, type ClientRequest } from 'node:http';
 import type { Socket } from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { daemonFiles, tokenPathOf } from './paths';
@@ -43,34 +43,83 @@ export interface DaemonClient {
   close(): void;
 }
 
-/** Connects to a daemon's socket, authenticating with the `.token` next to it. */
-export function connectDaemon(socketPath: string): Promise<DaemonClient> {
+/** The daemon accepted the connection and never answered: it is stopped, or stuck. */
+export class DaemonNotAnsweringError extends Error {
+  constructor(socketPath: string, timeoutMs: number) {
+    super(`Cockpit's background service did not answer within ${timeoutMs / 1000} s: ${socketPath}`);
+    this.name = 'DaemonNotAnsweringError';
+  }
+}
+
+export interface TimeoutOptions {
+  /** How long the connect, and `hello`, wait for an answer. Default 5000. */
+  timeoutMs?: number;
+}
+
+const DEFAULT_TIMEOUT_MS = 5_000;
+// A daemon writes its token just after it listens: a client that connects in between reads the
+// token of an earlier daemon, is answered 401, and reads it again.
+const TOKEN_ATTEMPTS = 3;
+const TOKEN_RETRY_MS = 50;
+
+/**
+ * Connects to a daemon's socket, authenticating with the `.token` next to it. Gives up with a
+ * `DaemonNotAnsweringError` when the upgrade is not answered in time.
+ */
+export function connectDaemon(socketPath: string, { timeoutMs = DEFAULT_TIMEOUT_MS }: TimeoutOptions = {}): Promise<DaemonClient> {
   return new Promise((resolve, reject) => {
-    let token: string;
-    try {
-      token = readFileSync(tokenPathOf(socketPath), 'utf8');
-    } catch (error) {
-      return reject(error);
-    }
-    const req = request({
-      socketPath,
-      path: '/attach',
-      headers: { connection: 'Upgrade', upgrade: UPGRADE, authorization: `Bearer ${token}` },
-    });
-    req.once('error', reject);
-    req.once('response', (res) => {
-      res.resume();
-      reject(new Error(`the background service refused the connection (HTTP ${res.statusCode})`));
-    });
-    req.once('upgrade', (_res, socket: Socket, head) => {
-      req.off('error', reject);
-      resolve(createClient(socket, head));
-    });
-    req.end();
+    let settled = false;
+    let current: ClientRequest | undefined;
+    const settle = (finish: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      finish();
+    };
+    const timer = setTimeout(() => {
+      settle(() => reject(new DaemonNotAnsweringError(socketPath, timeoutMs)));
+      current?.destroy();
+    }, timeoutMs);
+
+    const attempt = (left: number) => {
+      if (settled) return;
+      let token: string;
+      try {
+        token = readFileSync(tokenPathOf(socketPath), 'utf8');
+      } catch (error) {
+        return settle(() => reject(error));
+      }
+      let answered = false;
+      const req = request({
+        socketPath,
+        path: '/attach',
+        headers: { connection: 'Upgrade', upgrade: UPGRADE, authorization: `Bearer ${token}` },
+      });
+      current = req;
+      // Stays registered: a server that answered 401 and closed makes the write fail (EPIPE,
+      // ECONNRESET) after the answer, which is no news.
+      req.on('error', (error) => {
+        if (!answered) settle(() => reject(error));
+      });
+      req.once('response', (res) => {
+        answered = true;
+        res.on('error', () => {});
+        res.resume();
+        if (res.statusCode === 401 && left > 1) return void setTimeout(() => attempt(left - 1), TOKEN_RETRY_MS);
+        settle(() => reject(new Error(`the background service refused the connection (HTTP ${res.statusCode})`)));
+      });
+      req.once('upgrade', (_res, socket: Socket, head) => {
+        answered = true;
+        if (settled) return socket.destroy();
+        settle(() => resolve(createClient(socket, head, socketPath, timeoutMs)));
+      });
+      req.end();
+    };
+    attempt(TOKEN_ATTEMPTS);
   });
 }
 
-function createClient(socket: Socket, head: Buffer): DaemonClient {
+function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutMs: number): DaemonClient {
   let lastId = 0;
   const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();
   const dataListeners: Array<Parameters<DaemonClient['onData']>[0]> = [];
@@ -137,7 +186,14 @@ function createClient(socket: Socket, head: Buffer): DaemonClient {
   if (head.length > 0) read(head);
 
   return {
-    hello: (build) => call({ type: 'hello', build }),
+    hello: (build) =>
+      new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new DaemonNotAnsweringError(socketPath, timeoutMs)), timeoutMs);
+        call<Hello>({ type: 'hello', build }).then(
+          (value) => (clearTimeout(timer), resolve(value)),
+          (error: unknown) => (clearTimeout(timer), reject(error)),
+        );
+      }),
     spawn: (options) => call({ type: 'spawn', options }),
     list: () => call({ type: 'list' }),
     attach: (terminal) => call({ type: 'attach', terminal }),
@@ -157,7 +213,7 @@ export interface DaemonChild {
   on(event: 'exit', listener: (code: number | null, signal: string | null) => void): unknown;
 }
 
-export interface EnsureDaemonOptions {
+export interface EnsureDaemonOptions extends TimeoutOptions {
   home: string;
   build: string;
   /** Starts a daemon of this build, detached; its output goes to `daemon-<protocol>-<build>.log`. */
@@ -168,13 +224,14 @@ const START_TIMEOUT_MS = 15_000;
 
 /**
  * A client connected to the daemon of this build, said hello to. When none listens it starts one
- * and waits for it; a daemon that exits before it listens fails the call with the last line of
- * its log, which says why.
+ * and waits for it; a daemon that exits before it listens fails the call with the last line it
+ * wrote to its log, which says why. A daemon that listens and does not answer fails the call with
+ * a `DaemonNotAnsweringError`: no second daemon is started over it.
  */
-export async function ensureDaemon({ home, build, spawn }: EnsureDaemonOptions): Promise<DaemonClient> {
+export async function ensureDaemon({ home, build, spawn, timeoutMs }: EnsureDaemonOptions): Promise<DaemonClient> {
   const { socket, log } = daemonFiles(home, PROTOCOL_VERSION, build);
   const connect = async () => {
-    const client = await connectDaemon(socket);
+    const client = await connectDaemon(socket, { timeoutMs });
     await client.hello(build).catch((error: unknown) => {
       client.close();
       throw error;
@@ -184,10 +241,13 @@ export async function ensureDaemon({ home, build, spawn }: EnsureDaemonOptions):
 
   try {
     return await connect();
-  } catch {
+  } catch (error) {
+    if (error instanceof DaemonNotAnsweringError) throw error;
     // Not running: start one.
   }
 
+  // The log is appended to: what the daemon says is what comes after this.
+  const logStart = statSync(log, { throwIfNoEntry: false })?.size ?? 0;
   const child = spawn();
   let exit: { code: number | null; signal: string | null } | undefined;
   child.on('exit', (code, signal) => (exit = { code, signal }));
@@ -195,19 +255,27 @@ export async function ensureDaemon({ home, build, spawn }: EnsureDaemonOptions):
   for (;;) {
     try {
       return await connect();
-    } catch {
+    } catch (error) {
+      if (error instanceof DaemonNotAnsweringError) throw error;
       // Not listening yet.
     }
-    if (exit) throw new Error(lastLine(log) ?? `the background service exited (${exit.signal ?? `code ${exit.code}`})`);
-    if (Date.now() > deadline) throw new Error(lastLine(log) ?? `the background service did not start within ${START_TIMEOUT_MS / 1000} s`);
+    if (exit) {
+      throw new Error(
+        lastLine(log, logStart) ??
+          (exit.signal
+            ? `the background service was killed by ${exit.signal} before listening`
+            : `the background service exited with code ${exit.code} before listening`),
+      );
+    }
+    if (Date.now() > deadline) throw new Error(lastLine(log, logStart) ?? `the background service did not start within ${START_TIMEOUT_MS / 1000} s`);
     await sleep(25);
   }
 }
 
-/** The last non-empty line of the log, which is where a daemon that failed to start says why. */
-function lastLine(path: string): string | undefined {
+/** The last non-empty line the log got after `start` bytes, which is where a daemon that failed to start says why. */
+function lastLine(path: string, start: number): string | undefined {
   try {
-    return readFileSync(path, 'utf8').split('\n').findLast((line) => line.trim() !== '');
+    return readFileSync(path).subarray(start).toString('utf8').split('\n').findLast((line) => line.trim() !== '');
   } catch {
     return undefined;
   }

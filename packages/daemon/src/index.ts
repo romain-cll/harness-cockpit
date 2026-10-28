@@ -1,5 +1,7 @@
-export { connectDaemon, ensureDaemon } from './client';
-export type { DaemonChild, DaemonClient, EnsureDaemonOptions } from './client';
+export { connectDaemon, DaemonNotAnsweringError, ensureDaemon } from './client';
+export type { DaemonChild, DaemonClient, EnsureDaemonOptions, TimeoutOptions } from './client';
+export { runDaemonEntry } from './entry';
+export type { EntryIo } from './entry';
 export { daemonFiles, listDaemonFiles, tokenPathOf } from './paths';
 export type { DaemonFiles } from './paths';
 export { PROTOCOL_VERSION, SCROLLBACK } from './protocol';

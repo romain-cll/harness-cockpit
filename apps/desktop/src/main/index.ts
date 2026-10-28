@@ -7,6 +7,7 @@ import { basename, extname, isAbsolute, join, relative, resolve } from 'node:pat
 import { pathToFileURL } from 'node:url';
 import {
   connectDaemon,
+  DaemonNotAnsweringError,
   daemonFiles,
   ensureDaemon,
   listDaemonFiles,
@@ -307,7 +308,6 @@ interface Terminal extends TerminalInfo {
   closing?: boolean;
 }
 
-const daemons: Daemon[] = [];
 const terminals = new Map<number, Terminal>();
 let lastTerminalId = 0;
 let ownDaemon: Daemon | undefined;
@@ -335,7 +335,6 @@ function end(daemon: Daemon, remote: number, exit: TerminalExit): void {
 // terminals it already runs are listed (the `commands` ones belong to another app's connection).
 async function adopt(client: DaemonClient): Promise<Daemon> {
   const daemon: Daemon = { client, alive: true, terminals: new Map() };
-  daemons.push(daemon);
   client.onData(({ id, seq, data }) => {
     const terminal = daemon.terminals.get(id);
     if (terminal?.owner && !terminal.owner.isDestroyed()) terminal.owner.send('pty:data', terminal.appId, data, seq);
@@ -344,7 +343,6 @@ async function adopt(client: DaemonClient): Promise<Daemon> {
   client.onStatus(({ sessionId, event }) => reportSessionStatus(sessionId, event));
   client.onClose(() => {
     daemon.alive = false;
-    daemons.splice(daemons.indexOf(daemon), 1);
     for (const remote of daemon.terminals.keys()) end(daemon, remote, { exitCode: null, signal: null });
     if (ownDaemon === daemon) ownDaemon = undefined;
   });
@@ -413,8 +411,9 @@ async function connectDaemons(): Promise<void> {
       const client = await connectDaemon(found.socket);
       await client.hello(daemonBuild);
       await adopt(client);
-    } catch {
-      // Stale files of a daemon that is gone.
+    } catch (error) {
+      // Stale files of a daemon that is gone say nothing; one that is there and silent is noted.
+      if (error instanceof DaemonNotAnsweringError) console.error(`Cockpit skipped a background service of another build: ${error.message}`);
     }
   }
   try {
