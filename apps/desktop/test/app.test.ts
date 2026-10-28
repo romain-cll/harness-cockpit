@@ -8059,12 +8059,14 @@ async function runSecondLaunch(command: string, args: string[], env: NodeJS.Proc
   const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
     child.once('exit', (code, signal) => resolve({ code, signal })),
   );
+  // 'close' fires once the process ended and all its stdio streams are closed, so every chunk it
+  // wrote has been read.
+  const closed = new Promise<void>((resolve) => child.once('close', () => resolve()));
   const exit = await Promise.race([exited, sleep(timeout).then(() => 'timeout' as const)]);
   const elapsedMs = Date.now() - started;
   if (exit === 'timeout') await stopGroup(child);
   else await waitForGroupGone(child.pid!);
-  // Lets the last chunks arrive after the exit.
-  await sleep(200);
+  await closed;
   return { exit, output, elapsedMs };
 }
 
