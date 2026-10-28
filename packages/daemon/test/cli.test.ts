@@ -98,6 +98,7 @@ describe('cockpit usage', () => {
     ['an unknown command', ['frobnicate']],
     ['status with no event', ['status']],
     ['status with a value other than the three events', ['status', 'sleeping']],
+    ['status working with an extra argument', ['status', 'working', 'extra']],
   ])('AC4 — %s: the usage on stderr, exit 2, and nothing sent to the daemon', async (_label, argv) => {
     const home = makeHome();
     const files = daemonFiles(home, 1, 'aaaa1111');
