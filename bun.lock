@@ -26,11 +26,10 @@
       },
       "devDependencies": {
         "@base-ui/react": "^1.9.0",
-        "@cockpit/control": "workspace:*",
+        "@cockpit/daemon": "workspace:*",
         "@cockpit/github": "workspace:*",
         "@cockpit/harnesses": "workspace:*",
         "@cockpit/launchers": "workspace:*",
-        "@cockpit/pty": "workspace:*",
         "@cockpit/shell-env": "workspace:*",
         "@cockpit/state": "workspace:*",
         "@cockpit/workspaces": "workspace:*",
@@ -42,6 +41,8 @@
         "@types/react-dom": "^19.3.0",
         "@vitejs/plugin-react": "^6.1.2",
         "@xterm/addon-fit": "^0.11.0",
+        "@xterm/addon-serialize": "^0.14.0",
+        "@xterm/headless": "^6.0.0",
         "@xterm/xterm": "^6.0.0",
         "class-variance-authority": "^0.7.1",
         "cn": "^0.5.0",
@@ -59,11 +60,16 @@
         "vitest": "^5.0.5",
       },
     },
-    "packages/control": {
-      "name": "@cockpit/control",
+    "packages/daemon": {
+      "name": "@cockpit/daemon",
       "version": "0.0.0",
+      "dependencies": {
+        "node-pty": "1.2.0-beta.15",
+      },
       "devDependencies": {
         "@types/node": "^24.19.2",
+        "@xterm/addon-serialize": "^0.14.0",
+        "@xterm/headless": "^6.0.0",
         "vitest": "^5.0.5",
       },
     },
@@ -86,17 +92,6 @@
     "packages/launchers": {
       "name": "@cockpit/launchers",
       "version": "0.0.0",
-      "devDependencies": {
-        "@types/node": "^24.19.2",
-        "vitest": "^5.0.5",
-      },
-    },
-    "packages/pty": {
-      "name": "@cockpit/pty",
-      "version": "0.0.0",
-      "dependencies": {
-        "node-pty": "1.2.0-beta.15",
-      },
       "devDependencies": {
         "@types/node": "^24.19.2",
         "vitest": "^5.0.5",
@@ -192,7 +187,7 @@
 
     "@base-ui/utils": ["@base-ui/utils@0.5.0", "", { "dependencies": { "@babel/runtime": "^7.29.7 || ^8.0.0", "@floating-ui/utils": "^0.2.12", "reselect": "^5.3.0", "use-sync-external-store": "^1.7.0" }, "peerDependencies": { "@types/react": "^17 || ^18 || ^19", "react": "^17 || ^18 || ^19", "react-dom": "^17 || ^18 || ^19" }, "optionalPeers": ["@types/react"] }, "sha512-dYGGcEttjkYiMoa5nHm8vLaJ2UcuTWxo3BFAwOYXeRg/q7UVVvA6cacEIXEs3FgBfK1CGtW1ptElqs7wsx+t9A=="],
 
-    "@cockpit/control": ["@cockpit/control@workspace:packages/control"],
+    "@cockpit/daemon": ["@cockpit/daemon@workspace:packages/daemon"],
 
     "@cockpit/desktop": ["@cockpit/desktop@workspace:apps/desktop"],
 
@@ -203,8 +198,6 @@
     "@cockpit/launchers": ["@cockpit/launchers@workspace:packages/launchers"],
 
     "@cockpit/plane-sync": ["@cockpit/plane-sync@workspace:.github/scripts/plane-sync"],
-
-    "@cockpit/pty": ["@cockpit/pty@workspace:packages/pty"],
 
     "@cockpit/shell-env": ["@cockpit/shell-env@workspace:packages/shell-env"],
 
@@ -499,6 +492,10 @@
     "@xmldom/xmldom": ["@xmldom/xmldom@0.8.15", "", {}, "sha512-/5NV/vDALVFDXgLmfsy9TRCBlKwO2LNBFzpzvb9iIj+jR+eSc6DLYYvVOdivT/jm7MtU6TebYuRmzEOI7w40UA=="],
 
     "@xterm/addon-fit": ["@xterm/addon-fit@0.11.0", "", {}, "sha512-jYcgT6xtVYhnhgxh3QgYDnnNMYTcf8ElbxxFzX0IZo+vabQqSPAjC3c1wJrKB5E19VwQei89QCiZZP86DCPF7g=="],
+
+    "@xterm/addon-serialize": ["@xterm/addon-serialize@0.14.0", "", {}, "sha512-uteyTU1EkrQa2Ux6P/uFl2fzmXI46jy5uoQMKEOM0fKTyiW7cSn0WrFenHm5vO5uEXX/GpwW/FgILvv3r0WbkA=="],
+
+    "@xterm/headless": ["@xterm/headless@6.0.0", "", {}, "sha512-5Yj1QINYCyzrZtf8OFIHi47iQtI+0qYFPHmouEfG8dHNxbZ9Tb9YGSuLcsEwj9Z+OL75GJqPyJbyoFer80a2Hw=="],
 
     "@xterm/xterm": ["@xterm/xterm@6.0.0", "", {}, "sha512-TQwDdQGtwwDt+2cgKDLn0IRaSxYu1tSUjgKarSDkUM0ZNiSRXFpjxEsvc/Zgc5kq5omJ+V0a8/kIM2WD3sMOYg=="],
 

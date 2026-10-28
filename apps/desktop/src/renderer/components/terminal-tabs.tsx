@@ -181,6 +181,28 @@ function paneTerminal(id: number): LiveTerminal {
   return pane;
 }
 
+/**
+ * Shows the shells the page attached to again (`restoreTerminals`), one tab each, in the order given:
+ * no layout is saved, so a split comes back as two tabs. Tabs of a page that has none yet are
+ * replaced; otherwise the new ones follow the tabs it has.
+ */
+export function restoreTabs(shells: LiveTerminal[]) {
+  if (shells.length === 0) return;
+  let next: State = panes.size === 0 ? { tabs: [], selected: null, nextNumber: 1, nextTerminal: 1 } : state;
+  for (const shell of shells) {
+    const { nextNumber, nextTerminal } = next;
+    panes.set(nextTerminal, shell);
+    next = {
+      tabs: [...next.tabs, { number: nextNumber, layout: { terminal: nextTerminal }, focused: nextTerminal }],
+      selected: next.selected ?? nextNumber,
+      nextNumber: nextNumber + 1,
+      nextTerminal: nextTerminal + 1,
+    };
+  }
+  state = next;
+  for (const listener of listeners) listener();
+}
+
 function PaneButton({ label, onClick, children }: { label: string; onClick: () => void; children: ReactNode }) {
   return (
     <Button variant="ghost" size="icon-xs" aria-label={label} onClick={onClick}>
@@ -243,17 +265,20 @@ export function TerminalTabs() {
                 onFocus={() => dispatch({ type: 'focus', tab: tab.number, terminal })}
               >
                 <Terminal live={paneTerminal(terminal)} focused={shown && tab.focused === terminal} />
-                <div className="absolute top-1 right-3 flex gap-0.5 opacity-0 group-focus-within/pane:opacity-100 group-hover/pane:opacity-100">
-                  <PaneButton label="Split right" onClick={() => dispatch({ type: 'split', tab: tab.number, terminal, direction: 'right' })}>
-                    <Columns2Icon />
-                  </PaneButton>
-                  <PaneButton label="Split down" onClick={() => dispatch({ type: 'split', tab: tab.number, terminal, direction: 'down' })}>
-                    <Rows2Icon />
-                  </PaneButton>
-                  <PaneButton label="Close terminal" onClick={() => dispatch({ type: 'close-terminal', tab: tab.number, terminal })}>
-                    <XIcon />
-                  </PaneButton>
-                </div>
+                {/* Not rendered in a hidden tab: the buttons' own transition would keep them clickable for a moment. */}
+                {shown && (
+                  <div className="absolute top-1 right-3 flex gap-0.5 opacity-0 group-focus-within/pane:opacity-100 group-hover/pane:opacity-100">
+                    <PaneButton label="Split right" onClick={() => dispatch({ type: 'split', tab: tab.number, terminal, direction: 'right' })}>
+                      <Columns2Icon />
+                    </PaneButton>
+                    <PaneButton label="Split down" onClick={() => dispatch({ type: 'split', tab: tab.number, terminal, direction: 'down' })}>
+                      <Rows2Icon />
+                    </PaneButton>
+                    <PaneButton label="Close terminal" onClick={() => dispatch({ type: 'close-terminal', tab: tab.number, terminal })}>
+                      <XIcon />
+                    </PaneButton>
+                  </div>
+                )}
               </div>
             );
           }),

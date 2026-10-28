@@ -1,13 +1,27 @@
-import { randomUUID } from 'node:crypto';
-import { mkdirSync, rmSync, statSync } from 'node:fs';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { startControlServer, statusCommand, type SessionEvent } from '@cockpit/control';
+import {
+  connectDaemon,
+  DaemonNotAnsweringError,
+  daemonFiles,
+  ensureDaemon,
+  listDaemonFiles,
+  PROTOCOL_VERSION,
+  statusCommand,
+  type DaemonClient,
+  type SessionEventName,
+  type TerminalExit,
+  type TerminalInfo,
+  type TerminalKind,
+} from '@cockpit/daemon';
 import { createPullRequest, findPullRequest, GitHubError } from '@cockpit/github';
 import { detectHarnesses, harnesses, statusLaunch, type DetectedHarness } from '@cockpit/harnesses';
 import { apps, defaultApplicationDirs, detectApps, LaunchError, openIn, reveal, type App } from '@cockpit/launchers';
-import { createPtyClient, type PtySpawnOptions } from '@cockpit/pty';
 import {
   addProject,
   addSession,
@@ -47,7 +61,6 @@ import {
   Notification,
   protocol,
   shell,
-  utilityProcess,
   type IpcMainEvent,
   type IpcMainInvokeEvent,
   type WebContents,
@@ -62,9 +75,12 @@ import type {
   CommitResult,
   CreatePullRequestResult,
   CreateWorkspaceResult,
+  DaemonStatus,
   DiffResult,
+  ListedTerminal,
   Project,
   OpenWorkspaceResult,
+  PtySpawnOptions,
   PtySpawnRequest,
   PullRequestResult,
   PushResult,
@@ -75,7 +91,7 @@ import type {
   StartSessionOptions,
   StartSessionResult,
 } from '../shared/api';
-import ptyHostPath from './pty-host?modulePath';
+import daemonPath from './daemon?modulePath';
 import { shellEnv } from './shell-env';
 
 // The built renderer is served from a custom protocol rather than `file://`,
@@ -94,10 +110,11 @@ const devServerUrl = app.isPackaged ? undefined : process.env.ELECTRON_RENDERER_
 // honoured in the packaged app too: the packaged-app test needs them, and they
 // only change where the data lives and whether windows are shown.
 // - COCKPIT_USER_DATA_DIR: the app keeps its data in that folder.
-// - COCKPIT_HOME: where worktrees and session folders live, in `worktrees` and `sessions` under it
-//   (`~/.cockpit` when unset and packaged, `~/.cockpit-dev` when not, so a development build never
-//   shares the installed app's control endpoint). They are the user's work, not app data, so they
-//   stay out of `userData`.
+// - COCKPIT_HOME: where worktrees and session folders live, in `worktrees` and `sessions` under it,
+//   and the daemon's files (`~/.cockpit` when unset and packaged, `~/.cockpit-dev` when not, so a
+//   development build never shares the installed app's daemon). They are the user's work, not app
+//   data, so they stay out of `userData`.
+// - COCKPIT_TEST_DAEMON_BUILD: replaces the daemon's build when non-empty, so a test can play an update.
 // - COCKPIT_TEST_APPLICATIONS_DIR: the one folder the editors and terminals are looked up in,
 //   instead of the three applications folders (ignored when empty).
 // - COCKPIT_TEST_BACKGROUND=1: no Dock icon, windows never shown, so a test
@@ -136,7 +153,7 @@ function serveRenderer(request: Request): Promise<Response> | Response {
   return new Response(null, { status: 404 });
 }
 
-function createWindow(): void {
+function createWindow(path = '/'): void {
   const window = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -170,11 +187,7 @@ function createWindow(): void {
     return { action: 'deny' };
   });
 
-  if (devServerUrl) {
-    void window.loadURL(devServerUrl);
-  } else {
-    void window.loadURL(`${RENDERER_ORIGIN}/`);
-  }
+  void window.loadURL(new URL(path, devServerUrl ?? RENDERER_ORIGIN).href);
 }
 
 // `URL.origin` is "null" for a scheme Node does not know, such as `app:`, so the
@@ -195,47 +208,46 @@ function isFromApp({ senderFrame }: Pick<IpcMainEvent, 'senderFrame'>): boolean 
   return senderFrame !== null && originOf(senderFrame.url) === appOrigin;
 }
 
-// The path of `control.sock`, once the control endpoint is up. Unset when it is off.
-let controlSocket: string | undefined;
-// Why the endpoint is off, for the sidebar. Unset when it is up.
-let controlError: string | undefined;
+// The loaded state, replaced by a new one (and saved) on every change.
+let state: State;
 
-// The window that started each session of this launch, and the last status each one reported.
-const sessionOwners = new Map<string, WebContents>();
+// The last status each session reported, as the sidebar shows it.
 const sessionStatuses = new Map<string, SessionStatus>();
 
-// A harness hook reported `event`. Returns `false` for a session the state does not hold. The
-// owner window is told of a change; a macOS notification is raised for `waiting` and `finished`
-// when no Cockpit window is focused, and clicking it shows the session's window and page.
-function reportSessionStatus({ sessionId, event }: SessionEvent): boolean {
+// A harness hook reported `event` to a daemon. The window that holds the session's terminal is
+// told of a change; a macOS notification is raised for `waiting` and `finished` when no Cockpit
+// window is focused, and clicking it shows a window (a new one when none is open) on the session's page.
+function reportSessionStatus(sessionId: string, event: SessionEventName): void {
   const session = state.sessions.find(({ id }) => id === sessionId);
-  if (!session) return false;
-  const owner = sessionOwners.get(sessionId);
-  if (!owner || owner.isDestroyed() || sessionStatuses.get(sessionId) === event) return true;
+  if (!session || sessionStatuses.get(sessionId) === event) return;
 
   sessionStatuses.set(sessionId, event);
-  owner.send('sessions:status', sessionId, event);
-  if (event === 'working' || BrowserWindow.getFocusedWindow()) return true;
+  const owner = [...terminals.values()].find((terminal) => terminal.sessionId === sessionId)?.owner;
+  if (owner && !owner.isDestroyed()) owner.send('sessions:status', sessionId, event);
+  if (event === 'working' || BrowserWindow.getFocusedWindow()) return;
 
   const notification = new Notification({ title: session.name, body: event === 'waiting' ? 'Needs input' : 'Ready' });
   notification.on('click', () => {
-    if (owner.isDestroyed()) return;
-    const window = BrowserWindow.fromWebContents(owner);
-    window?.show();
-    window?.focus();
-    owner.send('sessions:open', sessionId);
+    const [window] = BrowserWindow.getAllWindows();
+    if (!window) {
+      createWindow(`/sessions/${sessionId}`);
+      return;
+    }
+    window.show();
+    window.focus();
+    window.webContents.send('sessions:open', sessionId);
   });
   notification.show();
-  return true;
 }
 
-// The environment of a terminal or a session: the login shell's, without the session
-// variables the app itself may have inherited (launched from a Cockpit session), with
-// `COCKPIT_SOCKET` when the endpoint is up and `extra` on top (a session's own variables).
+// The environment of a terminal or a session: the login shell's, without the session variables
+// the app itself may have inherited (launched from a Cockpit session) and the daemon's
+// `ELECTRON_RUN_AS_NODE`, with `COCKPIT_SOCKET` (the daemon's socket) and `extra` on top (a
+// session's own variables).
 async function terminalEnv(extra: Record<string, string> = {}): Promise<Record<string, string>> {
   const env = { ...(await shellEnv) };
-  for (const name of ['COCKPIT_SESSION_ID', 'COCKPIT_WORKSPACE_PATH', 'COCKPIT_SOCKET']) delete env[name];
-  if (controlSocket) env.COCKPIT_SOCKET = controlSocket;
+  for (const name of ['COCKPIT_SESSION_ID', 'COCKPIT_WORKSPACE_PATH', 'COCKPIT_SOCKET', 'ELECTRON_RUN_AS_NODE']) delete env[name];
+  env.COCKPIT_SOCKET = ownFiles.socket;
   return { ...env, TERM: 'xterm-256color', COLORTERM: 'truecolor', ...extra };
 }
 
@@ -254,9 +266,6 @@ async function withSpawnDefaults(request: PtySpawnRequest): Promise<PtySpawnOpti
   };
 }
 
-// The loaded state, replaced by a new one (and saved) on every change.
-let state: State;
-
 // A shell was spawned for a page that navigated or was destroyed meanwhile.
 class PageGoneError extends Error {
   constructor() {
@@ -264,78 +273,276 @@ class PageGoneError extends Error {
   }
 }
 
-// Terminals live in a utility process, so a pty crash does not take the app down.
-// The client starts it again at the next spawn after it died.
-// Returns what the main process needs to run a terminal of its own.
-function startPty() {
-  const pty = createPtyClient(() => utilityProcess.fork(ptyHostPath, [], { serviceName: 'Cockpit Pty Host' }));
-  // The window that spawned a session is the one that receives its output.
-  const owners = new Map<number, WebContents>();
-  // How many times each page's shells were ended (a navigation, a destroyed page).
+// --- The daemon ---------------------------------------------------------------
+
+// The build of this app's daemon: the first 12 hex characters of the SHA-256 of the daemon bundle's
+// bytes, Electron's version and node-pty's version, so an update that changes none of them keeps the
+// daemon it left running.
+function computeBuild(): string {
+  if (process.env.COCKPIT_TEST_DAEMON_BUILD) return process.env.COCKPIT_TEST_DAEMON_BUILD;
+  const nodePty = createRequire(import.meta.url)('node-pty/package.json') as { version: string };
+  return createHash('sha256').update(readFileSync(daemonPath)).update(process.versions.electron).update(nodePty.version).digest('hex').slice(0, 12);
+}
+
+const daemonBuild = computeBuild();
+const ownFiles = daemonFiles(cockpitHome, PROTOCOL_VERSION, daemonBuild);
+
+interface Daemon {
+  client: DaemonClient;
+  alive: boolean;
+  /** The terminals of this daemon the app knows, by the daemon's id for them. */
+  terminals: Map<number, Terminal>;
+}
+
+// A terminal of a daemon, under the id the renderer knows it by. Ids count for the app's lifetime,
+// across daemons, so the id of a dead daemon's terminal is never reused. The terminals are known
+// from what each daemon listed when the app connected, from the spawns and from the exit events: the
+// page's list is answered from here, without a round trip, so it does not wait for a busy daemon.
+interface Terminal extends TerminalInfo {
+  /** The renderer's id for it; `id` is the daemon's. */
+  appId: number;
+  daemon: Daemon;
+  /** The window that receives its output: the one that spawned or last attached it. */
+  owner?: WebContents;
+  /** The page asked to kill it: it is not listed any more, though its exit has not come yet. */
+  closing?: boolean;
+}
+
+const terminals = new Map<number, Terminal>();
+let lastTerminalId = 0;
+let ownDaemon: Daemon | undefined;
+let startingOwn: Promise<Daemon> | undefined;
+// Why this app's daemon could not start; unset while it can.
+let daemonFailure: string | undefined;
+
+function register(daemon: Daemon, info: TerminalInfo, owner?: WebContents): Terminal {
+  const terminal: Terminal = { ...info, appId: ++lastTerminalId, daemon, ...(owner && { owner }) };
+  daemon.terminals.set(info.id, terminal);
+  terminals.set(terminal.appId, terminal);
+  return terminal;
+}
+
+function end(daemon: Daemon, remote: number, exit: TerminalExit): void {
+  const terminal = daemon.terminals.get(remote);
+  if (!terminal) return;
+  daemon.terminals.delete(remote);
+  terminals.delete(terminal.appId);
+  if (terminal.owner && !terminal.owner.isDestroyed()) terminal.owner.send('pty:exit', terminal.appId, exit);
+}
+
+// Takes a connected client into use: its output goes to the window that owns each terminal, its
+// status reports to the sidebar, and its loss ends every terminal it held, as a crash does. The
+// terminals it already runs are listed (the `commands` ones belong to another app's connection).
+async function adopt(client: DaemonClient): Promise<Daemon> {
+  const daemon: Daemon = { client, alive: true, terminals: new Map() };
+  client.onData(({ id, seq, data }) => {
+    const terminal = daemon.terminals.get(id);
+    if (terminal?.owner && !terminal.owner.isDestroyed()) terminal.owner.send('pty:data', terminal.appId, data, seq);
+  });
+  client.onExit(({ id, exitCode, signal }) => end(daemon, id, { exitCode, signal }));
+  client.onStatus(({ sessionId, event }) => reportSessionStatus(sessionId, event));
+  client.onClose(() => {
+    daemon.alive = false;
+    for (const remote of daemon.terminals.keys()) end(daemon, remote, { exitCode: null, signal: null });
+    if (ownDaemon === daemon) ownDaemon = undefined;
+  });
+  for (const info of await client.list().catch(() => [])) {
+    if (info.kind === 'commands') continue;
+    register(daemon, info);
+    if (info.sessionId !== undefined && info.status !== undefined) sessionStatuses.set(info.sessionId, info.status);
+  }
+  return daemon;
+}
+
+// Starts the daemon of this build: the app's own Electron binary as Node, detached into its own
+// session so it outlives the app, with its output in the log.
+function spawnDaemon(): ChildProcess {
+  mkdirSync(cockpitHome, { recursive: true });
+  const log = openSync(ownFiles.log, 'a');
+  try {
+    const child = spawn(process.execPath, [daemonPath, '--cockpit-daemon', daemonBuild], {
+      detached: true,
+      stdio: ['ignore', log, log],
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', COCKPIT_HOME: cockpitHome },
+    });
+    child.on('error', (error) => {
+      appendFileSync(ownFiles.log, `${error.message}\n`);
+      child.emit('exit', 1, null);
+    });
+    child.unref();
+    return child;
+  } finally {
+    closeSync(log);
+  }
+}
+
+// This app's daemon, started when it is not running. Rejects with the reason it cannot start.
+function ensureOwnDaemon(): Promise<Daemon> {
+  if (ownDaemon?.alive) return Promise.resolve(ownDaemon);
+  startingOwn ??= (async () => {
+    try {
+      ownDaemon = await adopt(await ensureDaemon({ home: cockpitHome, build: daemonBuild, spawn: spawnDaemon }));
+      daemonFailure = undefined;
+      return ownDaemon;
+    } catch (error) {
+      daemonFailure = error instanceof Error ? error.message : String(error);
+      throw new Error(daemonFailure);
+    } finally {
+      startingOwn = undefined;
+    }
+  })();
+  return startingOwn;
+}
+
+const daemonStatus = (): DaemonStatus =>
+  daemonFailure === undefined ? { status: 'running' } : { status: 'down', reason: daemonFailure, log: existsSync(ownFiles.log) };
+
+// Connects to this app's daemon, starting it when needed, and to the daemons of other builds that
+// still hold terminals (their app was updated): the older ones first, so the terminals list in
+// creation order. Saying hello with this build supersedes them: one with no terminal exits.
+// A daemon that cannot start is reported, never thrown: the app opens its window all the same.
+async function connectDaemons(): Promise<void> {
+  const others = listDaemonFiles(cockpitHome)
+    .filter(({ protocol, build }) => protocol === PROTOCOL_VERSION && build !== daemonBuild)
+    .map((found) => ({ found, since: statSync(found.pid, { throwIfNoEntry: false })?.mtimeMs ?? 0 }))
+    .sort((a, b) => a.since - b.since);
+  for (const { found } of others) {
+    try {
+      const client = await connectDaemon(found.socket);
+      await client.hello(daemonBuild);
+      await adopt(client);
+    } catch (error) {
+      // Stale files of a daemon that is gone say nothing; one that is there and silent is noted.
+      if (error instanceof DaemonNotAnsweringError) console.error(`Cockpit skipped a background service of another build: ${error.message}`);
+    }
+  }
+  try {
+    await ensureOwnDaemon();
+  } catch {
+    console.error(`Cockpit's background service could not start: ${daemonFailure}`);
+  }
+}
+
+// Terminals live in the daemon, which outlives the page and the app. Returns what the main process
+// needs to run a terminal of its own.
+function startTerminals() {
+  // How many times each page's setup and teardown runs were ended (a navigation, a destroyed page).
   const endings = new WeakMap<WebContents, number>();
   const endingsOf = (contents: WebContents) => endings.get(contents) ?? 0;
 
-  // Spawns with the defaults, for the window that will receive the output. A spawn
-  // that resolves after its page navigated or was destroyed (the pty host was busy)
-  // is killed at once: no page is left to own it, and it throws `PageGoneError`.
-  // `before` is the page's ending count the caller read when it started waiting.
-  const spawnFor = async (contents: WebContents, request: PtySpawnRequest, before = endingsOf(contents)) => {
-    const id = await pty.spawn(await withSpawnDefaults(request));
+  const kill = (appId: number) => {
+    const terminal = terminals.get(appId);
+    if (!terminal) return;
+    terminal.closing = true;
+    terminal.daemon.client.kill(terminal.id);
+  };
+
+  // Spawns with the defaults, for the window that will receive the output. A spawn that resolves
+  // after its page navigated or was destroyed (the daemon was busy) is killed at once: no page is
+  // left to own it, and it throws `PageGoneError`. `before` is the page's ending count the caller
+  // read when it started waiting.
+  const spawnFor = async (
+    contents: WebContents,
+    request: PtySpawnRequest,
+    { kind, sessionId, workspace, before = endingsOf(contents) }: { kind: TerminalKind; sessionId?: string; workspace?: string; before?: number },
+  ) => {
+    const daemon = await ensureOwnDaemon();
+    const options = await withSpawnDefaults(request);
+    const { cwd, cols, rows } = options;
+    const remote = await daemon.client.spawn({
+      kind,
+      ...options,
+      ...(sessionId !== undefined && { sessionId }),
+      ...(workspace !== undefined && { workspace }),
+    });
+    const terminal = register(
+      daemon,
+      { id: remote, kind, cwd, cols, rows, ...(sessionId !== undefined && { sessionId }), ...(workspace !== undefined && { workspace }) },
+      contents,
+    );
     if (contents.isDestroyed() || endingsOf(contents) !== before) {
-      pty.kill(id);
+      kill(terminal.appId);
       throw new PageGoneError();
     }
-    owners.set(id, contents);
-    return id;
+    return terminal.appId;
   };
 
   ipcMain.handle('pty:spawn', (event, request: PtySpawnRequest) => {
     if (!isFromApp(event)) throw new Error('pty:spawn refused: unexpected origin');
     // The reply of a page that is gone reaches no one: the handler does not reject for it.
-    return spawnFor(event.sender, request).catch((error: unknown) => {
+    return spawnFor(event.sender, request, { kind: 'shell' }).catch((error: unknown) => {
       if (error instanceof PageGoneError) return -1;
       throw error;
     });
   });
   ipcMain.on('pty:write', (event, id: number, data: string) => {
-    if (isFromApp(event)) pty.write(id, data);
+    const terminal = isFromApp(event) ? terminals.get(id) : undefined;
+    terminal?.daemon.client.write(terminal.id, data);
   });
   ipcMain.on('pty:resize', (event, id: number, cols: number, rows: number) => {
-    if (isFromApp(event)) pty.resize(id, cols, rows);
+    const terminal = isFromApp(event) ? terminals.get(id) : undefined;
+    if (!terminal) return;
+    terminal.cols = cols;
+    terminal.rows = rows;
+    terminal.daemon.client.resize(terminal.id, cols, rows);
   });
   ipcMain.on('pty:kill', (event, id: number) => {
-    if (isFromApp(event)) pty.kill(id);
+    if (isFromApp(event)) kill(id);
   });
 
-  pty.onData((id, data) => {
-    const owner = owners.get(id);
-    if (owner && !owner.isDestroyed()) owner.send('pty:data', id, data);
-  });
-  pty.onExit((id, exit) => {
-    const owner = owners.get(id);
-    owners.delete(id);
-    if (owner && !owner.isDestroyed()) owner.send('pty:exit', id, exit);
+  // The shells and sessions the connected daemons run, for a page that starts and shows them again.
+  // Setup and teardown runs end with their page and are not listed.
+  ipcMain.handle('pty:list', (event): ListedTerminal[] => {
+    if (!isFromApp(event)) throw new Error('pty:list refused: unexpected origin');
+    return [...terminals.values()].flatMap(({ appId, kind, cwd, cols, rows, sessionId, workspace, closing }) => {
+      if (kind === 'commands' || closing) return [];
+      const status = sessionId === undefined ? undefined : sessionStatuses.get(sessionId);
+      return [{ id: appId, kind, cwd, cols, rows, ...(sessionId !== undefined && { sessionId }), ...(workspace !== undefined && { workspace }), ...(status && { status }) }];
+    });
   });
 
-  // A page's shells end with it: when its main frame commits another document
-  // (a reload included) or the page is destroyed. `did-navigate` fires only for a
-  // committed main-frame document, so a navigation that `will-navigate` cancels,
-  // and route changes inside the app (same-document), kill nothing. A main frame
-  // that commits an error page fires `did-fail-load` instead (an aborted
-  // navigation, `ERR_ABORTED`, commits nothing and kills nothing).
-  const killSessionsOf = (contents: WebContents) => {
+  ipcMain.handle('pty:attach', async (event, id: number) => {
+    if (!isFromApp(event)) throw new Error('pty:attach refused: unexpected origin');
+    const terminal = terminals.get(id);
+    if (!terminal) throw new Error(`no terminal ${id}`);
+    // The output that follows reaches this window, with a sequence number above the screen's.
+    terminal.owner = event.sender;
+    return terminal.daemon.client.attach(terminal.id);
+  });
+
+  // A page's setup and teardown runs end with it: when its main frame commits another document (a
+  // reload included) or the page is destroyed. Its shells and sessions run on, in the daemon.
+  // `did-navigate` fires only for a committed main-frame document, so a navigation that
+  // `will-navigate` cancels, and route changes inside the app (same-document), end nothing. A main
+  // frame that commits an error page fires `did-fail-load` instead (an aborted navigation,
+  // `ERR_ABORTED`, commits nothing and ends nothing).
+  const endRunsOf = (contents: WebContents) => {
     endings.set(contents, endingsOf(contents) + 1);
-    for (const [id, owner] of owners) if (owner === contents) pty.kill(id);
+    for (const terminal of terminals.values()) if (terminal.owner === contents && terminal.kind === 'commands') kill(terminal.appId);
   };
   app.on('web-contents-created', (_event, contents) => {
-    contents.on('did-navigate', () => killSessionsOf(contents));
+    contents.on('did-navigate', () => endRunsOf(contents));
     contents.on('did-fail-load', (_event, errorCode, _description, _url, isMainFrame) => {
-      if (isMainFrame && errorCode !== ERR_ABORTED) killSessionsOf(contents);
+      if (isMainFrame && errorCode !== ERR_ABORTED) endRunsOf(contents);
     });
-    contents.on('destroyed', () => killSessionsOf(contents));
+    contents.on('destroyed', () => endRunsOf(contents));
   });
 
-  return { spawnFor, endingsOf, kill: (id: number) => pty.kill(id) };
+  ipcMain.handle('daemon:status', (event) => {
+    if (!isFromApp(event)) throw new Error('daemon:status refused: unexpected origin');
+    return daemonStatus();
+  });
+  ipcMain.handle('daemon:retry', async (event) => {
+    if (!isFromApp(event)) throw new Error('daemon:retry refused: unexpected origin');
+    await ensureOwnDaemon().catch(() => {});
+    return daemonStatus();
+  });
+  ipcMain.handle('daemon:show-log', async (event) => {
+    if (!isFromApp(event)) throw new Error('daemon:show-log refused: unexpected origin');
+    await shell.openPath(ownFiles.log);
+  });
+
+  return { spawnFor, endingsOf, kill };
 }
 
 // Why git could not do what was asked of `path`, in words for the user.
@@ -359,7 +566,7 @@ async function toProject({ path }: { path: string }): Promise<Project> {
 }
 
 // The projects the user added, kept in `state.json`.
-function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typeof startPty>): void {
+function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typeof startTerminals>): void {
   ipcMain.handle('projects:list', (event) => {
     if (!isFromApp(event)) throw new Error('projects:list refused: unexpected origin');
     return Promise.all(state.projects.map(toProject));
@@ -691,7 +898,7 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
           const ptyId = await spawnFor(
             event.sender,
             { ...size, command, args, cwd: path, env: { ...env, TERM: 'xterm-256color', COLORTERM: 'truecolor', ...config.env } },
-            endings,
+            { kind: 'commands', before: endings },
           );
           return { status: 'started', ptyId };
         } catch (error) {
@@ -703,19 +910,14 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
 }
 
 // Sessions outside any project: an agent CLI run in a folder of its own under
-// the Cockpit home, in a pty owned by the window that started it. The sessions
-// are kept in `state.json`; the pty ends with its page or with the pty host (a start
-// after the host died starts a new one), the folder stays.
-function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnType<typeof startPty>): void {
+// the Cockpit home, in a pty of the daemon. The sessions are kept in `state.json`; the pty runs on
+// when the page or the app goes (and ends with the daemon: a start after it died starts a new one),
+// the folder stays.
+function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnType<typeof startTerminals>): void {
   // Detected on the first call that needs it, never at startup: detecting runs
   // each CLI's `--version`, and an app that never starts a session should not.
   let detection: Promise<DetectedHarness[]> | undefined;
   const detected = () => (detection ??= shellEnv.then((env) => detectHarnesses(env)));
-
-  ipcMain.handle('sessions:status-off', (event) => {
-    if (!isFromApp(event)) throw new Error('sessions:status-off refused: unexpected origin');
-    return controlError ?? null;
-  });
 
   ipcMain.handle('sessions:harnesses', async (event) => {
     if (!isFromApp(event)) throw new Error('sessions:harnesses refused: unexpected origin');
@@ -742,6 +944,12 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
       if (!harness || !found) return { status: 'refused', message: `${harness?.name ?? harnessId} is not installed.` };
       // Detected at launch, removed since: nothing is created or spawned.
       if (!isFile(found.path)) return { status: 'refused', message: `Could not start ${harness.name}: ${found.path} not found.` };
+      // The agent runs in the daemon: without it nothing is created, spawned or stored.
+      try {
+        await ensureOwnDaemon();
+      } catch (error) {
+        return { status: 'refused', message: `Could not start ${harness.name}: ${error instanceof Error ? error.message : String(error)}` };
+      }
 
       // In a workspace the session runs in the worktree, which is the user's: nothing is created
       // or removed there. Otherwise it gets a folder of its own, removed if the start fails.
@@ -763,14 +971,14 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
           COCKPIT_SESSION_ID: id,
           ...(workspace && { COCKPIT_WORKSPACE_PATH: workspace.path }),
         });
-        // With the endpoint up the harness is told, through its arguments and environment, to report its status.
-        let args = harness.start(prompt);
-        if (controlSocket) {
-          const status = await statusLaunch(harness.id, { command: statusCommand, pluginsDir: join(cockpitHome, 'plugins'), env });
-          args = [...status.args, ...args];
-          env = status.env as Record<string, string>;
-        }
-        ptyId = await spawnFor(event.sender, { ...size, command: found.path, args, cwd: directory, env }, endings);
+        // The harness is told, through its arguments and environment, to report its status to the daemon.
+        const status = await statusLaunch(harness.id, { command: statusCommand, pluginsDir: join(cockpitHome, 'plugins'), env });
+        env = status.env as Record<string, string>;
+        ptyId = await spawnFor(
+          event.sender,
+          { ...size, command: found.path, args: [...status.args, ...harness.start(prompt)], cwd: directory, env },
+          { kind: 'session', sessionId: id, workspace: workspace?.path, before: endings },
+        );
         const session = {
           id,
           name: sessionName(state, harness, workspace?.path),
@@ -782,7 +990,6 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
         const next = addSession(state, session);
         saveState(userData, next);
         state = next;
-        sessionOwners.set(id, event.sender);
         return { status: 'started', session, ptyId };
       } catch (error) {
         if (ptyId !== undefined) kill(ptyId);
@@ -860,18 +1067,8 @@ void app.whenReady().then(async () => {
     if (!isFromApp(event)) throw new Error('get-shell-path refused: unexpected origin');
     return (await shellEnv).PATH ?? '';
   });
-  // A failure leaves the endpoint off: the app runs, and terminals get no `COCKPIT_SOCKET`.
-  try {
-    const control = await startControlServer({
-      dir: cockpitHome,
-      onSessionEvent: reportSessionStatus,
-    });
-    controlSocket = control.socketPath;
-  } catch (error) {
-    controlError = error instanceof Error ? error.message : String(error);
-    console.error(`Cockpit control endpoint is off: ${controlError}`);
-  }
-  const pty = startPty();
+  await connectDaemons();
+  const pty = startTerminals();
   startProjects(userData, pty);
   startSessions(userData, pty);
 

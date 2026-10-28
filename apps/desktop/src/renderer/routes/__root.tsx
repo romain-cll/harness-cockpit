@@ -2,22 +2,26 @@ import { createRootRoute, Outlet, useNavigate, useParams, useRouter } from '@tan
 import { useEffect } from 'react';
 import { AppSidebar } from '@/components/app-sidebar';
 import { ChangesPanel, useChangesOpen, workspaceOf } from '@/components/changes-panel';
+import { restoreTerminals } from '@/components/live-terminals';
+import { restoreTabs } from '@/components/terminal-tabs';
 
 export const Route = createRootRoute({
   loader: async () => {
-    const [version, projects, sessions, statusOff] = await Promise.all([
+    const [version, projects, sessions, daemon] = await Promise.all([
       window.api.getVersion(),
       window.api.projects.list(),
       window.api.sessions.list(),
-      window.api.sessions.statusOff(),
+      window.api.daemon.status(),
+      // The shells and sessions the daemons run come back with their screens, once per page load.
+      restoreTerminals().then(restoreTabs),
     ]);
-    return { version, projects, sessions, statusOff };
+    return { version, projects, sessions, daemon };
   },
   component: RootLayout,
 });
 
 function RootLayout() {
-  const { version, projects, sessions, statusOff } = Route.useLoaderData();
+  const { version, projects, sessions, daemon } = Route.useLoaderData();
   const router = useRouter();
   const navigate = useNavigate();
   // The Changes sidebar belongs to the page of a session that runs in a workspace.
@@ -37,7 +41,7 @@ function RootLayout() {
   );
   return (
     <div className="flex h-screen">
-      <AppSidebar version={version} projects={projects} sessions={sessions} statusOff={statusOff} />
+      <AppSidebar version={version} projects={projects} sessions={sessions} daemon={daemon} />
       <main className="flex min-w-0 flex-1 flex-col">
         <Outlet />
       </main>

@@ -5,13 +5,13 @@ import type { HarnessId } from './catalogue';
 
 // How each harness is told to report the status of its session. Everything is passed through
 // argv and the environment of the spawn, never written in the user's repository or global
-// config. Hook commands always exit 0 and print nothing (`statusCommand` of `@cockpit/control`,
+// config. Hook commands always exit 0 and print nothing (`statusCommand` of `@cockpit/daemon`,
 // which this package does not depend on: the caller passes it in).
 //
 // Every fact below carries its source. Checked on 2026-10-25 against Claude Code 2.1.310,
 // Codex 0.163.0 and OpenCode 2.0.31.
 
-/** The states a harness reports; the values of `SESSION_EVENTS` of `@cockpit/control`. */
+/** The states a harness reports; the values of `SESSION_EVENTS` of `@cockpit/daemon`. */
 export type StatusEvent = 'working' | 'waiting' | 'finished';
 
 export interface StatusLaunchOptions {

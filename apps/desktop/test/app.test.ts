@@ -1,18 +1,37 @@
-import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { request as httpRequest } from 'node:http';
-import { createServer, type AddressInfo } from 'node:net';
-import { homedir, tmpdir, userInfo } from 'node:os';
+import { homedir, userInfo } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
-import { statusCommand } from '@cockpit/control';
+import { statusCommand } from '@cockpit/daemon';
 import { statusLaunch } from '@cockpit/harnesses';
-import { chromium, type Browser, type ElementHandle, type Page } from 'playwright-core';
+import { type ElementHandle, type Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest';
+import {
+  MAIN_PROCESS_ERROR,
+  UI_TIMEOUT,
+  appDir,
+  daemonSocketIn,
+  freePort,
+  isAlive,
+  launchBuilt,
+  launchDev,
+  launchEnv,
+  launchPackaged,
+  launchSpawned,
+  packagedAppDir,
+  poll,
+  stopGroup,
+  versionLabel,
+  waitForGroupGone,
+  type Session,
+} from './launch';
+import { makeTestDir } from './run-root';
 
 // Launches the app the four ways it runs: the dev server, the built app, the
 // packaged app and the packaged app with the minimal environment launchd gives
@@ -20,274 +39,6 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 // renders, logs no error, stays in the background and writes its data in its
 // own folder. In CI only, it also launches the packaged app without the
 // background switch.
-
-const appDir = join(import.meta.dirname, '..');
-const { version } = JSON.parse(readFileSync(join(appDir, 'package.json'), 'utf8')) as { version: string };
-// Shown in the sidebar from `window.api.getVersion()`, so it proves the
-// renderer reaches the main process.
-const versionLabel = `Cockpit ${version}`;
-
-// Signs of an uncaught error in the main process.
-const MAIN_PROCESS_ERROR = /\bUncaught\b|\bUnhandled\b|App threw an error/;
-
-interface Session {
-  page: Page;
-  /** The app's main process. */
-  pid: number;
-  /** The folder the app was told to keep its data in, removed on close. */
-  dataDir: string;
-  /**
-   * `COCKPIT_HOME` the app was launched with: inside `dataDir`, so it goes away with it. Empty
-   * when the launch left it unset or empty.
-   */
-  cockpitHome: string;
-  /** Everything the app wrote to stdout and stderr. */
-  output(): string;
-  /**
-   * Evaluates an expression in the app's main process, through the Node
-   * inspector, and returns its value. `require` is available in it (the
-   * inspector's command-line API). The app has no test hook: this is how a test
-   * replaces the folder picker.
-   */
-  evaluateInMain<T = unknown>(expression: string): Promise<T>;
-  /**
-   * Closes the connection to the main process's inspector. A Node process with a
-   * connected inspector waits for it to disconnect before it exits, so a test
-   * that makes the app quit disconnects first.
-   */
-  disconnectInspector(): Promise<void>;
-  isRunning(): boolean;
-  close(): Promise<void>;
-}
-
-// Every launch gets a fresh data folder, so no launch touches the data of
-// another one or of the Cockpit the developer has open. The background switch
-// keeps the app out of the Dock and out of the way: it never shows a window nor
-// takes the focus. The spawned app's `env` replaces the environment, hence the spread
-// of `base`, the test runner's environment unless the launch gives another one
-// (the launchd launch gives its own minimal one).
-// A test that must start the app twice on the same data folder creates the
-// folder itself, passes it in and removes it afterwards: sessions leave a folder
-// they were given in place.
-// `COCKPIT_HOME` is a folder inside the data folder: the worktrees and session
-// folders the app creates live under it and are removed with it, and no test
-// touches the developer's `~/.cockpit`. Only a test of the default passes `null`
-// (unset) or `''` (empty), with a `HOME` of its own.
-// The terminal page runs whatever `$SHELL` says: by default `/bin/sh`, which keeps
-// the developer's shell configuration from slowing or breaking the tests.
-function launchEnv(
-  background: boolean,
-  dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-')),
-  base: NodeJS.ProcessEnv = { ...process.env, SHELL: '/bin/sh' },
-  cockpitHome: string | null = join(dataDir, 'cockpit-home'),
-) {
-  const env = { ...base, COCKPIT_USER_DATA_DIR: dataDir } as Record<string, string>;
-  if (cockpitHome === null) delete env.COCKPIT_HOME;
-  else env.COCKPIT_HOME = cockpitHome;
-  if (background) env.COCKPIT_TEST_BACKGROUND = '1';
-  else delete env.COCKPIT_TEST_BACKGROUND;
-  return { dataDir, cockpitHome: cockpitHome ?? '', env };
-}
-
-// Attaches to a running Electron over the Chrome DevTools Protocol and returns
-// its first window. Reloads it so the page's console output is captured from the
-// start.
-async function attach(endpoint: string): Promise<{ browser: Browser; page: Page }> {
-  const browser = await chromium.connectOverCDP(endpoint);
-  const context = browser.contexts()[0]!;
-  const page = context.pages()[0] ?? (await context.waitForEvent('page'));
-  // The window's target starts as `about:blank` while its first navigation to the
-  // app is pending: a reload racing that navigation waits for a load that never
-  // comes. Wait until the page is on the app's URL and loaded.
-  await page.waitForURL((url) => url.protocol !== 'about:', { timeout: 30_000 });
-  await page.reload();
-  return { browser, page };
-}
-
-// Signals a process group, which may already be gone.
-function signalGroup(pid: number, signal: NodeJS.Signals) {
-  try {
-    process.kill(-pid, signal);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
-  }
-}
-
-// `kill(-pid, 0)` throws ESRCH once the group is gone.
-function groupAlive(pid: number): boolean {
-  try {
-    process.kill(-pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
-  }
-}
-
-// Waits until no process of the group `pid` is alive: the helpers of a child can
-// outlive it and still write in the data folder. The group gets SIGKILL 10 s after
-// `started` if anything is left, and an error names it after 20 s.
-async function waitForGroupGone(pid: number, started = Date.now()): Promise<void> {
-  const killer = setTimeout(() => signalGroup(pid, 'SIGKILL'), Math.max(0, 10_000 - (Date.now() - started)));
-  try {
-    while (groupAlive(pid)) {
-      if (Date.now() - started > 20_000) throw new Error(`the process group ${pid} is still alive after 20 s`);
-      await sleep(100);
-    }
-  } finally {
-    clearTimeout(killer);
-  }
-}
-
-// Stops a process started with `detached: true` and everything in its process
-// group, and waits until no process of the group is alive.
-async function stopGroup(child: ChildProcess): Promise<void> {
-  const pid = child.pid!;
-  const started = Date.now();
-  const exited =
-    child.exitCode !== null || child.signalCode !== null
-      ? Promise.resolve()
-      : new Promise((resolve) => child.once('exit', resolve));
-  signalGroup(pid, 'SIGTERM');
-  await Promise.all([exited, waitForGroupGone(pid, started)]);
-}
-
-// Connects to the main process's Node inspector (`--inspect=0` prints
-// `Debugger listening on ws://...` on stderr) with Node's own WebSocket, and
-// evaluates expressions in it. The connection opens on the first evaluation.
-// `Runtime.evaluate` with `includeCommandLineAPI` exposes `require`, which is
-// what `electronApp.evaluate` of Playwright's Electron launcher does too.
-function mainInspector(output: () => string) {
-  let socket: Promise<WebSocket> | undefined;
-  let lastId = 0;
-  const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();
-
-  const connect = async () => {
-    const url = await poll(() => /Debugger listening on (ws:\/\/\S+)/.exec(output())?.[1], Boolean, 15_000);
-    if (!url) throw new Error(`the app did not open an inspector:\n${output()}`);
-    const ws = new WebSocket(url);
-    await new Promise<void>((resolve, reject) => {
-      ws.addEventListener('open', () => resolve(), { once: true });
-      ws.addEventListener('error', () => reject(new Error(`cannot connect to the inspector at ${url}`)), { once: true });
-    });
-    ws.addEventListener('message', (event) => {
-      const message = JSON.parse(String(event.data)) as {
-        id?: number;
-        result?: { result?: { value?: unknown }; exceptionDetails?: { text: string; exception?: { description?: string } } };
-        error?: { message: string };
-      };
-      const waiting = message.id === undefined ? undefined : pending.get(message.id);
-      if (!waiting) return;
-      pending.delete(message.id!);
-      const failure = message.result?.exceptionDetails;
-      if (message.error) waiting.reject(new Error(message.error.message));
-      else if (failure) waiting.reject(new Error(failure.exception?.description ?? failure.text));
-      else waiting.resolve(message.result?.result?.value);
-    });
-    return ws;
-  };
-
-  return {
-    async evaluate<T>(expression: string): Promise<T> {
-      const ws = await (socket ??= connect());
-      const id = ++lastId;
-      const answer = new Promise<unknown>((resolve, reject) => pending.set(id, { resolve, reject }));
-      ws.send(
-        JSON.stringify({
-          id,
-          method: 'Runtime.evaluate',
-          params: { expression, includeCommandLineAPI: true, awaitPromise: true, returnByValue: true },
-        }),
-      );
-      return (await answer) as T;
-    },
-    // An inspector left connected can hold the process at exit.
-    async close() {
-      const ws = await socket?.catch(() => undefined);
-      ws?.close();
-    },
-  };
-}
-
-// Spawns the Electron binary itself, with its output piped from the first line,
-// and attaches over CDP. Chromium prints the port it picked on stderr
-// (`--remote-debugging-port=0`).
-async function launchSpawned(
-  executablePath: string,
-  args: string[],
-  background: boolean,
-  givenDataDir?: string,
-  base?: NodeJS.ProcessEnv,
-  givenCockpitHome?: string | null,
-): Promise<Session> {
-  const { dataDir, cockpitHome, env } = launchEnv(background, givenDataDir, base, givenCockpitHome);
-  // Its own process group, so closing stops Electron and its helpers together.
-  const child = spawn(executablePath, ['--remote-debugging-port=0', '--inspect=0', ...args], {
-    cwd: appDir,
-    env,
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let output = '';
-  child.stdout.on('data', (chunk) => (output += chunk));
-  child.stderr.on('data', (chunk) => (output += chunk));
-  const removeDataDir = () => {
-    if (givenDataDir === undefined) rmSync(dataDir, { recursive: true, force: true });
-  };
-
-  try {
-    const deadline = Date.now() + 30_000;
-    let port: string | undefined;
-    while (!(port = /DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)/.exec(output)?.[1])) {
-      if (child.exitCode !== null) throw new Error(`the app exited with code ${child.exitCode}:\n${output}`);
-      if (Date.now() > deadline) throw new Error(`the app did not open a debugging port:\n${output}`);
-      await sleep(50);
-    }
-    const { browser, page } = await attach(`http://127.0.0.1:${port}`);
-    const inspector = mainInspector(() => output);
-    return {
-      page,
-      pid: child.pid!,
-      dataDir,
-      cockpitHome,
-      output: () => output,
-      evaluateInMain: inspector.evaluate,
-      disconnectInspector: inspector.close,
-      isRunning: () => child.exitCode === null,
-      close: async () => {
-        await inspector.close();
-        await browser.close();
-        await stopGroup(child);
-        removeDataDir();
-      },
-    };
-  } catch (error) {
-    await stopGroup(child);
-    removeDataDir();
-    throw error;
-  }
-}
-
-function launchBuilt(): Promise<Session> {
-  // The `electron` package exports the path to its binary, downloading it if
-  // missing. Resolved here, not at import, so the dev test runs first without it.
-  const executablePath: string = createRequire(import.meta.url)('electron');
-  return launchSpawned(executablePath, ['.'], true);
-}
-
-function packagedAppDir(): string {
-  if (process.platform !== 'darwin') throw new Error(`No packaged app path for ${process.platform}`);
-  const releaseDir = process.arch === 'arm64' ? 'mac-arm64' : 'mac';
-  return join(appDir, 'release', releaseDir, 'Cockpit.app');
-}
-
-function launchPackaged({
-  background = true,
-  dataDir,
-  env,
-}: { background?: boolean; dataDir?: string; env?: NodeJS.ProcessEnv } = {}): Promise<Session> {
-  const executablePath = join(packagedAppDir(), 'Contents/MacOS/Cockpit');
-  return launchSpawned(executablePath, [], background, dataDir, env);
-}
 
 // What the page sees of the main process's `Api.getShellPath`.
 const getShellPath = (page: Page) =>
@@ -315,73 +66,6 @@ const LAUNCHD_ENV: Record<string, string> = (() => {
 const normalizeFnm = (path: string) => path.replace(/fnm_multishells\/[^/:]+/g, 'fnm_multishells/<id>');
 
 const launchLaunchd = () => launchPackaged({ env: LAUNCHD_ENV });
-
-function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = createServer()
-      .listen(0, '127.0.0.1', () => {
-        const { port } = server.address() as AddressInfo;
-        server.close(() => resolve(port));
-      })
-      .on('error', reject);
-  });
-}
-
-// Runs the `dev` script as a developer would, then attaches over the Chrome
-// DevTools Protocol.
-async function launchDev(base?: NodeJS.ProcessEnv): Promise<Session> {
-  const port = await freePort();
-  const inspectPort = await freePort();
-  const { dataDir, cockpitHome, env } = launchEnv(true, undefined, base);
-  // Its own process group, so closing stops the dev server and Electron with it.
-  // electron-vite ignores `--inspect 0` (0 is falsy for it): a free port instead.
-  const dev = spawn('bun', ['run', 'dev', '--remoteDebuggingPort', String(port), '--inspect', String(inspectPort)], {
-    cwd: appDir,
-    env,
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let output = '';
-  dev.stdout.on('data', (chunk) => (output += chunk));
-  dev.stderr.on('data', (chunk) => (output += chunk));
-  const stop = () => stopGroup(dev);
-  const removeDataDir = () => rmSync(dataDir, { recursive: true, force: true });
-
-  try {
-    const endpoint = `http://127.0.0.1:${port}`;
-    const deadline = Date.now() + 90_000;
-    while (!(await fetch(`${endpoint}/json/version`).then((r) => r.ok, () => false))) {
-      if (dev.exitCode !== null) throw new Error(`dev exited with code ${dev.exitCode}:\n${output}`);
-      if (Date.now() > deadline) throw new Error(`dev did not open a window:\n${output}`);
-      await sleep(250);
-    }
-    const { browser, page } = await attach(endpoint);
-    // The dev script runs Electron in the process group of `dev`; the helpers
-    // are named `Electron Helper ...`, so `-x` matches the main process only.
-    const pid = Number(execFileSync('pgrep', ['-g', String(dev.pid), '-x', 'Electron'], { encoding: 'utf8' }).split('\n')[0]);
-    const inspector = mainInspector(() => output);
-    return {
-      page,
-      pid,
-      dataDir,
-      cockpitHome,
-      output: () => output,
-      evaluateInMain: inspector.evaluate,
-      disconnectInspector: inspector.close,
-      isRunning: () => dev.exitCode === null,
-      close: async () => {
-        await inspector.close();
-        await browser.close();
-        await stop();
-        removeDataDir();
-      },
-    };
-  } catch (error) {
-    await stop();
-    removeDataDir();
-    throw error;
-  }
-}
 
 const run = promisify(execFile);
 
@@ -418,16 +102,6 @@ function watchFrontmost() {
       await sampling;
     },
   };
-}
-
-// Reads until `done` accepts the value or `timeout` ms pass, and returns the last value.
-async function poll<T>(read: () => T | Promise<T>, done: (value: T) => boolean, timeout: number): Promise<T> {
-  const deadline = Date.now() + timeout;
-  for (;;) {
-    const value = await read();
-    if (done(value) || Date.now() > deadline) return value;
-    await sleep(100);
-  }
 }
 
 // What `window.api.pty` must look like. Declared here, not imported, because
@@ -530,8 +204,6 @@ const allPageErrorsOf = (page: Page) => page.pageErrors({ filter: 'all' });
 
 // --- Terminal page helpers ---------------------------------------------------
 
-const UI_TIMEOUT = 10_000;
-
 // A terminal on the page. The page keeps every terminal of every tab in the DOM
 // (the ones of other tabs are hidden), so a helper never reads "the terminal":
 // it reads one pane, the one the keyboard is in unless the test gives another.
@@ -629,11 +301,26 @@ async function goToTerminalPage(page: Page) {
   await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
 }
 
-// Reloads the page on Home (the tabs outlive a visit, a reload starts over), then
-// opens the terminal page through the sidebar: each call opens a new page lifetime
+// Ends every shell of the daemon (COCKPIT-55: the shells outlive the page, so a reload shows them
+// again), through `window.api.pty`, and waits until the daemon lists none. Sessions are left running.
+async function endShells(page: Page) {
+  await page.evaluate(async () => {
+    type Listed = { id: number; kind?: string };
+    const pty = (window as unknown as { api: { pty: { list(): Promise<Listed[]>; kill(id: number): void } } }).api.pty;
+    for (const terminal of await pty.list()) if ((terminal.kind ?? 'shell') === 'shell') pty.kill(terminal.id);
+    const deadline = Date.now() + 5_000;
+    while ((await pty.list()).some((terminal) => (terminal.kind ?? 'shell') === 'shell') && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  });
+}
+
+// Reloads the page on Home (the tabs outlive a visit, and, once the shells are ended, a reload starts
+// over), then opens the terminal page through the sidebar: each call opens a new page lifetime
 // (one tab, one shell), and focuses the terminal.
 async function openTerminal(page: Page) {
   await goHome(page);
+  await endShells(page);
   await page.reload();
   await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
   await goToTerminalPage(page);
@@ -762,16 +449,6 @@ async function pidOf(page: Page, pane?: Pane): Promise<number> {
   return Number(pid);
 }
 
-// `process.kill(pid, 0)` throws ESRCH once the process is gone.
-function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
-  }
-}
-
 // Whether the process is gone within `timeout` ms.
 const endsWithin = async (pid: number, timeout = 5_000) => !(await poll(() => isAlive(pid), (alive) => !alive, timeout));
 
@@ -871,7 +548,7 @@ async function openTwoTabsOneSplit(page: Page): Promise<number[]> {
 const emptyStateNewTerminal = (page: Page) =>
   page.getByText('No terminal open', { exact: true }).locator('..').getByRole('button', { name: 'New terminal', exact: true });
 
-// The pid of the pty utility process, read from the parent of a probe shell (ended
+// The pid of the daemon (COCKPIT-55; it was the pty utility process), read from the parent of a probe shell (ended
 // before the call returns, so it leaves nothing under the host).
 async function ptyHostPid(page: Page): Promise<number> {
   const id = await spawnShell(page);
@@ -883,7 +560,7 @@ async function ptyHostPid(page: Page): Promise<number> {
   return hostPid;
 }
 
-// Kills the pty utility process, the way a crash does, and returns the id of the
+// Kills the daemon, the way a crash does, and returns the id of the
 // session that found it (its exit is reported). Works at the API level, so it
 // also runs in the launchd-environment mode.
 async function killPtyHost(page: Page): Promise<number> {
@@ -1025,7 +702,7 @@ interface TempRepo {
 
 // `<tmp>/<name>` with one commit (`README.md`, `src/main.ts`).
 function makeRepo(name: string): TempRepo {
-  const parent = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-project-test-')));
+  const parent = realpathSync(makeTestDir('p-'));
   const root = join(parent, name);
   mkdirSync(join(root, 'src'), { recursive: true });
   writeFileSync(join(root, 'README.md'), 'hello\n');
@@ -1039,7 +716,7 @@ function makeRepo(name: string): TempRepo {
 
 // A folder that is not inside any git repository.
 function makePlainFolder(name: string): TempRepo {
-  const parent = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-project-test-')));
+  const parent = realpathSync(makeTestDir('p-'));
   const root = join(parent, name);
   mkdirSync(root);
   return { parent, root, name };
@@ -1197,7 +874,7 @@ const sha8 = (root: string) => createHash('sha256').update(root).digest('hex').s
 // `$COCKPIT_HOME/worktrees/<repo basename>-<8 hex>/<branch>`, compared by real
 // path (macOS `/var` is `/private/var`; the data folder exists, the rest does not yet).
 const worktreePath = (session: Session, repo: TempRepo, branch: string) =>
-  join(realpathSync(session.dataDir), 'cockpit-home', 'worktrees', `${repo.name}-${sha8(repo.root)}`, branch);
+  join(realpathSync(session.dataDir), 'h', 'worktrees', `${repo.name}-${sha8(repo.root)}`, branch);
 
 // A repository with `origin` (a clone of `upstream`, which has `develop`,
 // `feature/x` and `release/1.0` besides `main`), a local commit on `main` that
@@ -1208,7 +885,7 @@ interface TempClone extends TempRepo {
 function makeClone(name: string): TempClone {
   const upstream = makeRepo(`${name}-upstream`);
   for (const branch of ['develop', 'feature/x', 'release/1.0']) gitIn(upstream.root, 'branch', branch);
-  const parent = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-project-test-')));
+  const parent = realpathSync(makeTestDir('p-'));
   const root = join(parent, name);
   gitIn(parent, 'clone', '--quiet', upstream.root, root);
   gitIn(root, 'commit', '--allow-empty', '-m', 'local only');
@@ -1220,7 +897,7 @@ function makeClone(name: string): TempClone {
 
 // A repository whose only content is an empty commit.
 function makeLightRepo(name: string): TempRepo {
-  const parent = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-project-test-')));
+  const parent = realpathSync(makeTestDir('p-'));
   const root = join(parent, name);
   mkdirSync(root);
   gitIn(root, 'init', '--quiet', '-b', 'main');
@@ -2221,7 +1898,7 @@ describe.each([
     }
   });
 
-  test.runIf(full)('survive AC6 — after Home and back, reloading the page ends every shell of every tab, and the page starts over with one tab', async () => {
+  test.runIf(full)('daemon AC4 — after Home and back, reloading the page keeps every shell of every tab running: the page shows one tab per shell, in creation order, each with its output and taking a new command', async () => {
     const { page } = session;
     const pids = await openTwoTabsOneSplit(page);
 
@@ -2233,53 +1910,15 @@ describe.each([
     await page.reload();
     await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
 
-    for (const pid of pids) expect(await endsWithin(pid), `shell ${pid} ends within 5 s`).toBe(true);
-    await expectTabs(page, ['Terminal 1'], 'Terminal 1');
-    await focusTerminal(page);
-    await waitForPrompt(page);
-    await typeLine(page, 'echo cockpit-$((6*7))');
-    await waitForRow(page, 'cockpit-42');
-  });
-
-  // The host is stopped, so a new tab's spawn stays pending in the main process; the page
-  // reloads and the host resumes: the pty that spawn creates belongs to a page that is gone
-  // and must not outlive it. Only the shell of the new page's Terminal 1 may be left.
-  test.runIf(full)('survive AC7 — a spawn still pending when the page reloads leaves no shell behind once the host resumes', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const hostPid = await ptyHostPid(page);
-    await replacePtySpawn(
-      session,
-      `async (...args) => { globalThis.__spawnCalls = (globalThis.__spawnCalls ?? 0) + 1; return original(...args); }`,
-    );
-    let mark = { errors: 0, output: 0 };
-    process.kill(hostPid, 'SIGSTOP');
-    try {
-      const calls = () => session.evaluateInMain<number>('globalThis.__spawnCalls ?? 0');
-      const before = await calls();
-      await newTerminal(page);
-      await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 2');
-      // The main process has received the spawn of the new tab, which the stopped host cannot answer.
-      expect(await poll(calls, (count) => count > before, UI_TIMEOUT)).toBeGreaterThan(before);
-
-      mark = await errorMark(session);
-      await page.reload();
-      await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
-    } finally {
-      process.kill(hostPid, 'SIGCONT');
-      await restorePtySpawn(session);
+    for (const pid of pids) expect(isAlive(pid), `shell ${pid} is still running`).toBe(true);
+    // One tab per running shell, without the split.
+    await poll(async () => (await tabsShown(page)).names.length, (count) => count >= pids.length, UI_TIMEOUT);
+    const shown: number[] = [];
+    for (const name of (await tabsShown(page)).names) {
+      await page.getByRole('tab', { name, exact: true }).click({ timeout: UI_TIMEOUT });
+      shown.push(await pidOf(page));
     }
-
-    await expectTabs(page, ['Terminal 1'], 'Terminal 1');
-    await focusTerminal(page);
-    const pid = await pidOf(page);
-    expect(
-      await poll(() => childPidsOf(hostPid), (children) => children.length === 1 && children[0] === pid, 5_000),
-      'the only child of the pty host is the shell of the reloaded page',
-    ).toEqual([pid]);
-    expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
-    // The pty:spawn handler does not reject for a page that is gone.
-    expect(session.output().slice(mark.output)).not.toContain('Error occurred in handler');
+    for (const pid of pids) expect(shown).toContain(pid);
   });
 
   // The spawn itself fails: the terminal says so, the other tabs go on, and the next spawn works.
@@ -3481,9 +3120,8 @@ describe.each([
         });
       }
 
-      // The host answers in order: once it ran a probe shell it has handled any spawn the calls would have sent.
-      const hostPid = await ptyHostPid(page);
-      expect(await poll(() => childPidsOf(hostPid), (children) => children.length === 0, 5_000)).toEqual([]);
+      // The daemon answers in order: once it ran a probe shell it has handled any spawn the calls would have sent.
+      await ptyHostPid(page);
       expect(waiters(repo, 'never-18')).toEqual([]);
     });
   });
@@ -3717,8 +3355,9 @@ describe.each([
     });
 
     // The URL is on the app's origin, so the navigation is allowed, and it ends on
-    // an error page. The shell must end all the same.
-    async function expectShellEndsOnNavigationTo(path: string) {
+    // an error page. The shell keeps running all the same (COCKPIT-55: only commands
+    // terminals end with their page), and the app page shows it again.
+    async function expectShellSurvivesNavigationTo(path: string) {
       const { page } = session;
       await openTerminal(page);
       const appUrl = await page.evaluate(() => location.href);
@@ -3731,18 +3370,20 @@ describe.each([
             location.href = new URL(path, location.href).href;
           }, path)
           .catch(() => {});
-        expect(await endsWithin(pid), 'the shell ends within 5 s').toBe(true);
+        // Not ended within the time an ended shell would be gone.
+        expect(await endsWithin(pid, 2_000), 'the shell keeps running').toBe(false);
         expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
         expect(session.isRunning()).toBe(true);
       } finally {
         await page.goto(appUrl);
         await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
       }
+      expect(isAlive(pid)).toBe(true);
       expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
     }
 
-    test.runIf(full)('tabs AC11 — a same-origin navigation to a missing file (a 404) ends the shell, with no main-process error', async () => {
-      await expectShellEndsOnNavigationTo('/missing.js');
+    test.runIf(full)('tabs AC11 — a same-origin navigation to a missing file (a 404) leaves the shell running, with no main-process error', async () => {
+      await expectShellSurvivesNavigationTo('/missing.js');
     });
 
     // The app's protocol handler throws on a malformed percent-encoding
@@ -3750,8 +3391,8 @@ describe.each([
     // document: the navigation commits an error page, and `did-navigate` is not
     // what the main process hears (a 404 does commit a document, which is why the
     // test above passes without `did-fail-load`).
-    test.runIf(full)('tabs AC11 — a same-origin navigation the app cannot serve (error page, no document) ends the shell, with no main-process error', async () => {
-      await expectShellEndsOnNavigationTo('/%');
+    test.runIf(full)('tabs AC11 — a same-origin navigation the app cannot serve (error page, no document) leaves the shell running, with no main-process error', async () => {
+      await expectShellSurvivesNavigationTo('/%');
     });
   });
 
@@ -4059,7 +3700,7 @@ describe('packaged app state file', () => {
   let dataDir: string;
 
   beforeEach(() => {
-    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+    dataDir = makeTestDir('d-');
   });
 
   afterEach(() => {
@@ -4211,49 +3852,6 @@ describe('packaged app state file', () => {
 
 // Quitting as Cmd+Q does (`app.quit()`): no shell may be left running behind the
 // user's back.
-describe('packaged app quit', () => {
-  test('tabs AC10 — quitting the app with two shells open ends the app and both shells within 5 s', async () => {
-    const session = await launchPackaged();
-    const pids: number[] = [];
-    try {
-      const { page } = session;
-      await page.getByText(versionLabel).waitFor();
-      await openTerminal(page);
-      pids.push(await pidOf(page));
-      await openTab(page);
-      pids.push(await pidOf(page));
-      for (const pid of pids) expect(isAlive(pid)).toBe(true);
-
-      // `app.quit()` is what Cmd+Q does. It runs a moment later, so the test can
-      // disconnect its inspector first: a Node process waits for a connected
-      // inspector to disconnect before it exits.
-      const quitAt = Date.now();
-      await session.evaluateInMain(`(() => {
-        const { app } = require('electron');
-        setTimeout(() => app.quit(), 300);
-      })()`);
-      await session.disconnectInspector();
-      const remaining = () => Math.max(0, 5_000 - (Date.now() - quitAt));
-
-      expect(await poll(() => session.isRunning(), (running) => !running, remaining()), 'the app exits within 5 s').toBe(false);
-      for (const pid of pids) {
-        expect(await poll(() => isAlive(pid), (alive) => !alive, remaining()), `shell ${pid} is gone within 5 s`).toBe(false);
-      }
-    } finally {
-      // A shell that survived must not outlive the test.
-      for (const pid of pids) {
-        try {
-          process.kill(pid, 'SIGKILL');
-        } catch {
-          // already gone
-        }
-      }
-      await Promise.race([session.close().catch(() => {}), sleep(15_000)]);
-      rmSync(session.dataDir, { recursive: true, force: true });
-    }
-  });
-});
-
 // A login shell that prints an environment whose PATH holds no git. A real
 // `/bin/sh -l` would source `/etc/profile`, whose `path_helper` puts `/usr/bin`
 // back, so the fake shell sets the PATH of the shell that prints the environment
@@ -4279,7 +3877,7 @@ describe('built app with no git on the login shell PATH', () => {
   let session: Session;
 
   beforeAll(async () => {
-    folder = mkdtempSync(join(tmpdir(), 'cockpit-fake-shell-'));
+    folder = makeTestDir('f-');
     repo = makeRepo('no-git-project');
     const executablePath: string = createRequire(import.meta.url)('electron');
     session = await launchSpawned(executablePath, ['.'], true, undefined, {
@@ -4390,7 +3988,7 @@ function makeSessionsFixture(
   binaries: string[],
   { log = false, slowVersion = false, gitLog = false }: { log?: boolean; slowVersion?: boolean; gitLog?: boolean } = {},
 ): SessionsFixture {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-sessions-test-')));
+  const root = realpathSync(makeTestDir('s-'));
   const bin = join(root, 'bin');
   mkdirSync(bin);
   const runLog = join(root, 'runs.log');
@@ -4597,7 +4195,7 @@ function postSessionEvent(socketPath: string, { authorization, body }: { authori
   });
 }
 
-const controlTokenIn = (cockpitHome: string) => readFileSync(join(cockpitHome, 'control.token'), 'utf8');
+const controlTokenIn = (cockpitHome: string) => readFileSync(daemonSocketIn(cockpitHome).replace(/\.sock$/, '.token'), 'utf8');
 
 // The status dot of a session's row (`role="img"`, wherever the row is in the sidebar): its accessible
 // name and its `title`, or `null` when the row has none.
@@ -4621,7 +4219,7 @@ async function expectDot(page: Page, id: string, label: string | null, timeout =
 // `working` only, which raises no notification.
 async function expectControlEndpoint(session: Session): Promise<void> {
   const { page } = session;
-  const socketPath = join(session.cockpitHome, 'control.sock');
+  const socketPath = daemonSocketIn(session.cockpitHome);
   const env = await readStubEnv(page);
   expect(env.session).toBe(sessionIdOf(page));
   expect(env.socket).toBe(socketPath);
@@ -5061,20 +4659,22 @@ describe('sessions: built app', () => {
     expect(new Date(stored[0]!.createdAt).toISOString()).toBe(stored[0]!.createdAt);
   });
 
-  test('control AC1 — control.sock and control.token sit in COCKPIT_HOME, both with mode 0600, the token being 64 lowercase hex characters and nothing else', () => {
-    const socketPath = join(session.cockpitHome, 'control.sock');
-    const tokenPath = join(session.cockpitHome, 'control.token');
+  test('daemon AC1 — daemon-1-<build>.sock and .token sit in COCKPIT_HOME, both with mode 0600, the token being 64 lowercase hex characters and nothing else, next to the daemon\'s .pid and .log', () => {
+    const socketPath = daemonSocketIn(session.cockpitHome);
+    const tokenPath = socketPath.replace(/\.sock$/, '.token');
     expect(statSync(socketPath).isSocket()).toBe(true);
     expect(statSync(socketPath).mode & 0o777).toBe(0o600);
     expect(statSync(tokenPath).isFile()).toBe(true);
     expect(statSync(tokenPath).mode & 0o777).toBe(0o600);
     expect(readFileSync(tokenPath, 'utf8')).toMatch(/^[0-9a-f]{64}$/);
+    expect(existsSync(socketPath.replace(/\.sock$/, '.pid'))).toBe(true);
+    expect(existsSync(socketPath.replace(/\.sock$/, '.log'))).toBe(true);
   });
 
   test('control AC8, AC9 — a session outside any project gets its own id and the socket, no workspace path, and not the values the app inherited', async () => {
     const env = await readStubEnv(session.page);
     expect(env.session).toBe(known.claude1.id);
-    expect(env.socket).toBe(join(session.cockpitHome, 'control.sock'));
+    expect(env.socket).toBe(daemonSocketIn(session.cockpitHome));
     expect(env.workspace).toBe('unset');
     expect(sessionsInState(session.dataDir)[0]!.id).toBe(env.session);
     expect(Object.values(env)).not.toContain(INHERITED_CONTROL_ENV.COCKPIT_SESSION_ID);
@@ -5082,7 +4682,7 @@ describe('sessions: built app', () => {
   });
 
   test('control AC4 — an id that is not a stored session gets 404 { "error": "unknown session" }', async () => {
-    const answer = await postSessionEvent(join(session.cockpitHome, 'control.sock'), {
+    const answer = await postSessionEvent(daemonSocketIn(session.cockpitHome), {
       authorization: `Bearer ${controlTokenIn(session.cockpitHome)}`,
       body: { sessionId: randomUUID(), event: 'working' },
     });
@@ -5097,7 +4697,7 @@ describe('sessions: built app', () => {
     await ptyWrite(page, id, `printf 'sock=<%s> sid=<%s> ws=<%s>\\n' "\${COCKPIT_SOCKET-unset}" "\${COCKPIT_SESSION_ID-unset}" "\${COCKPIT_WORKSPACE_PATH-unset}"\n`);
     await waitForOutput(page, id, /sock=<[^%>][^>]*> sid=<[^>]*> ws=<[^>]*>/);
     const printed = /sock=<([^%>][^>]*)> sid=<([^>]*)> ws=<([^>]*)>/.exec(await outputOf(page, id))!;
-    expect(printed.slice(1)).toEqual([join(session.cockpitHome, 'control.sock'), 'unset', 'unset']);
+    expect(printed.slice(1)).toEqual([daemonSocketIn(session.cockpitHome), 'unset', 'unset']);
     await ptyKill(page, id);
     await waitForExit(page, id);
   });
@@ -5168,63 +4768,24 @@ describe('sessions: built app', () => {
     expect(isAlive(known.claude2.pid)).toBe(true);
   });
 
-  test('AC8 — reloading the page ends the processes, marks every entry "Ended" and shows the ended page', async () => {
+  test('daemon AC4 — reloading the page keeps the processes: the running session shows no "Ended" dot, its page shows the running agent and a typed line reaches it', async () => {
     const { page } = session;
     await openSessionEntry(page, 'Claude Code 2');
-    const directory = sessionsInState(session.dataDir).find((stored) => stored.id === known.claude2.id)!.directory;
     expect(isAlive(known.claude2.pid)).toBe(true);
 
     await page.reload();
 
-    await page.getByText('This session has ended.').waitFor({ timeout: UI_TIMEOUT });
-    await page.getByText(directory).first().waitFor({ timeout: UI_TIMEOUT });
+    // The page shows the stub's output from before the reload: the same process.
+    expect((await readStub(page)).pid).toBe(known.claude2.pid);
     expect(sessionIdOf(page)).toBe(known.claude2.id);
-    expect(await poll(() => [isAlive(known.claude1.pid), isAlive(known.claude2.pid)], (alive) => !alive.includes(true), 10_000)).toEqual([
-      false,
-      false,
-    ]);
-    expect(await waitForSessionEntries(page, [['Codex 1', true], ['Claude Code 2', true], ['Claude Code 1', true]])).toEqual([
-      ['Codex 1', true],
-      ['Claude Code 2', true],
-      ['Claude Code 1', true],
-    ]);
+    expect(isAlive(known.claude2.pid)).toBe(true);
+    expect((await sessionEntries(page)).find((entry) => entry.name === 'Claude Code 2')?.ended).toBe(false);
+    expect(await page.getByText('This session has ended.').count()).toBe(0);
+    await focusTerminal(page);
+    await typeLine(page, 'after-reload');
+    await waitForRow(page, 'got:after-reload');
   });
 
-  // COCKPIT-46: the host is stopped, so the spawn of the session stays pending in the main
-  // process while the page reloads. Once the host resumes, the pty that spawn creates
-  // belongs to a page that is gone: no process may be left, and the start leaves no trace.
-  test('survive AC8 — a start whose spawn is pending when the page reloads leaves no process under the host, no folder and no stored session once the host resumes', async () => {
-    const { page } = session;
-    const hostPid = await ptyHostPid(page);
-    expect(await poll(() => childPidsOf(hostPid), (children) => children.length === 0, 5_000)).toEqual([]);
-    const foldersBefore = sessionFoldersIn(session.cockpitHome);
-    const storedBefore = sessionsInState(session.dataDir);
-
-    process.kill(hostPid, 'SIGSTOP');
-    try {
-      await openStartMenu(page);
-      await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).click({ timeout: UI_TIMEOUT });
-      // The main process created the session folder and waits for the stopped host to spawn.
-      expect(
-        await poll(() => sessionFoldersIn(session.cockpitHome).length, (count) => count > foldersBefore.length, UI_TIMEOUT),
-      ).toBeGreaterThan(foldersBefore.length);
-
-      await page.reload();
-      await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
-    } finally {
-      process.kill(hostPid, 'SIGCONT');
-    }
-
-    // The host answers in order: once it ran a probe shell it has handled the stale spawn too.
-    expect(await ptyHostPid(page)).toBe(hostPid);
-    expect(await poll(() => childPidsOf(hostPid), (children) => children.length === 0, 5_000), 'no stub runs under the host').toEqual([]);
-    expect(await poll(() => sessionFoldersIn(session.cockpitHome), (found) => found.length === foldersBefore.length, 5_000)).toEqual(foldersBefore);
-    expect(sessionsInState(session.dataDir)).toEqual(storedBefore);
-    expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
-  });
-
-  // The pty host dies here and the next spawn starts it again, so AC15 and the
-  // tests that follow work all the same.
   test('AC14 — with the pty host dead, picking a harness starts the session: its page opens, the stub runs in a new folder under COCKPIT_HOME, and it is listed and stored', async () => {
     const { page } = session;
     await killPtyHost(page);
@@ -5464,7 +5025,7 @@ describe('sessions: built app', () => {
     expect(env.session).toBe(ws.plus.ids[0]);
     expect(env.workspace).toBe(stored.directory);
     expect(env.workspace).toBe(ws.plus.path);
-    expect(env.socket).toBe(join(session.cockpitHome, 'control.sock'));
+    expect(env.socket).toBe(daemonSocketIn(session.cockpitHome));
   });
 
   test('workspace sessions AC3 — sessions are numbered per workspace, newest first, and apart from the Sessions section', async () => {
@@ -6176,7 +5737,7 @@ describe('sessions: built app', () => {
     expect(await sidebarLines(session.page)).toContain('Sessions');
     await expectNoErrors(session);
     // The endpoint started: the "off" line belongs to the launch that provokes it.
-    expect(session.output()).not.toContain('Cockpit control endpoint is off');
+    expect(session.output()).not.toContain("Cockpit's background service could not start");
   });
 });
 
@@ -7486,7 +7047,7 @@ const launchFiles = (fx: SessionsFixture) => readdirSync(fx.bin).filter((name) =
 
 // Reports a status the way a hook does, straight to the endpoint with the token.
 async function reportStatus(session: Session, id: string, event: 'working' | 'waiting' | 'finished') {
-  const answer = await postSessionEvent(join(session.cockpitHome, 'control.sock'), {
+  const answer = await postSessionEvent(daemonSocketIn(session.cockpitHome), {
     authorization: `Bearer ${controlTokenIn(session.cockpitHome)}`,
     body: { sessionId: id, event },
   });
@@ -7556,7 +7117,7 @@ describe('session status: built app', () => {
 
   afterEach(() => closeOverlays(session.page));
 
-  test('AC2, AC3, AC4, AC9, single instance AC8 — Claude Code, Codex and OpenCode are started with the arguments statusLaunch gives, OpenCode with its config variable and the plugin written under COCKPIT_HOME; none shows a dot before it reports, and the sidebar shows no "Status icons are off" alert', async () => {
+  test('AC2, AC3, AC4, AC9, single instance AC8 — Claude Code, Codex and OpenCode are started with the arguments statusLaunch gives, OpenCode with its config variable and the plugin written under COCKPIT_HOME; none shows a dot before it reports', async () => {
     const { page } = session;
     // Every session is started before anything is checked: the tests after this one need them.
     for (const [menuName, id] of [
@@ -7596,9 +7157,8 @@ describe('session status: built app', () => {
       ['Codex 1', null],
       ['Claude Code 1', null],
     ]);
-    // The endpoint is up: no alert says status is off (single instance AC8).
-    expect(await page.locator('aside [role="alert"]').count()).toBe(0);
-    expect((await sidebarLines(page)).filter((line) => line.includes('Status icons are off'))).toEqual([]);
+    // The daemon is up: nothing says status is off.
+    expect((await sidebarLines(page)).filter((line) => line.startsWith('Session status is off'))).toEqual([]);
   });
 
   test('AC7 — Claude Code hooks turn the row to "Working", "Needs input", "Working", "Ready" within 2 s of each report, another row is unchanged, and exiting with code 3 shows "Exited 3"', async () => {
@@ -7769,94 +7329,6 @@ describe('session status: built app', () => {
   });
 });
 
-describe('session status: built app with the control endpoint off', () => {
-  let fx: SessionsFixture;
-  let session: Session;
-  let dataDir: string;
-
-  beforeAll(async () => {
-    fx = makeSessionsFixture(['claude', 'codex', 'opencode'], { log: true });
-    // `control.sock` is a folder: the endpoint cannot start ("is not a socket").
-    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
-    const cockpitHome = join(dataDir, 'cockpit-home');
-    mkdirSync(join(cockpitHome, 'control.sock'), { recursive: true });
-    const env = fx.env();
-    delete env.OPENCODE_CONFIG_CONTENT;
-    session = await launchBuiltWith(env, dataDir, cockpitHome);
-    await session.page.getByText(versionLabel).waitFor();
-  });
-
-  afterAll(async () => {
-    await session?.close();
-    if (fx) rmSync(fx.root, { recursive: true, force: true });
-    if (dataDir) rmSync(dataDir, { recursive: true, force: true });
-  });
-
-  test('single instance AC7 — the sidebar shows, between the nav and the Projects header, an alert with a triangle-alert icon, the title "Status icons are off" in the --status-working color, the stderr reason and "Fix it, then restart Cockpit." in the muted color, and the Sessions section no longer shows "Session status is off"', async () => {
-    const { page } = session;
-    const prefix = 'Cockpit control endpoint is off: ';
-    const reason = session.output().split('\n').find((line) => line.startsWith(prefix))?.slice(prefix.length);
-    expect(reason, 'the app printed why the endpoint is off').toBeTruthy();
-
-    const alert = page.locator('aside [role="alert"]');
-    await alert.waitFor({ timeout: UI_TIMEOUT });
-    expect(await alert.count()).toBe(1);
-    const lines = (await alert.innerText()).split('\n').map((line) => line.trim()).filter(Boolean);
-    expect(lines).toEqual(['Status icons are off', reason, 'Fix it, then restart Cockpit.']);
-    expect(await alert.locator('svg.lucide-triangle-alert').count()).toBe(1);
-
-    // Between the Home/Terminal nav and the Projects header.
-    const placed = await page.evaluate(() => {
-      const aside = document.querySelector('aside')!;
-      const alertBox = aside.querySelector('[role="alert"]')!.getBoundingClientRect();
-      const navBox = aside.querySelector('nav')!.getBoundingClientRect();
-      const all = [...aside.querySelectorAll('*')] as HTMLElement[];
-      const titled = all.filter((element) => (element.textContent ?? '').trim() === 'Projects');
-      const header = titled.find((element) => !titled.some((other) => other !== element && element.contains(other)))!;
-      const headerBox = header.getBoundingClientRect();
-      return { belowNav: alertBox.top >= navBox.bottom - 1, aboveProjects: alertBox.bottom <= headerBox.top + 1 };
-    });
-    expect(placed).toEqual({ belowNav: true, aboveProjects: true });
-
-    const working = await page.evaluate(() => {
-      const probe = document.createElement('span');
-      probe.style.color = 'var(--status-working)';
-      document.body.append(probe);
-      const color = getComputedStyle(probe).color;
-      probe.remove();
-      return color;
-    });
-    const muted = await mutedColor(page);
-    expect(working).not.toBe(muted);
-    expect(await colorOfLine(page, 'Status icons are off'), 'the title').toBe(working);
-    expect(await colorOfLine(page, reason!), 'the reason').toBe(muted);
-    expect(await colorOfLine(page, 'Fix it, then restart Cockpit.'), 'the hint').toBe(muted);
-
-    expect((await sidebarLines(page)).filter((line) => line.startsWith('Session status is off'))).toEqual([]);
-  });
-
-  test('AC6 — with the endpoint off, each harness is started as before: no status argument, no OpenCode config variable, no plugin folder, and still its COCKPIT_SESSION_ID', async () => {
-    const { page } = session;
-    for (const [menuName, binary] of [
-      ['Claude Code', 'claude'],
-      ['Codex', 'codex'],
-      ['OpenCode', 'opencode'],
-    ] as const) {
-      const id = await startSession(page, menuName, `${menuName} 1`);
-      const stub = await readStub(page);
-      const launch = readLaunch(fx, binary, stub.pid);
-      expect(launch.args, binary).toEqual([]);
-      expect(launch.openCodeConfig, binary).toBe('unset');
-      expect(stub.argCount, binary).toBe(0);
-      const env = await readStubEnv(page);
-      expect(env.session, binary).toBe(id);
-      expect(env.socket, binary).toBe('unset');
-    }
-    expect(existsSync(join(session.cockpitHome, 'plugins'))).toBe(false);
-    await expectNoErrors(session);
-  });
-});
-
 describe('sessions smoke path: dev server', () => {
   let fx: SessionsFixture;
   let open: OpenFixture;
@@ -7948,11 +7420,8 @@ describe('built app without any agent CLI on the login shell PATH', () => {
 
   beforeAll(async () => {
     fx = makeSessionsFixture([]);
-    // COCKPIT_HOME is a regular file: the control endpoint cannot start (control endpoint AC10).
-    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
-    const cockpitHome = join(dataDir, 'cockpit-home');
-    writeFileSync(cockpitHome, 'a file, not a folder');
-    session = await launchBuiltWith(fx.env(), dataDir, cockpitHome);
+    dataDir = makeTestDir('d-');
+    session = await launchBuiltWith(fx.env(), dataDir);
     await session.page.getByText(versionLabel).waitFor();
   });
 
@@ -7960,20 +7429,6 @@ describe('built app without any agent CLI on the login shell PATH', () => {
     await session?.close();
     if (fx) rmSync(fx.root, { recursive: true, force: true });
     if (dataDir) rmSync(dataDir, { recursive: true, force: true });
-  });
-
-  test('control AC10 — with COCKPIT_HOME a regular file the window opens, stderr gets one "Cockpit control endpoint is off: " line and a terminal shell has no COCKPIT_SOCKET', async () => {
-    const { page } = session;
-    expect(session.isRunning()).toBe(true);
-    expect(session.output().split('\n').filter((line) => line.startsWith('Cockpit control endpoint is off: ')).length).toBe(1);
-    expect(statSync(session.cockpitHome).isFile()).toBe(true);
-
-    const id = await spawnShell(page, { command: '/bin/sh', cols: 80, rows: 24 });
-    await ptyWrite(page, id, `printf 'sock=<%s>\\n' "\${COCKPIT_SOCKET-unset}"\n`);
-    await waitForOutput(page, id, 'sock=<unset>');
-    await ptyKill(page, id);
-    await waitForExit(page, id);
-    await expectNoErrors(session);
   });
 
   test('AC2 — the "Start session" menu shows one disabled item "No agent CLI found"', async () => {
@@ -8012,8 +7467,9 @@ describe('built app sessions folder when COCKPIT_HOME is unset or empty', () => 
     ['empty', ''],
   ])('single instance AC5 — with COCKPIT_HOME %s and HOME=<tmp>, the unpackaged app puts the session folder in <tmp>/.cockpit-dev/sessions/<id> and nothing under <tmp>/.cockpit', async (_label, value) => {
     // A short folder: the socket path is limited to 103 bytes on macOS (`<fx.root>/…` would exceed it).
-    const userHome = realpathSync(mkdtempSync(join(tmpdir(), 'ck-')));
-    const session = await launchBuiltWith({ ...fx.env(), HOME: userHome }, undefined, value ?? null);
+    const userHome = realpathSync(makeTestDir('u'));
+    // A short build id keeps `<HOME>/.cockpit-dev/daemon-1-<build>.sock` under that limit (a 12-hex build would exceed it).
+    const session = await launchBuiltWith({ ...fx.env(), HOME: userHome, COCKPIT_TEST_DAEMON_BUILD: 'h' }, undefined, value ?? null);
     try {
       await session.page.getByText(versionLabel).waitFor();
       const id = await startSession(session.page, 'Claude Code', 'Claude Code 1');
@@ -8021,9 +7477,9 @@ describe('built app sessions folder when COCKPIT_HOME is unset or empty', () => 
 
       expect((await readStub(session.page)).cwd).toBe(directory);
       expect(statSync(directory).isDirectory()).toBe(true);
-      // Control endpoint AC11, now for an unpackaged app: the socket is <HOME>/.cockpit-dev/control.sock.
-      expect(statSync(join(userHome, '.cockpit-dev', 'control.sock')).isSocket()).toBe(true);
-      expect((await readStubEnv(session.page)).socket).toBe(join(userHome, '.cockpit-dev', 'control.sock'));
+      // Control endpoint AC11, now for an unpackaged app: the daemon's socket is <HOME>/.cockpit-dev/daemon-1-<build>.sock.
+      expect(statSync(daemonSocketIn(join(userHome, '.cockpit-dev'))).isSocket()).toBe(true);
+      expect((await readStubEnv(session.page)).socket).toBe(daemonSocketIn(join(userHome, '.cockpit-dev')));
       // The installed app's home is left alone.
       expect(existsSync(join(userHome, '.cockpit'))).toBe(false);
       const stored = await poll(() => sessionsInState(session.dataDir), (list) => list.length > 0, UI_TIMEOUT);
@@ -8092,29 +7548,29 @@ const windowCount = (session: Session) => session.evaluateInMain<number>(`requir
 
 // What a second launch must leave alone in the running app's folders.
 const filesOfRunningApp = (session: Session) => {
-  const socket = join(session.cockpitHome, 'control.sock');
+  const socket = daemonSocketIn(session.cockpitHome);
   return {
     state: stateSnapshot(session.dataDir),
     socketInode: statSync(socket).ino,
-    token: readFileSync(join(session.cockpitHome, 'control.token'), 'utf8'),
+    token: controlTokenIn(session.cockpitHome),
   };
 };
 
 // The socket still answers 401 to a request without the token.
 async function expectSocketAnswers401(session: Session) {
-  const answer = await postSessionEvent(join(session.cockpitHome, 'control.sock'), { body: { sessionId: randomUUID(), event: 'working' } });
+  const answer = await postSessionEvent(daemonSocketIn(session.cockpitHome), { body: { sessionId: randomUUID(), event: 'working' } });
   expect(answer).toEqual({ status: 401, text: '' });
 }
 
 // A second launch on the running app's folders: exits 0 within 10 s, prints no error, opens no
-// window, leaves state.json, control.sock and control.token alone, and the first process runs on.
+// window, leaves state.json and the daemon's socket and token alone, and the first process runs on.
 async function expectSecondLaunchLeaves(session: Session, launch: () => Promise<SecondLaunch>) {
   const before = filesOfRunningApp(session);
   const second = await launch();
   expect(second.exit, `the second launch exited (output: ${second.output})`).toEqual({ code: 0, signal: null });
   expect(second.elapsedMs).toBeLessThan(10_000);
   expect(second.output).not.toMatch(MAIN_PROCESS_ERROR);
-  expect(second.output).not.toContain('Cockpit control endpoint is off: ');
+  expect(second.output).not.toContain("Cockpit's background service could not start");
   expect(filesOfRunningApp(session)).toEqual(before);
   await expectSocketAnswers401(session);
   expect(await windowCount(session)).toBe(1);
@@ -8143,7 +7599,7 @@ describe('single instance: built app', () => {
 
   beforeAll(async () => {
     front = watchFrontmost();
-    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+    dataDir = makeTestDir('d-');
     session = await launchBuiltWith({ ...process.env, SHELL: '/bin/sh' }, dataDir);
     await session.page.getByText(versionLabel).waitFor();
     await stubFocus(session);
@@ -8155,7 +7611,7 @@ describe('single instance: built app', () => {
     if (dataDir) rmSync(dataDir, { recursive: true, force: true });
   });
 
-  test('AC1 — a second launch on the same userData folder exits with code 0 within 10 s, prints no error, opens no window and leaves state.json, control.sock and control.token untouched while the first process keeps running', async () => {
+  test('AC1 — a second launch on the same userData folder exits with code 0 within 10 s, prints no error, opens no window and leaves state.json and the daemon\'s socket and token untouched while the first process keeps running', async () => {
     await expectSecondLaunchLeaves(session, () => secondLaunch());
   });
 
@@ -8185,13 +7641,13 @@ describe('single instance: built app', () => {
     expect(front.pids.has(session.pid)).toBe(false);
   });
 
-  test('AC4 — two launches with their own userData folders and COCKPIT_HOME, started together, both render the home page and neither prints that the control endpoint is off', async () => {
+  test('AC4 — two launches with their own userData folders and COCKPIT_HOME, started together, both render the home page and neither prints that the background service could not start', async () => {
     const [one, two] = await Promise.all([launchBuilt(), launchBuilt()]);
     try {
       for (const other of [one, two]) {
         await other.page.getByText(versionLabel).waitFor();
         await other.page.getByRole('heading', { name: 'Home' }).waitFor();
-        expect(other.output()).not.toContain('Cockpit control endpoint is off: ');
+        expect(other.output()).not.toContain("Cockpit's background service could not start");
         expect(other.output()).not.toMatch(MAIN_PROCESS_ERROR);
       }
       expect(one.dataDir).not.toBe(two.dataDir);
@@ -8237,9 +7693,9 @@ describe('single instance: packaged app', () => {
 
   beforeAll(async () => {
     front = watchFrontmost();
-    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+    dataDir = makeTestDir('d-');
     // A short folder: the socket path is limited to 103 bytes on macOS.
-    userHome = realpathSync(mkdtempSync(join(tmpdir(), 'ck-')));
+    userHome = makeTestDir('u');
     env = { ...process.env, SHELL: '/bin/sh', HOME: userHome };
     // COCKPIT_HOME unset: the packaged app's default home.
     session = await launchSpawned(join(packagedAppDir(), 'Contents/MacOS/Cockpit'), [], true, dataDir, env, null);
@@ -8254,10 +7710,10 @@ describe('single instance: packaged app', () => {
     if (userHome) rmSync(userHome, { recursive: true, force: true });
   });
 
-  test('AC6 — with COCKPIT_HOME unset and HOME=<tmp>, the control socket is <tmp>/.cockpit/control.sock and <tmp>/.cockpit-dev does not exist', () => {
-    expect(statSync(join(userHome, '.cockpit', 'control.sock')).isSocket()).toBe(true);
+  test('AC6 — with COCKPIT_HOME unset and HOME=<tmp>, the daemon\'s socket is <tmp>/.cockpit/daemon-1-<build>.sock and <tmp>/.cockpit-dev does not exist', () => {
+    expect(statSync(daemonSocketIn(join(userHome, '.cockpit'))).isSocket()).toBe(true);
     expect(existsSync(join(userHome, '.cockpit-dev'))).toBe(false);
-    expect(session.output()).not.toContain('Cockpit control endpoint is off: ');
+    expect(session.output()).not.toContain("Cockpit's background service could not start");
   });
 
   test('AC1, AC2 smoke path — a second launch of the packaged app exits with code 0 and leaves the files alone, and the running app shows and focuses its window', async () => {
@@ -8269,7 +7725,7 @@ describe('single instance: packaged app', () => {
       );
     // The running app's home is <HOME>/.cockpit, not a folder inside the data folder.
     const home = join(userHome, '.cockpit');
-    const files = () => ({ state: stateSnapshot(dataDir), socketInode: statSync(join(home, 'control.sock')).ino, token: readFileSync(join(home, 'control.token'), 'utf8') });
+    const files = () => ({ state: stateSnapshot(dataDir), socketInode: statSync(daemonSocketIn(home)).ino, token: controlTokenIn(home) });
     const before = files();
     await clearFocusCalls(session);
 
@@ -8302,7 +7758,7 @@ describe('packaged app sessions after a restart', () => {
     open = addOpenFixture(fx);
     // A stub `gh` for the ship section (COCKPIT-38).
     gh = addGhFixture(fx);
-    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+    dataDir = makeTestDir('d-');
     repo = makeRepo('packaged-agent-ws');
     origin = addOrigin(repo);
   });
