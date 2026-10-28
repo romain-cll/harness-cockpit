@@ -3,6 +3,7 @@ import { HouseIcon, SquareTerminalIcon } from 'lucide-react';
 import type { Project, Session } from '../../shared/api';
 import { Projects } from '@/components/projects';
 import { Sessions } from '@/components/sessions';
+import { StatusOffAlert } from '@/components/status-off-alert';
 
 export function AppSidebar({
   version,
@@ -35,8 +36,9 @@ export function AppSidebar({
           Terminal
         </Link>
       </nav>
+      {statusOff !== null && <StatusOffAlert reason={statusOff} />}
       <Projects projects={projects} sessions={sessions} />
-      <Sessions sessions={sessions} statusOff={statusOff} />
+      <Sessions sessions={sessions} />
       <footer className="shrink-0 px-4 py-3 text-xs text-muted-foreground">Cockpit {version}</footer>
     </aside>
   );

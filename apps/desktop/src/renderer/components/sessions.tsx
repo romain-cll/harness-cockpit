@@ -41,7 +41,7 @@ export function SessionLink({ session }: { session: Session }) {
 }
 
 // The sessions outside any project; those of a workspace are listed under it.
-export function Sessions({ sessions, statusOff }: { sessions: Session[]; statusOff: string | null }) {
+export function Sessions({ sessions }: { sessions: Session[] }) {
   const router = useRouter();
   // Why the last start was refused; cleared by the next one that succeeds.
   const [message, setMessage] = useState<string>();
@@ -63,9 +63,6 @@ export function Sessions({ sessions, statusOff }: { sessions: Session[]; statusO
         <h2 className="font-medium">Sessions</h2>
         <StartSessionMenu label="Start session" onStart={(harness) => void start(harness)} />
       </header>
-      {statusOff !== null && (
-        <p className="shrink-0 px-2 py-1 text-xs break-words text-muted-foreground">Session status is off: {statusOff}</p>
-      )}
       {message && (
         <p role="status" className="shrink-0 px-2 py-1 text-xs break-words text-destructive">
           {message}
