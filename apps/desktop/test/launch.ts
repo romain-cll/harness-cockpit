@@ -69,6 +69,30 @@ export interface Session {
 // unpackaged app then keeps its `userData` in `<HOME>/.cockpit-dev/<folder>/user-data`, so the test
 // needs a `HOME` of its own); the data folder is then made only so the session has a folder to
 // report and to remove.
+// Safety guard: a launch that leaves `COCKPIT_USER_DATA_DIR` unset or empty relies on the app's own
+// default for `userData`, and a failing test (a regression in the app's default) would then write into
+// the developer's real data. `HOME` alone does not prevent it: on macOS Electron's `appData` ignores
+// it (a mutation run with `HOME=<tmp>` wrote into the real `~/Library/Application Support/@cockpit/desktop`).
+// So such a launch must have a `HOME` inside the run root, and gets `CFFIXED_USER_HOME` set to it:
+// Foundation's home override, which moves `appData`, `logs` and `cache` (all of `~/Library`) under it.
+// Proven with a probe Electron (own app name): `app.getPath('appData')` and every file Chromium
+// wrote were under the temporary HOME, nothing under the real `~/Library`.
+function guardRealData(env: Record<string, string>) {
+  const home = env.HOME;
+  let realHome = '';
+  try {
+    realHome = home ? realpathSync(home) : '';
+  } catch {
+    // A HOME that does not exist is not under the run root.
+  }
+  if (!realHome || !(realHome + '/').startsWith(runRoot() + '/')) {
+    throw new Error(
+      `a launch with COCKPIT_USER_DATA_DIR unset or empty needs HOME inside the run root (${runRoot()}), got ${home}`,
+    );
+  }
+  env.CFFIXED_USER_HOME = realHome;
+}
+
 // The terminal page runs whatever `$SHELL` says: by default `/bin/sh`, which keeps
 // the developer's shell configuration from slowing or breaking the tests.
 export function launchEnv(
@@ -82,6 +106,7 @@ export function launchEnv(
   const env = { ...base, COCKPIT_USER_DATA_DIR: dataDir } as Record<string, string>;
   if (givenDataDir === null) delete env.COCKPIT_USER_DATA_DIR;
   else if (givenDataDir === '') env.COCKPIT_USER_DATA_DIR = '';
+  if (!env.COCKPIT_USER_DATA_DIR) guardRealData(env);
   if (cockpitHome === null) delete env.COCKPIT_HOME;
   else env.COCKPIT_HOME = cockpitHome;
   if (background) env.COCKPIT_TEST_BACKGROUND = '1';
