@@ -5,7 +5,7 @@ export function StatusOffAlert({ reason }: { reason: string }) {
   return (
     <div
       role="alert"
-      className="mx-2 mb-2 flex shrink-0 items-start gap-2 rounded-lg border border-status-working/25 bg-status-working/10 p-2"
+      className="mx-2 mb-2 flex shrink-0 items-start gap-2 rounded-md border border-status-working/25 bg-status-working/10 p-2"
     >
       <TriangleAlertIcon className="mt-px size-3.5 shrink-0 text-status-working" />
       <div className="flex min-w-0 flex-col gap-0.5">
