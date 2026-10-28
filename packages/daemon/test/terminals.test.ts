@@ -1,4 +1,5 @@
 import { writeFileSync } from 'node:fs';
+import { Terminal as Headless } from '@xterm/headless';
 import { describe, expect, test } from 'vitest';
 import { SCROLLBACK } from '../src/index';
 import {
@@ -98,6 +99,26 @@ describe('attach and sequence numbers (AC14, AC5)', () => {
     client.write(id, 'echo after-$((1+1))\n');
     await until(() => connection.data.slice(before).some((chunk) => chunk.data.includes('after-2')), 'the later output');
     for (const chunk of connection.data.slice(before)) expect(chunk.seq).toBeGreaterThan(attached.seq);
+  });
+
+  test('AC5 — a resize sent to the pty resizes the headless terminal too: text placed at column 90 and row 28 stays there in the attached screen', async () => {
+    const { client, connection } = await start();
+    const id = await client.spawn(shellOptions);
+    client.resize(id, 100, 30);
+    // The cursor move only lands at row 28, column 90 on a 100 x 30 screen (an 80 x 24 one clamps it).
+    client.write(id, "printf '\\033[28;90H%s' \"$((6*7))-edge\"\n");
+    await waitForOutput(connection, id, '42-edge');
+
+    const attached = await client.attach(id);
+
+    const replay = new Headless({ cols: attached.cols, rows: attached.rows, allowProposedApi: true });
+    await new Promise<void>((resolve) => replay.write(attached.screen, resolve));
+    const buffer = replay.buffer.active;
+    const lines = Array.from({ length: buffer.length }, (_, index) => buffer.getLine(index)?.translateToString(true) ?? '');
+    const row = lines.findIndex((line) => line.includes('42-edge'));
+    replay.dispose();
+    expect(row - buffer.baseY, 'row of the text on the screen').toBe(27);
+    expect(lines[row]!.indexOf('42-edge'), 'column of the text').toBe(89);
   });
 
   test('AC14 — a client attaching during a burst of output gets every line exactly once: the screen it receives plus the data events after its sequence number', async () => {

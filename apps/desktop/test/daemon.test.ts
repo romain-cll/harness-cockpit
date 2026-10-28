@@ -614,6 +614,9 @@ describe('daemon: built app, the daemon cannot start', () => {
     const home = join(dataDir, 'h');
     writeFileSync(home, 'a file, not a folder');
     repo = makeRepoWithSetup();
+    // A session of an earlier launch, so its page can be opened while the daemon is down.
+    const seeded = { id: randomUUID(), name: 'Claude Code 1', harness: 'claude-code', directory: join(fx.root, 'earlier'), createdAt: new Date().toISOString() };
+    writeFileSync(join(dataDir, 'state.json'), JSON.stringify({ version: 1, sessions: [seeded] }));
     try {
       session = await launchBuiltOn(fx.env({ COCKPIT_TEST_DAEMON_BUILD: build }), dataDir, home);
       const { page } = session;
@@ -621,12 +624,21 @@ describe('daemon: built app, the daemon cannot start', () => {
       const reason = reasonOf(session.output());
       expect(reason).toContain(home);
 
+      // The failure view: title, subtitle, the reason in monospace and "Try again", on /terminal and on a session page.
+      const expectFailureView = async () => {
+        await failureView(page).waitFor({ timeout: UI_TIMEOUT });
+        await page.getByText(SUBTITLE, { exact: true }).waitFor({ timeout: UI_TIMEOUT });
+        await page.locator('code, pre, [class*="mono"]').filter({ hasText: reason }).first().waitFor({ timeout: UI_TIMEOUT });
+        await page.getByRole('button', { name: 'Try again', exact: true }).waitFor({ timeout: UI_TIMEOUT });
+        expect(await page.getByRole('button', { name: 'Show log', exact: true }).count(), 'no log file exists').toBe(0);
+      };
       await goToTerminalPage(page);
-      await failureView(page).waitFor({ timeout: UI_TIMEOUT });
-      await page.getByText(SUBTITLE, { exact: true }).waitFor();
-      await page.locator('code, pre, [class*="mono"]').filter({ hasText: reason }).first().waitFor({ timeout: UI_TIMEOUT });
-      await page.getByRole('button', { name: 'Try again', exact: true }).waitFor();
-      expect(await page.getByRole('button', { name: 'Show log', exact: true }).count(), 'no log file exists').toBe(0);
+      await expectFailureView();
+      await page.locator('aside').getByRole('link', { name: seeded.name }).click({ timeout: UI_TIMEOUT });
+      await page.waitForURL(new RegExp(`/sessions/${seeded.id}$`), { timeout: UI_TIMEOUT });
+      await page.getByRole('heading', { name: seeded.name }).waitFor({ timeout: UI_TIMEOUT });
+      await expectFailureView();
+      expect(await page.getByText('This session has ended.').count(), 'the failure view replaces the ended page').toBe(0);
 
       await page.locator('aside').getByText(`Cockpit's background service could not start: ${reason}`, { exact: true }).waitFor({ timeout: UI_TIMEOUT });
 
@@ -635,7 +647,7 @@ describe('daemon: built app, the daemon cannot start', () => {
       const started = await page.evaluate(() => (window as unknown as ApiWindow).api.sessions!.start!('claude-code', { cols: 80, rows: 24 }, {}));
       expect(started.status).toBe('refused');
       expect(started.message).toContain(reason);
-      expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).sessions ?? []).toEqual([]);
+      expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).sessions, 'only the seeded session').toEqual([seeded]);
 
       // Projects can still be added and removed (worktrees need the home folder, so no workspace is made).
       await stubPicker(session, repo.root);
