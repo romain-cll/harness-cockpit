@@ -1,0 +1,17 @@
+{
+  "name": "@cockpit/cli",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The cockpit command line, compiled to one binary",
+  "type": "module",
+  "scripts": {
+    "build": "node_modules/.bin/bun scripts/check-bun.ts && node_modules/.bin/bun build --compile src/main.ts --outfile dist/cockpit",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "oxlint"
+  },
+  "devDependencies": {
+    "@cockpit/daemon": "workspace:*",
+    "@types/node": "^24.19.2",
+    "bun": "1.4.2"
+  }
+}

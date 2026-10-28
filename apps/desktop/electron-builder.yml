@@ -4,6 +4,10 @@ directories:
   output: release
 files:
   - dist/**
+# The `cockpit` CLI the harness hooks run, built by `apps/cli`, sits in Contents/Resources/bin.
+extraResources:
+  - from: ../cli/dist/cockpit
+    to: bin/cockpit
 # node-pty is N-API: its prebuilds load under Electron as they are. A rebuild
 # would compile it in place in the shared Bun store.
 npmRebuild: false
