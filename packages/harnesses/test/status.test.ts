@@ -241,7 +241,7 @@ function expectedHash(eventName: string, hookCommand: string, matcher?: string):
 }
 
 describe('Codex (AC3)', () => {
-  // The line `statusCommand('finished')` of `@cockpit/control` is, recorded in the technical plan.
+  // The line of the former curl hook for `finished`, recorded in the technical plan.
   const finishedLine =
     '[ -n "$COCKPIT_SOCKET" ] && curl -s -m 2 --unix-socket "$COCKPIT_SOCKET" -H "Authorization: Bearer $(cat "${COCKPIT_SOCKET%/*}/control.token")" -d "{\\"sessionId\\":\\"$COCKPIT_SESSION_ID\\",\\"event\\":\\"finished\\"}" http://localhost/session-events >/dev/null 2>&1; exit 0';
 
