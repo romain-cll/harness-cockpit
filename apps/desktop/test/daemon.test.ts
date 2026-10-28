@@ -827,7 +827,7 @@ describe('daemon: built app, requests from another origin', () => {
     rmSync(dataDir, { recursive: true, force: true });
   });
 
-  test('AC22 — pty.list, pty.attach, daemon.status, daemon.retry and daemon.showLog reject from another origin: no daemon is started or contacted and shell.openPath is not called', async () => {
+  test('AC22 — pty.list, pty.attach (of an existing terminal), daemon.status, daemon.retry and daemon.showLog reject from another origin: no daemon is started or contacted, shell.openPath is not called and the terminal\'s owner is unchanged', async () => {
     const build = uniqueBuild();
     const home = join(dataDir, 'h');
     // The daemon cannot start (its socket path is a folder), so its log exists and a retry would start it once the cause is gone.
@@ -846,7 +846,7 @@ describe('daemon: built app, requests from another origin', () => {
 
     const results = await session.evaluateInMain<Record<string, string>>(`(async () => {
       const handlers = require('electron').ipcMain._invokeHandlers;
-      const calls = { 'pty:list': [], 'pty:attach': [1], 'daemon:status': [], 'daemon:retry': [], 'daemon:show-log': [] };
+      const calls = { 'pty:list': [], 'daemon:status': [], 'daemon:retry': [], 'daemon:show-log': [] };
       const results = {};
       for (const [channel, args] of Object.entries(calls)) {
         const handler = handlers.get(channel);
@@ -861,9 +861,8 @@ describe('daemon: built app, requests from another origin', () => {
       return results;
     })()`);
 
-    expect(results).toEqual({ 'pty:list': 'rejected', 'pty:attach': 'rejected', 'daemon:status': 'rejected', 'daemon:retry': 'rejected', 'daemon:show-log': 'rejected' });
+    expect(results).toEqual({ 'pty:list': 'rejected', 'daemon:status': 'rejected', 'daemon:retry': 'rejected', 'daemon:show-log': 'rejected' });
     expect(await session.evaluateInMain<string[]>('globalThis.__opened'), 'shell.openPath is not called').toEqual([]);
-    await sleep(1_000);
     expect(daemonProcessesOf(build), 'no daemon is started').toEqual([]);
     expect(daemonFile(home, 'sock', build)).toBeUndefined();
     expect(daemonFile(home, 'pid', build)).toBeUndefined();
@@ -874,6 +873,35 @@ describe('daemon: built app, requests from another origin', () => {
     await page.getByRole('button', { name: 'Try again', exact: true }).click({ timeout: UI_TIMEOUT });
     await poll(() => daemonPid(home, build), Boolean, UI_TIMEOUT);
     expect(daemonProcessesOf(build)).toHaveLength(1);
+
+    // A terminal that exists: the app's page spawns a shell and listens to its output.
+    const id = await page.evaluate(async () => {
+      const api = (window as unknown as { api: { pty: { spawn(o: { cols: number; rows: number }): Promise<number>; onData(l: (id: number, data: string) => void): () => void } } }).api;
+      const w = window as unknown as { __ptyData: Record<number, string> };
+      w.__ptyData = {};
+      api.pty.onData((terminalId, data) => {
+        w.__ptyData[terminalId] = (w.__ptyData[terminalId] ?? '') + data;
+      });
+      return api.pty.spawn({ cols: 80, rows: 24 });
+    });
+    const output = () => page.evaluate((id) => (window as unknown as { __ptyData: Record<number, string> }).__ptyData[id] ?? '', id);
+    const type = (text: string) => page.evaluate(([id, text]) => (window as unknown as ApiWindow).api.pty!.write!(id, text), [id, text] as const);
+    await type('echo before-$((6*7))\n');
+    await poll(output, (data) => data.includes('before-42'), UI_TIMEOUT);
+
+    // Another origin attaches that id: it is refused, and the owner (the app's page) is unchanged.
+    const attached = await session.evaluateInMain<string>(`(async () => {
+      const handler = require('electron').ipcMain._invokeHandlers.get('pty:attach');
+      try {
+        await handler({ senderFrame: { url: 'https://example.com/' }, sender: null }, ${id});
+        return 'resolved';
+      } catch (error) {
+        return 'rejected: ' + error.message;
+      }
+    })()`);
+    expect(attached, 'pty:attach from another origin').toBe('rejected: pty:attach refused: unexpected origin');
+    await type('echo after-$((6*7))\n');
+    expect(await poll(output, (data) => data.includes('after-42'), UI_TIMEOUT), 'the terminal still reaches the app\'s page').toContain('after-42');
   });
 });
 
