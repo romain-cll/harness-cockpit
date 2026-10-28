@@ -125,4 +125,18 @@ describe('AGENTS.md and the daemon', () => {
     expect(text.includes('runPtyHost'), 'AGENTS.md still says '+'runPtyHost').toBe(false);
     expect(text.includes('createPtyClient'), 'AGENTS.md still says '+'createPtyClient').toBe(false);
   });
+
+  test('AC20 — mentions neither @cockpit/control, packages/control, @cockpit/pty nor packages/pty', () => {
+    const text = agents();
+    for (const stale of ['@cockpit/control', 'packages/control', '@cockpit/pty', 'packages/pty']) {
+      expect(text.includes(stale), 'AGENTS.md still says ' + stale).toBe(false);
+    }
+  });
+
+  test('AC20 — the Harnesses status-reporting section names statusCommand of @cockpit/daemon', () => {
+    const text = agents();
+    const start = text.indexOf('**Status reporting (COCKPIT-36)**');
+    expect(start, 'the status-reporting paragraph').toBeGreaterThan(-1);
+    expect(text.slice(start, start + 600)).toContain('`statusCommand` of `@cockpit/daemon`');
+  });
 });

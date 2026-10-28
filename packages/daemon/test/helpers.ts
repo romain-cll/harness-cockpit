@@ -1,6 +1,7 @@
 import { spawn as spawnProcess } from 'node:child_process';
 import { chmodSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
+import { createServer as createNetServer, type Socket } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -141,22 +142,105 @@ export interface Answer {
   text: string;
 }
 
+/**
+ * One HTTP request over the socket. Settles with the answer, or rejects with the error that ended
+ * the request before one came. A server that answers and closes before the body is written (a
+ * `401`) makes the client's write fail (`EPIPE`, `ECONNRESET`): once there is an answer that error
+ * is no news, and it never goes unhandled.
+ */
 export function send(
   socketPath: string,
-  { method = 'POST', path = '/session-events', authorization, body, headers = {} }: { method?: string; path?: string; authorization?: string; body?: string; headers?: Record<string, string> },
+  { method = 'POST', path = '/session-events', authorization, body, headers = {} }: { method?: string; path?: string; authorization?: string; body?: string | Buffer; headers?: Record<string, string> },
 ): Promise<Answer> {
   return new Promise((resolve, reject) => {
     const all: Record<string, string> = { ...headers };
     if (authorization !== undefined) all.authorization = authorization;
-    const req = httpRequest({ socketPath, method, path, headers: all }, (res) => {
+    let answered = false;
+    const req = httpRequest({ socketPath, method, path, headers: all, agent: false }, (res) => {
+      answered = true;
       const chunks: Buffer[] = [];
       res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('error', () => {});
       res.on('end', () => resolve({ status: res.statusCode!, text: Buffer.concat(chunks).toString('utf8') }));
     });
-    req.on('error', reject);
+    req.on('error', (error: NodeJS.ErrnoException) => {
+      if (!answered) reject(error);
+    });
     req.end(body);
   });
 }
+
+/** What a test of a server that closes early may see: the answer, or the error that came instead. */
+export const sendOrError = (socketPath: string, options: Parameters<typeof send>[1]) =>
+  send(socketPath, options).then(
+    (answer) => ({ answer }),
+    (error: NodeJS.ErrnoException) => ({ error }),
+  );
+
+/**
+ * Runs `run`, then lets the event loop go on for a moment, and gives back what reached
+ * `uncaughtException` or `unhandledRejection` meanwhile (vitest's own handlers are set aside so
+ * the run does not report them: the test does, as an assertion).
+ */
+export async function collectUncaught<T>(run: () => Promise<T>): Promise<{ result: T; uncaught: unknown[] }> {
+  const uncaught: unknown[] = [];
+  const events: Array<'uncaughtException' | 'unhandledRejection'> = ['uncaughtException', 'unhandledRejection'];
+  const emitter: NodeJS.EventEmitter = process;
+  const saved = events.map((event) => [event, emitter.listeners(event) as Array<(...args: unknown[]) => void>] as const);
+  for (const [event] of saved) emitter.removeAllListeners(event);
+  const collect = (error: unknown) => void uncaught.push(error);
+  for (const event of events) emitter.on(event, collect);
+  try {
+    const result = await run();
+    await sleep(100);
+    return { result, uncaught };
+  } finally {
+    for (const event of events) emitter.off(event, collect);
+    for (const [event, listeners] of saved) for (const listener of listeners) emitter.on(event, listener);
+  }
+}
+
+export interface FakeRequest {
+  /** The `Authorization` header of the request. */
+  authorization: string | undefined;
+  socket: Socket;
+}
+
+/**
+ * A server on `socketPath` that is not a daemon: it hands every request (the head, once it is
+ * complete) to `onRequest`, which answers on the socket as the test wants. The connections are
+ * destroyed with the test.
+ */
+export async function listenFake(socketPath: string, onRequest: (request: FakeRequest) => void): Promise<void> {
+  const sockets = new Set<Socket>();
+  const server = createNetServer((socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    socket.on('error', () => {});
+    if (onRequest === NEVER) return;
+    let head = '';
+    socket.on('data', (chunk) => {
+      head += chunk.toString('latin1');
+      const end = head.indexOf('\r\n\r\n');
+      if (end === -1) return;
+      const authorization = /^authorization: (.*)$/im.exec(head.slice(0, end))?.[1]?.trim();
+      socket.removeAllListeners('data');
+      onRequest({ authorization, socket });
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  onCleanup(() => {
+    for (const socket of sockets) socket.destroy();
+    server.close();
+  });
+}
+
+const NEVER = (): void => {};
+/** A server that accepts connections and never reads or answers, as a daemon stopped with SIGSTOP does. */
+export const listenSilent = (socketPath: string) => listenFake(socketPath, NEVER);
+
+export const UNAUTHORIZED = 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n';
+export const UPGRADED = 'HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: cockpit-1\r\n\r\n';
 
 /** Leaves a socket nobody listens on, as a process killed with SIGKILL does. */
 export async function leaveStaleSocket(socketPath: string): Promise<void> {

@@ -1,9 +1,9 @@
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { request as httpRequest } from 'node:http';
-import { homedir, tmpdir, userInfo } from 'node:os';
+import { homedir, userInfo } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
@@ -31,6 +31,7 @@ import {
   waitForGroupGone,
   type Session,
 } from './launch';
+import { makeTestDir } from './run-root';
 
 // Launches the app the four ways it runs: the dev server, the built app, the
 // packaged app and the packaged app with the minimal environment launchd gives
@@ -701,7 +702,7 @@ interface TempRepo {
 
 // `<tmp>/<name>` with one commit (`README.md`, `src/main.ts`).
 function makeRepo(name: string): TempRepo {
-  const parent = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-project-test-')));
+  const parent = realpathSync(makeTestDir('p-'));
   const root = join(parent, name);
   mkdirSync(join(root, 'src'), { recursive: true });
   writeFileSync(join(root, 'README.md'), 'hello\n');
@@ -715,7 +716,7 @@ function makeRepo(name: string): TempRepo {
 
 // A folder that is not inside any git repository.
 function makePlainFolder(name: string): TempRepo {
-  const parent = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-project-test-')));
+  const parent = realpathSync(makeTestDir('p-'));
   const root = join(parent, name);
   mkdirSync(root);
   return { parent, root, name };
@@ -884,7 +885,7 @@ interface TempClone extends TempRepo {
 function makeClone(name: string): TempClone {
   const upstream = makeRepo(`${name}-upstream`);
   for (const branch of ['develop', 'feature/x', 'release/1.0']) gitIn(upstream.root, 'branch', branch);
-  const parent = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-project-test-')));
+  const parent = realpathSync(makeTestDir('p-'));
   const root = join(parent, name);
   gitIn(parent, 'clone', '--quiet', upstream.root, root);
   gitIn(root, 'commit', '--allow-empty', '-m', 'local only');
@@ -896,7 +897,7 @@ function makeClone(name: string): TempClone {
 
 // A repository whose only content is an empty commit.
 function makeLightRepo(name: string): TempRepo {
-  const parent = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-project-test-')));
+  const parent = realpathSync(makeTestDir('p-'));
   const root = join(parent, name);
   mkdirSync(root);
   gitIn(root, 'init', '--quiet', '-b', 'main');
@@ -3699,7 +3700,7 @@ describe('packaged app state file', () => {
   let dataDir: string;
 
   beforeEach(() => {
-    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+    dataDir = makeTestDir('d-');
   });
 
   afterEach(() => {
@@ -3876,7 +3877,7 @@ describe('built app with no git on the login shell PATH', () => {
   let session: Session;
 
   beforeAll(async () => {
-    folder = mkdtempSync(join(tmpdir(), 'cockpit-fake-shell-'));
+    folder = makeTestDir('f-');
     repo = makeRepo('no-git-project');
     const executablePath: string = createRequire(import.meta.url)('electron');
     session = await launchSpawned(executablePath, ['.'], true, undefined, {
@@ -3987,7 +3988,7 @@ function makeSessionsFixture(
   binaries: string[],
   { log = false, slowVersion = false, gitLog = false }: { log?: boolean; slowVersion?: boolean; gitLog?: boolean } = {},
 ): SessionsFixture {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'cockpit-sessions-test-')));
+  const root = realpathSync(makeTestDir('s-'));
   const bin = join(root, 'bin');
   mkdirSync(bin);
   const runLog = join(root, 'runs.log');
@@ -7419,7 +7420,7 @@ describe('built app without any agent CLI on the login shell PATH', () => {
 
   beforeAll(async () => {
     fx = makeSessionsFixture([]);
-    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+    dataDir = makeTestDir('d-');
     session = await launchBuiltWith(fx.env(), dataDir);
     await session.page.getByText(versionLabel).waitFor();
   });
@@ -7466,7 +7467,7 @@ describe('built app sessions folder when COCKPIT_HOME is unset or empty', () => 
     ['empty', ''],
   ])('single instance AC5 — with COCKPIT_HOME %s and HOME=<tmp>, the unpackaged app puts the session folder in <tmp>/.cockpit-dev/sessions/<id> and nothing under <tmp>/.cockpit', async (_label, value) => {
     // A short folder: the socket path is limited to 103 bytes on macOS (`<fx.root>/…` would exceed it).
-    const userHome = realpathSync(mkdtempSync(join(tmpdir(), 'ck-')));
+    const userHome = realpathSync(makeTestDir('u'));
     // A short build id keeps `<HOME>/.cockpit-dev/daemon-1-<build>.sock` under that limit (a 12-hex build would exceed it).
     const session = await launchBuiltWith({ ...fx.env(), HOME: userHome, COCKPIT_TEST_DAEMON_BUILD: 'h' }, undefined, value ?? null);
     try {
@@ -7598,7 +7599,7 @@ describe('single instance: built app', () => {
 
   beforeAll(async () => {
     front = watchFrontmost();
-    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+    dataDir = makeTestDir('d-');
     session = await launchBuiltWith({ ...process.env, SHELL: '/bin/sh' }, dataDir);
     await session.page.getByText(versionLabel).waitFor();
     await stubFocus(session);
@@ -7692,9 +7693,9 @@ describe('single instance: packaged app', () => {
 
   beforeAll(async () => {
     front = watchFrontmost();
-    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+    dataDir = makeTestDir('d-');
     // A short folder: the socket path is limited to 103 bytes on macOS.
-    userHome = realpathSync(mkdtempSync(join(tmpdir(), 'ck-')));
+    userHome = makeTestDir('u');
     env = { ...process.env, SHELL: '/bin/sh', HOME: userHome };
     // COCKPIT_HOME unset: the packaged app's default home.
     session = await launchSpawned(join(packagedAppDir(), 'Contents/MacOS/Cockpit'), [], true, dataDir, env, null);
@@ -7757,7 +7758,7 @@ describe('packaged app sessions after a restart', () => {
     open = addOpenFixture(fx);
     // A stub `gh` for the ship section (COCKPIT-38).
     gh = addGhFixture(fx);
-    dataDir = mkdtempSync(join(tmpdir(), 'cockpit-test-'));
+    dataDir = makeTestDir('d-');
     repo = makeRepo('packaged-agent-ws');
     origin = addOrigin(repo);
   });

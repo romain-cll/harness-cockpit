@@ -1,11 +1,12 @@
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createServer, type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { chromium, type Browser, type Page } from 'playwright-core';
+import { makeTestDir } from './run-root';
 
 // Launching the app the ways it runs (the dev server, the built app, the packaged app) and
 // stopping it, shared by the test files of this folder. See `app.test.ts` for what each launch is for.
@@ -68,7 +69,7 @@ export interface Session {
 // the developer's shell configuration from slowing or breaking the tests.
 export function launchEnv(
   background: boolean,
-  dataDir = mkdtempSync(join(tmpdir(), 'ck-')),
+  dataDir = makeTestDir('d-'),
   base: NodeJS.ProcessEnv = { ...process.env, SHELL: '/bin/sh' },
   cockpitHome: string | null = join(dataDir, 'h'),
 ) {

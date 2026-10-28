@@ -2,8 +2,8 @@ import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { describe, expect, test } from 'vitest';
-import { SESSION_EVENTS, statusCommand } from '../src/index';
-import { connectTo, registerCleanup, send, shellOptions, startDaemon, until } from './helpers';
+import { daemonFiles, SESSION_EVENTS, statusCommand } from '../src/index';
+import { collectUncaught, connectTo, listenFake, makeHome, registerCleanup, send, sendOrError, shellOptions, startDaemon, UNAUTHORIZED, until } from './helpers';
 
 // The session-events endpoint of the daemon (the control endpoint's rules, moved) and the
 // shell line a harness hook runs against it.
@@ -112,14 +112,44 @@ describe('POST /session-events', () => {
 
     for (const attempt of [
       { method: 'POST', path: '/session-events', body: valid },
-      { method: 'POST', path: '/session-events', body: 'x'.repeat(100 * 1024) },
       { method: 'GET', path: '/session-events' },
       { method: 'GET', path: '/attach' },
       { method: 'DELETE', path: '/' },
     ]) {
       expect(await send(files.socket, { ...attempt, authorization }), `${attempt.method} ${attempt.path}`).toEqual({ status: 401, text: '' });
     }
+    // A body big enough that the daemon may answer, and close, before it is written (AC17): the
+    // answer, or the write error that came instead, and nothing unhandled.
+    const { result, uncaught } = await collectUncaught(() => sendOrError(files.socket, { authorization, body: Buffer.alloc(8 * 1024 * 1024, 'x') }));
+    if ('answer' in result) expect(result.answer).toEqual({ status: 401, text: '' });
+    else expect(['EPIPE', 'ECONNRESET']).toContain(result.error.code);
+    expect(uncaught).toEqual([]);
     expect(connection.statuses).toEqual([]);
+  });
+});
+
+describe('a server that answers 401 and closes before the body is written (AC17)', () => {
+  test('AC17 — the request settles with the 401 or the write error, again and again, and no EPIPE or ECONNRESET goes unhandled', async () => {
+    const home = makeHome();
+    const { socket } = daemonFiles(home, 1, 'aaaa1111');
+    await listenFake(socket, ({ socket: connection }) => {
+      connection.write(UNAUTHORIZED);
+      connection.destroy();
+    });
+
+    const { result, uncaught } = await collectUncaught(async () => {
+      const outcomes = [];
+      for (let attempt = 0; attempt < 5; attempt++) {
+        outcomes.push(await sendOrError(socket, { authorization: 'Bearer wrong', body: Buffer.alloc(8 * 1024 * 1024, 'x') }));
+      }
+      return outcomes;
+    });
+
+    for (const outcome of result) {
+      if ('answer' in outcome) expect(outcome.answer).toEqual({ status: 401, text: '' });
+      else expect(['EPIPE', 'ECONNRESET']).toContain(outcome.error.code);
+    }
+    expect(uncaught).toEqual([]);
   });
 });
 

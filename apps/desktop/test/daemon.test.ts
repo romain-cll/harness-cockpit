@@ -1,9 +1,8 @@
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { request as httpRequest } from 'node:http';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { chromium, type Page } from 'playwright-core';
@@ -21,6 +20,7 @@ import {
   waitForGroupGone,
   type Session,
 } from './launch';
+import { makeTestDir } from './run-root';
 
 // COCKPIT-55: terminals and sessions live in a daemon that outlives the app. The built app runs the
 // full block (a launch per scenario, the app quit or killed and launched again on the same folders,
@@ -66,7 +66,7 @@ interface Fixture {
 }
 
 function makeFixture(): Fixture {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'ck-fix-')));
+  const root = realpathSync(makeTestDir('x-'));
   const bin = join(root, 'bin');
   mkdirSync(bin);
   const claude = join(bin, 'claude');
@@ -102,7 +102,7 @@ const factsOf = (fx: Fixture) =>
 const electron = () => createRequire(import.meta.url)('electron') as string;
 
 // A short folder name (`ck-`): the socket path is limited to 103 bytes on macOS.
-const makeDataDir = () => mkdtempSync(join(tmpdir(), 'ck-'));
+const makeDataDir = () => makeTestDir('d-');
 const uniqueBuild = () => `b${randomUUID().slice(0, 6)}`;
 
 const launchBuiltOn = (env: NodeJS.ProcessEnv, dataDir: string, home: string) => launchSpawned(electron(), ['.'], true, dataDir, env, home);
@@ -250,7 +250,7 @@ const windowUrls = (session: Session) =>
 
 // A git repository with a setup command that stays running, for the `commands` terminals.
 function makeRepoWithSetup(): { parent: string; root: string } {
-  const parent = realpathSync(mkdtempSync(join(tmpdir(), 'ck-repo-')));
+  const parent = realpathSync(makeTestDir('r-'));
   const root = join(parent, 'proj');
   mkdirSync(join(root, '.cockpit'), { recursive: true });
   writeFileSync(join(root, 'README.md'), 'hello\n');
@@ -724,6 +724,156 @@ describe('daemon: built app, the daemon cannot start', () => {
     } finally {
       rmSync(fx.root, { recursive: true, force: true });
     }
+  });
+});
+
+// --- Built app: a daemon that does not answer ---------------------------------
+
+describe('daemon: built app, a daemon that does not answer', () => {
+  let dataDir: string;
+  let home: string;
+  let session: Session | undefined;
+
+  beforeAll(() => {
+    dataDir = makeDataDir();
+    home = join(dataDir, 'h');
+  });
+
+  afterAll(async () => {
+    await session?.close().catch(() => {});
+    // A stopped daemon is resumed, then killed.
+    await killDaemonsIn(home);
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const failureView = (page: Page) => page.getByText("Cockpit's background service could not start", { exact: true });
+  const baseEnv = (build: string) => ({ ...process.env, SHELL: '/bin/sh', COCKPIT_TEST_DAEMON_BUILD: build });
+
+  test('AC18 — the daemon of the app\'s build is stopped (SIGSTOP): the window opens and, within 10 s, the failure state shows "did not answer within 5 s: <socket>" (view, sidebar line, stderr line, refusals); after SIGCONT "Try again" connects and a terminal runs a command', async () => {
+    const build = uniqueBuild();
+    const first = await launchBuiltOn(baseEnv(build), dataDir, home);
+    await first.page.getByText(versionLabel).waitFor();
+    const pid = must(daemonPid(home, build), 'the daemon pid');
+    await quitApp(first);
+    process.kill(pid, 'SIGSTOP');
+
+    session = await launchBuiltOn(baseEnv(build), dataDir, home);
+    const { page } = session;
+    await page.getByText(versionLabel).waitFor();
+    const socket = join(home, `daemon-1-${build}.sock`);
+    const reason = `Cockpit's background service did not answer within 5 s: ${socket}`;
+
+    await goToTerminalPage(page);
+    await failureView(page).waitFor({ timeout: 10_000 });
+    await page.locator('code, pre, [class*="mono"]').filter({ hasText: reason }).first().waitFor({ timeout: UI_TIMEOUT });
+    await page.locator('aside').getByText(`Cockpit's background service could not start: ${reason}`, { exact: true }).waitFor({ timeout: UI_TIMEOUT });
+    expect(session.output()).toContain(`Cockpit's background service could not start: ${reason}`);
+    const spawned = await page.evaluate(() => (window as unknown as ApiWindow).api.pty!.spawn!({ cols: 80, rows: 24 }).then(() => 'spawned', (error: Error) => error.message));
+    expect(spawned).toContain(reason);
+    const started = await page.evaluate(() => (window as unknown as ApiWindow).api.sessions!.start!('claude-code', { cols: 80, rows: 24 }, {}));
+    expect(started.status).toBe('refused');
+
+    process.kill(pid, 'SIGCONT');
+    await page.getByRole('button', { name: 'Try again', exact: true }).click({ timeout: UI_TIMEOUT });
+    await failureView(page).waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+    await page.getByRole('button', { name: 'New terminal', exact: true }).first().click({ timeout: UI_TIMEOUT });
+    await typeLine(page, 'echo cockpit-$((6*7))');
+    await expectScreen(page, /^cockpit-42$/m);
+    expect(isAlive(pid), 'the same daemon').toBe(true);
+    expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+  }, 90_000);
+
+  test('AC18 — a daemon of another build that does not answer is skipped, noted on stderr, and the app\'s own daemon works', async () => {
+    await session?.close().catch(() => {});
+    await killDaemonsIn(home);
+    rmSync(dataDir, { recursive: true, force: true });
+    mkdirSync(dataDir);
+    const [older, newer] = [uniqueBuild(), uniqueBuild()];
+    const first = await launchBuiltOn(baseEnv(older), dataDir, home);
+    await first.page.getByText(versionLabel).waitFor();
+    const pid = must(daemonPid(home, older), 'the older daemon pid');
+    await quitApp(first);
+    process.kill(pid, 'SIGSTOP');
+
+    session = await launchBuiltOn(baseEnv(newer), dataDir, home);
+    const { page } = session;
+    await page.getByText(versionLabel).waitFor();
+    await goToTerminalPage(page);
+    await page.getByRole('button', { name: 'New terminal', exact: true }).first().click({ timeout: 15_000 });
+    await typeLine(page, 'echo cockpit-$((6*7))');
+    await expectScreen(page, /^cockpit-42$/m);
+
+    expect(await page.getByText("Cockpit's background service could not start").count(), 'no failure state').toBe(0);
+    const olderSocket = join(home, `daemon-1-${older}.sock`);
+    expect(await poll(() => session!.output(), (output) => output.includes(olderSocket) && output.includes('did not answer'), 10_000)).toContain(olderSocket);
+    expect(daemonPid(home, newer), 'the app\'s own daemon').toBeDefined();
+    expect(isAlive(pid)).toBe(true);
+  }, 90_000);
+});
+
+// --- Built app: IPC from another origin ----------------------------------------
+
+describe('daemon: built app, requests from another origin', () => {
+  let dataDir: string;
+  let session: Session | undefined;
+
+  beforeAll(() => {
+    dataDir = makeDataDir();
+  });
+
+  afterAll(async () => {
+    await session?.close().catch(() => {});
+    await killDaemonsIn(join(dataDir, 'h'));
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  test('AC22 — pty.list, pty.attach, daemon.status, daemon.retry and daemon.showLog reject from another origin: no daemon is started or contacted and shell.openPath is not called', async () => {
+    const build = uniqueBuild();
+    const home = join(dataDir, 'h');
+    // The daemon cannot start (its socket path is a folder), so its log exists and a retry would start it once the cause is gone.
+    const socket = join(home, `daemon-1-${build}.sock`);
+    mkdirSync(socket, { recursive: true });
+    session = await launchBuiltOn({ ...process.env, SHELL: '/bin/sh', COCKPIT_TEST_DAEMON_BUILD: build }, dataDir, home);
+    const { page } = session;
+    await page.getByText(versionLabel).waitFor();
+    await poll(() => existsSync(join(home, `daemon-1-${build}.log`)), Boolean, UI_TIMEOUT);
+    await session.evaluateInMain(`(() => { globalThis.__opened = []; require('electron').shell.openPath = async (path) => { globalThis.__opened.push(path); return ''; }; })()`);
+    // The app's own page may ask: the handlers are there.
+    expect(await page.evaluate(() => (window as unknown as ApiWindow).api.daemon!.status!().then(() => 'answered'))).toBe('answered');
+    // The cause is gone: a retry that got through would start the daemon.
+    rmSync(socket, { recursive: true, force: true });
+    const outputBefore = session.output();
+
+    const results = await session.evaluateInMain<Record<string, string>>(`(async () => {
+      const handlers = require('electron').ipcMain._invokeHandlers;
+      const calls = { 'pty:list': [], 'pty:attach': [1], 'daemon:status': [], 'daemon:retry': [], 'daemon:show-log': [] };
+      const results = {};
+      for (const [channel, args] of Object.entries(calls)) {
+        const handler = handlers.get(channel);
+        if (!handler) { results[channel] = 'no handler'; continue; }
+        try {
+          await handler({ senderFrame: { url: 'https://example.com/' }, sender: null }, ...args);
+          results[channel] = 'resolved';
+        } catch {
+          results[channel] = 'rejected';
+        }
+      }
+      return results;
+    })()`);
+
+    expect(results).toEqual({ 'pty:list': 'rejected', 'pty:attach': 'rejected', 'daemon:status': 'rejected', 'daemon:retry': 'rejected', 'daemon:show-log': 'rejected' });
+    expect(await session.evaluateInMain<string[]>('globalThis.__opened'), 'shell.openPath is not called').toEqual([]);
+    await sleep(1_000);
+    expect(daemonProcessesOf(build), 'no daemon is started').toEqual([]);
+    expect(daemonFile(home, 'sock', build)).toBeUndefined();
+    expect(daemonFile(home, 'pid', build)).toBeUndefined();
+    expect(session.output().slice(outputBefore.length)).not.toMatch(MAIN_PROCESS_ERROR);
+
+    // The app's own "Try again" does start it.
+    await goToTerminalPage(page);
+    await page.getByRole('button', { name: 'Try again', exact: true }).click({ timeout: UI_TIMEOUT });
+    await poll(() => daemonPid(home, build), Boolean, UI_TIMEOUT);
+    expect(daemonProcessesOf(build)).toHaveLength(1);
   });
 });
 

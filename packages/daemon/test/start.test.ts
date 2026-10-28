@@ -3,7 +3,7 @@ import { connect } from 'node:net';
 import { join } from 'node:path';
 import { describe, expect, test } from 'vitest';
 import { connectDaemon, daemonFiles, runDaemon } from '../src/index';
-import { BUILD, exists, leaveStaleSocket, makeHome, onCleanup, registerCleanup, startDaemon } from './helpers';
+import { BUILD, exists, leaveStaleSocket, makeHome, onCleanup, registerCleanup, send, startDaemon } from './helpers';
 
 registerCleanup();
 
@@ -78,5 +78,32 @@ describe('start failures (AC10 reason)', () => {
       });
       probe.on('error', reject);
     });
+  });
+});
+
+describe('two daemons of one build started together (AC19)', () => {
+  test.each([1, 2, 3])('AC19 — round %i: exactly one listens, the .token and .pid on disk are its, and the other rejects with "another daemon holds <path>" without touching the files', async () => {
+    const home = makeHome();
+    const files = daemonFiles(home, 1, BUILD);
+
+    const settled = await Promise.allSettled([runDaemon({ home, build: BUILD }), runDaemon({ home, build: BUILD })]);
+
+    const winners = settled.filter((outcome) => outcome.status === 'fulfilled');
+    const losers = settled.filter((outcome) => outcome.status === 'rejected');
+    expect(winners).toHaveLength(1);
+    expect(losers).toHaveLength(1);
+    onCleanup(() => winners[0]!.value.close());
+    expect(String(losers[0]!.reason.message)).toContain(`another daemon holds ${files.socket}`);
+
+    // The files are still there after the loser gave up, and the token on disk is the winner's.
+    expect(statSync(files.socket).isSocket()).toBe(true);
+    const token = readFileSync(files.token, 'utf8');
+    expect(token).toMatch(/^[0-9a-f]{64}$/);
+    expect(readFileSync(files.pid, 'utf8').trim()).toBe(String(process.pid));
+    const answer = await send(files.socket, { authorization: `Bearer ${token}`, body: JSON.stringify({ sessionId: 'nobody', event: 'working' }) });
+    expect(answer.status, 'a request with the token on disk is not refused').toBe(404);
+    const client = await connectDaemon(files.socket);
+    onCleanup(() => client.close());
+    expect(await client.hello(BUILD)).toMatchObject({ protocol: 1, build: BUILD });
   });
 });
