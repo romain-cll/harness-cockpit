@@ -673,9 +673,10 @@ describe('daemon: built app, the daemon cannot start', () => {
 
       // Projects and workspaces are untouched: the home folder exists, so a worktree can be made and deleted.
       repo ??= makeRepoWithSetup();
-      await stubPicker(session, repo.root);
+      const root = repo.root;
+      await stubPicker(session, root);
       expect((await page.evaluate(() => (window as unknown as ApiWindow).api.projects!.add!())).status).toBe('added');
-      const created = await page.evaluate((root) => (window as unknown as ApiWindow).api.workspaces!.create!(root, 'still-works', 'main'), repo.root);
+      const created = await page.evaluate((root) => (window as unknown as ApiWindow).api.workspaces!.create!(root, 'still-works', 'main'), root);
       expect(created.status).toBe('created');
       const worktree = await poll(
         () =>
@@ -684,13 +685,13 @@ describe('daemon: built app, the daemon cannot start', () => {
               ((await (window as unknown as ApiWindow).api.projects!.list!()) as Array<{ path: string; workspaces: Array<{ path: string; name: string }> }>)
                 .find((project) => project.path === root)
                 ?.workspaces.find((workspace) => workspace.name === 'still-works')?.path,
-            repo.root,
+            root,
           ),
         Boolean,
         UI_TIMEOUT,
       );
       expect(existsSync(worktree!)).toBe(true);
-      const removed = await page.evaluate(([root, path]) => (window as unknown as ApiWindow).api.workspaces!.remove!(root, path, {}), [repo.root, worktree!] as const);
+      const removed = await page.evaluate(([root, path]) => (window as unknown as ApiWindow).api.workspaces!.remove!(root, path, {}), [root, worktree!] as const);
       expect(removed.status).toBe('removed');
       expect(existsSync(worktree!)).toBe(false);
 
