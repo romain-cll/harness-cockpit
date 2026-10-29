@@ -1,12 +1,11 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { RUN_ROOT_ENV } from './run-root';
 
 // COCKPIT-55 (AC16): a test that fails before its launch's `close()` leaves its daemon running (it is
 // detached, so stopping the app's process group does not reach it). Vitest runs this module as a
-// global setup: `setup` makes the run's root (`ck-` in the temporary directory) and publishes it in
+// global setup: `setup` makes the run's root (`ck-` in `/tmp`, resolved to `/private/tmp`) and publishes it in
 // `COCKPIT_TEST_RUN_ROOT`, every test folder is made inside it (`run-root.ts`), and `teardown` kills
 // the daemons whose `.pid` sits under that root, then removes it. A daemon of another run (its
 // `.pid` sits under that run's own root) is never looked at. A pid whose command line lacks the
@@ -62,7 +61,7 @@ export function killDaemonsUnder(root: string): void {
 }
 
 export function setup(): void {
-  process.env[RUN_ROOT_ENV] = mkdtempSync(join(tmpdir(), 'ck-'));
+  process.env[RUN_ROOT_ENV] = realpathSync(mkdtempSync('/tmp/ck-'));
 }
 
 export function teardown(): void {

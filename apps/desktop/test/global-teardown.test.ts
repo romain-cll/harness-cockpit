@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -87,10 +87,10 @@ describe('global setup and teardown', () => {
     expect(config.test?.globalSetup).toContain('test/global-teardown.ts');
   });
 
-  test('AC16 — the run has one root, a ck-* folder of the temporary directory, and the test folders are made inside it with a socket path within 103 bytes', () => {
+  test('AC16 — the run has one root, a ck-* folder of /tmp (resolved to /private/tmp), and the test folders are made inside it with a socket path within 103 bytes, a default dev home (COCKPIT-61) included', () => {
     const root = process.env[RUN_ROOT_ENV];
     expect(root, 'the global setup published the run\'s root').toBeTruthy();
-    expect(root!.startsWith(join(tmpdir(), 'ck-'))).toBe(true);
+    expect(root!.startsWith(join(realpathSync('/tmp'), 'ck-'))).toBe(true);
     expect(existsSync(root!)).toBe(true);
 
     const folder = makeTestDir('d-');
@@ -99,13 +99,20 @@ describe('global setup and teardown', () => {
     const socket = join(folder, 'h', `daemon-1-${'a'.repeat(12)}.sock`);
     expect(Buffer.byteLength(socket)).toBeLessThanOrEqual(103);
     rmSync(folder, { recursive: true, force: true });
+
+    // COCKPIT-61: a test of the default home makes a HOME (`u` + 6 characters) and the app puts
+    // `.cockpit-dev/<folder of 29 bytes at most>/daemon-1-<12 hex>.sock` under it.
+    const userHome = makeTestDir('u');
+    const devSocket = join(userHome, '.cockpit-dev', 'x'.repeat(29), `daemon-1-${'a'.repeat(12)}.sock`);
+    expect(Buffer.byteLength(devSocket)).toBeLessThanOrEqual(103);
+    rmSync(userHome, { recursive: true, force: true });
   });
 
   test('AC16 — setup makes the root and the teardown removes it, with the daemons under it', async () => {
     setup();
     const root = process.env[RUN_ROOT_ENV]!;
     folders.push(root);
-    expect(root.startsWith(join(tmpdir(), 'ck-'))).toBe(true);
+    expect(root.startsWith(join(realpathSync('/tmp'), 'ck-'))).toBe(true);
     expect(root).not.toBe(savedRoot);
     expect(existsSync(root)).toBe(true);
     const home = join(root, 'd-test', 'h');

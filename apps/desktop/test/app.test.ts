@@ -4028,12 +4028,12 @@ function makeSessionsFixture(
   return { root, bin, shell, shellLog, env: () => ({ ...process.env, SHELL: shell }), runLog, gitLog: gitLogFile };
 }
 
-const launchBuiltWith = (env: NodeJS.ProcessEnv, dataDir?: string, cockpitHome?: string | null) =>
+const launchBuiltWith = (env: NodeJS.ProcessEnv, dataDir?: string | null, cockpitHome?: string | null) =>
   launchSpawned(createRequire(import.meta.url)('electron') as string, ['.'], true, dataDir, env, cockpitHome);
 
 const launchPackagedWith = (env: NodeJS.ProcessEnv, dataDir?: string) => launchPackaged({ env, dataDir });
 
-const launchDevWith = (env: NodeJS.ProcessEnv) => launchDev(env);
+const launchDevWith = (env: NodeJS.ProcessEnv, dataDir?: string | null, cockpitHome?: string | null) => launchDev(env, dataDir, cockpitHome);
 
 interface StoredSession {
   id: string;
@@ -7478,7 +7478,15 @@ describe('built app without any agent CLI on the login shell PATH', () => {
   });
 });
 
-describe('built app sessions folder when COCKPIT_HOME is unset or empty', () => {
+// COCKPIT-61: an unpackaged build keeps its data in `~/.cockpit-dev/<folder>` (its Cockpit home) and
+// its `userData` in `~/.cockpit-dev/<folder>/user-data`, `<folder>` being `devFolderName` of the
+// worktree root (`app.getAppPath()` is `<root>/apps/desktop`). Only the running app shows which
+// path `app.getAppPath()` gives and that `userData` is set before the daemon and the lock.
+// Imported when a test runs, so the rest of this file loads whether or not the module exists.
+const devFolderOfThisWorktree = async () => (await import('../src/main/dev-folder')).devFolderName(resolve(appDir, '../..'));
+const devHomeIn = (userHome: string, folder: string) => join(userHome, '.cockpit-dev', folder);
+
+describe('built app default folders when COCKPIT_HOME and COCKPIT_USER_DATA_DIR are unset', () => {
   let fx: SessionsFixture;
 
   beforeAll(() => {
@@ -7492,27 +7500,102 @@ describe('built app sessions folder when COCKPIT_HOME is unset or empty', () => 
   test.each([
     ['unset', undefined],
     ['empty', ''],
-  ])('single instance AC5 — with COCKPIT_HOME %s and HOME=<tmp>, the unpackaged app puts the session folder in <tmp>/.cockpit-dev/sessions/<id> and nothing under <tmp>/.cockpit', async (_label, value) => {
+  ])('AC1, AC4, AC5 — with COCKPIT_HOME and COCKPIT_USER_DATA_DIR both %s and HOME=<tmp>, the unpackaged app puts the session folder in <tmp>/.cockpit-dev/<folder>/sessions/<id>, the socket next to it, state.json in <folder>/user-data, and nothing else under <tmp>/.cockpit-dev nor under <tmp>/.cockpit', async (_label, value) => {
     // A short folder: the socket path is limited to 103 bytes on macOS (`<fx.root>/…` would exceed it).
+    const devFolder = await devFolderOfThisWorktree();
     const userHome = realpathSync(makeTestDir('u'));
-    // A short build id keeps `<HOME>/.cockpit-dev/daemon-1-<build>.sock` under that limit (a 12-hex build would exceed it).
-    const session = await launchBuiltWith({ ...fx.env(), HOME: userHome, COCKPIT_TEST_DAEMON_BUILD: 'h' }, undefined, value ?? null);
+    const session = await launchBuiltWith({ ...fx.env(), HOME: userHome }, value ?? null, value ?? null);
     try {
       await session.page.getByText(versionLabel).waitFor();
       const id = await startSession(session.page, 'Claude Code', 'Claude Code 1');
-      const directory = join(userHome, '.cockpit-dev', 'sessions', id);
+      const home = devHomeIn(userHome, devFolder);
+      const directory = join(home, 'sessions', id);
 
       expect((await readStub(session.page)).cwd).toBe(directory);
       expect(statSync(directory).isDirectory()).toBe(true);
-      // Control endpoint AC11, now for an unpackaged app: the daemon's socket is <HOME>/.cockpit-dev/daemon-1-<build>.sock.
-      expect(statSync(daemonSocketIn(join(userHome, '.cockpit-dev'))).isSocket()).toBe(true);
-      expect((await readStubEnv(session.page)).socket).toBe(daemonSocketIn(join(userHome, '.cockpit-dev')));
-      // The installed app's home is left alone.
-      expect(existsSync(join(userHome, '.cockpit'))).toBe(false);
-      const stored = await poll(() => sessionsInState(session.dataDir), (list) => list.length > 0, UI_TIMEOUT);
+      // The daemon's socket is <HOME>/.cockpit-dev/<folder>/daemon-1-<build>.sock, and the session gets it.
+      expect(statSync(daemonSocketIn(home)).isSocket()).toBe(true);
+      expect((await readStubEnv(session.page)).socket).toBe(daemonSocketIn(home));
+      // userData is <folder>/user-data: state.json is there, with the session, and not in the data folder.
+      const userData = join(home, 'user-data');
+      expect(JSON.parse(readFileSync(join(userData, 'state.json'), 'utf8'))).toMatchObject({ version: 1 });
+      const stored = await poll(() => sessionsInState(userData), (list) => list.length > 0, UI_TIMEOUT);
       expect(stored.map((s) => s.directory)).toEqual([directory]);
-      // Nothing went to the developer's own Cockpit home.
+      expect(existsSync(join(session.dataDir, 'state.json'))).toBe(false);
+      // <HOME>/.cockpit-dev holds only the worktree's folder, and the installed app's home is left alone.
+      expect(readdirSync(join(userHome, '.cockpit-dev'))).toEqual([devFolder]);
+      expect(existsSync(join(userHome, '.cockpit'))).toBe(false);
+      // Nothing went to the developer's own folders.
       expect(existsSync(join(homedir(), '.cockpit', 'sessions', id))).toBe(false);
+      expect(existsSync(join(homedir(), '.cockpit-dev', devFolder, 'sessions', id))).toBe(false);
+      expect(existsSync(join(homedir(), '.cockpit-dev', 'sessions', id))).toBe(false);
+      await expectNoErrors(session);
+    } finally {
+      await session.close();
+      rmSync(userHome, { recursive: true, force: true });
+    }
+  });
+
+  test('AC6 — with COCKPIT_HOME set and COCKPIT_USER_DATA_DIR unset, the given home holds the daemon and userData defaults to <HOME>/.cockpit-dev/<folder>/user-data', async () => {
+    const devFolder = await devFolderOfThisWorktree();
+    const userHome = realpathSync(makeTestDir('u'));
+    const cockpitHome = makeTestDir('h');
+    const session = await launchBuiltWith({ ...fx.env(), HOME: userHome }, null, cockpitHome);
+    try {
+      await session.page.getByText(versionLabel).waitFor();
+
+      expect(statSync(daemonSocketIn(cockpitHome)).isSocket()).toBe(true);
+      expect(JSON.parse(readFileSync(join(devHomeIn(userHome, devFolder), 'user-data', 'state.json'), 'utf8'))).toMatchObject({ version: 1 });
+      // The default home is not used: <folder> holds user-data only.
+      expect(readdirSync(devHomeIn(userHome, devFolder))).toEqual(['user-data']);
+      expect(existsSync(join(userHome, '.cockpit'))).toBe(false);
+      await expectNoErrors(session);
+    } finally {
+      await session.close();
+      rmSync(userHome, { recursive: true, force: true });
+      rmSync(cockpitHome, { recursive: true, force: true });
+    }
+  });
+
+  test('AC6 — with COCKPIT_USER_DATA_DIR set and COCKPIT_HOME unset, state.json is in the given folder and the home defaults to <HOME>/.cockpit-dev/<folder>', async () => {
+    const devFolder = await devFolderOfThisWorktree();
+    const userHome = realpathSync(makeTestDir('u'));
+    const dataDir = makeTestDir('d-');
+    const session = await launchBuiltWith({ ...fx.env(), HOME: userHome }, dataDir, null);
+    try {
+      await session.page.getByText(versionLabel).waitFor();
+      const home = devHomeIn(userHome, devFolder);
+
+      expect(statSync(daemonSocketIn(home)).isSocket()).toBe(true);
+      expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8'))).toMatchObject({ version: 1 });
+      // userData is the given folder: <folder> holds no user-data.
+      expect(existsSync(join(home, 'user-data'))).toBe(false);
+      expect(existsSync(join(userHome, '.cockpit'))).toBe(false);
+      await expectNoErrors(session);
+    } finally {
+      await session.close();
+      rmSync(userHome, { recursive: true, force: true });
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('dev server default folders', () => {
+  test('AC1, AC4, AC5 smoke path — under electron-vite dev with COCKPIT_HOME and COCKPIT_USER_DATA_DIR unset and HOME=<tmp>, state.json is in <tmp>/.cockpit-dev/<folder>/user-data and the daemon\'s socket in <tmp>/.cockpit-dev/<folder>', async () => {
+    // A short folder, so the socket path fits 103 bytes. The temporary HOME applies to the whole
+    // `bun run dev` tree (bun and install-electron included); the Electron binary is already in node_modules.
+    const devFolder = await devFolderOfThisWorktree();
+    const userHome = realpathSync(makeTestDir('u'));
+    const session = await launchDevWith({ ...process.env, SHELL: '/bin/sh', HOME: userHome }, null, null);
+    try {
+      await session.page.getByText(versionLabel).waitFor();
+      const home = devHomeIn(userHome, devFolder);
+
+      expect(JSON.parse(readFileSync(join(home, 'user-data', 'state.json'), 'utf8'))).toMatchObject({ version: 1 });
+      expect(statSync(daemonSocketIn(home)).isSocket()).toBe(true);
+      expect(readdirSync(join(userHome, '.cockpit-dev'))).toEqual([devFolder]);
+      expect(existsSync(join(userHome, '.cockpit'))).toBe(false);
+      expect(existsSync(join(session.dataDir, 'state.json'))).toBe(false);
       await expectNoErrors(session);
     } finally {
       await session.close();
