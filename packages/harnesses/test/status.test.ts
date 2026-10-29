@@ -1,18 +1,20 @@
 import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { chmodSync, existsSync } from 'node:fs';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { codexTrustHash, statusLaunch } from '../src/index';
 
-// How each harness is told to report its status. The commands are fake here (`status <event>`),
-// the real one is `statusCommand` of `@cockpit/control`; the package has no dependency on it.
+// How each harness is told to report its status (COCKPIT-56): every hook runs the `cockpit` CLI,
+// `<cli> status <event>`; the CLI itself is `apps/cli`, the package has no dependency on it.
 //
 // Interface the tests assume, from the spec's technical plan:
-//   statusLaunch(harnessId, { command, pluginsDir, env }) -> Promise<{ args, env }>
-//   `command(event)` is the shell line for `working` | `waiting` | `finished`;
+//   statusLaunch(harnessId, { cli, pluginsDir, env }) -> Promise<{ args, env }>
+//   `cli` is the absolute path of the CLI; a hook command is `<cli single-quoted> status <event>`
+//   (a `'` in the path written `'\''`) for `working` | `waiting` | `finished`;
 //   `pluginsDir` is `$COCKPIT_HOME/plugins` (OpenCode's plugin goes in `<pluginsDir>/opencode-status/`);
 //   `env` is the login shell's environment.
 //   codexTrustHash(eventName, command, matcher?) -> 'sha256:<hex>'
@@ -20,7 +22,10 @@ import { codexTrustHash, statusLaunch } from '../src/index';
 vi.setConfig({ testTimeout: 30_000 });
 
 type Event = 'working' | 'waiting' | 'finished';
-const command = (event: Event) => `status ${event}`;
+// A path the quoting has to get right: a space, a `'` and a command substitution.
+const CLI = "/Applications/Co ckpit's $(touch pwned).app/Contents/Resources/bin/cockpit";
+const quoted = (path: string) => `'${path.replaceAll("'", "'\\''")}'`;
+const command = (event: Event) => `${quoted(CLI)} status ${event}`;
 
 const created: string[] = [];
 afterEach(async () => {
@@ -35,12 +40,12 @@ async function tempDir(): Promise<string> {
 
 async function launch(id: 'claude-code' | 'codex' | 'opencode', env: NodeJS.ProcessEnv = {}) {
   const pluginsDir = await tempDir();
-  const result = await statusLaunch(id, { command, pluginsDir, env });
+  const result = await statusLaunch(id, { cli: CLI, pluginsDir, env });
   return { ...result, pluginsDir, folder: join(pluginsDir, 'opencode-status') };
 }
 
 describe('Claude Code (AC2)', () => {
-  test('AC2 — --settings <inline JSON> whose hooks run the status command: working, waiting and finished events, each a synchronous command hook with timeout 5 and no matcher', async () => {
+  test('AC2, AC5 — --settings <inline JSON> whose hooks run the status command: working, waiting and finished events, each a synchronous command hook with timeout 5 and no matcher', async () => {
     const { args, pluginsDir } = await launch('claude-code');
 
     expect(args).toHaveLength(2);
@@ -69,6 +74,59 @@ describe('Claude Code (AC2)', () => {
     }
     // Nothing is written anywhere for Claude Code.
     expect(await readdir(pluginsDir)).toEqual([]);
+  });
+});
+
+// --- The hook command (COCKPIT-56) -------------------------------------------------------------
+
+// Every hook line the Claude Code and Codex launches carry, with the event it reports.
+async function hookLines(cli: string): Promise<Array<{ line: string; event: Event }>> {
+  const claude = await statusLaunch('claude-code', { cli, pluginsDir: await tempDir(), env: {} });
+  const codex = await statusLaunch('codex', { cli, pluginsDir: await tempDir(), env: {} });
+  const lines: Array<{ line: string; event: Event }> = [];
+  const settings = JSON.parse(claude.args[1]!) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> };
+  const claudeEvents: Record<string, Event> = { UserPromptSubmit: 'working', PermissionRequest: 'waiting', Stop: 'finished' };
+  for (const [name, event] of Object.entries(claudeEvents)) lines.push({ line: settings.hooks[name]![0]!.hooks[0]!.command, event });
+  const hooks = parseToml(codex.args[2]!.slice('hooks='.length)) as Record<string, Array<{ hooks: Array<{ command: string }> }>>;
+  const codexEvents: Record<string, Event> = { UserPromptSubmit: 'working', PermissionRequest: 'waiting', Stop: 'finished' };
+  for (const [name, event] of Object.entries(codexEvents)) lines.push({ line: hooks[name]![0]!.hooks[0]!.command, event });
+  return lines;
+}
+
+describe('the hook command (AC5)', () => {
+  test("AC5 — a path with a space and a ' is single-quoted, the ' written '\\'' , and the event follows", async () => {
+    const lines = await hookLines("/a b/it's/cockpit");
+
+    for (const { line, event } of lines) expect(line).toBe(`'/a b/it'\\''s/cockpit' status ${event}`);
+  });
+
+  test('AC5 — no argument and no environment value of any harness holds curl', async () => {
+    for (const id of ['claude-code', 'codex', 'opencode'] as const) {
+      const { args, env } = await launch(id);
+      expect(JSON.stringify([args, env]), id).not.toContain('curl');
+    }
+    expect(await readFile(join((await launch('opencode')).folder, 'server.js'), 'utf8')).not.toContain('curl');
+  });
+
+  test('AC5 — run by /bin/sh -c, a path with a space, a \' and $(…) reaches the CLI as one argument, followed by status and the event, and the substitution does not run', async () => {
+    const root = await tempDir();
+    const folder = join(root, "Co ckpit's $(touch pwned)");
+    await mkdir(folder);
+    const cli = join(folder, 'cockpit');
+    const log = join(root, 'log');
+    await writeFile(cli, `#!/bin/sh\nprintf '%s\\n' "$0" "$@" >> "$LOG"\n`);
+    chmodSync(cli, 0o755);
+
+    const lines = await hookLines(cli);
+    for (const { line } of lines) {
+      await new Promise<void>((resolve, reject) =>
+        execFile('/bin/sh', ['-c', line], { cwd: root, env: { PATH: '/usr/bin:/bin', LOG: log } }, (error) => (error ? reject(error) : resolve())),
+      );
+    }
+
+    const logged = (await readFile(log, 'utf8')).split('\n').filter(Boolean);
+    expect(logged).toEqual(lines.flatMap(({ event }) => [cli, 'status', event]));
+    expect(existsSync(join(root, 'pwned'))).toBe(false);
   });
 });
 
@@ -183,7 +241,7 @@ function expectedHash(eventName: string, hookCommand: string, matcher?: string):
 }
 
 describe('Codex (AC3)', () => {
-  // The line `statusCommand('finished')` of `@cockpit/control` is, recorded in the technical plan.
+  // The line of the former curl hook for `finished`, recorded in the technical plan.
   const finishedLine =
     '[ -n "$COCKPIT_SOCKET" ] && curl -s -m 2 --unix-socket "$COCKPIT_SOCKET" -H "Authorization: Bearer $(cat "${COCKPIT_SOCKET%/*}/control.token")" -d "{\\"sessionId\\":\\"$COCKPIT_SESSION_ID\\",\\"event\\":\\"finished\\"}" http://localhost/session-events >/dev/null 2>&1; exit 0';
 
@@ -198,7 +256,7 @@ describe('Codex (AC3)', () => {
     expect(codexTrustHash('pre_tool_use', command('waiting'), '^request_user_input$')).not.toBe(codexTrustHash('pre_tool_use', command('waiting')));
   });
 
-  test('AC3 — --no-daemon -c hooks={…} with the working, waiting and finished events as synchronous command hooks with timeout 3, and the trusted hash of each', async () => {
+  test('AC3, AC5 — --no-daemon -c hooks={…} with the working, waiting and finished events as synchronous command hooks with timeout 3, and the trusted hash of each', async () => {
     const { args, pluginsDir } = await launch('codex');
 
     expect(args).toHaveLength(3);
@@ -241,7 +299,7 @@ describe('Codex (AC3)', () => {
 // --- OpenCode ------------------------------------------------------------------------------
 
 describe('OpenCode (AC4)', () => {
-  test('AC4 — writes the plugin to <pluginsDir>/opencode-status/server.js, passes --standalone, and sets OPENCODE_CONFIG_CONTENT to {"plugins":[<folder>]} when the environment has none', async () => {
+  test('AC4, AC6 — writes the plugin to <pluginsDir>/opencode-status/server.js, passes --standalone, and sets OPENCODE_CONFIG_CONTENT to {"plugins":[<folder>]} when the environment has none', async () => {
     const { args, env, pluginsDir, folder } = await launch('opencode');
 
     expect(args).toEqual(['--standalone']);
@@ -249,6 +307,8 @@ describe('OpenCode (AC4)', () => {
     const source = await readFile(join(folder, 'server.js'), 'utf8');
     expect(source).toMatch(/export default/);
     expect(source).toContain('cockpit.session-status');
+    // The CLI is spawned directly with its arguments, never through a shell.
+    expect(source).not.toContain('/bin/sh');
     expect(await readdir(pluginsDir)).toEqual(['opencode-status']);
     // A plain file written whole: no temporary file is left next to it.
     expect(await readdir(folder)).toEqual(['server.js']);
@@ -260,7 +320,7 @@ describe('OpenCode (AC4)', () => {
     const written = await readFile(file, 'utf8');
     await writeFile(file, '// stale');
 
-    await statusLaunch('opencode', { command, pluginsDir, env: {} });
+    await statusLaunch('opencode', { cli: CLI, pluginsDir, env: {} });
 
     expect(await readFile(file, 'utf8')).toBe(written);
     expect(await readdir(folder)).toEqual(['server.js']);
@@ -298,7 +358,7 @@ describe('OpenCode (AC4)', () => {
 
 // --- OpenCode plugin behaviour ---------------------------------------------------------------
 
-describe('OpenCode plugin (AC5)', () => {
+describe('OpenCode plugin (AC6)', () => {
   // Events as OpenCode 2.0.31 emits them: `{ type, data }`.
   const started = (sessionID: string) => ({ type: 'session.execution.started', data: { sessionID } });
   const succeeded = (sessionID: string) => ({ type: 'session.execution.succeeded', data: { sessionID } });
@@ -321,21 +381,30 @@ describe('OpenCode plugin (AC5)', () => {
     }
   });
 
+  // What the stub CLI logs for an event: its arguments, as the plugin passes them.
+  const reported = (event: string) => `status ${event}`;
+
   interface Plugin {
     id: string;
     setup(ctx: unknown): unknown;
   }
 
-  // The plugin file `statusLaunch` writes in `<dir>/<name>`, whose commands append `<event>` to
-  // `<dir>/log`; `working` is slow, so a plugin that ran commands side by side would log them out
-  // of order.
+  // The plugin file `statusLaunch` writes in `<dir>/<name>`, for a stub CLI that appends
+  // `<arguments>` to `<dir>/log`; `working` is slow, so a plugin that ran commands side by side
+  // would log them out of order. The stub sits in a folder whose name holds a space and `$(…)`, so
+  // a plugin that went through `/bin/sh` would not find it.
   async function plugin(dir?: string, name = 'plugins') {
     dir ??= await tempDir();
     const log = join(dir, 'log');
-    const slow = (event: Event) => (event === 'working' ? 'sleep 0.2; ' : '');
-    const logging = (event: Event) => `${slow(event)}echo ${event} >> '${log}'`;
+    const folder = join(dir, `cli ${name} $(touch pwned)`);
+    const cli = join(folder, 'cockpit');
+    if (!existsSync(cli)) {
+      await mkdir(folder, { recursive: true });
+      await writeFile(cli, `#!/bin/sh\n[ "$2" = working ] && sleep 0.2\necho "$@" >> '${log}'\n`);
+      chmodSync(cli, 0o755);
+    }
     const pluginsDir = join(dir, name);
-    await statusLaunch('opencode', { command: logging, pluginsDir, env: {} });
+    await statusLaunch('opencode', { cli, pluginsDir, env: {} });
     const module = (await import(/* @vite-ignore */ pathToFileURL(join(pluginsDir, 'opencode-status', 'server.js')).href)) as { default: Plugin };
     const lines = async () => (existsSync(log) ? (await readFile(log, 'utf8')).split('\n').filter(Boolean) : []);
     return { plugin: module.default, lines, dir };
@@ -360,7 +429,7 @@ describe('OpenCode plugin (AC5)', () => {
     return lines;
   }
 
-  test('AC5 — runs the status command of each state the events lead to, in order and one at a time, only when the state changes', async () => {
+  test('AC6 — spawns the CLI directly with `status <event>` for each state the events lead to, in order and one at a time, only when the state changes', async () => {
     const lines = await run([
       started('s1'), // working (slow command)
       started('s1'), // no change
@@ -375,22 +444,22 @@ describe('OpenCode plugin (AC5)', () => {
       succeeded('s1'), // finished
     ]);
 
-    const expected = ['working', 'waiting', 'working', 'waiting', 'working', 'waiting', 'working', 'finished'];
+    const expected = ['working', 'waiting', 'working', 'waiting', 'working', 'waiting', 'working', 'finished'].map(reported);
     await vi.waitFor(async () => expect((await lines()).length).toBeGreaterThanOrEqual(expected.length), { timeout: 15_000, interval: 50 });
     expect(await lines()).toEqual(expected);
   });
 
-  test('AC5 — an execution that ends drops its pending permissions, whichever way it ends: the next start is working, not waiting', async () => {
+  test('AC6 — an execution that ends drops its pending permissions, whichever way it ends: the next start is working, not waiting', async () => {
     for (const ending of [succeeded, failed, interrupted]) {
       const lines = await run([started('s1'), asked('s1', 'p1'), ending('s1'), started('s1')]);
 
-      const expected = ['working', 'waiting', 'finished', 'working'];
+      const expected = ['working', 'waiting', 'finished', 'working'].map(reported);
       await vi.waitFor(async () => expect((await lines()).length).toBeGreaterThanOrEqual(expected.length), { timeout: 15_000, interval: 50 });
       expect(await lines(), ending.name).toEqual(expected);
     }
   });
 
-  test('AC5 — the state covers every session of the server: it stays waiting while another session has a pending permission, and finishes when the last execution ends', async () => {
+  test('AC6 — the state covers every session of the server: it stays waiting while another session has a pending permission, and finishes when the last execution ends', async () => {
     const lines = await run([
       started('s1'), // working
       started('s2'), // no change
@@ -400,7 +469,7 @@ describe('OpenCode plugin (AC5)', () => {
       failed('s1'), // finished
     ]);
 
-    const expected = ['working', 'waiting', 'working', 'finished'];
+    const expected = ['working', 'waiting', 'working', 'finished'].map(reported);
     await vi.waitFor(async () => expect((await lines()).length).toBeGreaterThanOrEqual(expected.length), { timeout: 15_000, interval: 50 });
     expect(await lines()).toEqual(expected);
   });
@@ -408,7 +477,7 @@ describe('OpenCode plugin (AC5)', () => {
   test.each([
     ['COCKPIT_SOCKET', 'COCKPIT_SESSION_ID'],
     ['COCKPIT_SESSION_ID', 'COCKPIT_SOCKET'],
-  ])('AC5 — with %s unset it runs nothing', async (unset, kept) => {
+  ])('AC6 — with %s unset it runs nothing', async (unset, kept) => {
     delete process.env[unset];
     process.env[kept] = 'value';
     const { plugin: silent, lines, dir } = await plugin();
@@ -422,6 +491,6 @@ describe('OpenCode plugin (AC5)', () => {
     await Promise.resolve(probe.setup(contextOf([started('probe')])));
 
     await vi.waitFor(async () => expect((await lines()).length).toBeGreaterThanOrEqual(1), { timeout: 15_000, interval: 50 });
-    expect(await lines()).toEqual(['working']);
+    expect(await lines()).toEqual([reported('working')]);
   });
 });

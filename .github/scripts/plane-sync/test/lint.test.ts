@@ -1,4 +1,6 @@
-import { readFileSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, test } from 'vitest';
 
@@ -12,6 +14,7 @@ const repoRoot = join(import.meta.dirname, '..', '..', '..', '..');
 const read = (...parts: string[]) => readFileSync(join(repoRoot, ...parts), 'utf8');
 
 const workspaces = [
+  'apps/cli',
   'apps/desktop',
   'packages/daemon',
   'packages/github',
@@ -133,10 +136,121 @@ describe('AGENTS.md and the daemon', () => {
     }
   });
 
-  test('AC20 — the Harnesses status-reporting section names statusCommand of @cockpit/daemon', () => {
+  test('AC20, AC9 — the Harnesses status-reporting section names the cockpit CLI path, not statusCommand', () => {
     const text = agents();
     const start = text.indexOf('**Status reporting (COCKPIT-36)**');
     expect(start, 'the status-reporting paragraph').toBeGreaterThan(-1);
-    expect(text.slice(start, start + 600)).toContain('`statusCommand` of `@cockpit/daemon`');
+    const paragraph = text.slice(start, start + 800);
+    expect(paragraph).toContain('cockpit status');
+    expect(paragraph).not.toContain('statusCommand');
+  });
+});
+
+// COCKPIT-56: the `cockpit` CLI replaces the curl line.
+describe('statusCommand is gone and AGENTS.md describes apps/cli (COCKPIT-56)', () => {
+  const sourceFiles = (dir: string): string[] =>
+    readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'release') return [];
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) return sourceFiles(full);
+      return /\.[cm]?[jt]sx?$/.test(entry.name) ? [full] : [];
+    });
+
+  test('AC9 — no source or test of apps/ and packages/ mentions statusCommand', () => {
+    const offenders = ['apps', 'packages']
+      .flatMap((dir) => sourceFiles(join(repoRoot, dir)))
+      .filter((file) => readFileSync(file, 'utf8').includes('statusCommand'));
+    expect(offenders).toEqual([]);
+  });
+
+  test('AC9 — @cockpit/daemon exports ./cli and AGENTS.md does not name statusCommand', () => {
+    const pkg = JSON.parse(read('packages/daemon/package.json')) as { exports: Record<string, string> };
+    expect(pkg.exports['./cli']).toBe('./src/cli.ts');
+    expect(read('AGENTS.md').includes('statusCommand'), 'AGENTS.md still names statusCommand').toBe(false);
+  });
+
+  test('AC9 — AGENTS.md describes apps/cli: its contract, where it ships, why a Bun compiled binary with the cold-start measurement, and its exit cost', () => {
+    const text = read('AGENTS.md');
+    for (const needed of [
+      '`apps/cli`',
+      'usage: cockpit status <working|waiting|finished>',
+      'Contents/Resources/bin/cockpit',
+      'apps/cli/dist/cockpit',
+      'bun build --compile',
+      'oven-sh/bun',
+    ]) {
+      expect(text.includes(needed), `AGENTS.md lacks ${needed}`).toBe(true);
+    }
+    expect(/^\s+cli\/\s+#/m.test(text), 'the tree lists no cli/').toBe(true);
+    const section = text.slice(text.indexOf('`apps/cli`'));
+    expect(/cold start/i.test(section), 'no cold start').toBe(true);
+    expect(/\d+(\.\d+)? ms/.test(section), 'no measurement in ms').toBe(true);
+    expect(/exit cost/i.test(section), 'no exit cost').toBe(true);
+  });
+
+  test('AC9 — the lint section counts 10 workspaces', () => {
+    const text = read('AGENTS.md');
+    expect(text.includes('all 10 workspaces'), 'AGENTS.md lacks all 10 workspaces').toBe(true);
+    expect(text.includes('all 9 workspaces'), 'AGENTS.md still says all 9 workspaces').toBe(false);
+  });
+});
+
+// COCKPIT-56 AC10: the Bun that compiles the CLI is the one `packageManager` names.
+describe('the Bun that compiles apps/cli (AC10)', () => {
+  const pinned = () => /^bun@(\d+\.\d+\.\d+)$/.exec((JSON.parse(read('package.json')) as { packageManager: string }).packageManager)![1]!;
+  const cliPackage = () => JSON.parse(read('apps/cli/package.json')) as { scripts: Record<string, string>; devDependencies: Record<string, string> };
+
+  test('AC10 — the bun devDependency of apps/cli is exactly the packageManager version', () => {
+    expect(cliPackage().devDependencies.bun).toBe(pinned());
+  });
+
+  test('AC10 — bun.lock resolves the bun of apps/cli to that version', () => {
+    const lock = read('bun.lock');
+    const at = lock.indexOf('"apps/cli": {');
+    expect(at, 'bun.lock has no apps/cli workspace').toBeGreaterThan(-1);
+    const workspace = lock.slice(at);
+    expect(workspace.slice(0, workspace.indexOf('}')).replace(/\s+/g, ' ')).toContain(`"bun": "${pinned()}"`);
+    expect(lock).toMatch(new RegExp(`"bun": \\["bun@${pinned().replaceAll('.', '\\.')}"`));
+  });
+
+  test('AC10 — the build script checks the version, then compiles with the devDependency binary, not the Bun on PATH', () => {
+    const build = cliPackage().scripts.build!;
+    const steps = build.split('&&').map((step) => step.trim());
+    expect(steps.length).toBeGreaterThanOrEqual(2);
+    const compile = steps[steps.length - 1]!;
+    expect(compile).toMatch(/node_modules\/(\.bin\/bun|bun\/bin\/bun)\s+build\b/);
+    expect(compile).toContain('--compile');
+    expect(compile).toContain('src/main.ts');
+    expect(compile).toContain('dist/cockpit');
+    expect(steps.slice(0, -1).join(' ')).not.toContain('--compile');
+  });
+
+  test('AC10 — a binary whose version differs from packageManager fails the build with a message naming both versions, and compiles nothing', async () => {
+    // A copy of the repository's root package.json and of apps/cli, whose root says another Bun.
+    const root = mkdtempSync(join(tmpdir(), 'ck-pin-'));
+    try {
+      const real = join(repoRoot, 'apps', 'cli');
+      const copy = join(root, 'apps', 'cli');
+      mkdirSync(copy, { recursive: true });
+      for (const entry of readdirSync(real)) {
+        if (entry === 'node_modules' || entry === 'dist') continue;
+        cpSync(join(real, entry), join(copy, entry), { recursive: true });
+      }
+      if (existsSync(join(real, 'node_modules'))) symlinkSync(join(real, 'node_modules'), join(copy, 'node_modules'));
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fake', private: true, packageManager: 'bun@0.0.1' }));
+
+      const outcome = await new Promise<{ code: number | null; output: string }>((resolve) =>
+        execFile('bun', ['run', 'build'], { cwd: copy, env: process.env, timeout: 60_000 }, (error, stdout, stderr) =>
+          resolve({ code: error ? ((error as NodeJS.ErrnoException & { code?: number }).code ?? 1) : 0, output: `${stdout}${stderr}` }),
+        ),
+      );
+
+      expect(outcome.code).not.toBe(0);
+      expect(outcome.output).toContain('0.0.1');
+      expect(outcome.output).toContain(pinned());
+      expect(existsSync(join(copy, 'dist', 'cockpit'))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

@@ -16,4 +16,4 @@ export type {
 } from './protocol';
 export { runDaemon } from './server';
 export type { Daemon, DaemonOptions } from './server';
-export { SESSION_EVENTS, statusCommand } from './status';
+export { SESSION_EVENTS } from './status';
