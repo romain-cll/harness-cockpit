@@ -12,7 +12,6 @@ import {
   ensureDaemon,
   listDaemonFiles,
   PROTOCOL_VERSION,
-  statusCommand,
   type DaemonClient,
   type SessionEventName,
   type TerminalExit,
@@ -122,6 +121,9 @@ const devServerUrl = app.isPackaged ? undefined : process.env.ELECTRON_RENDERER_
 const background = process.env.COCKPIT_TEST_BACKGROUND === '1';
 const userDataDir = process.env.COCKPIT_USER_DATA_DIR;
 const cockpitHome = resolve(process.env.COCKPIT_HOME || join(homedir(), app.isPackaged ? '.cockpit' : '.cockpit-dev'));
+// The `cockpit` CLI the harness hooks run: copied into the bundle when packaged, built in
+// `apps/cli` otherwise (`app.getAppPath()` is `apps/desktop`).
+const cliPath = app.isPackaged ? join(process.resourcesPath, 'bin', 'cockpit') : resolve(app.getAppPath(), '../cli/dist/cockpit');
 const worktreesRoot = join(cockpitHome, 'worktrees');
 const applicationDirs = process.env.COCKPIT_TEST_APPLICATIONS_DIR
   ? [process.env.COCKPIT_TEST_APPLICATIONS_DIR]
@@ -972,7 +974,7 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
           ...(workspace && { COCKPIT_WORKSPACE_PATH: workspace.path }),
         });
         // The harness is told, through its arguments and environment, to report its status to the daemon.
-        const status = await statusLaunch(harness.id, { command: statusCommand, pluginsDir: join(cockpitHome, 'plugins'), env });
+        const status = await statusLaunch(harness.id, { cli: cliPath, pluginsDir: join(cockpitHome, 'plugins'), env });
         env = status.env as Record<string, string>;
         ptyId = await spawnFor(
           event.sender,

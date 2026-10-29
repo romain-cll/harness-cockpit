@@ -5,8 +5,8 @@ import type { HarnessId } from './catalogue';
 
 // How each harness is told to report the status of its session. Everything is passed through
 // argv and the environment of the spawn, never written in the user's repository or global
-// config. Hook commands always exit 0 and print nothing (`statusCommand` of `@cockpit/daemon`,
-// which this package does not depend on: the caller passes it in).
+// config. Every hook runs the `cockpit` CLI of `apps/cli`, `<cli> status <event>`, which always
+// exits 0 and prints nothing; this package does not depend on it: the caller passes in its path.
 //
 // Every fact below carries its source. Checked on 2026-10-25 against Claude Code 2.1.310,
 // Codex 0.163.0 and OpenCode 2.0.31.
@@ -15,8 +15,8 @@ import type { HarnessId } from './catalogue';
 export type StatusEvent = 'working' | 'waiting' | 'finished';
 
 export interface StatusLaunchOptions {
-  /** The shell line that reports `event` for the session the process belongs to. */
-  command: (event: StatusEvent) => string;
+  /** The absolute path of the `cockpit` CLI, which reports an event for the session the process belongs to. */
+  cli: string;
   /** Where OpenCode's plugin is written, in `<pluginsDir>/opencode-status/`. */
   pluginsDir: string;
   /** The environment the harness would run with. */
@@ -37,17 +37,22 @@ export interface StatusLaunch {
  */
 export async function statusLaunch(
   harnessId: HarnessId,
-  { command, pluginsDir, env }: StatusLaunchOptions,
+  { cli, pluginsDir, env }: StatusLaunchOptions,
 ): Promise<StatusLaunch> {
+  const command = hookCommand(cli);
   switch (harnessId) {
     case 'claude-code':
       return { args: ['--settings', JSON.stringify({ hooks: claudeHooks(command) })], env: { ...env } };
     case 'codex':
       return { args: ['--no-daemon', '-c', `hooks=${codexHooks(command)}`], env: { ...env } };
     case 'opencode':
-      return openCodeLaunch(command, pluginsDir, env);
+      return openCodeLaunch(cli, pluginsDir, env);
   }
 }
+
+// The shell line of a hook (the harnesses run it by a shell): the CLI's path single-quoted, a `'`
+// in it written `'\''`, so a space, a `$(…)` or a quote reaches the CLI as part of one argument.
+const hookCommand = (cli: string) => (event: StatusEvent) => `'${cli.replaceAll("'", "'\\''")}' status ${event}`;
 
 // --- Claude Code ---------------------------------------------------------------------------
 
@@ -142,7 +147,7 @@ function codexHooks(command: (event: StatusEvent) => string): string {
 // giving an async iterable of `{ type, data }` events (source in `anomalyco/opencode` at
 // `v2.0.31`, not in the docs).
 async function openCodeLaunch(
-  command: (event: StatusEvent) => string,
+  cli: string,
   pluginsDir: string,
   env: NodeJS.ProcessEnv,
 ): Promise<StatusLaunch> {
@@ -163,11 +168,7 @@ async function openCodeLaunch(
     if (config.plugins !== undefined && !Array.isArray(config.plugins)) return unchanged;
   }
 
-  await writePlugin(folder, {
-    working: command('working'),
-    waiting: command('waiting'),
-    finished: command('finished'),
-  });
+  await writePlugin(folder, cli);
   const plugins = [...((config.plugins as unknown[] | undefined) ?? []), folder];
   return {
     args: ['--standalone'],
@@ -176,11 +177,11 @@ async function openCodeLaunch(
 }
 
 // A temporary file, then a rename: an OpenCode starting at the same time never reads half of it.
-async function writePlugin(folder: string, commands: Record<StatusEvent, string>): Promise<void> {
+async function writePlugin(folder: string, cli: string): Promise<void> {
   await mkdir(folder, { recursive: true });
   const file = join(folder, 'server.js');
   const temporary = `${file}.${process.pid}.tmp`;
-  await writeFile(temporary, openCodePlugin(commands));
+  await writeFile(temporary, openCodePlugin(cli));
   await rename(temporary, file);
 }
 
@@ -193,11 +194,11 @@ async function writePlugin(folder: string, commands: Record<StatusEvent, string>
 //   `data.{ sessionID, id }`.
 // Not reported: a plain-text question ends the execution, so it reports `finished`.
 
-/** The source text of the plugin; `commands` are embedded as JSON strings. */
-export function openCodePlugin(commands: Record<StatusEvent, string>): string {
+/** The source text of the plugin; the path of the CLI is embedded as a JSON string. */
+export function openCodePlugin(cli: string): string {
   return `import { spawn } from 'node:child_process';
 
-const commands = ${JSON.stringify(commands)};
+const cli = ${JSON.stringify(cli)};
 
 // Pending permissions and forms per session, and the running executions.
 const pending = new Map();
@@ -212,20 +213,21 @@ function state() {
   return ran ? 'finished' : null;
 }
 
-function run(command) {
+// The CLI is spawned directly, with no shell: its path needs no quoting.
+function run(event) {
   return new Promise((resolve) => {
-    const child = spawn('/bin/sh', ['-c', command], { stdio: 'ignore' });
+    const child = spawn(cli, ['status', event], { stdio: 'ignore' });
     child.on('error', resolve);
     child.on('close', resolve);
   });
 }
 
-// One command at a time, in the order of the changes, and only when the state changes.
+// One report at a time, in the order of the changes, and only when the state changes.
 function report() {
   const next = state();
   if (next === null || next === current) return;
   current = next;
-  queue = queue.then(() => run(commands[next]));
+  queue = queue.then(() => run(next));
 }
 
 function add(sessionID, id) {
