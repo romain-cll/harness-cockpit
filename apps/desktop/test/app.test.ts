@@ -372,6 +372,63 @@ async function waitForRow(page: Page, text: string | RegExp, pane?: Pane) {
   );
 }
 
+// COCKPIT-63: runs a terminal check and, when it fails, appends to its error what `diagnose`
+// reports, so a flaky failure carries its evidence. A failing diagnostic is reported, never thrown.
+async function withDiagnostic<T>(check: () => Promise<T>, diagnose: () => Promise<string>): Promise<T> {
+  try {
+    return await check();
+  } catch (error) {
+    let report: string;
+    try {
+      report = await diagnose();
+    } catch (failure) {
+      report = `diagnostic failed: ${failure instanceof Error ? failure.stack : String(failure)}`;
+    }
+    if (error instanceof Error) error.message += `\n--- diagnostic ---\n${report}`;
+    throw error;
+  }
+}
+
+const nonEmpty = (rows: string[]) => rows.map((row, index) => [index, row] as const).filter(([, row]) => row !== '');
+
+// What a pane shows at the failure, two animation frames later and 1 s later (the pause runs only
+// once the check has failed), how long after `since`, and, when `home` is given, every shell of the
+// daemon with its sequence number and the screen `attach` serializes. The daemon client says no
+// `hello` (`list` and `attach` need none, and another build would supersede the daemon) and spawns
+// nothing; `attach` only subscribes.
+async function terminalDiagnostic(page: Page, pane: Pane, since: number, home?: string): Promise<string> {
+  const lines: string[] = [];
+  const elapsed = Date.now() - since;
+  const view = await pane.evaluate((element) => {
+    const screen = element.querySelector('.xterm-screen')?.getBoundingClientRect();
+    return {
+      rows: element.querySelectorAll('.xterm-rows > div').length,
+      screen: screen ? `${Math.round(screen.width)}x${Math.round(screen.height)}` : 'none',
+      connected: element.isConnected,
+      visibility: getComputedStyle(element).visibility,
+    };
+  });
+  lines.push(`elapsed since the action checked: ${elapsed} ms`, `view: ${JSON.stringify(view)}`);
+  lines.push(`rows at the check: ${JSON.stringify(nonEmpty(await rowsOf(pane)))}`);
+  await pane.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  lines.push(`rows after two frames (+${Date.now() - since - elapsed} ms): ${JSON.stringify(nonEmpty(await rowsOf(pane)))}`);
+  await sleep(1_000);
+  lines.push(`rows after 1 s (+${Date.now() - since - elapsed} ms): ${JSON.stringify(nonEmpty(await rowsOf(pane)))}`);
+  if (home) {
+    const { connectDaemon } = await import('@cockpit/daemon');
+    const client = await connectDaemon(daemonSocketIn(home));
+    try {
+      for (const terminal of await client.list()) {
+        const { seq, cols, rows, screen } = await client.attach(terminal.id);
+        lines.push(`daemon terminal ${terminal.id} (${terminal.kind}, ${cols}x${rows}, seq ${seq}): ${JSON.stringify(screen)}`);
+      }
+    } finally {
+      client.close();
+    }
+  }
+  return lines.join('\n');
+}
+
 // Waits for a row matching `pattern` and returns its capture groups.
 async function captureRow(page: Page, pattern: RegExp, pane?: Pane): Promise<string[]> {
   const target = pane ?? (await focusedPane(page));
@@ -1053,9 +1110,12 @@ function writeConfig(repo: TempRepo, config: unknown) {
 // Scripts the configured commands call, kept in the main working tree so a command stays short (the
 // terminal echoes it as one row). `$COCKPIT_ROOT_PATH` is set by the app. `waitfor.sh <marker>` waits
 // until the test creates `<root>/<marker>`; `record.sh <file>` appends the environment of its run.
+// Its trap makes a Ctrl+C always end it by SIGINT: without it, a SIGINT that lands as a `sleep`
+// exits on its own lets bash go on looping (bash's wait-and-cooperative-exit, COCKPIT-63), so the
+// run never ends.
 function writeScripts(repo: TempRepo, extra: Record<string, string> = {}) {
   const scripts: Record<string, string> = {
-    'waitfor.sh': 'while [ ! -f "$COCKPIT_ROOT_PATH/$1" ]; do sleep 0.1; done\n',
+    'waitfor.sh': "trap 'trap - INT; kill -INT $$' INT\n" + 'while [ ! -f "$COCKPIT_ROOT_PATH/$1" ]; do sleep 0.1; done\n',
     'record.sh':
       'echo "root=$COCKPIT_ROOT_PATH ws=$COCKPIT_WORKSPACE_PATH name=$COCKPIT_WORKSPACE_NAME term=$TERM pwd=$(pwd -P) path=$PATH" >> "$COCKPIT_ROOT_PATH/$1"\n',
     ...extra,
@@ -1857,13 +1917,23 @@ describe.each([
       for (const pid of pids) expect(isAlive(pid), `shell ${pid} is alive after the command ended`).toBe(true);
 
       await goToTerminalPage(page);
+      const shown = Date.now();
       for (const pid of pids) expect(isAlive(pid), `shell ${pid} is alive after coming back`).toBe(true);
       await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 2');
       expect(await visiblePanes(page)).toHaveLength(2);
-      expect(await rowsOf(two)).toContain('m2-22');
-      expect(await rowsOf(three)).toContain('m3-33');
+      await withDiagnostic(
+        () => waitForRow(page, 'm2-22', two),
+        () => terminalDiagnostic(page, two, shown, session.cockpitHome),
+      );
+      await withDiagnostic(
+        () => waitForRow(page, 'm3-33', three),
+        () => terminalDiagnostic(page, three, shown, session.cockpitHome),
+      );
       // AC2: the output of the command that ended while the user was away.
-      await waitForRow(page, 'later-42', three);
+      await withDiagnostic(
+        () => waitForRow(page, 'later-42', three),
+        () => terminalDiagnostic(page, three, shown, session.cockpitHome),
+      );
 
       // The keyboard is where it was: no click before typing.
       const active = await poll(() => activePane(page), Boolean, UI_TIMEOUT);
@@ -1886,7 +1956,7 @@ describe.each([
       await selectTab(page, 1);
       await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 1');
       await poll(() => one.isVisible(), Boolean, UI_TIMEOUT);
-      expect(await rowsOf(one)).toContain('m1-11');
+      await waitForRow(page, 'm1-11', one);
       await focusPane(one);
       await typeLine(page, 'echo cmd-one-$((1+1))');
       await waitForRow(page, 'cmd-one-2', one);
@@ -5737,14 +5807,30 @@ describe('sessions: built app', () => {
     await setupHeading(page, 'setup-signal').waitFor({ timeout: UI_TIMEOUT });
     const pid = await startedWaiter(repo, 'never-sig-setup');
     await focusTerminal(page);
+    const focus = await page.evaluate(() => document.activeElement?.className ?? null);
+    const pressed = Date.now();
     await page.keyboard.press('Control+c');
 
-    await page.getByText('Setup ended before it finished.').waitFor({ timeout: UI_TIMEOUT });
-    expect(await endsWithin(pid)).toBe(true);
-    expect(await page.getByText('Setup finished').count()).toBe(0);
-    expect(await retryButton(page).count()).toBe(1);
-    expect(await startAnywayButton(page).count()).toBe(1);
-    expect(await waitForSetupStatus(page, path, 'Failed')).toBe('Failed');
+    await withDiagnostic(
+      async () => {
+        await page.getByText('Setup ended before it finished.').waitFor({ timeout: UI_TIMEOUT });
+        expect(await endsWithin(pid)).toBe(true);
+        expect(await page.getByText('Setup finished').count()).toBe(0);
+        expect(await retryButton(page).count()).toBe(1);
+        expect(await startAnywayButton(page).count()).toBe(1);
+        expect(await waitForSetupStatus(page, path, 'Failed')).toBe('Failed');
+      },
+      async () => {
+        const [pane] = await visiblePanes(page);
+        return [
+          `focused element when Control+c was pressed: ${focus}`,
+          `waitfor.sh ${pid} alive: ${isAlive(pid)}; waiters now: ${JSON.stringify(waiters(repo, 'never-sig-setup'))}`,
+          `setup link: ${await setupLinkStatus(page, path)}`,
+          `main text: ${JSON.stringify(await page.evaluate(() => document.querySelector('main')?.innerText ?? null))}`,
+          pane ? await terminalDiagnostic(page, pane, pressed) : 'no visible terminal',
+        ].join('\n');
+      },
+    );
     await sleep(300);
     expect(new URL(page.url()).pathname).toBe('/setup');
     expectNoSessionStarted(before, path);
