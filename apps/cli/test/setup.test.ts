@@ -232,6 +232,27 @@ describe('cockpit setup', () => {
     expect(events()).toEqual(['setup-running', 'setup-done', 'exited']);
   });
 
+  test('AC15 — "--then <binary>" that cannot be spawned (no such file), once the setup passes: "[<binary> could not start: <reason>]" is printed, exited is reported with a null exit code, and with --shell the login shell (-l) starts in the worktree', async () => {
+    writeConfig({ setup: ['echo only'] });
+    const missing = join(bin, 'no-such-agent');
+
+    const run = await cockpit(['setup', '--shell', '--then', missing, '--some', 'arg'], { env: SESSION() });
+    await reportsSettled(3);
+
+    expect(run.lines.slice(0, 4)).toEqual([HEADER('setup'), '$ echo only', 'only', '✓ Setup done']);
+    expect(run.lines[4]).toMatch(/^\[(.*\/)?no-such-agent could not start: .+\]$/);
+    expect(run.lines.at(-1)).toBe('shell-prompt');
+    expect(run.lines.indexOf('shell-prompt')).toBeGreaterThan(4);
+    expect(run.stub.file('agent.cwd'), 'no stub agent ran').toBeUndefined();
+    expect(run.stub.file('shell.cwd')?.trim()).toBe(worktree);
+    expect(nulSplit(run.stub.file('shell.argv'))).toEqual(['-l']);
+    expect(reports).toEqual([
+      { sessionId: 'session-1', event: 'setup-running' },
+      { sessionId: 'session-1', event: 'setup-done' },
+      { sessionId: 'session-1', event: 'exited', exitCode: null },
+    ]);
+  });
+
   test('AC3 — a command that exits with code N stops the setup: the later commands do not run, the failure and the hint lines are printed, then the login shell starts in the worktree and the agent never does', async () => {
     writeConfig({ setup: ['echo before', 'echo bad; exit 4', 'touch "$COCKPIT_ROOT_PATH/should-not-exist"'] });
 

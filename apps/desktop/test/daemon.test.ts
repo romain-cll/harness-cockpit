@@ -290,7 +290,7 @@ async function startSetup(session: Session, repo: { root: string }, name: string
     Boolean,
     UI_TIMEOUT,
   );
-  const started = await page.evaluate(([root, path]) => (window as unknown as ApiWindow).api.workspaces!.runCommands!(root, path, 'teardown', { cols: 80, rows: 24 }), [repo.root, path!] as const);
+  const started = await page.evaluate(([root, path]) => (window as unknown as ApiWindow).api.workspaces!.teardown!(root, path, { cols: 80, rows: 24 }), [repo.root, path!] as const);
   expect(started.status).toBe('started');
   const sleeper = await poll(
     () => execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' }).split('\n').find((line) => line.trim().endsWith('sleep 300')),

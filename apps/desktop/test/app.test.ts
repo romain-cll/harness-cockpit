@@ -829,11 +829,13 @@ interface SidebarEntry {
   text: string;
 }
 
-// The sidebar elements that carry a `title`: the project entries (the outermost
-// one when the title is repeated on nested elements).
+// The rows of the Projects section (a project, a workspace): the elements that carry a `title` there,
+// the outermost one when the title is repeated on nested elements. The status dots of the sessions
+// (`role="img"` with a `title`) and the Sessions section's own entries are not rows.
 const sidebarEntries = (page: Page): Promise<SidebarEntry[]> =>
   page.evaluate(() => {
-    const titled = [...document.querySelectorAll('aside [title]')] as HTMLElement[];
+    const section = [...document.querySelectorAll('aside section')].find((candidate) => candidate.querySelector('h2')?.textContent === 'Projects');
+    const titled = [...(section?.querySelectorAll('div[title]') ?? [])] as HTMLElement[];
     return titled
       .filter((element) => !titled.some((other) => other !== element && other.contains(element) && other.title === element.title))
       .map((element) => ({ title: element.title, text: (element.textContent ?? '').trim() }));
@@ -841,8 +843,14 @@ const sidebarEntries = (page: Page): Promise<SidebarEntry[]> =>
 
 const entryTitles = async (page: Page) => (await sidebarEntries(page)).map((entry) => entry.title);
 
-const waitForEntries = (page: Page, expected: string[]) =>
-  poll(() => entryTitles(page), (titles) => JSON.stringify(titles) === JSON.stringify(expected), UI_TIMEOUT);
+// Waits for exactly these rows and throws, with the rows it last saw, when they do not show up.
+async function waitForEntries(page: Page, expected: string[]): Promise<string[]> {
+  const titles = await poll(() => entryTitles(page), (found) => JSON.stringify(found) === JSON.stringify(expected), UI_TIMEOUT);
+  if (JSON.stringify(titles) !== JSON.stringify(expected)) {
+    throw new Error(`The sidebar rows did not become ${JSON.stringify(expected)} within ${UI_TIMEOUT} ms; the last ones seen: ${JSON.stringify(titles)}`);
+  }
+  return titles;
+}
 
 // The text lines of the sidebar.
 const sidebarLines = async (page: Page) =>
@@ -1218,25 +1226,20 @@ const collectPtyData = (page: Page) =>
 const plain = (text: string) => text.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, '').replaceAll('\r', '');
 const collectedPtyData = async (page: Page) => plain(await page.evaluate(() => (window as unknown as { __allPtyData?: string }).__allPtyData ?? ''));
 
-// What `window.api.workspaces.runCommands` answers.
-const runCommandsApi = (page: Page, project: string, path: string, which: 'setup' | 'teardown') =>
+// What `window.api.workspaces.teardown` answers.
+const teardownApi = (page: Page, project: string, path: string) =>
   page.evaluate(
-    ([project, path, which]) =>
+    ([project, path]) =>
       (
         window as unknown as {
           api: {
             workspaces: {
-              runCommands(
-                project: string,
-                path: string,
-                which: 'setup' | 'teardown',
-                size: { cols: number; rows: number },
-              ): Promise<{ status: string; message?: string }>;
+              teardown(project: string, path: string, size: { cols: number; rows: number }): Promise<{ status: string; message?: string }>;
             };
           };
         }
-      ).api.workspaces.runCommands(project, path, which as 'setup', { cols: 80, rows: 24 }),
-    [project, path, which] as const,
+      ).api.workspaces.teardown(project, path, { cols: 80, rows: 24 }),
+    [project, path] as const,
   );
 
 // The terminal a dialog shows (the teardown's).
@@ -3025,7 +3028,7 @@ describe.each([
       writeConfig(repo, { run: ['bun dev'] });
       const path = await addExternal('td-bad');
       const { page } = session;
-      const refused = await runCommandsApi(page, repo.root, path, 'teardown');
+      const refused = await teardownApi(page, repo.root, path);
       expect(refused.status).toBe('refused');
 
       const dialog = await confirmDeletion(path);
@@ -3043,28 +3046,25 @@ describe.each([
       expect(localBranches(repo)).not.toContain('td-bad');
     });
 
-    test('AC18 — workspaces.runCommands refuses a project that is not in Cockpit and a path that is not one of its linked worktrees, and spawns nothing', async () => {
+    test('AC18 — workspaces.teardown refuses a project that is not in Cockpit and a path that is not one of its linked worktrees, and spawns nothing', async () => {
       const { page } = session;
       writeConfig(repo, { setup: ['sh "$COCKPIT_ROOT_PATH/waitfor.sh" never-18'], teardown: ['sh "$COCKPIT_ROOT_PATH/waitfor.sh" never-18'] });
       const elsewhere = join(repo.parent, 'not-a-worktree');
       mkdirSync(elsewhere);
 
-      // COCKPIT-57: only the teardown runs through runCommands; the setup is `cockpit setup`.
-      for (const which of ['teardown'] as const) {
-        expect(await runCommandsApi(page, '/no/such/project', '/no/such/project/ws', which)).toEqual({
-          status: 'refused',
-          message: '/no/such/project is not a project in Cockpit.',
-        });
-        expect(await runCommandsApi(page, repo.root, elsewhere, which)).toEqual({
-          status: 'refused',
-          message: `${elsewhere} is not a workspace of ${repo.name}.`,
-        });
-        // The main working tree is the project, not a workspace.
-        expect(await runCommandsApi(page, repo.root, repo.root, which)).toEqual({
-          status: 'refused',
-          message: `${repo.root} is not a workspace of ${repo.name}.`,
-        });
-      }
+      expect(await teardownApi(page, '/no/such/project', '/no/such/project/ws')).toEqual({
+        status: 'refused',
+        message: '/no/such/project is not a project in Cockpit.',
+      });
+      expect(await teardownApi(page, repo.root, elsewhere)).toEqual({
+        status: 'refused',
+        message: `${elsewhere} is not a workspace of ${repo.name}.`,
+      });
+      // The main working tree is the project, not a workspace.
+      expect(await teardownApi(page, repo.root, repo.root)).toEqual({
+        status: 'refused',
+        message: `${repo.root} is not a workspace of ${repo.name}.`,
+      });
 
       // The daemon answers in order: once it ran a probe shell it has handled any spawn the calls would have sent.
       await ptyHostPid(page);
@@ -3865,6 +3865,8 @@ describe('built app with no git on the login shell PATH', () => {
 const STUB_HARNESS = `#!/bin/sh
 #VERSION_LOG#
 if [ "$1" = "--version" ]; then [ -e "$0.slow" ] && sleep 1; echo 9.9.9; exit 0; fi
+# With a "<stub>.ignore-hup" file the stub ignores SIGHUP and outlives its terminal (COCKPIT-57 AC14).
+[ -e "$0.ignore-hup" ] && trap '' HUP
 # The launch as it reached the process: its arguments, one per line, then the OpenCode config variable.
 printf '%s\\n' "$@" "OPENCODE_CONFIG_CONTENT=\${OPENCODE_CONFIG_CONTENT-unset}" > "$0.launch.$$"
 # What the session status feature adds before the other arguments (session status, COCKPIT-36) is
@@ -3898,6 +3900,8 @@ while IFS= read -r line; do
     *) echo "got:$line" ;;
   esac
 done
+
+if [ -e "$0.ignore-hup" ]; then while :; do sleep 1; done; fi
 `;
 
 interface SessionsFixture {
@@ -3964,7 +3968,7 @@ function makeSessionsFixture(
     // Started as a login shell with no command (`-l`) it returns at once, unless the test made the file
     // `interactive` in `root`: it is then an interactive /bin/sh with a prompt of its own, which is
     // where `cockpit setup` leaves the user (COCKPIT-57).
-    `#!/bin/sh\n[ "$1" = --warmup ] && exit 0\necho "$*" >> '${shellLog}'\n[ "$*" = -l ] && [ -e '${root}/interactive' ] && { PS1='login-shell> '; export PS1; exec /bin/sh -i; }\nPATH='${bin}:/usr/bin:/bin' /bin/sh -c "$2"\n`,
+    `#!/bin/sh\n[ "$1" = --warmup ] && exit 0\necho "$*" >> '${shellLog}'\n[ -e '${root}/ignore-hup' ] && trap '' HUP\n[ "$*" = -l ] && [ -e '${root}/interactive' ] && { PS1='login-shell> '; export PS1; exec /bin/sh -i; }\nPATH='${bin}:/usr/bin:/bin' /bin/sh -c "$2"\n`,
   );
   chmodSync(shell, 0o755);
   execFileSync(shell, ['--warmup']);
@@ -5673,6 +5677,113 @@ describe('sessions: built app', () => {
       // The app was launched with a sentinel COCKPIT_SESSION_ID that a terminal does not inherit: a report
       // for it would have been refused by the daemon, and nothing was logged.
       await expectNoErrors(session);
+    }, 60_000);
+
+    // AC14: what a deleted workspace or a removed project leaves behind. The process tree is read
+    // while it is alive (the pids come from the stub's own output and from the shell's `$$`, never from
+    // a pattern that also matches the CLI's command line), and every pid of it must be gone 5 s after.
+    const processTable = () =>
+      execFileSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8' })
+        .split('\n')
+        .map((line) => line.trim().split(/\s+/).map(Number))
+        .filter((pair) => pair.length === 2 && pair.every(Number.isInteger)) as Array<[pid: number, ppid: number]>;
+    const parentOf = (pid: number) => processTable().find(([found]) => found === pid)?.[1];
+    const commandOf = (pid: number) => execFileSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' }).trim();
+    const descendantsOf = (root: number) => {
+      const table = processTable();
+      const found: number[] = [];
+      for (const queue = [root]; queue.length > 0; ) {
+        const parent = queue.shift()!;
+        for (const [pid, ppid] of table) if (ppid === parent && !found.includes(pid)) (found.push(pid), queue.push(pid));
+      }
+      return found;
+    };
+    // The `cockpit setup …` process that is the parent of `pid`, and the pids of its whole tree.
+    const cliTreeAbove = (pid: number) => {
+      const cli = parentOf(pid)!;
+      expect(commandOf(cli).startsWith(`${REPOSITORY_CLI} setup `), `the parent of ${pid} is the CLI: ${commandOf(cli)}`).toBe(true);
+      return { cli, tree: [cli, ...descendantsOf(cli)] };
+    };
+    const stillAliveAfter = async (pids: number[], timeout = 5_000) =>
+      (await poll(() => pids.filter((pid) => isAlive(pid)), (alive) => alive.length === 0, timeout)).map((pid) => `${pid} ${commandOf(pid)}`);
+
+    test('AC14 — deleting the workspace of a session whose agent runs (and ignores SIGHUP) leaves no process: the CLI and the agent are gone within 5 s', async () => {
+      const { page } = session;
+      await removeAllWorkspaces();
+      writeConfig(repo, { setup: ['echo before-agent'] });
+      const ignoring = join(fx.bin, 'claude.ignore-hup');
+      writeFileSync(ignoring, '');
+      let tree: number[] = [];
+      try {
+        const { path } = await createWorkspaceWithSetup('kill-agent', 'p14');
+        const stub = await readStub(page);
+        const above = cliTreeAbove(stub.pid);
+        const cli = above.cli;
+        tree = above.tree;
+        expect(tree, 'the agent is under the CLI').toContain(stub.pid);
+        expect(isAlive(stub.pid)).toBe(true);
+
+        await startDeletion(page, path);
+        const dialog = deleteDialog(page, 'Delete kill-agent?');
+        await dialog.waitFor({ timeout: UI_TIMEOUT });
+        await dialog.getByRole('button', { name: 'Delete', exact: true }).click({ timeout: UI_TIMEOUT });
+        await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
+        await waitForEntries(page, [repo.root]);
+
+        expect((await stillAliveAfter(tree)).join(' | '), `the CLI ${cli} and everything under it`).toBe('');
+      } finally {
+        rmSync(ignoring, { force: true });
+        // A stub that ignores SIGHUP and outlived the test would run forever.
+        for (const pid of tree) {
+          try {
+            process.kill(pid, 'SIGKILL');
+          } catch {
+            // Already gone.
+          }
+        }
+      }
+    }, 60_000);
+
+    test('AC14 — removing the project of a session whose setup failed leaves no process: the CLI and the login shell it left (which ignores SIGHUP) are gone within 5 s', async () => {
+      const { page } = session;
+      await removeAllWorkspaces();
+      writeConfig(repo, { setup: ['exit 7'] });
+      const ignoring = join(fx.root, 'ignore-hup');
+      writeFileSync(ignoring, '');
+      let tree: number[] = [];
+      try {
+        const { path } = await createWorkspaceWithSetup('kill-shell', 'p14b');
+        await waitForRow(page, '✗ Setup failed: exit 7 exited with code 7');
+        await waitForRow(page, loginPrompt);
+        await focusTerminal(page);
+        await typeLine(page, 'echo shell-pid:$$');
+        await waitForRow(page, /^shell-pid:\d+$/);
+        const shellPid = Number((await terminalRows(page)).find((row) => /^shell-pid:\d+$/.test(row))!.slice('shell-pid:'.length));
+        const above = cliTreeAbove(shellPid);
+        const cli = above.cli;
+        tree = above.tree;
+        expect(tree, 'the login shell is under the CLI').toContain(shellPid);
+        expect(stubPids(fx).filter((pid) => tree.includes(pid)), 'the agent never started').toEqual([]);
+
+        try {
+          await removeThroughMenu(page, repo.root);
+          await waitForEntries(page, []);
+
+          expect((await stillAliveAfter(tree)).join(' | '), `the CLI ${cli} and the login shell ${shellPid}`).toBe('');
+        } finally {
+          await addRepository(session, repo);
+        }
+        expect(linkedWorktrees(repo).map((worktree) => worktree.path)).toContain(path);
+      } finally {
+        rmSync(ignoring, { force: true });
+        for (const pid of tree) {
+          try {
+            process.kill(pid, 'SIGKILL');
+          } catch {
+            // Already gone.
+          }
+        }
+      }
     }, 60_000);
   });
 
