@@ -47,7 +47,7 @@ const api: Api = {
         if (watch === latestWatch) ipcRenderer.send('workspaces:unwatch');
       };
     },
-    runCommands: (project, path, which, size) => ipcRenderer.invoke('workspaces:run-commands', project, path, which, size),
+    teardown: (project, path, size) => ipcRenderer.invoke('workspaces:teardown', project, path, size),
     status: (project, path) => ipcRenderer.invoke('workspaces:status', project, path),
     commit: (project, path, message) => ipcRenderer.invoke('workspaces:commit', project, path, message),
     push: (project, path) => ipcRenderer.invoke('workspaces:push', project, path),

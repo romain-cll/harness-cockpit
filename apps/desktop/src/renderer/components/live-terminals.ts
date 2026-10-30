@@ -5,12 +5,12 @@ import type {
   AttachedTerminal,
   ListedTerminal,
   PtyExit,
-  RunCommandsResult,
   SessionEvent,
   SessionStatus,
   SetupState,
   StartSessionOptions,
   StartSessionResult,
+  TeardownResult,
 } from '../../shared/api';
 import { exitMessage, readTheme } from './terminal';
 
@@ -305,10 +305,10 @@ export async function runWorkspaceTeardown(
   project: string,
   path: string,
 ): Promise<{ status: 'none' } | { status: 'refused'; message: string } | { status: 'started'; entry: LiveTerminal; exit: Promise<PtyExit> }> {
-  // What `workspaces.runCommands` answered, which the terminal's start cannot return.
-  const answer: { result?: RunCommandsResult } = {};
+  // What `workspaces.teardown` answered, which the terminal's start cannot return.
+  const answer: { result?: TeardownResult } = {};
   const { entry, started, exit } = createLiveTerminal(async (size) => {
-    const result = await window.api.workspaces.runCommands(project, path, 'teardown', size);
+    const result = await window.api.workspaces.teardown(project, path, size);
     answer.result = result;
     if (result.status !== 'started') throw new Error(result.status === 'refused' ? result.message : 'no commands to run');
     return result.ptyId;

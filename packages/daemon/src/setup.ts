@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { basename } from 'node:path';
 import { harnesses } from '@cockpit/harnesses';
 import { readWorkspaceConfig, shellInvocation } from '@cockpit/workspaces';
@@ -53,19 +53,72 @@ function run(command: string, args: string[], cwd: string, env: NodeJS.ProcessEn
 const describe = ({ code, signal, error }: Outcome) =>
   error !== undefined ? `could not start: ${error}` : signal !== null ? `was killed by ${signal}` : `exited with code ${code}`;
 
+/** How long the processes under the CLI have to end after a hangup before they are killed. */
+const HANGUP_GRACE_MS = 300;
+
+/** The pids of every process under `root` (its children, theirs, whatever their process group). */
+function descendantsOf(root: number): number[] {
+  const table = spawnSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8' }).stdout ?? '';
+  const children = new Map<number, number[]>();
+  for (const line of table.split('\n')) {
+    const [pid, ppid] = line.trim().split(/\s+/).map(Number);
+    if (pid !== undefined && ppid !== undefined && Number.isInteger(pid) && Number.isInteger(ppid)) children.set(ppid, [...(children.get(ppid) ?? []), pid]);
+  }
+  const found: number[] = [];
+  for (const queue = [root]; queue.length > 0; ) {
+    for (const pid of children.get(queue.shift()!) ?? []) {
+      found.push(pid);
+      queue.push(pid);
+    }
+  }
+  return found;
+}
+
+const signal = (pid: number, name: NodeJS.Signals | 0) => {
+  try {
+    process.kill(pid, name);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * The terminal hung up on the CLI (the daemon kills a terminal with SIGHUP, then SIGKILL on the pid
+ * alone a second later), or it was told to end: everything under it gets the same signal, whatever
+ * its process group (an interactive shell makes its own), then SIGKILL after a short grace, and the
+ * CLI exits. Done synchronously, so no child's end moves the run on to its next step meanwhile, and
+ * well before the daemon's SIGKILL, after which the children would be orphans.
+ */
+function endChildren(name: 'SIGHUP' | 'SIGTERM', code: number): never {
+  const children = descendantsOf(process.pid);
+  for (const pid of children) signal(pid, name);
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  for (const deadline = Date.now() + HANGUP_GRACE_MS; Date.now() < deadline && children.some((pid) => signal(pid, 0)); ) Atomics.wait(pause, 0, 0, 20);
+  for (const pid of new Set([...children, ...descendantsOf(process.pid)])) signal(pid, 'SIGKILL');
+  process.exit(code);
+}
+
 /**
  * A terminal's Ctrl+C reaches every process of its foreground group, this one included: the child
- * decides what it does with it, this process must outlive it to report and go on.
+ * decides what it does with it, this process must outlive it to report and go on. A hangup or a
+ * termination ends everything under this process (see `endChildren`).
  */
-async function ignoringInterrupts<T>(work: () => Promise<T>): Promise<T> {
+async function inTerminal<T>(work: () => Promise<T>): Promise<T> {
   const ignore = () => {};
+  const hangUp = () => endChildren('SIGHUP', 129);
+  const terminate = () => endChildren('SIGTERM', 143);
   process.on('SIGINT', ignore);
   process.on('SIGQUIT', ignore);
+  process.on('SIGHUP', hangUp);
+  process.on('SIGTERM', terminate);
   try {
     return await work();
   } finally {
     process.off('SIGINT', ignore);
     process.off('SIGQUIT', ignore);
+    process.off('SIGHUP', hangUp);
+    process.off('SIGTERM', terminate);
   }
 }
 
@@ -124,7 +177,7 @@ async function runShell(io: SetupIo, env: NodeJS.ProcessEnv): Promise<number> {
  * the agent's end) leaves a usable prompt. Resolves to the exit code.
  */
 export function runSetup({ shell, agent }: SetupArguments, io: SetupIo, env: NodeJS.ProcessEnv): Promise<number> {
-  return ignoringInterrupts(async () => {
+  return inTerminal(async () => {
     // Reports go out in order, without holding the run back.
     let sent = Promise.resolve();
     const send = (report: SetupReport) => void (sent = sent.then(() => io.report(report)));
@@ -152,7 +205,7 @@ export function runSetup({ shell, agent }: SetupArguments, io: SetupIo, env: Nod
 
 /** `cockpit teardown`: the teardown commands in the current linked worktree. Resolves to the exit code: 0, or that of the command that failed. */
 export function runTeardown(io: SetupIo, env: NodeJS.ProcessEnv): Promise<number> {
-  return ignoringInterrupts(async () => {
+  return inTerminal(async () => {
     const { failure } = await runCommands('teardown', io, env, () => {});
     if (!failure) return 0;
     io.stdout.write(`✗ Teardown failed: ${failure.reason}\n`);

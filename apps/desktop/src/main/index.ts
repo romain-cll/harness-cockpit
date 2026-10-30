@@ -85,8 +85,8 @@ import type {
   PushResult,
   Refused,
   RemoveWorkspaceResult,
-  RunCommandsResult,
   SessionStatus,
+  TeardownResult,
   StartSessionOptions,
   StartSessionResult,
 } from '../shared/api';
@@ -908,9 +908,9 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
   // The CLI reads the config again and adds the variables it holds; `none` and an invalid config
   // are answered here, so the dialog shows them as before.
   ipcMain.handle(
-    'workspaces:run-commands',
-    (event, project: string, path: string, _which: 'teardown', size: { cols: number; rows: number }): Promise<RunCommandsResult> =>
-      forProject<RunCommandsResult>(event, 'workspaces:run-commands', project, async () => {
+    'workspaces:teardown',
+    (event, project: string, path: string, size: { cols: number; rows: number }): Promise<TeardownResult> =>
+      forProject<TeardownResult>(event, 'workspaces:teardown', project, async () => {
         const endings = endingsOf(event.sender);
         const workspace = await findWorkspace({ project, path });
         if ('status' in workspace) return workspace;

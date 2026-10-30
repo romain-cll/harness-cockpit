@@ -158,10 +158,10 @@ export type PullRequestResult = { status: 'read'; pullRequest: PullRequest | nul
 export type CreatePullRequestResult = { status: 'created'; pullRequest: PullRequest } | Refused;
 
 /**
- * `started`: the commands run in the pty `ptyId`, which the calling window owns. `none`: the config
- * holds no command of that kind.
+ * `started`: the teardown runs in the pty `ptyId`, which the calling window owns. `none`: the config
+ * holds no teardown command.
  */
-export type RunCommandsResult = { status: 'started'; ptyId: number } | { status: 'none' } | Refused;
+export type TeardownResult = { status: 'started'; ptyId: number } | { status: 'none' } | Refused;
 
 /**
  * A run of an agent CLI, in a folder of its own or in a workspace's worktree (`directory`);
@@ -275,12 +275,7 @@ export interface Api {
      * worktree, in a pty owned by the calling window. Refused when the project is not in the app state, the path is
      * not one of its linked worktrees, or the config is invalid.
      */
-    runCommands(
-      project: string,
-      path: string,
-      which: 'teardown',
-      size: { cols: number; rows: number },
-    ): Promise<RunCommandsResult>;
+    teardown(project: string, path: string, size: { cols: number; rows: number }): Promise<TeardownResult>;
 
     /** Where the workspace's branch stands against its upstream. Refused like `changes`. */
     status(project: string, path: string): Promise<BranchStatusResult>;
