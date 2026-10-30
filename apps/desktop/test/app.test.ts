@@ -5694,7 +5694,12 @@ describe('sessions: built app', () => {
       const found: number[] = [];
       for (const queue = [root]; queue.length > 0; ) {
         const parent = queue.shift()!;
-        for (const [pid, ppid] of table) if (ppid === parent && !found.includes(pid)) (found.push(pid), queue.push(pid));
+        for (const [pid, ppid] of table) {
+          if (ppid === parent && !found.includes(pid)) {
+            found.push(pid);
+            queue.push(pid);
+          }
+        }
       }
       return found;
     };
