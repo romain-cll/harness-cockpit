@@ -34,6 +34,11 @@ function RootLayout() {
     window.addEventListener('focus', refresh);
     return () => window.removeEventListener('focus', refresh);
   }, [router]);
+  // A session the sidebar does not list yet (started by another caller than its menus) reported: list again.
+  useEffect(
+    () => window.api.sessions.onStatus((sessionId) => sessions.some(({ id }) => id === sessionId) || void router.invalidate()),
+    [router, sessions],
+  );
   // A clicked notification opens its session's page.
   useEffect(
     () => window.api.sessions.onOpen((sessionId) => void navigate({ to: '/sessions/$sessionId', params: { sessionId } })),

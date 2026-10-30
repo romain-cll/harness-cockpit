@@ -9,7 +9,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
-import { closeLiveTerminal, failureLine, passed, runWorkspaceCommands, type LiveTerminal } from '@/components/live-terminals';
+import { closeLiveTerminal, failureLine, passed, runWorkspaceTeardown, type LiveTerminal } from '@/components/live-terminals';
 import { Terminal } from '@/components/terminal';
 import { Button } from '@/components/ui/button';
 
@@ -47,7 +47,7 @@ export function DeleteWorkspaceDialog({
 
   // Whether the teardown passed (or there was none); otherwise says why in the dialog.
   async function teardown(): Promise<boolean> {
-    const result = await runWorkspaceCommands(project.path, workspace.path, 'teardown');
+    const result = await runWorkspaceTeardown(project.path, workspace.path);
     if (result.status === 'none') return true;
     if (result.status === 'refused') {
       setMessage(result.message);
@@ -64,7 +64,7 @@ export function DeleteWorkspaceDialog({
     // The commands are over: the terminal gives the keyboard back, so Escape closes the dialog (xterm.js would swallow it).
     result.entry.term.blur();
     if (passed(exit)) return true;
-    setMessage(failureLine('Teardown', exit));
+    setMessage(failureLine(exit));
     return false;
   }
 

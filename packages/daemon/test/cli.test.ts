@@ -14,7 +14,8 @@ import { connectTo, listenFake, listenSilent, makeHome, registerCleanup, shellOp
 
 registerCleanup();
 
-const USAGE = 'usage: cockpit status <working|waiting|finished>';
+// COCKPIT-57: the usage lists the three commands (`--shell` stays out of it).
+const USAGE_LINES = ['cockpit status <working|waiting|finished>', 'cockpit setup [--then <command> [args…]]', 'cockpit teardown'];
 const TOKEN = 'a'.repeat(64);
 
 async function runCliWith(argv: string[], env: Record<string, string | undefined>) {
@@ -99,7 +100,9 @@ describe('cockpit usage', () => {
     ['status with no event', ['status']],
     ['status with a value other than the three events', ['status', 'sleeping']],
     ['status working with an extra argument', ['status', 'working', 'extra']],
-  ])('AC4 — %s: the usage on stderr, exit 2, and nothing sent to the daemon', async (_label, argv) => {
+    ['status with a setup event, which only the setup command reports', ['status', 'setup-running']],
+    ['status with exited', ['status', 'exited']],
+  ])('AC12 — %s: the usage on stderr, exit 2, and nothing sent to the daemon', async (_label, argv) => {
     const home = makeHome();
     const files = daemonFiles(home, 1, 'aaaa1111');
     const requests: Array<string | undefined> = [];
@@ -112,7 +115,9 @@ describe('cockpit usage', () => {
     const result = await runCliWith(argv, { COCKPIT_SOCKET: files.socket, COCKPIT_SESSION_ID: 'session-1' });
 
     expect(result.exits).toEqual([2]);
-    expect(result.err.trim()).toBe(USAGE);
+    expect(result.err.startsWith('usage:')).toBe(true);
+    for (const line of USAGE_LINES) expect(result.err).toContain(line);
+    expect(result.err).not.toContain('--shell');
     expect(result.out).toBe('');
     // A request, had there been one, would have reached the server by now.
     await new Promise((resolve) => setTimeout(resolve, 100));

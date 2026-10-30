@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
-import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   connectDaemon,
@@ -13,7 +13,8 @@ import {
   listDaemonFiles,
   PROTOCOL_VERSION,
   type DaemonClient,
-  type SessionEventName,
+  type SessionReport,
+  type SetupState,
   type TerminalExit,
   type TerminalInfo,
   type TerminalKind,
@@ -35,7 +36,6 @@ import {
 } from '@cockpit/state';
 import {
   branchStatus,
-  commandsInvocation,
   commitAll,
   createWorktree,
   fileDiff,
@@ -85,8 +85,8 @@ import type {
   PushResult,
   Refused,
   RemoveWorkspaceResult,
-  RunCommandsResult,
   SessionStatus,
+  TeardownResult,
   StartSessionOptions,
   StartSessionResult,
 } from '../shared/api';
@@ -221,16 +221,31 @@ let state: State;
 // The last status each session reported, as the sidebar shows it.
 const sessionStatuses = new Map<string, SessionStatus>();
 
-// A harness hook reported `event` to a daemon. The window that holds the session's terminal is
-// told of a change; a macOS notification is raised for `waiting` and `finished` when no Cockpit
-// window is focused, and clicking it shows a window (a new one when none is open) on the session's page.
-function reportSessionStatus(sessionId: string, event: SessionEventName): void {
+// A session reported to a daemon: a harness hook (a status), or `cockpit setup` (a setup state, the
+// agent's exit). The window that holds the session's terminal is told of a change; a macOS
+// notification is raised for `waiting` and `finished` when no Cockpit window is focused, and
+// clicking it shows a window (a new one when none is open) on the session's page.
+function reportSessionStatus(report: SessionReport): void {
+  const { sessionId, event } = report;
   const session = state.sessions.find(({ id }) => id === sessionId);
-  if (!session || sessionStatuses.get(sessionId) === event) return;
+  if (!session) return;
+  const terminal = [...terminals.values()].find((each) => each.sessionId === sessionId);
+  const owner = terminal?.owner && !terminal.owner.isDestroyed() ? terminal.owner : undefined;
 
-  sessionStatuses.set(sessionId, event);
-  const owner = [...terminals.values()].find((terminal) => terminal.sessionId === sessionId)?.owner;
-  if (owner && !owner.isDestroyed()) owner.send('sessions:status', sessionId, event);
+  if (report.event === 'exited') {
+    if (terminal) terminal.exitCode = report.exitCode;
+    owner?.send('sessions:status', sessionId, event, report.exitCode);
+    return;
+  }
+  if (report.event.startsWith('setup-')) {
+    if (terminal) terminal.setup = report.event.slice('setup-'.length) as SetupState;
+    owner?.send('sessions:status', sessionId, event);
+    return;
+  }
+
+  if (sessionStatuses.get(sessionId) === event) return;
+  sessionStatuses.set(sessionId, event as SessionStatus);
+  owner?.send('sessions:status', sessionId, event);
   if (event === 'working' || BrowserWindow.getFocusedWindow()) return;
 
   const notification = new Notification({ title: session.name, body: event === 'waiting' ? 'Needs input' : 'Ready' });
@@ -249,12 +264,13 @@ function reportSessionStatus(sessionId: string, event: SessionEventName): void {
 
 // The environment of a terminal or a session: the login shell's, without the session variables
 // the app itself may have inherited (launched from a Cockpit session) and the daemon's
-// `ELECTRON_RUN_AS_NODE`, with `COCKPIT_SOCKET` (the daemon's socket) and `extra` on top (a
-// session's own variables).
+// `ELECTRON_RUN_AS_NODE`, with `COCKPIT_SOCKET` (the daemon's socket), the `cockpit` CLI's folder
+// first on `PATH` and `extra` on top (a session's own variables).
 async function terminalEnv(extra: Record<string, string> = {}): Promise<Record<string, string>> {
   const env = { ...(await shellEnv) };
   for (const name of ['COCKPIT_SESSION_ID', 'COCKPIT_WORKSPACE_PATH', 'COCKPIT_SOCKET', 'ELECTRON_RUN_AS_NODE']) delete env[name];
   env.COCKPIT_SOCKET = ownFiles.socket;
+  env.PATH = [dirname(cliPath), env.PATH].filter(Boolean).join(':');
   return { ...env, TERM: 'xterm-256color', COLORTERM: 'truecolor', ...extra };
 }
 
@@ -347,7 +363,7 @@ async function adopt(client: DaemonClient): Promise<Daemon> {
     if (terminal?.owner && !terminal.owner.isDestroyed()) terminal.owner.send('pty:data', terminal.appId, data, seq);
   });
   client.onExit(({ id, exitCode, signal }) => end(daemon, id, { exitCode, signal }));
-  client.onStatus(({ sessionId, event }) => reportSessionStatus(sessionId, event));
+  client.onStatus(reportSessionStatus);
   client.onClose(() => {
     daemon.alive = false;
     for (const remote of daemon.terminals.keys()) end(daemon, remote, { exitCode: null, signal: null });
@@ -501,10 +517,10 @@ function startTerminals() {
   // Setup and teardown runs end with their page and are not listed.
   ipcMain.handle('pty:list', (event): ListedTerminal[] => {
     if (!isFromApp(event)) throw new Error('pty:list refused: unexpected origin');
-    return [...terminals.values()].flatMap(({ appId, kind, cwd, cols, rows, sessionId, workspace, closing }) => {
+    return [...terminals.values()].flatMap(({ appId, kind, cwd, cols, rows, sessionId, workspace, setup, exitCode, closing }) => {
       if (kind === 'commands' || closing) return [];
       const status = sessionId === undefined ? undefined : sessionStatuses.get(sessionId);
-      return [{ id: appId, kind, cwd, cols, rows, ...(sessionId !== undefined && { sessionId }), ...(workspace !== undefined && { workspace }), ...(status && { status }) }];
+      return [{ id: appId, kind, cwd, cols, rows, ...(sessionId !== undefined && { sessionId }), ...(workspace !== undefined && { workspace }), ...(status && { status }), ...(setup && { setup }), ...(exitCode !== undefined && { exitCode }) }];
     });
   });
 
@@ -888,23 +904,22 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
     if (isFromApp(event)) unwatch(event.sender);
   });
 
-  // Runs the setup or teardown commands of a workspace in a pty owned by the calling window, in the
-  // worktree, with the login-shell environment and the variables the config adds.
+  // Runs `cockpit teardown` for a workspace in a pty owned by the calling window, in the worktree.
+  // The CLI reads the config again and adds the variables it holds; `none` and an invalid config
+  // are answered here, so the dialog shows them as before.
   ipcMain.handle(
-    'workspaces:run-commands',
-    (event, project: string, path: string, which: 'setup' | 'teardown', size: { cols: number; rows: number }): Promise<RunCommandsResult> =>
-      forProject<RunCommandsResult>(event, 'workspaces:run-commands', project, async () => {
+    'workspaces:teardown',
+    (event, project: string, path: string, size: { cols: number; rows: number }): Promise<TeardownResult> =>
+      forProject<TeardownResult>(event, 'workspaces:teardown', project, async () => {
         const endings = endingsOf(event.sender);
         const workspace = await findWorkspace({ project, path });
         if ('status' in workspace) return workspace;
-        const env = await shellEnv;
-        const config = await readWorkspaceConfig({ repo: project, path, env });
-        if (config[which].length === 0) return { status: 'none' };
-        const { command, args } = commandsInvocation(config[which]);
+        const config = await readWorkspaceConfig({ repo: project, path, env: await shellEnv });
+        if (config.teardown.length === 0) return { status: 'none' };
         try {
           const ptyId = await spawnFor(
             event.sender,
-            { ...size, command, args, cwd: path, env: { ...env, TERM: 'xterm-256color', COLORTERM: 'truecolor', ...config.env } },
+            { ...size, command: cliPath, args: ['teardown'], cwd: path, env: await terminalEnv() },
             { kind: 'commands', before: endings },
           );
           return { status: 'started', ptyId };
@@ -981,9 +996,20 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
         // The harness is told, through its arguments and environment, to report its status to the daemon.
         const status = await statusLaunch(harness.id, { cli: cliPath, pluginsDir: join(cockpitHome, 'plugins'), env });
         env = status.env as Record<string, string>;
+        // From the New workspace dialog the terminal runs `cockpit setup`, which runs the repository's
+        // setup, then the agent, then the login shell. The agent follows `--then` by the path detection
+        // found, so that binary is the one that runs.
+        const viaSetup = workspace && options?.setup;
+        const agentArgs = [...status.args, ...harness.start(prompt)];
         ptyId = await spawnFor(
           event.sender,
-          { ...size, command: found.path, args: [...status.args, ...harness.start(prompt)], cwd: directory, env },
+          {
+            ...size,
+            command: viaSetup ? cliPath : found.path,
+            args: viaSetup ? ['setup', '--shell', '--then', found.path, ...agentArgs] : agentArgs,
+            cwd: directory,
+            env,
+          },
           { kind: 'session', sessionId: id, workspace: workspace?.path, before: endings },
         );
         const session = {

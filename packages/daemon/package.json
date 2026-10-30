@@ -16,6 +16,8 @@
     "lint": "oxlint"
   },
   "dependencies": {
+    "@cockpit/harnesses": "workspace:*",
+    "@cockpit/workspaces": "workspace:*",
     "node-pty": "1.2.0-beta.15"
   },
   "devDependencies": {

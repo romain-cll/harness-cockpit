@@ -32,6 +32,10 @@ export interface ListedTerminal {
   sessionId?: string;
   workspace?: string;
   status?: SessionStatus;
+  /** The last setup state `cockpit setup` reported. */
+  setup?: SetupState;
+  /** How the agent ended, once `cockpit setup` reported it (`null` for a signal). */
+  exitCode?: number | null;
 }
 
 /**
@@ -154,10 +158,10 @@ export type PullRequestResult = { status: 'read'; pullRequest: PullRequest | nul
 export type CreatePullRequestResult = { status: 'created'; pullRequest: PullRequest } | Refused;
 
 /**
- * `started`: the commands run in the pty `ptyId`, which the calling window owns. `none`: the config
- * holds no command of that kind.
+ * `started`: the teardown runs in the pty `ptyId`, which the calling window owns. `none`: the config
+ * holds no teardown command.
  */
-export type RunCommandsResult = { status: 'started'; ptyId: number } | { status: 'none' } | Refused;
+export type TeardownResult = { status: 'started'; ptyId: number } | { status: 'none' } | Refused;
 
 /**
  * A run of an agent CLI, in a folder of its own or in a workspace's worktree (`directory`);
@@ -174,16 +178,24 @@ export interface Session {
   project?: string;
 }
 
+/** What a session's agent reported through its hooks; the values of the daemon's session events. */
+export type SessionStatus = 'working' | 'waiting' | 'finished';
+
+/** What `cockpit setup` reported of a run; the values of the daemon's `setup-*` events without the prefix. */
+export type SetupState = 'running' | 'done' | 'failed';
+
+/** What a session reports: its agent's status, `cockpit setup`'s states, and the agent's exit. */
+export type SessionEvent = SessionStatus | 'setup-running' | 'setup-done' | 'setup-failed' | 'exited';
+
 /**
  * `workspace`: run in that linked worktree of a project instead of a new folder. `prompt`: the
  * harness's initial prompt (trimmed; blank means none).
  */
-/** What a session's agent reported through its hooks; the values of the daemon's session events. */
-export type SessionStatus = 'working' | 'waiting' | 'finished';
-
 export interface StartSessionOptions {
   workspace?: { project: string; path: string };
   prompt?: string;
+  /** Run `cockpit setup` in the workspace first, then the agent, then the login shell. */
+  setup?: boolean;
 }
 
 /** A detected agent CLI the user can start a session with. */
@@ -259,16 +271,11 @@ export interface Api {
     watch(project: string, path: string, listener: () => void): Promise<() => void>;
 
     /**
-     * Runs the `setup` or `teardown` commands of the repository's `.cockpit/config.json` in the worktree,
-     * in a pty owned by the calling window. Refused when the project is not in the app state, the path is
+     * Runs `cockpit teardown` (the `teardown` commands of the repository's `.cockpit/config.json`) in the
+     * worktree, in a pty owned by the calling window. Refused when the project is not in the app state, the path is
      * not one of its linked worktrees, or the config is invalid.
      */
-    runCommands(
-      project: string,
-      path: string,
-      which: 'setup' | 'teardown',
-      size: { cols: number; rows: number },
-    ): Promise<RunCommandsResult>;
+    teardown(project: string, path: string, size: { cols: number; rows: number }): Promise<TeardownResult>;
 
     /** Where the workspace's branch stands against its upstream. Refused like `changes`. */
     status(project: string, path: string): Promise<BranchStatusResult>;
@@ -292,8 +299,11 @@ export interface Api {
      * Refused when the project is not in the app state or the path is not one of its linked worktrees.
      */
     start(harness: string, size: { cols: number; rows: number }, options?: StartSessionOptions): Promise<StartSessionResult>;
-    /** Calls `listener` each time a session of this window reports a status; returns the unsubscribe function. */
-    onStatus(listener: (sessionId: string, status: SessionStatus) => void): () => void;
+    /**
+     * Calls `listener` each time a session of this window reports (a status, a setup state, the agent's exit,
+     * whose `exitCode` is then given); returns the unsubscribe function.
+     */
+    onStatus(listener: (sessionId: string, event: SessionEvent, exitCode?: number | null) => void): () => void;
     /** Calls `listener` with the id of the session whose notification the user clicked. */
     onOpen(listener: (sessionId: string) => void): () => void;
   };

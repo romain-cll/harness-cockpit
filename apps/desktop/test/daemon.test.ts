@@ -248,13 +248,15 @@ async function pagesOf(session: Session): Promise<Page[]> {
 const windowUrls = (session: Session) =>
   session.evaluateInMain<string[]>(`require('electron').BrowserWindow.getAllWindows().map((window) => window.webContents.getURL())`);
 
-// A git repository with a setup command that stays running, for the `commands` terminals.
-function makeRepoWithSetup(): { parent: string; root: string } {
+// A git repository with a teardown command that stays running, for the `commands` terminals (COCKPIT-57:
+// only the teardown runs as one; the setup is `cockpit setup`, in the session's own terminal), or with
+// the given `.cockpit/config.json`.
+function makeRepoWithSetup(config: unknown = { teardown: ['echo setup-running; exec sleep 300'] }): { parent: string; root: string } {
   const parent = realpathSync(makeTestDir('r-'));
   const root = join(parent, 'proj');
   mkdirSync(join(root, '.cockpit'), { recursive: true });
   writeFileSync(join(root, 'README.md'), 'hello\n');
-  writeFileSync(join(root, '.cockpit', 'config.json'), JSON.stringify({ setup: ['echo setup-running; exec sleep 300'] }));
+  writeFileSync(join(root, '.cockpit', 'config.json'), JSON.stringify(config));
   const git = (...args: string[]) =>
     execFileSync('git', args, { cwd: root, env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
   git('init', '-b', 'main');
@@ -288,7 +290,7 @@ async function startSetup(session: Session, repo: { root: string }, name: string
     Boolean,
     UI_TIMEOUT,
   );
-  const started = await page.evaluate(([root, path]) => (window as unknown as ApiWindow).api.workspaces!.runCommands!(root, path, 'setup', { cols: 80, rows: 24 }), [repo.root, path!] as const);
+  const started = await page.evaluate(([root, path]) => (window as unknown as ApiWindow).api.workspaces!.teardown!(root, path, { cols: 80, rows: 24 }), [repo.root, path!] as const);
   expect(started.status).toBe('started');
   const sleeper = await poll(
     () => execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' }).split('\n').find((line) => line.trim().endsWith('sleep 300')),
@@ -547,6 +549,83 @@ describe('daemon: built app', () => {
     expect(daemonFile(home, 'sock', newer)).toBeDefined();
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
   });
+});
+
+// --- Built app: the setup state and the agent's exit survive a relaunch (COCKPIT-57) ---------------
+
+describe('daemon: built app, setup states and agent exits after a relaunch', () => {
+  let fx: Fixture;
+  let dataDir: string;
+  let home: string;
+  let env: NodeJS.ProcessEnv;
+  let session: Session | undefined;
+  let repo: { parent: string; root: string } | undefined;
+
+  beforeAll(() => {
+    fx = makeFixture();
+    dataDir = makeDataDir();
+    home = join(dataDir, 'h');
+    env = fx.env({ COCKPIT_TEST_DAEMON_BUILD: uniqueBuild() });
+  });
+
+  afterAll(async () => {
+    await session?.close().catch(() => {});
+    await killDaemonsIn(home);
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(fx.root, { recursive: true, force: true });
+    if (repo) rmSync(repo.parent, { recursive: true, force: true });
+  });
+
+  // The label the workspace's own row shows (`Setting up`, `Setup failed`), null when it shows none.
+  const labelOf = (page: Page, path: string) =>
+    page.evaluate((path) => {
+      const item = [...document.querySelectorAll('aside [title]')].find((element) => element.getAttribute('title') === path)?.closest('li');
+      const leaf = [...(item?.querySelectorAll('*') ?? [])].find(
+        (element) => element.children.length === 0 && !element.closest('a[href*="/sessions/"]') && /^(Setting up|Setup failed)$/.test((element.textContent ?? '').trim()),
+      );
+      return leaf ? (leaf.textContent ?? '').trim() : null;
+    }, path);
+  const expectLabel = async (page: Page, path: string, label: string | null) =>
+    expect(await poll(() => labelOf(page, path), (found) => found === label, UI_TIMEOUT), `the label of ${path}`).toBe(label);
+
+  test('AC6 — a workspace whose setup failed, then reported running again, and a session whose agent exited with code 3, show the same label and the same dot after the app quit and was launched again', async () => {
+    repo = makeRepoWithSetup({ setup: ['exit 6'] });
+    session = await launchBuiltOn(env, dataDir, home);
+    const { page } = session;
+    await page.getByText(versionLabel).waitFor();
+
+    // A workspace and a session in it started as the New workspace dialog does: `cockpit setup`, which fails.
+    await stubPicker(session, repo.root);
+    await page.evaluate(() => (window as unknown as ApiWindow).api.projects!.add!());
+    const created = await page.evaluate(([root, name]) => (window as unknown as ApiWindow).api.workspaces!.create!(root, name, 'main'), [repo.root, 'relaunch-ws'] as const);
+    expect(created.status).toBe('created');
+    const path = (created as { workspace: { path: string } }).workspace.path;
+    const started = await page.evaluate(
+      ([root, path]) =>
+        (window as unknown as ApiWindow).api.sessions!.start!('claude-code', { cols: 80, rows: 24 }, { workspace: { project: root, path }, prompt: 'p', setup: true }),
+      [repo.root, path] as const,
+    );
+    expect(started.status).toBe('started');
+    await expectLabel(page, path, 'Setup failed');
+
+    // The daemon is told the setup runs again (what `cockpit setup` typed in the shell reports).
+    const socket = must(daemonFile(home, 'sock'), 'the daemon sock');
+    expect(await postEvent(socket, tokenFor(socket), { sessionId: started.session.id, event: 'setup-running' })).toBe(204);
+    await expectLabel(page, path, 'Setting up');
+
+    // A plain session whose agent exits with code 3 while its shell goes on.
+    const exiting = await startSession(page);
+    expect(await postEvent(socket, tokenFor(socket), { sessionId: exiting, event: 'exited', exitCode: 3 })).toBe(204);
+    await expectDot(page, exiting, 'Exited 3');
+
+    await quitApp(session);
+    session = await launchBuiltOn(env, dataDir, home);
+    await session.page.getByText(versionLabel).waitFor();
+
+    await expectLabel(session.page, path, 'Setting up');
+    await expectDot(session.page, exiting, 'Exited 3');
+    expect(await dotOf(session.page, started.session.id)).toBeNull();
+  }, 90_000);
 });
 
 describe('daemon: an update with an idle daemon', () => {

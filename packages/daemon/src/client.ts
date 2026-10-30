@@ -12,7 +12,7 @@ import {
   type Hello,
   type Message,
   type Request,
-  type SessionEventName,
+  type SessionReport,
   type SpawnOptions,
   type TerminalExit,
   type TerminalInfo,
@@ -36,8 +36,8 @@ export interface DaemonClient {
   /** A client receives the events of the terminals it spawned or attached. */
   onData(listener: (event: { id: number; seq: number; data: string }) => void): void;
   onExit(listener: (event: { id: number } & TerminalExit) => void): void;
-  /** Every status a hook reported, for any session of the daemon. */
-  onStatus(listener: (event: { sessionId: string; event: SessionEventName }) => void): void;
+  /** Everything a session reported (a hook, `cockpit setup`), for any session of the daemon. */
+  onStatus(listener: (report: SessionReport) => void): void;
   /** The connection ended: the daemon went away, or `close` was called. */
   onClose(listener: () => void): void;
   close(): void;
@@ -158,9 +158,12 @@ function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutM
       case 'exit':
         exitListeners.forEach((listener) => listener({ id: message.terminal, exitCode: message.exitCode, signal: message.signal }));
         break;
-      case 'status':
-        statusListeners.forEach((listener) => listener({ sessionId: message.sessionId, event: message.event }));
+      case 'status': {
+        const { sessionId } = message;
+        const report: SessionReport = message.event === 'exited' ? { sessionId, event: 'exited', exitCode: message.exitCode } : { sessionId, event: message.event };
+        statusListeners.forEach((listener) => listener(report));
         break;
+      }
     }
   };
   const drain = async () => {
