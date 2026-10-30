@@ -997,8 +997,8 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
         const status = await statusLaunch(harness.id, { cli: cliPath, pluginsDir: join(cockpitHome, 'plugins'), env });
         env = status.env as Record<string, string>;
         // From the New workspace dialog the terminal runs `cockpit setup`, which runs the repository's
-        // setup, then the agent, then the login shell. The agent follows `--then` by its binary name,
-        // which the terminal's `PATH` (the one it was detected on) resolves.
+        // setup, then the agent, then the login shell. The agent follows `--then` by the path detection
+        // found, so that binary is the one that runs.
         const viaSetup = workspace && options?.setup;
         const agentArgs = [...status.args, ...harness.start(prompt)];
         ptyId = await spawnFor(
@@ -1006,7 +1006,7 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
           {
             ...size,
             command: viaSetup ? cliPath : found.path,
-            args: viaSetup ? ['setup', '--shell', '--then', harness.binary, ...agentArgs] : agentArgs,
+            args: viaSetup ? ['setup', '--shell', '--then', found.path, ...agentArgs] : agentArgs,
             cwd: directory,
             env,
           },
