@@ -7,7 +7,7 @@ export function PageHeader({ title, children }: { title: string; children?: Reac
   const sidebarHidden = useSidebarCollapsed();
   return (
     // With the sidebar hidden the row leaves room for the window controls, then holds the button that brings it back.
-    <header className={`app-drag flex mb-1 h-7 shrink-0 items-center select-none ${sidebarHidden ? 'pl-16' : ''}`}>
+    <header className={`app-drag flex mb-2 h-7 shrink-0 items-center select-none ${sidebarHidden ? 'pl-16' : ''}`}>
       {sidebarHidden && (
         <Button variant="ghost" size="icon" aria-label="Show sidebar" className="app-no-drag mr-1 font-normal" onClick={toggleSidebar}>
           <PanelLeftOpenIcon />

@@ -271,6 +271,13 @@ const boxOf = (pane: Pane) =>
   });
 type Box = Awaited<ReturnType<typeof boxOf>>;
 
+// The area a terminal's pane is given by its tab's layout: its terminal snaps to whole rows inside it.
+const slotOf = (pane: Pane) =>
+  pane.evaluate((element) => {
+    const { left, top, right, bottom, width, height } = element.closest('.group\\/pane')!.getBoundingClientRect();
+    return { left, top, right, bottom, width, height };
+  });
+
 // Waits until the terminals stop moving: a terminal is refitted to its area a
 // moment after the area changes, and a terminal's box follows its rows.
 async function settle(...panes: Pane[]) {
@@ -1749,18 +1756,25 @@ describe.each([
     await waitForRow(page, 'b-marker-15', b);
     const c = await splitPane(page, b, 'down');
     const cPid = await pidOf(page);
+    // The expected areas come from the panes' own slots, not from the terminals, which snap to whole rows.
     const aBox = await boxOf(a);
-    const bBox = await boxOf(b);
-    const cBox = await boxOf(c);
-    const slot: Box = { left: bBox.left, top: bBox.top, right: cBox.right, bottom: cBox.bottom, width: bBox.width, height: cBox.bottom - bBox.top };
+    const aSlot = await slotOf(a);
+    const bSlot = await slotOf(b);
+    const cSlot = await slotOf(c);
+    const slot: Box = { left: bSlot.left, top: bSlot.top, right: cSlot.right, bottom: cSlot.bottom, width: bSlot.width, height: cSlot.bottom - bSlot.top };
 
     await clickPaneButton(c, 'Close terminal');
 
     expect(await endsWithin(cPid)).toBe(true);
     await poll(async () => (await visiblePanes(page)).length, (count) => count === 2, UI_TIMEOUT);
-    const grown = await poll(() => boxOf(b), (box) => sameArea(box, slot), UI_TIMEOUT);
+    const grown = await poll(() => slotOf(b), (box) => sameArea(box, slot), UI_TIMEOUT);
     expect(sameArea(grown, slot), 'the sibling takes the closed terminal\'s whole area').toBe(true);
+    // Its terminal fills that area, short of it by less than one row (plus the view's padding).
+    const rowHeight = await b.evaluate((element) => element.querySelector('.xterm-rows > div')!.getBoundingClientRect().height);
+    const fills = (box: Box) => box.top >= slot.top && box.bottom <= slot.bottom && slot.height - box.height < rowHeight + 10;
+    expect(fills(await poll(() => boxOf(b), fills, UI_TIMEOUT)), 'the sibling\'s terminal fills its area').toBe(true);
     expect(sameArea(await boxOf(a), aBox), 'the other half is untouched').toBe(true);
+    expect(sameArea(await slotOf(a), aSlot), 'the other half\'s area is untouched').toBe(true);
     expect(await rowsOf(b), 'the sibling keeps its output').toContain('b-marker-15');
     expect(isAlive(aPid)).toBe(true);
     expect(isAlive(bPid)).toBe(true);
@@ -1775,12 +1789,12 @@ describe.each([
     expect((await rowsOf(a)).join('\n')).not.toContain('echo sibling-');
 
     // The layout is now A | B. Closing A, the first child, gives the keyboard to B too.
-    const whole: Box = { left: aBox.left, top: slot.top, right: slot.right, bottom: slot.bottom, width: slot.right - aBox.left, height: slot.height };
+    const whole: Box = { left: aSlot.left, top: slot.top, right: slot.right, bottom: slot.bottom, width: slot.right - aSlot.left, height: slot.height };
     await clickPaneButton(a, 'Close terminal');
 
     expect(await endsWithin(aPid), 'the first child\'s shell ends within 5 s').toBe(true);
     await poll(async () => (await visiblePanes(page)).length, (count) => count === 1, UI_TIMEOUT);
-    const whole2 = await poll(() => boxOf(b), (box) => sameArea(box, whole), UI_TIMEOUT);
+    const whole2 = await poll(() => slotOf(b), (box) => sameArea(box, whole), UI_TIMEOUT);
     expect(sameArea(whole2, whole), 'B takes the whole area').toBe(true);
     expect(isAlive(bPid)).toBe(true);
     const active2 = await poll(() => activePane(page), Boolean, UI_TIMEOUT);
@@ -2817,7 +2831,6 @@ describe.each([
         expect(await entryTitles(page)).toEqual(expect.arrayContaining([other.root, unreadable.root]));
         expect(await isBelowProjectsHeader(page, { text: message })).toBe(true);
         expect(projectsInState(session.dataDir)).toContainEqual({ path: unreadable.root });
-        await sleep(300);
         await expectNoNewErrors(session, mark);
       } finally {
         chmodSync(unreadable.parent, 0o755);
