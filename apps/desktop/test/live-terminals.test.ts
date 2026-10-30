@@ -15,6 +15,7 @@ vi.mock('@xterm/xterm', () => ({
     write(data: string) {
       this.written.push(data);
     }
+    resize() {}
     onData() {}
     onResize() {}
     dispose() {}
@@ -28,7 +29,21 @@ vi.mock('../src/renderer/components/terminal', () => ({
 
 type DataListener = (id: number, data: string) => void;
 type ExitListener = (id: number, exit: { exitCode: number | null; signal: number | null }) => void;
-type StatusListener = (sessionId: string, status: 'working' | 'waiting' | 'finished') => void;
+// COCKPIT-57: the status event also carries the setup states and the agent's exit.
+type StatusEvent = 'working' | 'waiting' | 'finished' | 'setup-running' | 'setup-done' | 'setup-failed' | 'exited';
+type StatusListener = (sessionId: string, event: StatusEvent, exitCode?: number | null) => void;
+interface ListedTerminal {
+  id: number;
+  kind: 'shell' | 'session';
+  cwd: string;
+  cols: number;
+  rows: number;
+  sessionId?: string;
+  workspace?: string;
+  status?: 'working' | 'waiting' | 'finished';
+  setup?: 'running' | 'done' | 'failed';
+  exitCode?: number | null;
+}
 
 const dataListeners: DataListener[] = [];
 const exitListeners: ExitListener[] = [];
@@ -37,6 +52,7 @@ const offData = vi.fn();
 const offExit = vi.fn();
 const kill = vi.fn();
 const start = vi.fn();
+let listed: ListedTerminal[] = [];
 
 beforeEach(() => {
   dataListeners.length = 0;
@@ -46,6 +62,7 @@ beforeEach(() => {
   offExit.mockClear();
   kill.mockClear();
   start.mockReset();
+  listed = [];
   vi.stubGlobal('matchMedia', () => ({ addEventListener() {} }));
   vi.stubGlobal('window', {
     api: {
@@ -55,6 +72,8 @@ beforeEach(() => {
         write() {},
         resize() {},
         kill,
+        list: async () => listed,
+        attach: async () => ({ cols: 80, rows: 24, screen: '', seq: 0 }),
       },
       sessions: { start, onStatus: (listener: StatusListener) => (statusListeners.push(listener), () => {}) },
     },
@@ -73,6 +92,9 @@ interface Store {
   subscribe(listener: () => void): () => void;
   /** Session id -> accessible name of its dot; a running session that reported nothing has none. */
   getSessionDots(): ReadonlyMap<string, string>;
+  /** Workspace path -> `running` or `failed`, from the running sessions' last setup state; a done setup has no entry. */
+  getWorkspaceSetups(): ReadonlyMap<string, 'running' | 'failed'>;
+  restoreTerminals(): Promise<unknown>;
 }
 
 // A variable specifier: the test project does not include the app sources, so tsc leaves it alone.
@@ -168,8 +190,8 @@ describe('session dots', () => {
     return store;
   }
 
-  const report = (sessionId: string, status: 'working' | 'waiting' | 'finished') => {
-    for (const listener of statusListeners) listener(sessionId, status);
+  const report = (sessionId: string, status: StatusEvent, exitCode?: number | null) => {
+    for (const listener of statusListeners) listener(sessionId, status, exitCode);
   };
 
   test('AC9 — a running session that has reported nothing has no dot', async () => {
@@ -224,5 +246,134 @@ describe('session dots', () => {
 
     expect(getSessionDots().get('s1')).toBe(dot);
     expect(getSessionDots().get('s2')).toBe('Needs input');
+  });
+});
+
+// COCKPIT-57: `exited` (the agent ended, the shell `cockpit setup` leaves goes on) and the setup states
+// come with the session statuses, from `sessions.onStatus` and, after a reload, from `pty.list`.
+//
+// Interface the tests assume: `onStatus(listener)` calls `listener(sessionId, event, exitCode?)` with
+// `event` one of the three statuses, `setup-running`, `setup-done`, `setup-failed` or `exited` (with
+// the exit code, `null` for a signal); `pty.list()` entries carry `workspace`, `setup` and `exitCode`;
+// `getWorkspaceSetups()` is a `ReadonlyMap` replaced, never mutated, on every change, keyed by the
+// session's directory (a workspace's worktree).
+describe('agent exit and setup states', () => {
+  beforeEach(() => vi.resetModules());
+
+  const workspaceSession = (id: string, directory: string) => ({
+    id,
+    name: `Claude Code ${id}`,
+    harness: 'claude-code',
+    directory,
+    project: '/p',
+    createdAt: '2026-10-30T10:00:00.000Z',
+  });
+
+  async function startedStore(...sessions: Array<[id: string, ptyId: number, directory: string]>) {
+    const store = await loadStore();
+    for (const [id, ptyId, directory] of sessions) {
+      start.mockResolvedValueOnce({ status: 'started', ptyId, session: workspaceSession(id, directory) });
+      await store.startSession('claude-code', { workspace: { project: '/p', path: directory } });
+    }
+    return store;
+  }
+
+  const report = (sessionId: string, event: StatusEvent, exitCode?: number | null) => {
+    for (const listener of statusListeners) listener(sessionId, event, exitCode);
+  };
+
+  test.each([
+    ['code 3', 3, 'Exited 3'],
+    ['code 0', 0, 'Ended'],
+    ['a signal (no code)', null, 'Ended'],
+  ])('AC5 — exited with %s sets the dot at once, whatever it reported before, and a later pty exit (the shell the agent left) leaves it', async (_label, exitCode, dot) => {
+    const { getSessionDots } = await startedStore(['s1', 7, '/w1']);
+    report('s1', 'working');
+
+    report('s1', 'exited', exitCode);
+    expect(getSessionDots().get('s1')).toBe(dot);
+
+    for (const code of [0, 5]) {
+      for (const listener of exitListeners) listener(7, { exitCode: code, signal: null });
+      expect(getSessionDots().get('s1'), `after the shell exited with ${code}`).toBe(dot);
+    }
+  });
+
+  test('AC5 — without an exited report, the pty exit still sets the dot as before', async () => {
+    const { getSessionDots } = await startedStore(['s1', 7, '/w1']);
+
+    for (const listener of exitListeners) listener(7, { exitCode: 3, signal: null });
+
+    expect(getSessionDots().get('s1')).toBe('Exited 3');
+  });
+
+  test('AC2, AC3 — setup-running gives the workspace "running", setup-failed "failed", setup-done nothing; each change replaces the snapshot and notifies, and another workspace is untouched', async () => {
+    const { getWorkspaceSetups, subscribe } = await startedStore(['s1', 7, '/w1'], ['s2', 8, '/w2']);
+    const changed = vi.fn();
+    subscribe(changed);
+    expect(getWorkspaceSetups().size).toBe(0);
+
+    const seen: Array<string | undefined> = [];
+    for (const event of ['setup-running', 'setup-failed', 'setup-running', 'setup-done'] as const) {
+      const before = getWorkspaceSetups();
+      report('s1', event);
+      seen.push(getWorkspaceSetups().get('/w1'));
+      expect(getWorkspaceSetups()).not.toBe(before);
+    }
+
+    expect(seen).toEqual(['running', 'failed', 'running', undefined]);
+    expect(getWorkspaceSetups().has('/w2')).toBe(false);
+    expect(changed).toHaveBeenCalledTimes(4);
+  });
+
+  test('AC2 — a report for a session the store does not hold changes no setup', async () => {
+    const { getWorkspaceSetups } = await startedStore(['s1', 7, '/w1']);
+
+    expect(() => report('unknown', 'setup-running')).not.toThrow();
+
+    expect(getWorkspaceSetups().size).toBe(0);
+  });
+
+  test('AC3 — a session whose terminal ended drops its setup state', async () => {
+    const { getWorkspaceSetups } = await startedStore(['s1', 7, '/w1'], ['s2', 8, '/w2']);
+    report('s1', 'setup-failed');
+    report('s2', 'setup-running');
+    expect(Object.fromEntries(getWorkspaceSetups())).toEqual({ '/w1': 'failed', '/w2': 'running' });
+
+    for (const listener of exitListeners) listener(7, { exitCode: 0, signal: null });
+
+    expect(Object.fromEntries(getWorkspaceSetups())).toEqual({ '/w2': 'running' });
+  });
+
+  test('AC6 — after a reload, restoring seeds the dots and the setup states from pty.list: the setup state, and the exit of an agent that left its shell running', async () => {
+    const entry = (id: number, sessionId: string, workspace: string, extra: Partial<ListedTerminal> = {}): ListedTerminal => ({
+      id,
+      kind: 'session',
+      cwd: workspace,
+      cols: 80,
+      rows: 24,
+      sessionId,
+      workspace,
+      ...extra,
+    });
+    listed = [
+      entry(7, 's1', '/w1', { setup: 'failed' }),
+      entry(8, 's2', '/w2', { setup: 'running' }),
+      entry(9, 's3', '/w3', { setup: 'done', status: 'working' }),
+      entry(10, 's4', '/w4', { setup: 'done', exitCode: 3 }),
+      entry(11, 's5', '/w5', { setup: 'done', exitCode: null }),
+    ];
+    const { restoreTerminals, getWorkspaceSetups, getSessionDots } = await loadStore();
+
+    await restoreTerminals();
+
+    expect(Object.fromEntries(getWorkspaceSetups())).toEqual({ '/w1': 'failed', '/w2': 'running' });
+    expect(getSessionDots().get('s3')).toBe('Working');
+    expect(getSessionDots().get('s4')).toBe('Exited 3');
+    expect(getSessionDots().get('s5')).toBe('Ended');
+    expect(getSessionDots().has('s1')).toBe(false);
+    // The shell of s4 exiting later leaves the dot.
+    for (const listener of exitListeners) listener(10, { exitCode: 0, signal: null });
+    expect(getSessionDots().get('s4')).toBe('Exited 3');
   });
 });

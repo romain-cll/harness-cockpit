@@ -1162,47 +1162,61 @@ async function startedWaiter(repo: TempRepo, marker: string): Promise<number> {
 // Lets a `waitfor.sh <marker>` go on.
 const release = (repo: TempRepo, marker: string) => writeFileSync(join(repo.root, marker), '');
 
-const setupHeading = (page: Page, workspaceName: string) =>
-  page.getByRole('heading', { name: `Setup of ${workspaceName}`, exact: true });
-const retryButton = (page: Page) => page.getByRole('button', { name: 'Retry setup', exact: true });
-const startAnywayButton = (page: Page) => page.getByRole('button', { name: 'Start anyway', exact: true });
-
-// The status label of the `Setup` link under a workspace row (`Running`, `Done`, `Failed`), null when
-// the row has no such link.
-const setupLinkStatus = (page: Page, workspacePath: string) =>
-  page.evaluate((workspacePath) => {
-    const row = [...document.querySelectorAll('aside [title]')].find((element) => element.getAttribute('title') === workspacePath);
-    const link = row?.closest('li')?.querySelector('a[href*="/setup"]');
-    if (!link) return null;
-    const found = /^Setup\s*(Running|Done|Failed)$/.exec((link.textContent ?? '').trim());
-    return found ? found[1]! : `unexpected label: ${link.textContent}`;
-  }, workspacePath);
-
-const waitForSetupStatus = (page: Page, workspacePath: string, status: string | null) =>
-  poll(() => setupLinkStatus(page, workspacePath), (found) => found === status, UI_TIMEOUT);
-
-// Every `Setup` link of the sidebar.
-const setupLinkCount = (page: Page) => page.locator('aside a[href*="/setup"]').count();
-
-async function openSetupLink(page: Page, workspacePath: string) {
-  const handle = await page.evaluateHandle((workspacePath) => {
-    const row = [...document.querySelectorAll('aside [title]')].find((element) => element.getAttribute('title') === workspacePath);
-    return row?.closest('li')?.querySelector('a[href*="/setup"]') ?? null;
-  }, workspacePath);
-  const link = handle.asElement();
-  if (!link) throw new Error(`no Setup link under the workspace ${workspacePath}`);
-  await link.click({ timeout: UI_TIMEOUT });
-}
-
-// Whether the workspace's `Setup` link is drawn above its first session link.
-const setupAboveSessions = (page: Page, workspacePath: string) =>
+// COCKPIT-57: the label a workspace's own row shows while its setup runs (`Setting up`, muted) or
+// after it failed (`Setup failed`, destructive); null when the row shows none. The sessions listed
+// under the row are not read. `rightGap` is the distance from the label to the row's right edge.
+const setupLabel = (page: Page, workspacePath: string) =>
   page.evaluate((workspacePath) => {
     const row = [...document.querySelectorAll('aside [title]')].find((element) => element.getAttribute('title') === workspacePath);
     const item = row?.closest('li');
-    const setup = item?.querySelector('a[href*="/setup"]');
-    const session = item?.querySelector('a[href*="/sessions/"]');
-    return !!setup && !!session && setup.getBoundingClientRect().top < session.getBoundingClientRect().top;
+    if (!row || !item) return null;
+    const leaves = [...item.querySelectorAll('*')].filter(
+      (element) => element.children.length === 0 && !element.closest('a[href*="/sessions/"]') && /^(Setting up|Setup failed)$/.test((element.textContent ?? '').trim()),
+    );
+    const leaf = leaves[0];
+    if (!leaf) return null;
+    const box = leaf.getBoundingClientRect();
+    return {
+      text: (leaf.textContent ?? '').trim(),
+      color: getComputedStyle(leaf).color,
+      rightGap: item.getBoundingClientRect().right - box.right,
+      isRightOfTheName: box.left > row.getBoundingClientRect().left + 20,
+    };
   }, workspacePath);
+
+const waitForSetupLabel = (page: Page, workspacePath: string, text: string | null) =>
+  poll(() => setupLabel(page, workspacePath), (found) => (found?.text ?? null) === text, UI_TIMEOUT);
+
+// Every `Setup` link of the sidebar: COCKPIT-57 removed the links and the /setup page.
+const setupLinkCount = (page: Page) => page.locator('aside a[href*="/setup"]').count();
+
+// The color the `destructive` token resolves to, for "Setup failed".
+const destructiveColor = (page: Page) =>
+  page.evaluate(() => {
+    const probe = document.createElement('span');
+    probe.style.color = 'var(--destructive)';
+    document.body.append(probe);
+    const color = getComputedStyle(probe).color;
+    probe.remove();
+    return color;
+  });
+
+// Everything every pty of the page writes from now on, in one string (the page's own listener, so a
+// terminal that is gone by the time the test reads it, the dialog's, is read too). Raw: see `plain`.
+const collectPtyData = (page: Page) =>
+  page.evaluate(() => {
+    const w = window as unknown as { __allPtyData?: string; api: { pty: { onData(listener: (id: number, data: string) => void): () => void } } };
+    const listening = w.__allPtyData !== undefined;
+    w.__allPtyData = '';
+    if (listening) return;
+    w.api.pty.onData((_id, data) => {
+      w.__allPtyData += data;
+    });
+  });
+
+// eslint-disable-next-line no-control-regex
+const plain = (text: string) => text.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, '').replaceAll('\r', '');
+const collectedPtyData = async (page: Page) => plain(await page.evaluate(() => (window as unknown as { __allPtyData?: string }).__allPtyData ?? ''));
 
 // What `window.api.workspaces.runCommands` answers.
 const runCommandsApi = (page: Page, project: string, path: string, which: 'setup' | 'teardown') =>
@@ -2849,194 +2863,43 @@ describe.each([
       return existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean) : [];
     };
 
-    test('AC1, AC2, AC4 — Create opens the setup page: each command after a "$ <command>" line, in order, in the worktree with the login-shell environment; the Setup link shows Running then Done, Home and back keeps the terminal and the process, and the page ends on "Setup finished" with no button', async () => {
+    test('AC9 — with Agent None, Create makes the workspace and nothing else: the setup commands do not run, no terminal opens, the page does not change, and the sidebar has no Setup link or label', async () => {
       const { page } = session;
-      const record = 'sh "$COCKPIT_ROOT_PATH/record.sh" setup-env.txt';
-      const wait = 'sh "$COCKPIT_ROOT_PATH/waitfor.sh" go-ok';
-      writeConfig(repo, { setup: [record, 'echo second-output', wait] });
+      await goHome(page);
+      const ran = join(repo.root, 'setup-ran-ac9');
+      writeConfig(repo, { setup: [`touch "${ran}"`] });
+      await collectPtyData(page);
 
-      const path = await createWorkspace('setup-ok');
+      const path = await createWorkspace('no-agent-no-setup');
 
-      await setupHeading(page, 'setup-ok').waitFor({ timeout: UI_TIMEOUT });
-      expect(new URL(page.url()).pathname).toBe('/setup');
       await waitListed(path);
       expect(existsSync(path)).toBe(true);
-      await waitForRow(page, `$ ${wait}`);
-      const rows = await terminalRows(page);
-      const at = (row: string) => rows.indexOf(row);
-      expect(at(`$ ${record}`)).toBeGreaterThanOrEqual(0);
-      expect(at(`$ ${record}`)).toBeLessThan(at('$ echo second-output'));
-      expect(rows[at('$ echo second-output') + 1]).toBe('second-output');
-      expect(at('$ echo second-output')).toBeLessThan(at(`$ ${wait}`));
-      expect(await waitForSetupStatus(page, path, 'Running')).toBe('Running');
-
-      // The environment the first command saw.
-      const [env] = await poll(() => records('setup-env.txt'), (found) => found.length > 0, UI_TIMEOUT);
-      expect(env!.root).toBe(repo.root);
-      expect(env!.ws).toBe(path);
-      expect(env!.name).toBe('setup-ok');
-      expect(env!.term).toBe('xterm-256color');
-      expect(env!.pwd).toBe(path);
-      expect(normalizeFnm(env!.path!)).toBe(normalizeFnm(await getShellPath(page)));
-      expect(records('setup-env.txt')).toHaveLength(1);
-
-      // Home and back through the link: the same terminal, and the process was not interrupted.
-      const pid = await startedWaiter(repo, 'go-ok');
-      await goHome(page);
-      expect(await setupLinkStatus(page, path)).toBe('Running');
-      await openSetupLink(page, path);
-      await setupHeading(page, 'setup-ok').waitFor({ timeout: UI_TIMEOUT });
-      await waitForRow(page, 'second-output');
-      expect(waiters(repo, 'go-ok')).toEqual([pid]);
-      expect(isAlive(pid)).toBe(true);
-
-      // AC4: it finishes, the page stays with its status and no button.
-      release(repo, 'go-ok');
-      await page.getByText('Setup finished').waitFor({ timeout: UI_TIMEOUT });
-      expect(await waitForSetupStatus(page, path, 'Done')).toBe('Done');
-      expect(await retryButton(page).count()).toBe(0);
-      expect(await startAnywayButton(page).count()).toBe(0);
-      expect(await setupHeading(page, 'setup-ok').isVisible()).toBe(true);
-      expect(waiters(repo, 'go-ok')).toEqual([]);
-    }, 60_000);
-
-    test('AC9 — a failing setup with no agent shows the output, "Setup failed with exit code N" and Retry setup only; the commands after it do not run, and a retry that exits 0 shows "Setup finished" on the same page', async () => {
-      const { page } = session;
-      writeConfig(repo, { setup: ['echo before-failure', 'test -f "$COCKPIT_ROOT_PATH/ok9" || exit 4', 'echo after-failure'] });
-
-      const path = await createWorkspace('retry-ok');
-
-      await setupHeading(page, 'retry-ok').waitFor({ timeout: UI_TIMEOUT });
-      await page.getByText('Setup failed with exit code 4').waitFor({ timeout: UI_TIMEOUT });
-      expect(await retryButton(page).count()).toBe(1);
-      expect(await startAnywayButton(page).count()).toBe(0);
-      await waitForRow(page, 'before-failure');
-      expect(await terminalRows(page)).not.toContain('after-failure');
-      expect(await waitForSetupStatus(page, path, 'Failed')).toBe('Failed');
-      expect(existsSync(path)).toBe(true);
-      expect(await isListed(path)).toBe(true);
-
-      writeFileSync(join(repo.root, 'ok9'), '');
-      await retryButton(page).click({ timeout: UI_TIMEOUT });
-      await page.getByText('Setup finished').waitFor({ timeout: UI_TIMEOUT });
-      expect(await waitForSetupStatus(page, path, 'Done')).toBe('Done');
-      expect(await retryButton(page).count()).toBe(0);
-      expect(await setupHeading(page, 'retry-ok').isVisible()).toBe(true);
-    });
-
-    test('AC10 — a config that readWorkspaceConfig refuses keeps the workspace and shows its error message in place of the output, with Retry setup; once the file is fixed, Retry setup runs the setup', async () => {
-      const { page } = session;
-      writeConfig(repo, { run: ['bun dev'] });
-
-      const path = await createWorkspace('bad-config');
-
-      await setupHeading(page, 'bad-config').waitFor({ timeout: UI_TIMEOUT });
-      // The message is the one the IPC call answers (and it names the file and the key at fault).
-      const refused = await runCommandsApi(page, repo.root, path, 'setup');
-      expect(refused.status).toBe('refused');
-      expect(refused.message).toContain('config.json');
-      await page.getByText(refused.message!).first().waitFor({ timeout: UI_TIMEOUT });
-      expect(await page.getByText('Setup failed with exit code').count()).toBe(0);
+      expect(new URL(page.url()).pathname).toBe('/');
       expect(await visiblePanes(page)).toHaveLength(0);
-      expect(await retryButton(page).count()).toBe(1);
-      expect(await startAnywayButton(page).count()).toBe(0);
-      expect(await waitForSetupStatus(page, path, 'Failed')).toBe('Failed');
-      expect(existsSync(path)).toBe(true);
-      expect(await isListed(path)).toBe(true);
-
-      writeConfig(repo, { setup: ['echo fixed-config'] });
-      await retryButton(page).click({ timeout: UI_TIMEOUT });
-      await page.getByText('Setup finished').waitFor({ timeout: UI_TIMEOUT });
-      await waitForRow(page, '$ echo fixed-config');
-      expect(await waitForSetupStatus(page, path, 'Done')).toBe('Done');
+      expect(await setupLabel(page, path)).toBeNull();
+      expect(await setupLinkCount(page)).toBe(0);
+      expect(await page.getByRole('button', { name: /Retry setup|Start anyway/ }).count()).toBe(0);
+      // Nothing the setup would have printed reached a terminal, and its command did not run.
+      await ptyHostPid(page);
+      expect(await collectedPtyData(page)).not.toContain('cockpit setup');
+      expect(existsSync(ran)).toBe(false);
     });
 
-    test('AC12 — deleting a workspace, or removing its project, ends its running setup and removes its Setup link', async () => {
-      const { page } = session;
-      writeConfig(repo, { setup: ['sh "$COCKPIT_ROOT_PATH/waitfor.sh" never-a'] });
-      const pathA = await createWorkspace('end-a');
-      await waitForSetupStatus(page, pathA, 'Running');
-      writeConfig(repo, { setup: ['sh "$COCKPIT_ROOT_PATH/waitfor.sh" never-b'] });
-      const pathB = await createWorkspace('end-b');
-      await waitForSetupStatus(page, pathB, 'Running');
-      const pidA = await startedWaiter(repo, 'never-a');
-      const pidB = await startedWaiter(repo, 'never-b');
-
-      // The workspace is deleted.
-      await goHome(page);
-      const dialog = await confirmDeletion(pathA);
-      await dialog.first().waitFor({ state: 'hidden', timeout: 15_000 });
-      await waitUnlisted(pathA);
-      expect(await endsWithin(pidA)).toBe(true);
-      expect(await setupLinkStatus(page, pathA)).toBeNull();
-      // The other one runs on.
-      expect(isAlive(pidB)).toBe(true);
-      expect(await setupLinkStatus(page, pathB)).toBe('Running');
-
-      // Its project is removed.
-      await removeThroughMenu(page, repo.root);
-      await waitForEntries(page, []);
-      expect(await endsWithin(pidB)).toBe(true);
-      expect(await setupLinkCount(page)).toBe(0);
-
-      // Added again, the workspace is listed without a link.
-      await addRepository(session, repo);
-      await waitListed(pathB);
-      expect(await setupLinkStatus(page, pathB)).toBeNull();
-      expect(await setupLinkCount(page)).toBe(0);
-    }, 60_000);
-
-    test('AC12 — a reload ends the running setup and drops its link and output: /setup for that workspace shows "No setup ran for this workspace in this window."', async () => {
-      const { page } = session;
-      writeConfig(repo, { setup: ['sh "$COCKPIT_ROOT_PATH/waitfor.sh" never-c'] });
-      const path = await createWorkspace('end-c');
-      await waitForSetupStatus(page, path, 'Running');
-      const pid = await startedWaiter(repo, 'never-c');
-
-      await page.reload();
-      await page.getByText('No setup ran for this workspace in this window.').waitFor({ timeout: UI_TIMEOUT });
-
-      expect(new URL(page.url()).pathname).toBe('/setup');
-      expect(await endsWithin(pid)).toBe(true);
-      await waitListed(path);
-      expect(await setupLinkStatus(page, path)).toBeNull();
-      expect(await setupLinkCount(page)).toBe(0);
-      expect(await visiblePanes(page)).toHaveLength(0);
-    }, 60_000);
-
-    // The two cases run right after a reload test, so the sidebar holds no Setup link before them.
-    test.each([
-      ['no config file', undefined],
-      ['a config without setup commands', { teardown: ['echo only-teardown'] }],
-    ])('AC11 — with %s, Create closes the dialog as before: no setup page opens and no Setup link appears', async (label, config) => {
-      const { page } = session;
-      await goHome(page);
-      if (config) writeConfig(repo, config);
-      else rmSync(join(repo.root, '.cockpit'), { recursive: true, force: true });
-      const name = config ? 'no-setup-teardown-only' : 'no-setup-no-config';
-
-      const path = await createWorkspace(name);
-
-      await waitListed(path);
-      expect(existsSync(path)).toBe(true);
-      expect(new URL(page.url()).pathname, label).not.toBe('/setup');
-      expect(await setupHeading(page, name).count()).toBe(0);
-      expect(await setupLinkStatus(page, path)).toBeNull();
-      expect(await setupLinkCount(page)).toBe(0);
-    });
-
-    test('AC13, AC17 — Delete runs the teardown in a terminal of the dialog (shell, order, environment, worktree as cwd), and once it exits 0 the folder, the worktree, the branch and the row go', async () => {
+    test('AC13, AC17, setup through the CLI AC11 — Delete runs `cockpit teardown` in a terminal of the dialog (header, "$ <command>" lines in order with their output, "✓ Teardown done", environment, worktree as cwd), and once it exits 0 the folder, the worktree, the branch and the row go', async () => {
       const { page } = session;
       const record = 'sh "$COCKPIT_ROOT_PATH/record.sh" teardown-env.txt';
       const wait = 'sh "$COCKPIT_ROOT_PATH/waitfor.sh" go-td';
       writeConfig(repo, { teardown: [record, 'echo teardown-second', wait] });
       const path = await addExternal('td-ok');
+      await collectPtyData(page);
 
       const dialog = await confirmDeletion(path);
       const pane = await dialogTerminal(page);
       await waitForRow(page, `$ ${wait}`, pane);
       const rows = await rowsOf(pane);
       const at = (row: string) => rows.indexOf(row);
+      expect(at('cockpit teardown · td-ok · .cockpit/config.json')).toBeGreaterThanOrEqual(0);
+      expect(at('cockpit teardown · td-ok · .cockpit/config.json')).toBeLessThan(at(`$ ${record}`));
       expect(at(`$ ${record}`)).toBeGreaterThanOrEqual(0);
       expect(at(`$ ${record}`)).toBeLessThan(at('$ echo teardown-second'));
       expect(rows[at('$ echo teardown-second') + 1]).toBe('teardown-second');
@@ -3050,6 +2913,10 @@ describe.each([
       await dialog.first().waitFor({ state: 'hidden', timeout: 15_000 });
       await waitUnlisted(path);
 
+      // The dialog is gone by now: the terminal's whole output was collected from the pty.
+      const printed = await collectedPtyData(page);
+      expect(printed.indexOf('✓ Teardown done')).toBeGreaterThan(printed.indexOf('teardown-second'));
+      expect(printed).not.toContain('Teardown failed');
       expect(existsSync(path)).toBe(false);
       expect(linkedWorktrees(repo).map((worktree) => worktree.path)).not.toContain(path);
       expect(localBranches(repo)).not.toContain('td-ok');
@@ -3060,18 +2927,24 @@ describe.each([
       expect(found[0]!.name).toBe('td-ok');
       expect(found[0]!.term).toBe('xterm-256color');
       expect(found[0]!.pwd).toBe(path);
-      expect(normalizeFnm(found[0]!.path!)).toBe(normalizeFnm(await getShellPath(page)));
+      // The CLI's folder may come first (it is on the PATH of every terminal): the login shell's PATH ends it.
+      expect(normalizeFnm(found[0]!.path!).endsWith(normalizeFnm(await getShellPath(page)))).toBe(true);
     }, 60_000);
 
-    test('AC14 — a failing teardown keeps the worktree and the row and shows the output, "Teardown failed with exit code N" and Delete anyway, which removes the workspace (an unmerged branch is kept and says so) without running the teardown again', async () => {
+    test('AC14, setup through the CLI AC11 — a failing teardown keeps the worktree and the row and shows the output, the CLI\'s "✗ Teardown failed" line, "Teardown failed with exit code N" and Delete anyway, which removes the workspace (an unmerged branch is kept and says so) without running the teardown again', async () => {
       const { page } = session;
       writeConfig(repo, { teardown: ['echo td-fail-output', 'echo ran >> "$COCKPIT_ROOT_PATH/td14.log"; exit 5'] });
       const path = await addExternal('td-fail');
       gitIn(path, 'commit', '--allow-empty', '-m', 'unmerged work');
+      await collectPtyData(page);
 
       const dialog = await confirmDeletion(path);
       await dialog.getByText('Teardown failed with exit code 5').waitFor({ timeout: UI_TIMEOUT });
       expect(await rowsOf(await dialogTerminal(page))).toContain('td-fail-output');
+      // COCKPIT-57 AC11: the CLI's own line names the command that failed.
+      const printed = await collectedPtyData(page);
+      expect(printed).toContain('cockpit teardown · td-fail · .cockpit/config.json');
+      expect(printed).toContain('✗ Teardown failed: echo ran >> "$COCKPIT_ROOT_PATH/td14.log"; exit 5 exited with code 5');
       expect(await dialog.getByRole('button', { name: 'Delete anyway', exact: true }).count()).toBe(1);
       expect(existsSync(path)).toBe(true);
       expect(await isListed(path)).toBe(true);
@@ -3126,17 +2999,19 @@ describe.each([
       expect(await isListed(path)).toBe(true);
     });
 
-    test('AC14 — Ctrl+C in the teardown terminal is a failure: "Teardown ended before it finished." with Delete anyway, and the worktree and the row stay', async () => {
+    test('AC14 — Ctrl+C in the teardown terminal is a failure: the CLI says "was killed by SIGINT", the dialog says the teardown failed or ended with Delete anyway, and the worktree and the row stay', async () => {
       const { page } = session;
       writeConfig(repo, { teardown: ['sh "$COCKPIT_ROOT_PATH/waitfor.sh" never-sig-td'] });
       const path = await addExternal('td-signal');
+      await collectPtyData(page);
 
       const dialog = await confirmDeletion(path);
       const pid = await startedWaiter(repo, 'never-sig-td');
       await focusPane(await dialogTerminal(page));
       await page.keyboard.press('Control+c');
 
-      await dialog.getByText('Teardown ended before it finished.').waitFor({ timeout: UI_TIMEOUT });
+      await dialog.getByText(/Teardown (failed with exit code \d+|ended before it finished\.)/).waitFor({ timeout: UI_TIMEOUT });
+      expect(await collectedPtyData(page)).toMatch(/✗ Teardown failed: .*waitfor\.sh.* was killed by SIGINT/);
       expect(await endsWithin(pid)).toBe(true);
       expect(await dialog.getByRole('button', { name: 'Delete anyway', exact: true }).count()).toBe(1);
       expect(existsSync(path)).toBe(true);
@@ -3173,7 +3048,8 @@ describe.each([
       const elsewhere = join(repo.parent, 'not-a-worktree');
       mkdirSync(elsewhere);
 
-      for (const which of ['setup', 'teardown'] as const) {
+      // COCKPIT-57: only the teardown runs through runCommands; the setup is `cockpit setup`.
+      for (const which of ['teardown'] as const) {
         expect(await runCommandsApi(page, '/no/such/project', '/no/such/project/ws', which)).toEqual({
           status: 'refused',
           message: '/no/such/project is not a project in Cockpit.',
@@ -3251,14 +3127,14 @@ describe.each([
       expect(onDisk.hasGit).toBe(true);
     });
 
-    test('smoke path (b), workspace scripts AC19 — workspaces: "New workspace…" creates a worktree under COCKPIT_HOME from the preselected base main and lists it, its setup writes the login-shell PATH and the worktree path and the setup page shows "Setup finished"; "Delete workspace…" runs the teardown, then removes the folder, the worktree, the branch and the row', async () => {
+    test('smoke path (b), workspace scripts AC19, setup through the CLI AC11 — workspaces: "New workspace…" creates a worktree under COCKPIT_HOME from the preselected base main and lists it, with no setup (no agent); "Delete workspace…" runs `cockpit teardown`, which writes the login-shell PATH and the worktree path, then removes the folder, the worktree, the branch and the row', async () => {
       const { page } = session;
       const repo = makeRepo('smoke-workspace');
       folders.push(repo);
       const branch = 'smoke-ws';
       writeConfig(repo, {
-        setup: ['printf \'%s\\n\' "$PATH" "$(pwd -P)" > "$COCKPIT_ROOT_PATH/setup-out.txt"'],
-        teardown: ['touch "$COCKPIT_ROOT_PATH/teardown-ran"'],
+        setup: ['touch "$COCKPIT_ROOT_PATH/setup-ran"'],
+        teardown: ['printf \'%s\\n\' "$PATH" "$(pwd -P)" > "$COCKPIT_ROOT_PATH/teardown-out.txt"'],
       });
       await addRepository(session, repo);
       const path = worktreePath(session, repo, branch);
@@ -3274,15 +3150,11 @@ describe.each([
       expect(linkedWorktrees(repo)).toContainEqual({ path, branch });
       expect(localBranches(repo)).toContain(branch);
 
-      // The setup ran in the worktree with the login shell's PATH, on its page.
-      await setupHeading(page, branch).waitFor({ timeout: UI_TIMEOUT });
-      await page.getByText('Setup finished').waitFor({ timeout: UI_TIMEOUT });
-      expect(await waitForSetupStatus(page, path, 'Done')).toBe('Done');
-      const [setupPath, setupCwd] = readFileSync(join(repo.root, 'setup-out.txt'), 'utf8').split('\n');
-      expect(normalizeFnm(setupPath!)).toBe(normalizeFnm(await getShellPath(page)));
-      expect(setupCwd).toBe(path);
+      // No agent chosen: no setup ran, and none is shown.
+      expect(existsSync(join(repo.root, 'setup-ran'))).toBe(false);
+      expect(new URL(page.url()).pathname).toBe('/');
 
-      expect(existsSync(join(repo.root, 'teardown-ran'))).toBe(false);
+      expect(existsSync(join(repo.root, 'teardown-out.txt'))).toBe(false);
       await startDeletion(page, path);
       const confirm = deleteDialog(page, `Delete ${branch}?`);
       await confirm.waitFor({ timeout: UI_TIMEOUT });
@@ -3290,7 +3162,10 @@ describe.each([
       await confirm.waitFor({ state: 'hidden', timeout: 15_000 });
       await waitForEntries(page, [repo.root]);
 
-      expect(existsSync(join(repo.root, 'teardown-ran'))).toBe(true);
+      // The teardown ran through the CLI in the worktree, with the login shell's PATH (the CLI's folder may come first).
+      const [teardownPath, teardownCwd] = readFileSync(join(repo.root, 'teardown-out.txt'), 'utf8').split('\n');
+      expect(normalizeFnm(teardownPath!).endsWith(normalizeFnm(await getShellPath(page)))).toBe(true);
+      expect(teardownCwd).toBe(path);
       expect(existsSync(path)).toBe(false);
       expect(linkedWorktrees(repo)).toEqual([]);
       expect(localBranches(repo)).not.toContain(branch);
@@ -4084,7 +3959,10 @@ function makeSessionsFixture(
   const shellLog = join(root, 'shell-args.log');
   writeFileSync(
     shell,
-    `#!/bin/sh\n[ "$1" = --warmup ] && exit 0\necho "$*" >> '${shellLog}'\nPATH='${bin}:/usr/bin:/bin' /bin/sh -c "$2"\n`,
+    // Started as a login shell with no command (`-l`) it returns at once, unless the test made the file
+    // `interactive` in `root`: it is then an interactive /bin/sh with a prompt of its own, which is
+    // where `cockpit setup` leaves the user (COCKPIT-57).
+    `#!/bin/sh\n[ "$1" = --warmup ] && exit 0\necho "$*" >> '${shellLog}'\n[ "$*" = -l ] && [ -e '${root}/interactive' ] && { PS1='login-shell> '; export PS1; exec /bin/sh -i; }\nPATH='${bin}:/usr/bin:/bin' /bin/sh -c "$2"\n`,
   );
   chmodSync(shell, 0o755);
   execFileSync(shell, ['--warmup']);
@@ -4318,6 +4196,16 @@ async function expectControlEndpoint(session: Session, fx: SessionsFixture, cli:
   await typeLine(page, 'hook UserPromptSubmit');
   await waitForRow(page, 'hooked:UserPromptSubmit');
   await expectDot(page, env.session, 'Working');
+}
+
+// COCKPIT-57 smoke path: the terminal of the session page that is open shows the setup `cockpit setup`
+// ran before the agent, then the stub with its prompt.
+async function expectSetupThenAgent(page: Page, name: string, command: string, output: string) {
+  await waitForRow(page, '✓ Setup done');
+  const rows = (await terminalRows(page)).filter(Boolean);
+  const header = rows.indexOf(`cockpit setup · ${name} · .cockpit/config.json`);
+  expect(header).toBeGreaterThanOrEqual(0);
+  expect(rows.slice(header + 1, header + 4)).toEqual([`$ ${command}`, output, '✓ Setup done']);
 }
 
 // Whether the deepest element whose text starts with `text` sits below the
@@ -5090,7 +4978,8 @@ describe('sessions: built app', () => {
     expect(stub.cwd).toBe(ws.plus.path);
     expect(stub.argCount).toBe(0);
     expect(stub.term).toBe('xterm-256color');
-    expect(stub.path).toBe(`${fx.bin}:/usr/bin:/bin`);
+    // The `cockpit` CLI's folder comes first on the PATH of every terminal the app spawns (COCKPIT-57).
+    expect(stub.path).toBe(`${dirname(REPOSITORY_CLI)}:${fx.bin}:/usr/bin:/bin`);
     expect(stub.path).not.toBe(process.env.PATH);
     expect(isAlive(stub.pid)).toBe(true);
     ws.plus.pids.push(stub.pid);
@@ -5579,170 +5468,196 @@ describe('sessions: built app', () => {
     await openWorkspaceMenu(page, launcher.path, menu);
   });
 
-  // --- Setup before an agent session (COCKPIT-32). The stub `claude` logs every run in `fx.runLog`,
-  // and `mark.sh <text>` appends a line to the same log, so the order of a setup's last command and
-  // the stub's start shows in it. The tests run in order on this launch, with the repository above.
-
-  // Creates a workspace with Claude Code and a prompt through the dialog and returns its path. The
-  // page it leaves is the caller's to wait for.
-  async function createWorkspaceWithSetup(name: string, prompt: string): Promise<string> {
-    const { page } = session;
-    writeScripts(repo, { 'mark.sh': `echo "$1" >> '${fx.runLog}'\n` });
-    const dialog = await openNewWorkspaceDialog(page, repo);
-    await fillNewWorkspace(page, dialog, { name, agent: 'Claude Code', prompt });
-    await createButton(dialog).click({ timeout: UI_TIMEOUT });
-    await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
-    return worktreePath(session, repo, name);
-  }
+  // --- Setup through the CLI (COCKPIT-57). The New workspace dialog with an agent starts the session
+  // as `cockpit setup --shell --then <agent>` in the one terminal of its page. The stub `claude` logs
+  // every run in `fx.runLog`, and `mark.sh <text>` appends a line to the same log, so the order of a
+  // setup's last command and the stub's start shows in it. The login shell is interactive for these
+  // tests (`interactive` in the fixture's folder): it is where a failed setup or an exited agent
+  // leaves the user.
 
   const storedIn = (directory: string) => sessionsInState(session.dataDir).filter((entry) => entry.directory === directory);
 
-  // Nothing of the agent ran: no stub process, no run of it, no stored session.
-  function expectNoSessionStarted(before: { pids: number[]; runs: string[] }, directory: string) {
-    expect(stubPids(fx)).toEqual(before.pids);
-    expect(startRuns(fx)).toEqual(before.runs);
-    expect(storedIn(directory)).toEqual([]);
+  // Creates a workspace with Claude Code and a prompt through the dialog; resolves with its path and
+  // with the id of the session whose page opened.
+  async function createWorkspaceWithSetup(name: string, prompt: string): Promise<{ path: string; id: string }> {
+    const { page } = session;
+    writeScripts(repo, {
+      'mark.sh': `echo "$1" >> '${fx.runLog}'\n`,
+      'check.sh': 'test -f "$COCKPIT_ROOT_PATH/$1" || exit 6\n',
+    });
+    const id = await createWorkspaceWithAgent(page, repo, { name, agent: 'Claude Code', prompt }, 'Claude Code 1');
+    return { path: worktreePath(session, repo, name), id };
   }
 
-  test('workspace scripts AC5 — with the setup page shown, no session starts until the setup exited; then the stub runs in the worktree with the prompt and the session page opens', async () => {
-    const { page } = session;
-    writeConfig(repo, {
-      setup: ['sh "$COCKPIT_ROOT_PATH/waitfor.sh" go-s5', 'sh "$COCKPIT_ROOT_PATH/mark.sh" setup-done'],
-    });
-    const before = { pids: stubPids(fx), runs: startRuns(fx) };
+  const loginPrompt = /^login-shell>(\s.*)?$/;
 
-    const path = await createWorkspaceWithSetup('setup-then-agent', 'do the thing');
+  describe('setup through the CLI', () => {
+    beforeAll(() => writeFileSync(join(fx.root, 'interactive'), ''));
+    afterAll(() => rmSync(join(fx.root, 'interactive'), { force: true }));
 
-    await setupHeading(page, 'setup-then-agent').waitFor({ timeout: UI_TIMEOUT });
-    await startedWaiter(repo, 'go-s5');
-    await sleep(500);
-    expectNoSessionStarted(before, path);
-    expect(existsSync(path)).toBe(true);
-    expect(new URL(page.url()).pathname).toBe('/setup');
+    test('AC1, AC2 — Create opens the session page whose single terminal shows the header, each "$ <command>" line with its output, then "✓ Setup done" and the agent in the worktree with its hooks and the prompt as one argument; the workspace row says "Setting up" (muted, right-aligned) meanwhile and nothing once done, with no line added under it', async () => {
+      const { page } = session;
+      await removeAllWorkspaces();
+      const record = 'sh "$COCKPIT_ROOT_PATH/record.sh" setup-env.txt';
+      const wait = 'sh "$COCKPIT_ROOT_PATH/waitfor.sh" go-s1';
+      const mark = 'sh "$COCKPIT_ROOT_PATH/mark.sh" setup-done';
+      const prompt = `say "hi" $HOME 100% 'q'`;
+      writeScripts(repo);
+      writeConfig(repo, { setup: [record, wait, mark] });
+      const before = { pids: stubPids(fx), runs: startRuns(fx) };
 
-    release(repo, 'go-s5');
-    const id = await waitForSessionPage(page, undefined, 'Claude Code 1');
+      const { path, id } = await createWorkspaceWithSetup('setup-cli', prompt);
 
-    const stub = await readStub(page);
-    expect(stub.cwd).toBe(path);
-    expect(stub.argCount).toBe(1);
-    expect(stub.args).toBe('do the thing');
-    expect(waiters(repo, 'go-s5')).toEqual([]);
-    // The last command of the setup ran before the stub did.
-    expect(startRuns(fx).slice(before.runs.length)).toEqual(['setup-done', 'claude do the thing']);
-    expect(await waitForWorkspaceLinks(page, path, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
-    expect(await waitForSetupStatus(page, path, 'Done')).toBe('Done');
-    expect(await setupAboveSessions(page, path)).toBe(true);
-    expect(storedIn(path)).toEqual([
-      { id, name: 'Claude Code 1', harness: 'claude-code', directory: path, project: repo.root, createdAt: expect.any(String) },
-    ]);
-  }, 60_000);
+      await waitForRow(page, `$ ${wait}`);
+      const header = 'cockpit setup · setup-cli · .cockpit/config.json';
+      const rows = await terminalRows(page);
+      expect(rows.indexOf(header)).toBeGreaterThanOrEqual(0);
+      expect(rows.indexOf(header)).toBeLessThan(rows.indexOf(`$ ${record}`));
+      expect(rows.indexOf(`$ ${record}`)).toBeLessThan(rows.indexOf(`$ ${wait}`));
+      expect(await visiblePanes(page)).toHaveLength(1);
+      // AC2: the label while it runs, and nothing else under the row.
+      const label = await waitForSetupLabel(page, path, 'Setting up');
+      expect(label!.color, 'muted').toBe(await mutedColor(page));
+      expect(label!.isRightOfTheName).toBe(true);
+      expect(label!.rightGap, 'right-aligned in the row').toBeLessThan(80);
+      expect(await setupLinkCount(page)).toBe(0);
+      expect((await sessionLinks(page, { workspace: path })).map((entry) => entry.id)).toEqual([id]);
+      // The environment the first command saw, and no agent yet.
+      const [env] = await poll(() => readRecords(repo, 'setup-env.txt'), (found) => found.length > 0, UI_TIMEOUT);
+      expect(env).toMatchObject({ root: repo.root, ws: path, name: 'setup-cli', pwd: path });
+      await startedWaiter(repo, 'go-s1');
+      expect(stubPids(fx)).toEqual(before.pids);
+      expect(startRuns(fx)).toEqual(before.runs);
 
-  test('workspace scripts AC5 — when the user has left the setup page, the session still starts in the worktree with the prompt, the page does not change and the session is listed under the workspace', async () => {
-    const { page } = session;
-    writeConfig(repo, { setup: ['sh "$COCKPIT_ROOT_PATH/waitfor.sh" go-s5b'] });
-    const before = { pids: stubPids(fx), runs: startRuns(fx) };
+      release(repo, 'go-s1');
+      await waitForRow(page, '✓ Setup done');
+      const stub = await readStub(page);
+      expect(stub.cwd).toBe(path);
+      expect(stub.argCount).toBe(1);
+      expect(stub.args).toBe(prompt);
+      expect(startRuns(fx).slice(before.runs.length)).toEqual(['setup-done', `claude ${prompt}`]);
+      const done = await terminalRows(page);
+      expect(done.indexOf('✓ Setup done')).toBeLessThan(done.indexOf('ready'));
+      // The agent runs with its status hooks, which name the CLI.
+      expect(hookCommandsOf(fx, 'claude', stub.pid).UserPromptSubmit).toBe(`${singleQuoted(REPOSITORY_CLI)} status working`);
+      expect(await waitForSetupLabel(page, path, null)).toBeNull();
+      expect(await setupLinkCount(page)).toBe(0);
+      expect(storedIn(path)).toEqual([{ id, name: 'Claude Code 1', harness: 'claude-code', directory: path, project: repo.root, createdAt: expect.any(String) }]);
+    }, 60_000);
 
-    const path = await createWorkspaceWithSetup('setup-left', 'run it');
-    await setupHeading(page, 'setup-left').waitFor({ timeout: UI_TIMEOUT });
-    await startedWaiter(repo, 'go-s5b');
-    await goHome(page);
-    expectNoSessionStarted(before, path);
+    test('AC3, AC4, AC6, AC10 — a failing command stops the setup (the later ones do not run) with the failure line, the hint and the login shell prompt, no agent, and "Setup failed" (destructive) on the row, which a reload keeps; after fixing the config, "cockpit setup" typed in that shell runs it again ("Setting up", then no label) and returns to the same shell; "--then claude" starts the agent', async () => {
+      const { page } = session;
+      await removeAllWorkspaces();
+      const count = 'echo run >> "$COCKPIT_ROOT_PATH/runs-s2"';
+      const check = 'sh "$COCKPIT_ROOT_PATH/check.sh" ok-s2';
+      writeScripts(repo);
+      writeConfig(repo, { setup: [count, check, 'echo after-failure'] });
+      const before = { pids: stubPids(fx), runs: startRuns(fx) };
 
-    release(repo, 'go-s5b');
-    await poll(() => startRuns(fx).slice(before.runs.length), (runs) => runs.includes('claude run it'), UI_TIMEOUT);
-    expect(await waitForWorkspaceLinks(page, path, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+      const { path, id } = await createWorkspaceWithSetup('setup-fails', 'p2');
 
-    // The page it was on did not change.
-    expect(new URL(page.url()).pathname).toBe('/');
-    expect(await page.getByRole('heading', { name: 'Home', exact: true }).isVisible()).toBe(true);
-    const [stored] = storedIn(path);
-    expect(stored).toMatchObject({ name: 'Claude Code 1', directory: path, project: repo.root });
-    expect(await waitForSetupStatus(page, path, 'Done')).toBe('Done');
-  }, 60_000);
+      await waitForRow(page, `✗ Setup failed: ${check} exited with code 6`);
+      await waitForRow(page, 'Claude Code was not started. Run `cockpit setup --then claude` to try again.');
+      await waitForRow(page, loginPrompt);
+      expect(await terminalRows(page)).not.toContain('after-failure');
+      const failed = await waitForSetupLabel(page, path, 'Setup failed');
+      expect(failed!.color, 'destructive').toBe(await destructiveColor(page));
+      expect(stubPids(fx)).toEqual(before.pids);
+      expect(startRuns(fx)).toEqual(before.runs);
+      expect(linkedWorktrees(repo)).toContainEqual({ path, branch: 'setup-fails' });
+      expect(await setupLinkCount(page)).toBe(0);
 
-  test('workspace scripts AC6, AC7 — a failing setup starts no session and keeps the workspace; Retry setup reads the config again, replaces the terminal, fails again with both buttons, then starts the session once the setup passes', async () => {
-    const { page } = session;
-    const count = 'echo run >> "$COCKPIT_ROOT_PATH/runs-s7"; wc -l < "$COCKPIT_ROOT_PATH/runs-s7"';
-    const check = 'test -f "$COCKPIT_ROOT_PATH/ok-s7" || exit 6';
-    writeConfig(repo, { setup: [count, check] });
-    const before = { pids: stubPids(fx), runs: startRuns(fx) };
+      // AC6: a reload shows the same label, and the terminal as it was.
+      await page.reload();
+      await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
+      await waitForSetupLabel(page, path, 'Setup failed');
+      await waitForRow(page, `✗ Setup failed: ${check} exited with code 6`);
+      await waitForRow(page, loginPrompt);
 
-    const path = await createWorkspaceWithSetup('setup-fails', 'p7');
+      // AC4: the config is fixed; the command typed in the shell the failure left runs it again.
+      const wait = 'sh "$COCKPIT_ROOT_PATH/waitfor.sh" go-s2';
+      writeConfig(repo, { setup: [count, check, wait] });
+      writeFileSync(join(repo.root, 'ok-s2'), '');
+      await focusTerminal(page);
+      await typeLine(page, 'echo level:$SHLVL');
+      await waitForRow(page, /^level:\d+$/);
+      const level = (await terminalRows(page)).find((row) => /^level:\d+$/.test(row));
+      await typeLine(page, 'cockpit setup');
+      await waitForSetupLabel(page, path, 'Setting up');
+      await startedWaiter(repo, 'go-s2');
+      release(repo, 'go-s2');
+      await waitForRow(page, '✓ Setup done');
+      await waitForSetupLabel(page, path, null);
+      await typeLine(page, 'echo level:$SHLVL');
+      await poll(async () => (await terminalRows(page)).filter((row) => /^level:\d+$/.test(row)).length, (found) => found === 2, UI_TIMEOUT);
+      expect((await terminalRows(page)).filter((row) => /^level:\d+$/.test(row)), 'no nested shell').toEqual([level, level]);
+      expect(readFileSync(join(repo.root, 'runs-s2'), 'utf8').split('\n').filter(Boolean)).toEqual(['run', 'run']);
+      expect(stubPids(fx)).toEqual(before.pids);
 
-    await setupHeading(page, 'setup-fails').waitFor({ timeout: UI_TIMEOUT });
-    await page.getByText('Setup failed with exit code 6').waitFor({ timeout: UI_TIMEOUT });
-    expect(await retryButton(page).count()).toBe(1);
-    expect(await startAnywayButton(page).count()).toBe(1);
-    expect(await waitForSetupStatus(page, path, 'Failed')).toBe('Failed');
-    await sleep(300);
-    expectNoSessionStarted(before, path);
-    expect(linkedWorktrees(repo)).toContainEqual({ path, branch: 'setup-fails' });
-    expect(localBranches(repo)).toContain('setup-fails');
-    expect(await entryTitles(page)).toContain(path);
-    expect(await sessionLinks(page, { workspace: path })).toEqual([]);
+      // "--then <binary>" starts the agent after the setup, in the same shell's terminal.
+      await typeLine(page, 'cockpit setup --then claude');
+      await waitForRow(page, 'ready');
+      expect((await readStub(page)).cwd).toBe(path);
+      expect(sessionIdOf(page)).toBe(id);
+      await typeLine(page, 'quit');
+      await waitForRow(page, /^\[Claude Code exited with code 0\]$/);
+    }, 90_000);
 
-    // Still failing: the new terminal replaces the old one (its counter says 2, the check is shown once).
-    await retryButton(page).click({ timeout: UI_TIMEOUT });
-    await waitForRow(page, /^\s*2$/);
-    await page.getByText('Setup failed with exit code 6').waitFor({ timeout: UI_TIMEOUT });
-    expect(await retryButton(page).count()).toBe(1);
-    expect(await startAnywayButton(page).count()).toBe(1);
-    expect((await terminalRows(page)).filter((row) => row === `$ ${check}`)).toHaveLength(1);
-    expect(await visiblePanes(page)).toHaveLength(1);
-    expectNoSessionStarted(before, path);
+    test('AC5, AC6, AC7 — with no setup commands the agent starts at once with no setup output or label; when it exits with code 3 the dot turns "Exited 3" at that moment and the terminal shows "[Claude Code exited with code 3]" and the login shell prompt; a reload keeps the dot, and typing exit in that shell leaves it', async () => {
+      const { page } = session;
+      await removeAllWorkspaces();
+      rmSync(join(repo.root, '.cockpit'), { recursive: true, force: true });
 
-    // The config is read again: a command added now runs after the check passes.
-    writeConfig(repo, { setup: [count, check, 'echo reread >> "$COCKPIT_ROOT_PATH/runs-s7"'] });
-    writeFileSync(join(repo.root, 'ok-s7'), '');
-    await retryButton(page).click({ timeout: UI_TIMEOUT });
-    await waitForSessionPage(page, undefined, 'Claude Code 1');
+      const { path, id } = await createWorkspaceWithSetup('agent-exit', 'p3');
 
-    const stub = await readStub(page);
-    expect(stub.cwd).toBe(path);
-    expect(stub.args).toBe('p7');
-    expect(readFileSync(join(repo.root, 'runs-s7'), 'utf8').split('\n').filter(Boolean)).toEqual(['run', 'run', 'run', 'reread']);
-    expect(startRuns(fx).filter((run) => run === 'claude p7')).toHaveLength(1);
-    expect(await waitForSetupStatus(page, path, 'Done')).toBe('Done');
-    expect(storedIn(path)).toHaveLength(1);
-  }, 60_000);
+      const stub = await readStub(page);
+      expect(stub.cwd).toBe(path);
+      expect(stub.args).toBe('p3');
+      expect((await terminalRows(page)).some((row) => row.startsWith('cockpit setup'))).toBe(false);
+      expect(await setupLabel(page, path)).toBeNull();
+      await expectDot(page, id, null);
 
-  test('workspace scripts AC6, AC8 — Start anyway starts the session in the worktree with the prompt and opens its page; the link stays Failed, the setup page then offers Retry setup only, and a successful retry starts no second session', async () => {
-    const { page } = session;
-    writeConfig(repo, { setup: ['test -f "$COCKPIT_ROOT_PATH/ok-s8" || exit 8'] });
-    const before = { pids: stubPids(fx), runs: startRuns(fx) };
+      await focusTerminal(page);
+      await typeLine(page, 'exit');
+      await waitForRow(page, '[Claude Code exited with code 3]');
+      await waitForRow(page, loginPrompt);
+      await expectDot(page, id, 'Exited 3');
 
-    const path = await createWorkspaceWithSetup('setup-anyway', 'p8');
-    await setupHeading(page, 'setup-anyway').waitFor({ timeout: UI_TIMEOUT });
-    await page.getByText('Setup failed with exit code 8').waitFor({ timeout: UI_TIMEOUT });
-    expectNoSessionStarted(before, path);
+      // AC6: a reload shows the same dot.
+      await page.reload();
+      await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
+      await expectDot(page, id, 'Exited 3', UI_TIMEOUT);
+      await waitForRow(page, '[Claude Code exited with code 3]');
 
-    const previous = sessionIdOf(page);
-    await startAnywayButton(page).click({ timeout: UI_TIMEOUT });
-    await waitForSessionPage(page, previous, 'Claude Code 1');
-    const stub = await readStub(page);
-    expect(stub.cwd).toBe(path);
-    expect(stub.argCount).toBe(1);
-    expect(stub.args).toBe('p8');
-    expect(await waitForSetupStatus(page, path, 'Failed')).toBe('Failed');
+      // The shell the agent left exits: the dot stays.
+      await focusTerminal(page);
+      await typeLine(page, 'exit');
+      await waitForRow(page, /^\[Process exited with code \d+\]$/);
+      await expectDot(page, id, 'Exited 3');
+      expect(await setupLabel(page, path)).toBeNull();
+    }, 60_000);
 
-    await openSetupLink(page, path);
-    await setupHeading(page, 'setup-anyway').waitFor({ timeout: UI_TIMEOUT });
-    await page.getByText('Setup failed with exit code 8').waitFor({ timeout: UI_TIMEOUT });
-    expect(await retryButton(page).count()).toBe(1);
-    expect(await startAnywayButton(page).count()).toBe(0);
+    test('AC10 — "cockpit setup" typed in a Terminal page shell, inside a linked worktree, is found and runs as in AC1; the shell is no session, so nothing is reported and no label changes', async () => {
+      const { page } = session;
+      await removeAllWorkspaces();
+      const path = await createPlainWorkspace(session, repo, 'term-setup');
+      writeConfig(repo, { setup: ['echo from-terminal'] });
 
-    writeFileSync(join(repo.root, 'ok-s8'), '');
-    await retryButton(page).click({ timeout: UI_TIMEOUT });
-    await page.getByText('Setup finished').waitFor({ timeout: UI_TIMEOUT });
-    expect(await waitForSetupStatus(page, path, 'Done')).toBe('Done');
-    // Still the setup page, and no second session: one stub run, one stored session, one link.
-    expect(new URL(page.url()).pathname).toBe('/setup');
-    await sleep(500);
-    expect(startRuns(fx).filter((run) => run === 'claude p8')).toHaveLength(1);
-    expect(storedIn(path)).toHaveLength(1);
-    expect(await waitForWorkspaceLinks(page, path, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
-  }, 60_000);
+      await openTerminal(page);
+      await waitForRow(page, loginPrompt);
+      await typeLine(page, `cd ${path} && cockpit setup`);
+
+      await waitForRow(page, '✓ Setup done');
+      const rows = (await terminalRows(page)).filter(Boolean);
+      const header = rows.indexOf('cockpit setup · term-setup · .cockpit/config.json');
+      expect(header).toBeGreaterThanOrEqual(0);
+      expect(rows.slice(header + 1, header + 3)).toEqual(['$ echo from-terminal', 'from-terminal']);
+      expect(await setupLabel(page, path)).toBeNull();
+      // The app was launched with a sentinel COCKPIT_SESSION_ID that a terminal does not inherit: a report
+      // for it would have been refused by the daemon, and nothing was logged.
+      await expectNoErrors(session);
+    }, 60_000);
+  });
 
   // The sidebar list scrolls once it holds this many rows, and its scrollbar then covers the "…" trigger
   // of the project row (Playwright's click on it hits the list). The tests below open that menu, so they
@@ -5763,80 +5678,6 @@ describe('sessions: built app', () => {
     await dispatchFocus(page);
     await waitForEntries(page, [repo.root]);
   }
-
-  test('workspace scripts AC10 — with an agent chosen, a config readWorkspaceConfig refuses starts no session: the setup page shows the message with Retry setup and Start anyway, and once the file is fixed Retry setup starts the session', async () => {
-    const { page } = session;
-    await removeAllWorkspaces();
-    writeConfig(repo, { run: ['bun dev'] });
-    const before = { pids: stubPids(fx), runs: startRuns(fx) };
-
-    const path = await createWorkspaceWithSetup('setup-bad-config', 'p10');
-
-    await setupHeading(page, 'setup-bad-config').waitFor({ timeout: UI_TIMEOUT });
-    const refused = await runCommandsApi(page, repo.root, path, 'setup');
-    expect(refused.status).toBe('refused');
-    expect(refused.message).toContain('config.json');
-    await page.getByText(refused.message!).first().waitFor({ timeout: UI_TIMEOUT });
-    expect(await page.getByText('Setup failed with exit code').count()).toBe(0);
-    expect(await retryButton(page).count()).toBe(1);
-    expect(await startAnywayButton(page).count()).toBe(1);
-    expect(await waitForSetupStatus(page, path, 'Failed')).toBe('Failed');
-    await sleep(300);
-    expect(new URL(page.url()).pathname).toBe('/setup');
-    expectNoSessionStarted(before, path);
-    expect(existsSync(path)).toBe(true);
-    expect(await entryTitles(page)).toContain(path);
-    expect(await sessionLinks(page, { workspace: path })).toEqual([]);
-
-    writeConfig(repo, { setup: ['echo fixed-config'] });
-    await retryButton(page).click({ timeout: UI_TIMEOUT });
-    await waitForSessionPage(page, undefined, 'Claude Code 1');
-    const stub = await readStub(page);
-    expect(stub.cwd).toBe(path);
-    expect(stub.args).toBe('p10');
-    expect(startRuns(fx).filter((run) => run === 'claude p10')).toHaveLength(1);
-    expect(storedIn(path)).toHaveLength(1);
-  }, 60_000);
-
-  test('workspace scripts AC5, AC6 — Ctrl+C in the setup terminal is a failure, not a success: "Setup ended before it finished." with both buttons, and no session starts', async () => {
-    const { page } = session;
-    writeConfig(repo, { setup: ['sh "$COCKPIT_ROOT_PATH/waitfor.sh" never-sig-setup'] });
-    const before = { pids: stubPids(fx), runs: startRuns(fx) };
-
-    const path = await createWorkspaceWithSetup('setup-signal', 'p-signal');
-    await setupHeading(page, 'setup-signal').waitFor({ timeout: UI_TIMEOUT });
-    const pid = await startedWaiter(repo, 'never-sig-setup');
-    await focusTerminal(page);
-    const focus = await page.evaluate(() => document.activeElement?.className ?? null);
-    const pressed = Date.now();
-    await page.keyboard.press('Control+c');
-
-    await withDiagnostic(
-      async () => {
-        await page.getByText('Setup ended before it finished.').waitFor({ timeout: UI_TIMEOUT });
-        expect(await endsWithin(pid)).toBe(true);
-        expect(await page.getByText('Setup finished').count()).toBe(0);
-        expect(await retryButton(page).count()).toBe(1);
-        expect(await startAnywayButton(page).count()).toBe(1);
-        expect(await waitForSetupStatus(page, path, 'Failed')).toBe('Failed');
-      },
-      async () => {
-        const [pane] = await visiblePanes(page);
-        return [
-          `focused element when Control+c was pressed: ${focus}`,
-          `waitfor.sh ${pid} alive: ${isAlive(pid)}; waiters now: ${JSON.stringify(waiters(repo, 'never-sig-setup'))}`,
-          `setup link: ${await setupLinkStatus(page, path)}`,
-          `main text: ${JSON.stringify(await page.evaluate(() => document.querySelector('main')?.innerText ?? null))}`,
-          pane ? await terminalDiagnostic(page, pane, pressed) : 'no visible terminal',
-        ].join('\n');
-      },
-    );
-    await sleep(300);
-    expect(new URL(page.url()).pathname).toBe('/setup');
-    expectNoSessionStarted(before, path);
-    expect(existsSync(path)).toBe(true);
-    expect(await sessionLinks(page, { workspace: path })).toEqual([]);
-  }, 60_000);
 
   test('logs no error and keeps running', async () => {
     expect(await sidebarLines(session.page)).toContain('Sessions');
@@ -7484,10 +7325,13 @@ describe('sessions smoke path: dev server', () => {
     const repo = makeRepo('smoke-agent-ws');
     const origin = addOrigin(repo);
     try {
+      writeConfig(repo, { setup: ['echo smoke-setup'] });
       await addRepository(session, repo);
       const id = await createWorkspaceWithAgent(page, repo, { name: 'smoke-agent', agent: 'Claude Code', prompt: 'fix the tests' }, 'Claude Code 1');
       const path = worktreePath(session, repo, 'smoke-agent');
 
+      // COCKPIT-57: `apps/cli/dist/cockpit setup` ran the setup in the terminal, then the stub.
+      await expectSetupThenAgent(page, 'smoke-agent', 'echo smoke-setup', 'smoke-setup');
       const stub = await readStub(page);
       expect(stub.cwd).toBe(path);
       expect(stub.argCount).toBe(1);
@@ -7986,9 +7830,12 @@ describe('packaged app sessions after a restart', () => {
       await poll(() => sessionsInState(dataDir), (list) => list.length === 2, UI_TIMEOUT);
 
       // Workspace sessions smoke path: a new workspace with Claude Code and a prompt.
+      writeConfig(repo, { setup: ['echo smoke-setup'] });
       await addRepository(first, repo);
       const wsId = await createWorkspaceWithAgent(first.page, repo, { name: 'smoke-agent', agent: 'Claude Code', prompt: 'fix the tests' }, 'Claude Code 1');
       const wsPath = worktreePath(first, repo, 'smoke-agent');
+      // COCKPIT-57: the bundle's `Contents/Resources/bin/cockpit setup` ran the setup, then the stub.
+      await expectSetupThenAgent(first.page, 'smoke-agent', 'echo smoke-setup', 'smoke-setup');
       const wsStub = await readStub(first.page);
       expect(wsStub.cwd).toBe(wsPath);
       expect(wsStub.argCount).toBe(1);

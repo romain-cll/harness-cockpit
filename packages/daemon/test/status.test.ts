@@ -32,6 +32,59 @@ describe('POST /session-events', () => {
     expect((await connection.client.list()).find((entry) => entry.sessionId === sessionId)?.status).toBe(event);
   });
 
+  test.each([
+    ['setup-running', 'running'],
+    ['setup-done', 'done'],
+    ['setup-failed', 'failed'],
+  ])('AC13 — event %s gets 204, reaches the client without an exit code and shows as the session\'s setup state %s in list', async (event, setup) => {
+    const { files, token, connection, sessionId } = await start();
+
+    expect(await post(files.socket, token, { sessionId, event })).toEqual({ status: 204, text: '' });
+
+    await until(() => connection.statuses.length === 1, 'the status event');
+    expect(connection.statuses).toEqual([{ sessionId, event }]);
+    const listed = (await connection.client.list()).find((entry) => entry.sessionId === sessionId);
+    expect(listed).toMatchObject({ setup });
+    expect(listed).not.toHaveProperty('exitCode');
+  });
+
+  test('AC13 — the last setup event wins in list: running, then failed, then running again, then done', async () => {
+    const { files, token, connection, sessionId } = await start();
+    const setupOf = async () => (await connection.client.list()).find((entry) => entry.sessionId === sessionId)?.setup;
+
+    expect(await setupOf()).toBeUndefined();
+    for (const [event, expected] of [
+      ['setup-running', 'running'],
+      ['setup-failed', 'failed'],
+      ['setup-running', 'running'],
+      ['setup-done', 'done'],
+    ] as const) {
+      expect(await post(files.socket, token, { sessionId, event })).toEqual({ status: 204, text: '' });
+      await until(async () => (await setupOf()) === expected, `the setup state ${expected}`);
+    }
+  });
+
+  test.each([3, 0, null])('AC13 — event exited with exitCode %s gets 204, reaches the client with the exit code and shows as the session\'s exit in list', async (exitCode) => {
+    const { files, token, connection, sessionId } = await start();
+
+    expect(await post(files.socket, token, { sessionId, event: 'exited', exitCode })).toEqual({ status: 204, text: '' });
+
+    await until(() => connection.statuses.length === 1, 'the exited event');
+    expect(connection.statuses).toEqual([{ sessionId, event: 'exited', exitCode }]);
+    const listed = (await connection.client.list()).find((entry) => entry.sessionId === sessionId);
+    expect(listed).toHaveProperty('exitCode', exitCode);
+  });
+
+  test.each(['setup-running', 'exited'])('AC13 — event %s for an id that is not a session of the daemon gets 404 and no event', async (event) => {
+    const { files, token, connection } = await start();
+
+    const answer = await post(files.socket, token, { sessionId: 'nobody', event, ...(event === 'exited' ? { exitCode: 1 } : {}) });
+
+    expect(answer.status).toBe(404);
+    expect(JSON.parse(answer.text)).toEqual({ error: 'unknown session' });
+    expect(connection.statuses).toEqual([]);
+  });
+
   test('AC13 — an id that is not a session of the daemon gets 404 { "error": "unknown session" } and no event', async () => {
     const { files, token, connection } = await start();
 
@@ -47,8 +100,14 @@ describe('POST /session-events', () => {
     ['an empty body', ''],
     ['an array', '[]'],
     ['no sessionId', '{"event":"working"}'],
-    ['an event that is not one of the three', '{"sessionId":"session-1","event":"sleeping"}'],
+    ['an event that is not one of the known ones', '{"sessionId":"session-1","event":"sleeping"}'],
     ['another field', '{"sessionId":"session-1","event":"working","extra":true}'],
+    ['exited without an exitCode', '{"sessionId":"session-1","event":"exited"}'],
+    ['exited with a string exitCode', '{"sessionId":"session-1","event":"exited","exitCode":"3"}'],
+    ['exited with a fractional exitCode', '{"sessionId":"session-1","event":"exited","exitCode":1.5}'],
+    ['working with an exitCode', '{"sessionId":"session-1","event":"working","exitCode":0}'],
+    ['setup-running with an exitCode', '{"sessionId":"session-1","event":"setup-running","exitCode":null}'],
+    ['setup-done with another field', '{"sessionId":"session-1","event":"setup-done","extra":true}'],
   ])('AC13 — %s gets 400 with an error reason and no event', async (_label, body) => {
     const { files, token, connection } = await start();
 

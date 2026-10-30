@@ -10,7 +10,7 @@ import { afterEach, beforeAll, describe, expect, test } from 'vitest';
 // builds `dist/cockpit` before `test`.
 
 const BINARY = resolve(import.meta.dirname, '../dist/cockpit');
-const USAGE = 'usage: cockpit status <working|waiting|finished>';
+const USAGE_LINES = ['cockpit status <working|waiting|finished>', 'cockpit setup [--then <command> [args…]]', 'cockpit teardown'];
 const TOKEN = 'a'.repeat(64);
 
 const cleanups: Array<() => void> = [];
@@ -89,7 +89,7 @@ describe('cockpit status, the compiled binary', () => {
     expect(result.ms).toBeLessThan(3_000);
   });
 
-  test('status working <extra>: the usage on stderr, exit 2, and no connection to the daemon', async () => {
+  test('AC12 — status working <extra>: the usage on stderr, exit 2, and no connection to the daemon', async () => {
     const socket = join(makeHome(), 'daemon-1-aaaa1111.sock');
     writeFileSync(socket.replace(/\.sock$/, '.token'), TOKEN);
     const server = await listenSilent(socket);
@@ -97,7 +97,8 @@ describe('cockpit status, the compiled binary', () => {
     const result = await run(['status', 'working', 'extra'], { COCKPIT_SOCKET: socket, COCKPIT_SESSION_ID: 'session-1' });
 
     expect(result).toMatchObject({ code: 2, out: '' });
-    expect(result.err.trim()).toBe(USAGE);
+    expect(result.err.startsWith('usage:')).toBe(true);
+    for (const line of USAGE_LINES) expect(result.err).toContain(line);
     expect(server.connections()).toBe(0);
   });
 });

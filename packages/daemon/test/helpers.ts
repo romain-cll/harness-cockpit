@@ -24,7 +24,9 @@ import { connectDaemon, daemonFiles, runDaemon, type DaemonClient } from '../src
 //     attach(id)              -> { cols, rows, screen, seq }
 //     write(id, data), resize(id, cols, rows), kill(id)       (no answer awaited)
 //     onData(({ id, seq, data }) => void), onExit(({ id, exitCode, signal }) => void),
-//     onStatus(({ sessionId, event }) => void), onClose(() => void), close()
+//     onStatus(({ sessionId, event, exitCode? }) => void), onClose(() => void), close()
+//   `list` entries also carry, for a session, `setup` (`running`, `done` or `failed`, the last
+//   `setup-*` event it reported) and `exitCode` (a number or `null`, once it reported `exited`).
 //   A client receives the data and exit events of the terminals it spawned or attached.
 // - `spawn` options: { kind, command, args, cwd, env, cols, rows, sessionId?, workspace? }.
 
@@ -76,7 +78,7 @@ export interface Connection {
   client: DaemonClient;
   data: Array<{ id: unknown; seq: number; data: string }>;
   exits: Array<{ id: unknown; exitCode: number | null; signal: number | null }>;
-  statuses: Array<{ sessionId: string; event: string }>;
+  statuses: Array<{ sessionId: string; event: string; exitCode?: number | null }>;
   closed: () => boolean;
   output: (id: unknown) => string;
 }
