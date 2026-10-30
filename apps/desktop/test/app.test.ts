@@ -271,6 +271,13 @@ const boxOf = (pane: Pane) =>
   });
 type Box = Awaited<ReturnType<typeof boxOf>>;
 
+// The area a terminal's pane is given by its tab's layout: its terminal snaps to whole rows inside it.
+const slotOf = (pane: Pane) =>
+  pane.evaluate((element) => {
+    const { left, top, right, bottom, width, height } = element.closest('.group\\/pane')!.getBoundingClientRect();
+    return { left, top, right, bottom, width, height };
+  });
+
 // Waits until the terminals stop moving: a terminal is refitted to its area a
 // moment after the area changes, and a terminal's box follows its rows.
 async function settle(...panes: Pane[]) {
@@ -1140,14 +1147,80 @@ const mutedColor = (page: Page) =>
     return color;
   });
 
-// The computed color of the deepest sidebar element that shows `text`.
-const colorOfLine = (page: Page, text: string) =>
-  page.evaluate((text) => {
+// The color a token (`--destructive`, `--status-working`…) resolves to, as `getComputedStyle` writes it.
+const tokenColor = (page: Page, token: string) =>
+  page.evaluate((token) => {
+    const probe = document.createElement('span');
+    probe.style.color = `var(${token})`;
+    document.body.append(probe);
+    const color = getComputedStyle(probe).color;
+    probe.remove();
+    return color;
+  }, token);
+
+// What a project whose folder is gone shows (COCKPIT-65 AC11): a `triangle-alert` icon after its name and
+// the colours of the icon, of the "Folder not found" line and of the path.
+const missingFolderBlock = (page: Page, path: string, name: string) =>
+  page.evaluate(
+    ({ path, name }) => {
+      const entry = [...document.querySelectorAll('aside [title]')].find((element) => element.getAttribute('title') === path);
+      const item = entry?.closest('li');
+      const deepest = (text: string) => {
+        const all = [...(item?.querySelectorAll('*') ?? [])] as HTMLElement[];
+        const matches = all.filter((element) => (element.textContent ?? '').trim() === text);
+        return matches.find((element) => !matches.some((other) => other !== element && element.contains(other)));
+      };
+      const nameElement = deepest(name);
+      const icon = item?.querySelector('svg.lucide-triangle-alert');
+      const line = deepest('Folder not found');
+      const pathElement = deepest(path);
+      return {
+        icon: !!icon && !!nameElement && icon.getBoundingClientRect().left >= nameElement.getBoundingClientRect().right - 1,
+        iconColor: icon ? getComputedStyle(icon).color : null,
+        lineColor: line ? getComputedStyle(line).color : null,
+        pathColor: pathElement ? getComputedStyle(pathElement).color : null,
+      };
+    },
+    { path, name },
+  );
+
+// What `window.api.projects.git()` answers (COCKPIT-65).
+const projectsGit = (page: Page) =>
+  page.evaluate(() => (window as unknown as { api: { projects: { git(): Promise<string> } } }).api.projects.git());
+
+// The git alert of the sidebar (COCKPIT-65 AC10), or null when it is not shown: whether it holds a
+// `triangle-alert` icon, where it sits against the Terminal link and the Projects header, and its icon's RGB.
+const gitAlertOf = (page: Page) =>
+  page.evaluate(() => {
     const all = [...document.querySelectorAll('aside *')] as HTMLElement[];
-    const matches = all.filter((element) => (element.textContent ?? '').trim() === text);
-    const deepest = matches.find((element) => !matches.some((other) => other !== element && element.contains(other)));
-    return deepest ? getComputedStyle(deepest).color : null;
-  }, text);
+    const deepest = (text: string) => {
+      const matches = all.filter((element) => (element.textContent ?? '').trim() === text);
+      return matches.find((element) => !matches.some((other) => other !== element && element.contains(other)));
+    };
+    const title = deepest('Git is not installed');
+    const detail = deepest('Projects and workspaces need git 2.36 or later. Install it, then restart Cockpit.');
+    if (!title || !detail) return null;
+    let box: HTMLElement | null = title;
+    while (box && box.tagName !== 'ASIDE' && !(box.contains(detail) && box.querySelector('svg.lucide-triangle-alert'))) box = box.parentElement;
+    const terminal = [...document.querySelectorAll('aside a')].find((link) => (link.textContent ?? '').trim() === 'Terminal');
+    const projects = [...document.querySelectorAll('aside button')].find((button) => (button.textContent ?? '').trim() === 'Projects');
+    const icon = box && box.tagName !== 'ASIDE' ? box.querySelector('svg.lucide-triangle-alert') : null;
+    if (!box || !icon || !terminal || !projects) return { icon: false, top: 0, bottom: 0, terminalBottom: 0, projectsTop: 0, iconRgb: [0, 0, 0] };
+    const context = document.createElement('canvas').getContext('2d')!;
+    context.fillStyle = '#000000';
+    context.fillStyle = getComputedStyle(icon).color;
+    context.fillRect(0, 0, 1, 1);
+    const [r, g, b] = context.getImageData(0, 0, 1, 1).data;
+    const rect = box.getBoundingClientRect();
+    return {
+      icon: true,
+      top: rect.top,
+      bottom: rect.bottom,
+      terminalBottom: terminal.getBoundingClientRect().bottom,
+      projectsTop: projects.getBoundingClientRect().top,
+      iconRgb: [r!, g!, b!],
+    };
+  });
 
 // --- Workspace scripts helpers (COCKPIT-32) -----------------------------------
 
@@ -1340,9 +1413,19 @@ describe.each([
     const { page } = session;
     const background = () => page.evaluate(() => getComputedStyle(document.body).backgroundColor);
     await page.emulateMedia({ colorScheme: 'dark' });
-    expect(await background()).toBe('oklch(0.145 0 0)');
+    // COCKPIT-65 AC1, AC12: the `app` fill of the new tokens.
+    expect(await background()).toBe('rgb(14, 14, 16)');
     await page.emulateMedia({ colorScheme: 'light' });
-    expect(await background()).toBe('oklch(1 0 0)');
+    expect(await background()).toBe('rgb(255, 255, 255)');
+  });
+
+  // COCKPIT-65 AC4, AC10, AC12: the smoke assertion of the modes that do not run the full block. The
+  // launchd-environment mode is the one where the login shell's real PATH must find git.
+  test.runIf(!full)('COCKPIT-65 AC4, AC10 smoke — the sidebar is 220 px wide and shows no git alert', async () => {
+    const { page } = session;
+    await page.getByText(versionLabel).waitFor();
+    expect((await page.locator('aside').boundingBox())?.width).toBe(220);
+    expect(await sidebarLines(page)).not.toContain('Git is not installed');
   });
 
   test('reloads to the same page', async () => {
@@ -1715,18 +1798,25 @@ describe.each([
     await waitForRow(page, 'b-marker-15', b);
     const c = await splitPane(page, b, 'down');
     const cPid = await pidOf(page);
+    // The expected areas come from the panes' own slots, not from the terminals, which snap to whole rows.
     const aBox = await boxOf(a);
-    const bBox = await boxOf(b);
-    const cBox = await boxOf(c);
-    const slot: Box = { left: bBox.left, top: bBox.top, right: cBox.right, bottom: cBox.bottom, width: bBox.width, height: cBox.bottom - bBox.top };
+    const aSlot = await slotOf(a);
+    const bSlot = await slotOf(b);
+    const cSlot = await slotOf(c);
+    const slot: Box = { left: bSlot.left, top: bSlot.top, right: cSlot.right, bottom: cSlot.bottom, width: bSlot.width, height: cSlot.bottom - bSlot.top };
 
     await clickPaneButton(c, 'Close terminal');
 
     expect(await endsWithin(cPid)).toBe(true);
     await poll(async () => (await visiblePanes(page)).length, (count) => count === 2, UI_TIMEOUT);
-    const grown = await poll(() => boxOf(b), (box) => sameArea(box, slot), UI_TIMEOUT);
+    const grown = await poll(() => slotOf(b), (box) => sameArea(box, slot), UI_TIMEOUT);
     expect(sameArea(grown, slot), 'the sibling takes the closed terminal\'s whole area').toBe(true);
+    // Its terminal fills that area, short of it by less than one row (plus the view's padding).
+    const rowHeight = await b.evaluate((element) => element.querySelector('.xterm-rows > div')!.getBoundingClientRect().height);
+    const fills = (box: Box) => box.top >= slot.top && box.bottom <= slot.bottom && slot.height - box.height < rowHeight + 10;
+    expect(fills(await poll(() => boxOf(b), fills, UI_TIMEOUT)), 'the sibling\'s terminal fills its area').toBe(true);
     expect(sameArea(await boxOf(a), aBox), 'the other half is untouched').toBe(true);
+    expect(sameArea(await slotOf(a), aSlot), 'the other half\'s area is untouched').toBe(true);
     expect(await rowsOf(b), 'the sibling keeps its output').toContain('b-marker-15');
     expect(isAlive(aPid)).toBe(true);
     expect(isAlive(bPid)).toBe(true);
@@ -1741,12 +1831,12 @@ describe.each([
     expect((await rowsOf(a)).join('\n')).not.toContain('echo sibling-');
 
     // The layout is now A | B. Closing A, the first child, gives the keyboard to B too.
-    const whole: Box = { left: aBox.left, top: slot.top, right: slot.right, bottom: slot.bottom, width: slot.right - aBox.left, height: slot.height };
+    const whole: Box = { left: aSlot.left, top: slot.top, right: slot.right, bottom: slot.bottom, width: slot.right - aSlot.left, height: slot.height };
     await clickPaneButton(a, 'Close terminal');
 
     expect(await endsWithin(aPid), 'the first child\'s shell ends within 5 s').toBe(true);
     await poll(async () => (await visiblePanes(page)).length, (count) => count === 1, UI_TIMEOUT);
-    const whole2 = await poll(() => boxOf(b), (box) => sameArea(box, whole), UI_TIMEOUT);
+    const whole2 = await poll(() => slotOf(b), (box) => sameArea(box, whole), UI_TIMEOUT);
     expect(sameArea(whole2, whole), 'B takes the whole area').toBe(true);
     expect(isAlive(bPid)).toBe(true);
     const active2 = await poll(() => activePane(page), Boolean, UI_TIMEOUT);
@@ -2716,7 +2806,7 @@ describe.each([
       expect(existsSync(lateReload), 'removing a project deletes no worktree').toBe(true);
     });
 
-    test('AC12, AC8 — a project whose folder is gone stays listed with a muted "<path> is not a git repository." and no workspace, logs no error, offers an unusable New workspace dialog and can be removed', async () => {
+    test('AC12, AC8, COCKPIT-65 AC11 — a project whose folder is gone stays listed with a red alert icon after its name, a red "Folder not found" line, its path in muted text and no workspace, logs no error, offers an unusable New workspace dialog and is removed by its "Remove from Cockpit" button', async () => {
       const { page } = session;
       await clearProjects();
       const vanishing = makeLightRepo('ws-vanishing');
@@ -2727,13 +2817,19 @@ describe.each([
       rmSync(vanishing.parent, { recursive: true, force: true });
       await page.reload();
       await page.getByText(versionLabel).waitFor();
-      const line = `${vanishing.root} is not a git repository.`;
-      await waitForLine(page, line);
+      await waitForLine(page, 'Folder not found');
 
       expect(await entryTitles(page)).toEqual([vanishing.root]);
       expect((await sidebarEntries(page))[0]!.text).toContain(vanishing.name);
-      expect(await isBelowProjectsHeader(page, { text: line })).toBe(true);
-      expect(await colorOfLine(page, line), 'the line is muted').toBe(await mutedColor(page));
+      const lines = await sidebarLines(page);
+      expect(lines).toContain(vanishing.root);
+      expect(lines.filter((line) => line.endsWith('is not a git repository.'))).toEqual([]);
+      expect(await isBelowProjectsHeader(page, { text: 'Folder not found' })).toBe(true);
+      const missing = await missingFolderBlock(page, vanishing.root, vanishing.name);
+      expect(missing.icon, 'a triangle-alert icon after the name').toBe(true);
+      expect(missing.iconColor, 'the icon is red').toBe(await tokenColor(page, '--destructive'));
+      expect(missing.lineColor, 'the line is red').toBe(await tokenColor(page, '--destructive'));
+      expect(missing.pathColor, 'the path is muted').toBe(await mutedColor(page));
       expect(projectsInState(session.dataDir)).toContainEqual({ path: vanishing.root });
 
       // AC8: listing the branches fails, the dialog says so and "Create" stays disabled.
@@ -2744,11 +2840,43 @@ describe.each([
       expect(await createButton(dialog).isDisabled()).toBe(true);
       await dismissDialogs(page);
 
-      await removeThroughMenu(page, vanishing.root);
+      // The button removes it as the "…" menu does: the entry and the state's entry go, the disk is untouched.
+      await page.locator('aside').getByRole('button', { name: 'Remove from Cockpit', exact: true }).click({ timeout: UI_TIMEOUT });
       await waitForEntries(page, []);
       await poll(() => projectsInState(session.dataDir), (projects) => Array.isArray(projects) && projects.length === 0, UI_TIMEOUT);
       expect(projectsInState(session.dataDir)).toEqual([]);
+      expect(existsSync(vanishing.parent)).toBe(false);
       await expectNoNewErrors(session, mark);
+    });
+
+    test('COCKPIT-65 AC11 — a project whose folder exists but cannot be listed keeps the muted "<path> is not a git repository." line, with no "Folder not found", no error screen and the other projects still listed', async () => {
+      const { page } = session;
+      await clearProjects();
+      const other = makeLightRepo('ws-listable');
+      const unreadable = makeLightRepo('ws-unreadable');
+      folders.push(other, unreadable);
+      await addRepository(session, other);
+      await addRepository(session, unreadable);
+      const mark = await errorMark(session);
+
+      // The folder is still there, but nothing under its parent can be reached any more.
+      chmodSync(unreadable.parent, 0o000);
+      try {
+        await page.reload();
+        await page.getByText(versionLabel).waitFor();
+        const message = `${unreadable.root} is not a git repository.`;
+        await waitForLine(page, message);
+
+        const lines = await sidebarLines(page);
+        expect(lines).not.toContain('Folder not found');
+        expect(lines).toContain('Projects');
+        expect(await entryTitles(page)).toEqual(expect.arrayContaining([other.root, unreadable.root]));
+        expect(await isBelowProjectsHeader(page, { text: message })).toBe(true);
+        expect(projectsInState(session.dataDir)).toContainEqual({ path: unreadable.root });
+        await expectNoNewErrors(session, mark);
+      } finally {
+        chmodSync(unreadable.parent, 0o755);
+      }
     });
 
     test.runIf(mode === 'built app')('AC13 — with 30 projects the Projects header and the footer stay in the window and the list scrolls to its last entry', async () => {
@@ -3895,6 +4023,19 @@ describe('built app with no git on the login shell PATH', () => {
     expect(projectsInState(session.dataDir) ?? []).toEqual([]);
     expect(existsSync(join(session.dataDir, 'state.json.tmp'))).toBe(false);
   });
+
+  test('COCKPIT-65 AC10 — an amber alert with a triangle-alert icon sits under the Home and Terminal links and above the Projects header, and projects.git() answers "missing"', async () => {
+    const { page } = session;
+    await page.getByText(versionLabel).waitFor();
+    expect(await projectsGit(page)).toBe('missing');
+    const alert = await poll(() => gitAlertOf(page), (found) => found !== null, UI_TIMEOUT);
+    expect(alert, 'the alert shows').not.toBeNull();
+    expect(alert!.icon, 'a triangle-alert icon').toBe(true);
+    expect(alert!.top, 'under the Terminal link').toBeGreaterThanOrEqual(alert!.terminalBottom - 1);
+    expect(alert!.bottom, 'above the Projects header').toBeLessThanOrEqual(alert!.projectsTop + 1);
+    const [r, g, b] = alert!.iconRgb;
+    expect(r! >= 150 && r! > g! && g! >= 70 && g! > b! && b! <= 80, `the icon is amber, got rgb(${r}, ${g}, ${b})`).toBe(true);
+  });
 });
 
 // --- Sessions (COCKPIT-25) ---------------------------------------------------
@@ -4064,7 +4205,7 @@ const sessionLinks = (page: Page, scope: 'sessions' | { workspace: string }): Pr
   page.evaluate((scope) => {
     const root =
       scope === 'sessions'
-        ? [...document.querySelectorAll('aside section')].find((section) => section.querySelector('h2')?.textContent?.trim() === 'Sessions')
+        ? [...document.querySelectorAll('aside section')].find((section) => section.querySelector('h2, button[aria-expanded]')?.textContent?.trim() === 'Sessions')
         : [...document.querySelectorAll('aside [title]')].find((element) => element.getAttribute('title') === scope.workspace)?.closest('li');
     if (!root) return [];
     return [...root.querySelectorAll('a[href*="/sessions/"]')].map((link) => {
@@ -4126,7 +4267,7 @@ async function startSession(page: Page, harnessName: string, pageName: string): 
 
 async function openSessionEntry(page: Page, name: string) {
   // The Sessions section's links only: a workspace's sessions can bear the same name.
-  const section = page.locator('aside section').filter({ has: page.getByRole('heading', { name: 'Sessions', exact: true }) });
+  const section = page.locator('aside section').filter({ has: page.locator('h2, button[aria-expanded]').filter({ hasText: /^\s*Sessions\s*$/ }) });
   const entry = section.locator('a[href*="/sessions/"]', { hasText: new RegExp(`^\\s*${escapeRegExp(name)}(\\s|$)`) });
   await entry.first().click({ timeout: UI_TIMEOUT });
   await page.getByRole('heading', { name, exact: true }).waitFor({ timeout: UI_TIMEOUT });
@@ -7455,6 +7596,476 @@ describe('session status: built app', () => {
 
     for (const id of [known.codex.id, known.opencode.id, known.workspace.id, known.notified.id]) await expectDot(page, id, 'Ended', UI_TIMEOUT);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+  });
+});
+
+// --- Redesign foundation (COCKPIT-65) ----------------------------------------
+
+// The titles (project roots, workspace paths, session folders) of the sidebar rows that are shown.
+const visibleTitles = (page: Page) =>
+  page.evaluate(() =>
+    [
+      ...new Set(
+        [...document.querySelectorAll('aside [title]')]
+          .filter((element) => {
+            const { width, height } = element.getBoundingClientRect();
+            return width > 0 && height > 0 && element.checkVisibility();
+          })
+          .map((element) => element.getAttribute('title')!),
+      ),
+    ],
+  );
+
+// The computed fills of `body`, `<main>` and `<aside>` under a color scheme.
+async function fillsUnder(page: Page, colorScheme: 'dark' | 'light') {
+  await page.emulateMedia({ colorScheme });
+  return page.evaluate(() => {
+    const fill = (selector: string) => {
+      const element = document.querySelector(selector);
+      return element ? getComputedStyle(element).backgroundColor : 'missing';
+    };
+    return { body: fill('body'), main: fill('main'), aside: fill('aside') };
+  });
+}
+
+// What AC2 measures: `<main>` against the window, its box model, the sidebar's right border and the
+// page header row.
+const shellOf = (page: Page) =>
+  page.evaluate(() => {
+    const main = document.querySelector('main')!;
+    const aside = document.querySelector('aside');
+    const style = getComputedStyle(main);
+    const sides = ['Top', 'Right', 'Bottom', 'Left'] as const;
+    const rect = main.getBoundingClientRect();
+    const header = main.querySelector('header')?.getBoundingClientRect();
+    return {
+      windowHeight: window.innerHeight,
+      mainTop: rect.top,
+      mainHeight: rect.height,
+      margin: sides.map((side) => style[`margin${side}`]),
+      border: sides.map((side) => style[`border${side}Width`]),
+      radius: style.borderRadius,
+      padding: sides.map((side) => style[`padding${side}`]),
+      asideRightBorder: aside ? getComputedStyle(aside).borderRightWidth : null,
+      headerTop: header?.top ?? null,
+      headerHeight: header?.height ?? null,
+    };
+  });
+
+// The project badge of the row titled `path`: the 16 px element holding the first character of `name`.
+const badgeOf = (page: Page, path: string, name: string) =>
+  page.evaluate(
+    ({ path, name }) => {
+      const item = [...document.querySelectorAll('aside [title]')].find((element) => element.getAttribute('title') === path)?.closest('li');
+      const letter = name[0]!.toLowerCase();
+      const badge = ([...(item?.querySelectorAll('*') ?? [])] as HTMLElement[]).find((element) => {
+        const { width, height } = element.getBoundingClientRect();
+        return (element.textContent ?? '').trim().toLowerCase() === letter && Math.round(width) === 16 && Math.round(height) === 16;
+      });
+      if (!badge) return null;
+      const style = getComputedStyle(badge);
+      return { text: badge.innerText.trim(), background: style.backgroundColor, color: style.color, radius: style.borderRadius };
+    },
+    { path, name },
+  );
+
+// The chevron button of a project row and what its icon looks like (class and transform), so a test sees
+// the chevron turn.
+const chevronOf = (page: Page, label: string) =>
+  page.getByRole('button', { name: label, exact: true }).evaluate((button) => {
+    const icon = button.querySelector('svg');
+    return {
+      expanded: button.getAttribute('aria-expanded'),
+      look: icon ? `${icon.getAttribute('class')} ${getComputedStyle(icon).transform} ${getComputedStyle(button).transform}` : 'no icon',
+    };
+  });
+
+const STATUS_ICON = /lucide-(contrast|circle-dot|circle-check|circle-x|circle-dashed)(\s|$)/;
+
+// The status icon of a session's row (COCKPIT-65 AC9): which Lucide icon, its size, its color, its
+// accessible name and whether it sits left of the session's name.
+const statusIconOf = (page: Page, id: string, name: string) =>
+  page.evaluate(
+    ({ id, name, source }) => {
+      const link = document.querySelector(`aside a[href$="/sessions/${id}"]`);
+      if (!link) return null;
+      const svg = [...link.querySelectorAll('svg')].find((element) => new RegExp(source).test(element.getAttribute('class') ?? ''));
+      if (!svg) return null;
+      const holder = svg.closest('[role="img"]');
+      const texts = ([...link.querySelectorAll('*')] as HTMLElement[]).filter((element) => (element.textContent ?? '').trim() === name);
+      const nameElement = texts.find((element) => !texts.some((other) => other !== element && element.contains(other)));
+      const box = svg.getBoundingClientRect();
+      return {
+        kind: new RegExp(source).exec(svg.getAttribute('class')!)![1]!,
+        width: Math.round(box.width),
+        height: Math.round(box.height),
+        color: getComputedStyle(svg).color,
+        role: holder?.getAttribute('role') ?? null,
+        label: holder?.getAttribute('aria-label') ?? null,
+        title: holder?.getAttribute('title') ?? null,
+        hidden: svg.getAttribute('aria-hidden'),
+        roleImgInRow: !!link.closest('li')?.querySelector('[role="img"]'),
+        leftOfName: !!nameElement && box.right <= nameElement.getBoundingClientRect().left + 1,
+      };
+    },
+    { id, name, source: STATUS_ICON.source },
+  );
+
+// Waits until the row of session `id` shows the icon `kind`, then checks all of AC9 for it: 14 px, left of
+// the name, the token's color and, when `label` is given, role img with that aria-label and title.
+async function expectStatusIcon(
+  page: Page,
+  id: string,
+  name: string,
+  expected: { kind: string; token: string; label: string | null },
+) {
+  const icon = await poll(() => statusIconOf(page, id, name), (found) => found?.kind === expected.kind && (found?.label ?? null) === expected.label, UI_TIMEOUT);
+  expect(icon, `the status icon of ${name} (${id})`).not.toBeNull();
+  expect(icon!.kind).toBe(expected.kind);
+  expect([icon!.width, icon!.height], 'the icon is 14 px').toEqual([14, 14]);
+  expect(icon!.leftOfName, 'the icon sits left of the name').toBe(true);
+  expect(icon!.color, `the color of ${expected.token}`).toBe(await tokenColor(page, expected.token));
+  if (expected.label === null) {
+    expect(icon!.hidden).toBe('true');
+    expect(icon!.roleImgInRow, 'no accessible name').toBe(false);
+  } else {
+    expect([icon!.role, icon!.label, icon!.title]).toEqual(['img', expected.label, expected.label]);
+  }
+}
+
+describe('redesign foundation: built app', () => {
+  let fx: SessionsFixture;
+  let session: Session;
+  let alpha: TempRepo;
+  let bravo: TempRepo;
+  let plain: TempRepo;
+  let alphaWorkspace = '';
+  let bravoWorkspace = '';
+  const ids = { top: '', workspace: '' };
+
+  beforeAll(async () => {
+    // Stub agents, and a `git` wrapper that logs every run (the number of `--version` runs, AC10).
+    fx = makeSessionsFixture(['claude'], { log: true, gitLog: true });
+    alpha = makeRepo('alpha-redesign');
+    bravo = makeLightRepo('bravo-redesign');
+    plain = makePlainFolder('not-a-repository-redesign');
+    alphaWorkspace = join(alpha.parent, 'feat-a');
+    bravoWorkspace = join(bravo.parent, 'feat-b');
+    gitIn(alpha.root, 'worktree', 'add', '--quiet', '-b', 'feat-a', alphaWorkspace);
+    gitIn(bravo.root, 'worktree', 'add', '--quiet', '-b', 'feat-b', bravoWorkspace);
+    session = await launchBuiltWith(fx.env());
+    await session.page.getByText(versionLabel).waitFor();
+    // A status report with no window focused would show a real notification.
+    await stubNotifications(session);
+  });
+
+  afterAll(async () => {
+    await session?.close();
+    if (fx) rmSync(fx.root, { recursive: true, force: true });
+    for (const repo of [alpha, bravo, plain]) if (repo) rmSync(repo.parent, { recursive: true, force: true });
+  });
+
+  afterEach(() => closeOverlays(session.page));
+
+  const gitRuns = () => readFileSync(fx.gitLog, 'utf8').split('\n').filter((line) => line.endsWith(' --version')).length;
+
+  test('COCKPIT-65 AC10 — with git on the login shell PATH no alert shows and projects.git() answers "ok"; git --version ran once, and a reload, a focus and another call run none', async () => {
+    const { page } = session;
+    expect(await projectsGit(page)).toBe('ok');
+    expect(await gitAlertOf(page)).toBeNull();
+    expect(await sidebarLines(page)).not.toContain('Git is not installed');
+    expect(gitRuns(), 'the first call checked git').toBe(1);
+
+    await page.reload();
+    await page.getByText(versionLabel).waitFor();
+    await dispatchFocus(page);
+    expect(await projectsGit(page)).toBe('ok');
+    await sleep(500);
+    expect(gitRuns(), 'a reload, a focus and a second call run no new git --version').toBe(1);
+  });
+
+  test('COCKPIT-65 setup — two projects with a workspace each, and a session outside any project and one in a workspace', async () => {
+    const { page } = session;
+    await addRepository(session, alpha);
+    await addRepository(session, bravo);
+    await poll(() => visibleTitles(page), (titles) => titles.includes(alphaWorkspace) && titles.includes(bravoWorkspace), UI_TIMEOUT);
+    ids.top = await startSession(page, 'Claude Code', 'Claude Code 1');
+    await readStub(page);
+    ids.workspace = await startInWorkspace(page, alphaWorkspace, 'feat-a', 'Claude Code', 'Claude Code 1');
+    await readStub(page);
+    expect(ids.top).not.toBe(ids.workspace);
+    await goHome(page);
+  });
+
+  test('COCKPIT-65 AC1 — in dark mode body and <main> are #0E0E10 and the <aside> #161618, in light mode #FFFFFF and #F7F7F8, on Home and on a session page', async () => {
+    const { page } = session;
+    try {
+      for (const where of ['home', 'session'] as const) {
+        if (where === 'home') await goHome(page);
+        else await openSessionEntry(page, 'Claude Code 1');
+        expect(await fillsUnder(page, 'dark'), `dark, ${where}`).toEqual({ body: 'rgb(14, 14, 16)', main: 'rgb(14, 14, 16)', aside: 'rgb(22, 22, 24)' });
+        expect(await fillsUnder(page, 'light'), `light, ${where}`).toEqual({ body: 'rgb(255, 255, 255)', main: 'rgb(255, 255, 255)', aside: 'rgb(247, 247, 248)' });
+      }
+    } finally {
+      await page.emulateMedia({ colorScheme: null });
+    }
+  });
+
+  test('COCKPIT-65 AC2 — <main> fills the window height with no margin, border or rounded corner, nothing separates it from the sidebar, it has 8 px of padding and the header row is 28 px tall at 8 px from the top', async () => {
+    const { page } = session;
+    for (const where of ['home', 'session'] as const) {
+      if (where === 'home') await goHome(page);
+      else await openSessionEntry(page, 'Claude Code 1');
+      const shell = await shellOf(page);
+      expect([shell.mainTop, shell.mainHeight], `${where}: <main> spans the window`).toEqual([0, shell.windowHeight]);
+      expect(shell.margin, `${where}: margin`).toEqual(['0px', '0px', '0px', '0px']);
+      expect(shell.border, `${where}: border`).toEqual(['0px', '0px', '0px', '0px']);
+      expect(shell.radius, `${where}: radius`).toBe('0px');
+      expect(shell.padding, `${where}: padding`).toEqual(['8px', '8px', '8px', '8px']);
+      expect(shell.asideRightBorder, `${where}: the sidebar's right border`).toBe('0px');
+      expect([shell.headerTop, shell.headerHeight], `${where}: the header row`).toEqual([8, 28]);
+      expect(shell.headerTop! + shell.headerHeight! / 2, `${where}: its centre`).toBe(22);
+    }
+  });
+
+  test('COCKPIT-65 AC3 — the traffic lights are at { x: 14, y: 16 }', async () => {
+    expect(
+      await session.evaluateInMain<{ x: number; y: number }>("require('electron').BrowserWindow.getAllWindows()[0].getWindowButtonPosition()"),
+    ).toEqual({ x: 14, y: 16 });
+  });
+
+  test('COCKPIT-65 AC4 — the sidebar is 220 px wide: a 28 px top strip 8 px from the top with "Hide sidebar" at its right, then Home, Terminal, Projects, Sessions and the muted version line at the bottom', async () => {
+    const { page } = session;
+    await goHome(page);
+    const box = async (locator: ReturnType<Page['locator']>) => (await locator.boundingBox())!;
+    const aside = await box(page.locator('aside'));
+    expect(aside.width).toBe(220);
+    const hide = page.getByRole('button', { name: 'Hide sidebar', exact: true });
+    const hideBox = await box(hide);
+    expect(hideBox.x + hideBox.width / 2, 'at the right of the strip').toBeGreaterThan(aside.x + aside.width / 2);
+    expect(hideBox.x + hideBox.width).toBeLessThanOrEqual(aside.x + aside.width);
+    // The strip: the button or one of its ancestors is 28 px tall, 8 px from the top.
+    expect(
+      await hide.evaluate((button) => {
+        for (let element: Element | null = button; element && element.tagName !== 'ASIDE'; element = element.parentElement) {
+          const { top, height } = element.getBoundingClientRect();
+          if (top === 8 && height === 28) return true;
+        }
+        return false;
+      }),
+      'a 28 px strip at 8 px from the top',
+    ).toBe(true);
+    expect(hideBox.y + hideBox.height / 2).toBe(22);
+
+    const tops = {
+      hide: hideBox.y,
+      home: (await box(page.locator('aside').getByRole('link', { name: 'Home', exact: true }))).y,
+      terminal: (await box(page.locator('aside').getByRole('link', { name: 'Terminal', exact: true }))).y,
+      projects: (await box(page.getByRole('button', { name: 'Projects', exact: true }))).y,
+      sessions: (await box(page.getByRole('button', { name: 'Sessions', exact: true }))).y,
+      version: (await box(page.locator('aside').getByText(versionLabel))).y,
+    };
+    const order = Object.entries(tops).sort(([, a], [, b]) => a - b).map(([name]) => name);
+    expect(order).toEqual(['hide', 'home', 'terminal', 'projects', 'sessions', 'version']);
+
+    const version = page.locator('aside').getByText(versionLabel);
+    const versionBox = await box(version);
+    expect(aside.y + aside.height - (versionBox.y + versionBox.height), 'at the bottom of the sidebar').toBeLessThanOrEqual(24);
+    const colours = await version.evaluate((element) => ({
+      line: getComputedStyle(element).color,
+      sidebar: getComputedStyle(element.closest('aside')!).color,
+    }));
+    expect(colours.line, 'muted').not.toBe(colours.sidebar);
+  });
+
+  test('COCKPIT-65 AC5 — nothing in the sidebar is heavier than 400 and every Lucide icon in it has a stroke width of 1.25, with a project, a workspace, sessions and the selected row shown', async () => {
+    const { page } = session;
+    await page.locator(`aside a[href$="/sessions/${ids.workspace}"]`).click({ timeout: UI_TIMEOUT });
+    await page.locator(`aside a[href$="/sessions/${ids.workspace}"][aria-current="page"]`).waitFor({ timeout: UI_TIMEOUT });
+    expect(await badgeOf(page, alpha.root, alpha.name), 'the project badge shows').not.toBeNull();
+    const facts = await page.evaluate(() => {
+      const elements = [...document.querySelectorAll('aside *')] as Element[];
+      const icons = [...document.querySelectorAll('aside svg.lucide')];
+      return {
+        heavy: elements
+          .filter((element) => Number(getComputedStyle(element).fontWeight) > 400)
+          .map((element) => `${element.tagName.toLowerCase()} "${(element.textContent ?? '').trim().slice(0, 30)}" ${getComputedStyle(element).fontWeight}`),
+        icons: icons.length,
+        strokes: icons.filter((icon) => parseFloat(getComputedStyle(icon).strokeWidth) !== 1.25).map((icon) => `${icon.getAttribute('class')} ${getComputedStyle(icon).strokeWidth}`),
+        bots: document.querySelectorAll('aside svg.lucide-bot').length,
+      };
+    });
+    expect(facts.heavy, 'elements with a font weight above 400').toEqual([]);
+    expect(facts.icons).toBeGreaterThan(6);
+    expect(facts.strokes, 'icons whose stroke width is not 1.25').toEqual([]);
+    expect(facts.bots, "today's bot icon is gone").toBe(0);
+  });
+
+  test('COCKPIT-65 AC6 — "Hide sidebar" removes the <aside> and puts "Show sidebar" in the main header row right of the traffic lights, with the page content right of it; "Show sidebar" brings back the same content; a reload shows the sidebar', async () => {
+    const { page } = session;
+    await goHome(page);
+    const content = await sidebarLines(page);
+    expect(content).toContain('Projects');
+    expect(await page.getByRole('button', { name: 'Show sidebar', exact: true }).count()).toBe(0);
+
+    await page.getByRole('button', { name: 'Hide sidebar', exact: true }).click({ timeout: UI_TIMEOUT });
+    await page.locator('aside').waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+    const show = page.getByRole('button', { name: 'Show sidebar', exact: true });
+    await show.waitFor({ timeout: UI_TIMEOUT });
+    const showBox = (await show.boundingBox())!;
+    expect(showBox.y + showBox.height / 2, 'centred on the 22 px line').toBeCloseTo(22, 0);
+    expect(showBox.x, 'right of the traffic lights').toBeGreaterThanOrEqual(72);
+    expect(await page.locator('main').getByRole('button', { name: 'Show sidebar', exact: true }).count(), 'in the main area').toBe(1);
+    const heading = (await page.getByRole('heading', { name: 'Home' }).boundingBox())!;
+    expect(heading.x, 'the page content starts right of the button').toBeGreaterThanOrEqual(showBox.x + showBox.width - 1);
+    const shell = await shellOf(page);
+    expect([shell.headerTop, shell.headerHeight]).toEqual([8, 28]);
+
+    await show.click({ timeout: UI_TIMEOUT });
+    await page.locator('aside').waitFor({ timeout: UI_TIMEOUT });
+    expect(await sidebarLines(page), 'the same Projects and Sessions content').toEqual(content);
+    expect(await page.getByRole('button', { name: 'Show sidebar', exact: true }).count()).toBe(0);
+
+    await page.getByRole('button', { name: 'Hide sidebar', exact: true }).click({ timeout: UI_TIMEOUT });
+    await page.locator('aside').waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+    await page.reload();
+    await page.locator('aside').waitFor({ timeout: UI_TIMEOUT });
+    await page.getByText(versionLabel).waitFor();
+    expect(await page.locator('aside').count()).toBe(1);
+  });
+
+  test('COCKPIT-65 AC8 — a project row shows a 16 px badge (radius 4) with the first letter of its name in upper case, white on one of six palette colours, the same after a reload; its chevron button hides that project\'s workspaces and their sessions only, and a reload shows every project expanded', async () => {
+    const { page } = session;
+    const palette = ['rgb(94, 106, 210)', 'rgb(217, 119, 6)', 'rgb(13, 148, 136)', 'rgb(225, 29, 72)', 'rgb(2, 132, 199)', 'rgb(124, 58, 237)'];
+    const badges = {
+      alpha: await badgeOf(page, alpha.root, alpha.name),
+      bravo: await badgeOf(page, bravo.root, bravo.name),
+    };
+    expect(badges.alpha).toMatchObject({ text: 'A', color: 'rgb(255, 255, 255)', radius: '4px' });
+    expect(badges.bravo).toMatchObject({ text: 'B', color: 'rgb(255, 255, 255)', radius: '4px' });
+    expect(palette).toContain(badges.alpha!.background);
+    expect(palette).toContain(badges.bravo!.background);
+
+    const expanded = `Collapse ${alpha.name}`;
+    const collapsed = `Expand ${alpha.name}`;
+    const open = await chevronOf(page, expanded);
+    expect(open.expanded).toBe('true');
+    expect((await chevronOf(page, `Collapse ${bravo.name}`)).expanded).toBe('true');
+    expect(await visibleTitles(page)).toEqual(expect.arrayContaining([alphaWorkspace, bravoWorkspace]));
+    const alphaSession = page.locator(`aside a[href$="/sessions/${ids.workspace}"]`);
+    expect(await alphaSession.isVisible()).toBe(true);
+
+    await page.getByRole('button', { name: expanded, exact: true }).click({ timeout: UI_TIMEOUT });
+    const closed = await chevronOf(page, collapsed);
+    expect(closed.expanded).toBe('false');
+    expect(closed.look, 'the chevron turns to point right').not.toBe(open.look);
+    const titles = await visibleTitles(page);
+    expect(titles).toContain(alpha.root);
+    expect(titles, 'the workspace rows of the project are hidden').not.toContain(alphaWorkspace);
+    expect(await alphaSession.isVisible(), 'and their sessions').toBe(false);
+    expect(titles, 'another project is unaffected').toContain(bravoWorkspace);
+    expect((await chevronOf(page, `Collapse ${bravo.name}`)).expanded).toBe('true');
+
+    await page.getByRole('button', { name: collapsed, exact: true }).click({ timeout: UI_TIMEOUT });
+    expect((await chevronOf(page, expanded)).expanded).toBe('true');
+    expect(await visibleTitles(page)).toContain(alphaWorkspace);
+    expect(await alphaSession.isVisible()).toBe(true);
+
+    // The colour is picked from the path: it does not change.
+    await page.getByRole('button', { name: expanded, exact: true }).click({ timeout: UI_TIMEOUT });
+    await page.reload();
+    await page.getByText(versionLabel).waitFor();
+    await poll(() => visibleTitles(page), (shown) => shown.includes(alphaWorkspace), UI_TIMEOUT);
+    expect((await chevronOf(page, expanded)).expanded, 'a reload shows the project expanded').toBe('true');
+    expect((await chevronOf(page, `Collapse ${bravo.name}`)).expanded).toBe('true');
+    expect(await badgeOf(page, alpha.root, alpha.name)).toEqual(badges.alpha);
+    expect(await badgeOf(page, bravo.root, bravo.name)).toEqual(badges.bravo);
+  });
+
+  test('COCKPIT-65 AC7 — the "Projects" and "Sessions" header buttons hide and show their list, their "+" button and message lines stay, and a reload shows both lists', async () => {
+    const { page } = session;
+    const projects = page.getByRole('button', { name: 'Projects', exact: true });
+    const sessions = page.getByRole('button', { name: 'Sessions', exact: true });
+    const topSession = page.locator(`aside a[href$="/sessions/${ids.top}"]`);
+    expect(await projects.getAttribute('aria-expanded')).toBe('true');
+    expect(await sessions.getAttribute('aria-expanded')).toBe('true');
+    expect(await projects.locator('svg').count(), 'a caret').toBeGreaterThan(0);
+
+    // A message line under each header.
+    const refusal = `${plain.root} is not in a git repository.`;
+    await addProject(session, plain.root);
+    await waitForLine(page, refusal);
+    const binary = join(fx.bin, 'claude');
+    const startFailure = `Could not start Claude Code: ${binary} not found.`;
+    renameSync(binary, `${binary}.gone`);
+    try {
+      await openStartMenu(page);
+      await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).click({ timeout: UI_TIMEOUT });
+      await waitForLine(page, startFailure);
+    } finally {
+      renameSync(`${binary}.gone`, binary);
+    }
+
+    await projects.click({ timeout: UI_TIMEOUT });
+    expect(await projects.getAttribute('aria-expanded')).toBe('false');
+    const hiddenProjects = await visibleTitles(page);
+    expect(hiddenProjects).not.toContain(alpha.root);
+    expect(hiddenProjects).not.toContain(bravo.root);
+    expect(await page.getByRole('button', { name: 'Add project', exact: true }).isVisible()).toBe(true);
+    expect(await sidebarLines(page), 'the message stays').toContain(refusal);
+    expect(await topSession.isVisible(), 'the other section is unaffected').toBe(true);
+    await projects.click({ timeout: UI_TIMEOUT });
+    expect(await projects.getAttribute('aria-expanded')).toBe('true');
+    expect(await visibleTitles(page)).toEqual(expect.arrayContaining([alpha.root, bravo.root]));
+
+    await sessions.click({ timeout: UI_TIMEOUT });
+    expect(await sessions.getAttribute('aria-expanded')).toBe('false');
+    expect(await topSession.isVisible()).toBe(false);
+    expect(await page.getByRole('button', { name: 'Start session', exact: true }).isVisible()).toBe(true);
+    expect(await sidebarLines(page), 'the message stays').toContain(startFailure);
+    await sessions.click({ timeout: UI_TIMEOUT });
+    expect(await sessions.getAttribute('aria-expanded')).toBe('true');
+    expect(await topSession.isVisible()).toBe(true);
+
+    // A second click on each, then a reload: both lists show.
+    await projects.click({ timeout: UI_TIMEOUT });
+    await sessions.click({ timeout: UI_TIMEOUT });
+    await page.reload();
+    await page.getByText(versionLabel).waitFor();
+    await poll(() => visibleTitles(page), (shown) => shown.includes(alpha.root), UI_TIMEOUT);
+    expect(await page.getByRole('button', { name: 'Projects', exact: true }).getAttribute('aria-expanded')).toBe('true');
+    expect(await page.getByRole('button', { name: 'Sessions', exact: true }).getAttribute('aria-expanded')).toBe('true');
+    expect(await page.locator(`aside a[href$="/sessions/${ids.top}"]`).isVisible()).toBe(true);
+  });
+
+  test('COCKPIT-65 AC9 — a session row shows a 14 px status icon left of its name: contrast Working, circle-dot Needs input, circle-check Ready, circle-x Exited 3, circle-dashed Ended, and a muted aria-hidden circle-dashed before its first report', async () => {
+    const { page } = session;
+    const top = 'Claude Code 1';
+    const unreported = { kind: 'circle-dashed', token: '--muted-foreground', label: null };
+    await expectStatusIcon(page, ids.top, top, unreported);
+    await expectStatusIcon(page, ids.workspace, top, unreported);
+
+    await reportStatus(session, ids.top, 'working');
+    await expectStatusIcon(page, ids.top, top, { kind: 'contrast', token: '--status-working', label: 'Working' });
+    await reportStatus(session, ids.top, 'waiting');
+    await expectStatusIcon(page, ids.top, top, { kind: 'circle-dot', token: '--status-waiting', label: 'Needs input' });
+    await reportStatus(session, ids.top, 'finished');
+    await expectStatusIcon(page, ids.top, top, { kind: 'circle-check', token: '--status-ready', label: 'Ready' });
+    // The row under a workspace is drawn the same way.
+    await reportStatus(session, ids.workspace, 'working');
+    await expectStatusIcon(page, ids.workspace, top, { kind: 'contrast', token: '--status-working', label: 'Working' });
+
+    await openSessionEntry(page, top);
+    await focusTerminal(page);
+    await typeLine(page, 'exit');
+    await waitForRow(page, '[Process exited with code 3]');
+    await expectStatusIcon(page, ids.top, top, { kind: 'circle-x', token: '--status-exited', label: 'Exited 3' });
+
+    await page.locator(`aside a[href$="/sessions/${ids.workspace}"]`).click({ timeout: UI_TIMEOUT });
+    await focusTerminal(page);
+    await typeLine(page, 'quit');
+    await waitForRow(page, '[Process exited with code 0]');
+    await expectStatusIcon(page, ids.workspace, top, { kind: 'circle-dashed', token: '--muted-foreground', label: 'Ended' });
   });
 });
 

@@ -1,42 +1,53 @@
 import { Link, useRouter } from '@tanstack/react-router';
-import { BotIcon } from 'lucide-react';
+import { CircleCheckIcon, CircleDashedIcon, CircleDotIcon, CircleXIcon, ChevronDownIcon, ChevronRightIcon, ContrastIcon } from 'lucide-react';
 import { useState, useSyncExternalStore } from 'react';
 import type { DaemonStatus, Session } from '../../shared/api';
+import { toggleSessions, useSessionsCollapsed } from '@/components/collapsed';
 import { useRetrying } from '@/components/daemon-down';
 import { getRunningIds, getSessionDots, startSession, subscribe } from '@/components/live-terminals';
 import { StartSessionMenu } from '@/components/start-session-menu';
 
-// The color of a dot by its accessible name; "Ended" is any session the store does not hold (an earlier launch).
-function dotColor(label: string): string {
+/** The classes of a 28 px sidebar row, with its icons at 14 px unless they set a size of their own. */
+export const rowClass =
+  'flex h-7 items-center gap-2 rounded-md px-2 text-xs hover:bg-hover [&_svg:not([class*=size-])]:size-3.5 [&_svg]:shrink-0';
+
+/** The classes of a row that links to a page, filled while it is the current one. */
+export const linkRowClass = `${rowClass} cursor-default aria-[current=page]:bg-sidebar-accent`;
+
+// The icon and color of a status icon by its accessible name; "Ended" is any session the store does not
+// hold (an earlier launch).
+function statusIcon(label: string) {
   switch (label) {
     case 'Working':
-      return 'bg-status-working';
+      return { Icon: ContrastIcon, color: 'text-status-working' };
     case 'Needs input':
-      return 'bg-status-waiting';
+      return { Icon: CircleDotIcon, color: 'text-status-waiting' };
     case 'Ready':
-      return 'bg-status-ready';
+      return { Icon: CircleCheckIcon, color: 'text-status-ready' };
     case 'Ended':
-      return 'bg-muted-foreground';
+      return { Icon: CircleDashedIcon, color: 'text-muted-foreground' };
     default:
-      return 'bg-destructive';
+      return { Icon: CircleXIcon, color: 'text-status-exited' };
   }
 }
 
-// A session's link, with a dot: what its agent last reported while it runs (none before its first
-// report), "Ended" or "Exited N" once its process ended.
+// A session's link, with a status icon: what its agent last reported while it runs (a muted dashed
+// circle without a name before its first report), "Ended" or "Exited N" once its process ended.
 export function SessionLink({ session }: { session: Session }) {
   const dots = useSyncExternalStore(subscribe, getSessionDots);
   const running = useSyncExternalStore(subscribe, getRunningIds);
   const label = dots.get(session.id) ?? (running.has(session.id) ? undefined : 'Ended');
+  const { Icon, color } = label ? statusIcon(label) : { Icon: CircleDashedIcon, color: 'text-muted-foreground' };
   return (
-    <Link
-      to="/sessions/$sessionId"
-      params={{ sessionId: session.id }}
-      className="flex h-8 cursor-default items-center gap-2 rounded-[calc(var(--radius-sm)+2px)] p-2 text-xs hover:bg-sidebar-accent hover:text-sidebar-accent-foreground aria-[current=page]:bg-sidebar-accent aria-[current=page]:font-medium aria-[current=page]:text-sidebar-accent-foreground [&_svg]:size-4 [&_svg]:shrink-0"
-    >
-      <BotIcon />
-      <span className="truncate">{session.name}</span>{' '}
-      {label && <span role="img" aria-label={label} title={label} className={`ml-auto size-2 shrink-0 rounded-full ${dotColor(label)}`} />}
+    <Link to="/sessions/$sessionId" params={{ sessionId: session.id }} className={linkRowClass}>
+      {label ? (
+        <span role="img" aria-label={label} title={label} className={`flex shrink-0 ${color}`}>
+          <Icon className="size-3.5" />
+        </span>
+      ) : (
+        <Icon aria-hidden="true" className={`size-3.5 ${color}`} />
+      )}
+      <span className="truncate">{session.name}</span>
     </Link>
   );
 }
@@ -45,6 +56,7 @@ export function SessionLink({ session }: { session: Session }) {
 export function Sessions({ sessions, daemon }: { sessions: Session[]; daemon: DaemonStatus }) {
   const router = useRouter();
   const retrying = useRetrying();
+  const collapsed = useSessionsCollapsed();
   // Why the last start was refused; cleared by the next one that succeeds.
   const [message, setMessage] = useState<string>();
 
@@ -60,10 +72,15 @@ export function Sessions({ sessions, daemon }: { sessions: Session[]; daemon: Da
   }
 
   return (
-    <section className="flex max-h-[40%] shrink-0 flex-col gap-px p-2">
-      <header className="flex h-7 shrink-0 items-center justify-between pl-2 text-xs text-muted-foreground">
-        <h2 className="font-medium">Sessions</h2>
-        <StartSessionMenu label="Start session" onStart={(harness) => void start(harness)} />
+    <section className="flex max-h-[40%] shrink-0 flex-col gap-px">
+      <header className="flex h-6 shrink-0 items-center justify-between pr-1.5 text-[11px] text-muted-foreground">
+        <h2>
+          <button type="button" aria-expanded={!collapsed} onClick={toggleSessions} className="flex h-6 cursor-default items-center gap-1 pl-2">
+            Sessions
+            {collapsed ? <ChevronRightIcon className="size-2.5 text-subtle" /> : <ChevronDownIcon className="size-2.5 text-subtle" />}
+          </button>
+        </h2>
+        <StartSessionMenu label="Start session" className="text-subtle" onStart={(harness) => void start(harness)} />
       </header>
       {daemon.status === 'down' && !retrying && (
         <p className="shrink-0 px-2 py-1 text-xs break-words text-muted-foreground">{`Cockpit's background service could not start: ${daemon.reason}`}</p>
@@ -73,15 +90,17 @@ export function Sessions({ sessions, daemon }: { sessions: Session[]; daemon: Da
           {message}
         </p>
       )}
-      <ul className="flex min-h-0 flex-col gap-px overflow-y-auto">
-        {sessions
-          .filter((session) => session.project === undefined)
-          .map((session) => (
-            <li key={session.id} title={session.directory}>
-              <SessionLink session={session} />
-            </li>
-          ))}
-      </ul>
+      {!collapsed && (
+        <ul className="flex min-h-0 flex-col gap-px overflow-y-auto">
+          {sessions
+            .filter((session) => session.project === undefined)
+            .map((session) => (
+              <li key={session.id} title={session.directory}>
+                <SessionLink session={session} />
+              </li>
+            ))}
+        </ul>
+      )}
     </section>
   );
 }

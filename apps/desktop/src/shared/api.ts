@@ -69,6 +69,8 @@ export interface Project {
   name: string;
   workspaces: Workspace[];
   error?: string;
+  /** The project's folder no longer exists. */
+  missing?: true;
 }
 
 /** What adding a project came to; `refused` carries the message to show the user. */
@@ -236,6 +238,8 @@ export interface Api {
   /** Git repositories the user works in, kept in the app state. */
   projects: {
     list(): Promise<Project[]>;
+    /** Whether git is on the login shell's `PATH`; checked once per launch, on the first call. */
+    git(): Promise<'ok' | 'missing'>;
     /** Opens the folder picker, then adds the repository that holds the folder. */
     add(): Promise<AddProjectResult>;
     /** Forgets the project; its files stay on disk. */

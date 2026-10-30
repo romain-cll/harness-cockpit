@@ -25,6 +25,7 @@ const api: Api = {
   },
   projects: {
     list: () => ipcRenderer.invoke('projects:list'),
+    git: () => ipcRenderer.invoke('projects:git'),
     add: () => ipcRenderer.invoke('projects:add'),
     remove: (path) => ipcRenderer.invoke('projects:remove', path),
   },
