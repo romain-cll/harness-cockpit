@@ -19,7 +19,12 @@ interface Terminal {
   subscribers: Set<Subscriber>;
   /** The connection a `commands` terminal ends with. */
   owner?: Subscriber;
+  /** The pending SIGKILL of a terminal that was hung up, cleared when it exits. */
+  killTimer?: NodeJS.Timeout;
 }
+
+/** How long a hung-up process has to end before it is killed. */
+const HANGUP_GRACE_MS = 1000;
 
 /**
  * The terminals the daemon owns: node-pty sessions, each mirrored by a headless terminal that
@@ -40,6 +45,20 @@ export function createTerminals(onEnd: () => void) {
     } catch {
       // The terminal ends through its own exit event.
     }
+  };
+
+  // node-pty's `kill()` sends SIGHUP, which bash 3.2 (macOS's /bin/sh and /bin/bash) drops when it
+  // arrives during the shell's startup, and which a process may ignore: the terminal would then
+  // never end. A process that has not exited after the grace period gets SIGKILL.
+  const hangUp = (terminal: Terminal) => {
+    terminal.killTimer ??= setTimeout(() => {
+      try {
+        terminal.pty.kill('SIGKILL');
+      } catch {
+        // The terminal ends through its own exit event.
+      }
+    }, HANGUP_GRACE_MS).unref();
+    terminal.pty.kill();
   };
 
   return {
@@ -73,6 +92,7 @@ export function createTerminals(onEnd: () => void) {
         for (const each of terminal.subscribers) each.data(id, seq, data);
       });
       pty.onExit(({ exitCode, signal }) => {
+        clearTimeout(terminal.killTimer);
         terminals.delete(id);
         headless.dispose();
         for (const each of terminal.subscribers) each.exit(id, { exitCode, signal: signal ?? null });
@@ -112,13 +132,13 @@ export function createTerminals(onEnd: () => void) {
         terminal.info.rows = rows;
       }),
 
-    kill: (id: unknown) => withTerminal(id, ({ pty }) => pty.kill()),
+    kill: (id: unknown) => withTerminal(id, hangUp),
 
     /** Stops sending to a connection that closed, and ends the `commands` terminals it owns. */
     release(subscriber: Subscriber): void {
       for (const [id, terminal] of terminals) {
         terminal.subscribers.delete(subscriber);
-        if (terminal.owner === subscriber) withTerminal(id, ({ pty }) => pty.kill());
+        if (terminal.owner === subscriber) withTerminal(id, hangUp);
       }
     },
 
@@ -133,7 +153,7 @@ export function createTerminals(onEnd: () => void) {
     },
 
     killAll: () => {
-      for (const id of terminals.keys()) withTerminal(id, ({ pty }) => pty.kill());
+      for (const id of terminals.keys()) withTerminal(id, hangUp);
     },
   };
 }

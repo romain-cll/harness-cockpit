@@ -162,6 +162,9 @@ describe('the headless terminal (AC5)', () => {
   });
 });
 
+// Ignores SIGHUP (inherited by the `sleep` it execs), prints its pid, then waits.
+const HUP_IGNORER = "trap '' HUP; echo ready-$$-end; exec sleep 60";
+
 describe('kill and exit (AC6)', () => {
   test('AC6 — kill ends the process and the daemon no longer lists the terminal; a shell that exits by itself leaves the list too', async () => {
     const { client, connection } = await start();
@@ -174,8 +177,26 @@ describe('kill and exit (AC6)', () => {
 
     await until(() => connection.exits.length === 2, 'both exits');
     expect(connection.exits.find((exit) => exit.id === exiting)?.exitCode).toBe(3);
+    // AC2 — a shell that ends on SIGHUP reports it: no SIGKILL was needed.
+    expect(connection.exits.find((exit) => exit.id === killed)?.signal).toBe(1);
     expect(await client.list()).toEqual([]);
     await until(() => !isAlive(killedPid), 'the killed shell to be gone');
+  });
+
+  test('AC1 — a process that ignores SIGHUP gets SIGKILL 1 s after the hang-up: the client receives signal 9 within 3 s, the terminal leaves the list and the process is gone', async () => {
+    const { client, connection } = await start();
+    const id = await client.spawn({ ...shellOptions, command: '/bin/sh', args: ['-c', HUP_IGNORER] });
+    await until(() => /ready-\d+-end/.test(connection.output(id)), 'the process to ignore SIGHUP');
+    const pid = Number(/ready-(\d+)-end/.exec(connection.output(id))![1]);
+
+    const killedAt = Date.now();
+    client.kill(id);
+
+    await until(() => connection.exits.some((exit) => exit.id === id), 'the exit of the SIGHUP-ignoring process', 3000);
+    expect(Date.now() - killedAt).toBeGreaterThanOrEqual(900);
+    expect(connection.exits.find((exit) => exit.id === id)?.signal).toBe(9);
+    expect(await client.list()).toEqual([]);
+    await until(() => !isAlive(pid), 'the process to be gone');
   });
 });
 
@@ -198,6 +219,24 @@ describe('commands bound to a connection (AC7)', () => {
     expect(isAlive(pids.session)).toBe(true);
     other.client.kill(shell);
     other.client.kill(session);
+  });
+});
+
+describe('commands that ignore SIGHUP (AC3)', () => {
+  test('AC3 — closing the connection that spawned a commands terminal running a SIGHUP-ignoring process ends it within 3 s, and another client no longer lists it', async () => {
+    const { connection, files } = await start();
+    const { client } = connection;
+    const id = await client.spawn({ ...shellOptions, kind: 'commands', command: '/bin/sh', args: ['-c', HUP_IGNORER] });
+    await until(() => /ready-\d+-end/.test(connection.output(id)), 'the process to ignore SIGHUP');
+    const pid = Number(/ready-(\d+)-end/.exec(connection.output(id))![1]);
+    const other = await connectTo(files.socket);
+    expect((await other.client.list()).map((entry) => entry.id)).toEqual([id]);
+    expect(isAlive(pid)).toBe(true);
+
+    client.close();
+
+    await until(() => !isAlive(pid), 'the commands process to be gone', 3000);
+    await until(async () => (await other.client.list()).length === 0, 'the commands terminal to leave the list');
   });
 });
 
