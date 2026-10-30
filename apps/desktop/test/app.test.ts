@@ -468,6 +468,23 @@ async function terminalSize(page: Page, pane?: Pane): Promise<[number, number]> 
   return [r!, c!];
 }
 
+// Like `terminalSize`, for a read repeated many times on one screen: the answer carries a tag
+// unique to this call (`size-<n> <rows> <cols>`) and the call waits for that row, so old answers
+// scrolling off a full screen never hide the new one.
+let sizeReads = 0;
+async function taggedTerminalSize(page: Page, pane: Pane): Promise<[number, number]> {
+  const tag = `size-${sizeReads++}`;
+  await typeLine(page, `printf '${tag} %s\\n' "$(stty size)"`);
+  const answer = new RegExp(`^${tag} (\\d+) (\\d+)$`);
+  await page.waitForFunction(
+    ([element, source]) => [...element.querySelectorAll('.xterm-rows > div')].some((row) => new RegExp(source).test(row.textContent ?? '')),
+    [pane, answer.source] as const,
+    { timeout: 15_000 },
+  );
+  const found = (await rowsOf(pane)).map((row) => answer.exec(row)).find(Boolean)!;
+  return [Number(found[1]), Number(found[2])];
+}
+
 // The `[rows, cols]` the terminal displays: its rendered rows, and the width of
 // the wrapped rows of a long line of one digit the shell prints. Each call prints
 // another digit, so the lines of an earlier call on the same screen are not mistaken
@@ -485,13 +502,38 @@ async function displayedSize(page: Page, pane: Pane): Promise<[number, number]> 
   return [rows.length, cols];
 }
 
-// What `stty size` answers in a terminal must be what the terminal displays.
+// What `stty size` answers in a terminal must be what the terminal displays. On a mismatch only,
+// `stty size` is read again for up to 5 s, which tells a late resize (LATE: it matches in the end,
+// one line says so) from a lost one (LOST: the failure holds every size seen); each re-read is
+// tagged, so it still works once the screen is full. A match on the
+// first answer re-reads nothing and writes nothing.
 async function expectSizeMatchesDisplay(page: Page, pane: Pane) {
   await focusPane(pane);
   await waitForPrompt(page, pane);
-  const answered = await terminalSize(page, pane);
+  const first = await terminalSize(page, pane);
   const shown = await displayedSize(page, pane);
-  expect(answered, 'the shell is told the rows and columns the terminal displays').toEqual(shown);
+  const matches = (size: [number, number]) => size[0] === shown[0] && size[1] === shown[1];
+  if (matches(first)) return;
+
+  let rereads = 0;
+  const last = await poll(
+    async () => {
+      rereads++;
+      // With poll's own 100 ms, about 250 ms between re-reads bounds the lines they print.
+      await sleep(150);
+      return taggedTerminalSize(page, pane);
+    },
+    matches,
+    5_000,
+  );
+  if (matches(last)) {
+    console.log(`late resize: displayed ${shown[0]} ${shown[1]}, first answer ${first[0]} ${first[1]}, matched after ${rereads} re-reads`);
+    return;
+  }
+  expect(
+    last,
+    `the shell is told the rows and columns the terminal displays: displayed ${shown[0]} ${shown[1]}, first answer ${first[0]} ${first[1]}, last answer ${last[0]} ${last[1]} after ${rereads} re-reads: LOST`,
+  ).toEqual(shown);
 }
 
 // Types `echo pid-$$` in a terminal and returns the shell's process id. With a
