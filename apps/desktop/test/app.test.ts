@@ -2870,11 +2870,12 @@ describe.each([
       writeConfig(repo, { setup: [`touch "${ran}"`] });
       await collectPtyData(page);
 
+      const urlBefore = page.url();
       const path = await createWorkspace('no-agent-no-setup');
 
       await waitListed(path);
       expect(existsSync(path)).toBe(true);
-      expect(new URL(page.url()).pathname).toBe('/');
+      expect(page.url()).toBe(urlBefore);
       expect(await visiblePanes(page)).toHaveLength(0);
       expect(await setupLabel(page, path)).toBeNull();
       expect(await setupLinkCount(page)).toBe(0);
@@ -3139,6 +3140,7 @@ describe.each([
       await addRepository(session, repo);
       const path = worktreePath(session, repo, branch);
 
+      const urlBefore = page.url();
       const dialog = await openNewWorkspaceDialog(page, repo);
       await poll(() => selectedBase(dialog), (value) => value === 'main', UI_TIMEOUT);
       await nameField(dialog).fill(branch);
@@ -3152,7 +3154,7 @@ describe.each([
 
       // No agent chosen: no setup ran, and none is shown.
       expect(existsSync(join(repo.root, 'setup-ran'))).toBe(false);
-      expect(new URL(page.url()).pathname).toBe('/');
+      expect(page.url()).toBe(urlBefore);
 
       expect(existsSync(join(repo.root, 'teardown-out.txt'))).toBe(false);
       await startDeletion(page, path);
@@ -4208,6 +4210,18 @@ async function expectSetupThenAgent(page: Page, name: string, command: string, o
   expect(rows.slice(header + 1, header + 4)).toEqual([`$ ${command}`, output, '✓ Setup done']);
 }
 
+// COCKPIT-57: the app's own `cockpit setup` (the CLI parent of the agent, alive while it runs) was
+// given the absolute path harness detection found after `--then`, so the binary detection found is
+// the one that runs, not the first `claude` of a `PATH` the CLI would search itself.
+function expectSetupSpawnedWithDetectedPath(fx: SessionsFixture, cli: string, binary = 'claude') {
+  const lines = execFileSync('ps', ['-axo', 'command='], { encoding: 'utf8' })
+    .split('\n')
+    .filter((line) => line.startsWith(`${cli} setup `));
+  expect(lines, 'one `cockpit setup` command runs').toHaveLength(1);
+  expect(lines[0]).toContain(` --then ${join(fx.bin, binary)} `);
+  expect(lines[0]).not.toMatch(new RegExp(` --then ${binary}( |$)`));
+}
+
 // Whether the deepest element whose text starts with `text` sits below the
 // "Sessions" header of the sidebar.
 const isBelowSessionsHeader = (page: Page, text: string) =>
@@ -4308,10 +4322,12 @@ const waitForWorkspaceLinks = (page: Page, workspacePath: string, expected: Arra
     UI_TIMEOUT,
   );
 
-// The pids of the stubs running as sessions (`pgrep -f` on their path).
+// The pids of the stubs running as sessions (`pgrep -f` on their own command: the stub script, run by
+// its interpreter or not). A pattern that is not anchored would also match the command line of
+// `cockpit setup … --then <abs path>`, the CLI parent of the stub, which holds the stub's path.
 function stubPids(fx: SessionsFixture): number[] {
   try {
-    return execFileSync('pgrep', ['-f', `${escapeRegExp(fx.bin)}/(claude|codex)`], { encoding: 'utf8' })
+    return execFileSync('pgrep', ['-f', `^(/bin/sh |sh )?${escapeRegExp(fx.bin)}/(claude|codex)( |$)`], { encoding: 'utf8' })
       .split('\n')
       .filter(Boolean)
       .map(Number)
@@ -5536,6 +5552,7 @@ describe('sessions: built app', () => {
       expect(stub.argCount).toBe(1);
       expect(stub.args).toBe(prompt);
       expect(startRuns(fx).slice(before.runs.length)).toEqual(['setup-done', `claude ${prompt}`]);
+      expectSetupSpawnedWithDetectedPath(fx, REPOSITORY_CLI);
       const done = await terminalRows(page);
       expect(done.indexOf('✓ Setup done')).toBeLessThan(done.indexOf('ready'));
       // The agent runs with its status hooks, which name the CLI.
@@ -7336,6 +7353,7 @@ describe('sessions smoke path: dev server', () => {
       expect(stub.cwd).toBe(path);
       expect(stub.argCount).toBe(1);
       expect(stub.args).toBe('fix the tests');
+      expectSetupSpawnedWithDetectedPath(fx, REPOSITORY_CLI);
       expect(await waitForWorkspaceLinks(page, path, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
       const stored = await poll(() => sessionsInState(session.dataDir), (list) => list.some((entry) => entry.id === id), UI_TIMEOUT);
       expect(stored.find((entry) => entry.id === id)).toMatchObject({ name: 'Claude Code 1', directory: path, project: repo.root });
@@ -7840,6 +7858,7 @@ describe('packaged app sessions after a restart', () => {
       expect(wsStub.cwd).toBe(wsPath);
       expect(wsStub.argCount).toBe(1);
       expect(wsStub.args).toBe('fix the tests');
+      expectSetupSpawnedWithDetectedPath(fx, PACKAGED_CLI());
       expect(await waitForWorkspaceLinks(first.page, wsPath, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
       const storedWs = await poll(() => sessionsInState(dataDir), (list) => list.some((entry) => entry.id === wsId), UI_TIMEOUT);
       expect(storedWs.find((entry) => entry.id === wsId)).toMatchObject({ name: 'Claude Code 1', directory: wsPath, project: repo.root });

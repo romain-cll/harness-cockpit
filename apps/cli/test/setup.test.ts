@@ -213,19 +213,19 @@ describe('cockpit setup', () => {
   });
 
   test.each([
-    ['code 3', 'exit3', 3],
-    ['code 0', '', 0],
-    ['a signal', 'term', null],
-  ])('AC5 — the agent exits with %s: exited is reported with it, "[Claude Code exited with code N]" is printed for a code, and the login shell (-l) then starts in the worktree', async (_label, how, exitCode) => {
+    ['code 3', 'exit3', 3, '[Claude Code exited with code 3]'],
+    ['code 0', '', 0, '[Claude Code exited with code 0]'],
+    ['a signal', 'term', null, '[Claude Code was killed by SIGTERM]'],
+  ])('AC5 — the agent exits with %s: exited is reported with it, "%s" is printed, and the login shell (-l) then starts in the worktree', async (_label, how, exitCode, line) => {
     writeConfig({ setup: ['echo only'] });
 
     const run = await cockpit(['setup', '--shell', '--then', agent], { env: { ...SESSION(), STUB_AGENT: how } });
     await reportsSettled(3);
 
     expect(run.lines.slice(0, 5)).toEqual([HEADER('setup'), '$ echo only', 'only', '✓ Setup done', 'agent-started']);
-    if (exitCode !== null) expect(run.lines).toContain(`[Claude Code exited with code ${exitCode}]`);
+    expect(run.lines).toContain(line);
     expect(run.lines.at(-1)).toBe('shell-prompt');
-    if (exitCode !== null) expect(run.lines.indexOf(`[Claude Code exited with code ${exitCode}]`)).toBeLessThan(run.lines.indexOf('shell-prompt'));
+    expect(run.lines.indexOf(line)).toBeLessThan(run.lines.indexOf('shell-prompt'));
     expect(run.stub.file('shell.cwd')?.trim()).toBe(worktree);
     expect(nulSplit(run.stub.file('shell.argv'))).toEqual(['-l']);
     expect(reports.at(-1)).toEqual({ sessionId: 'session-1', event: 'exited', exitCode });
