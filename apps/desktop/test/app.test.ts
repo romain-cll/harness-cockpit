@@ -1173,15 +1173,6 @@ const gitAlertOf = (page: Page) =>
     };
   });
 
-// The computed color of the deepest sidebar element that shows `text`.
-const colorOfLine = (page: Page, text: string) =>
-  page.evaluate((text) => {
-    const all = [...document.querySelectorAll('aside *')] as HTMLElement[];
-    const matches = all.filter((element) => (element.textContent ?? '').trim() === text);
-    const deepest = matches.find((element) => !matches.some((other) => other !== element && element.contains(other)));
-    return deepest ? getComputedStyle(deepest).color : null;
-  }, text);
-
 // --- Workspace scripts helpers (COCKPIT-32) -----------------------------------
 
 // The repository's `.cockpit/config.json` (a string is written as is, to test an invalid one).
