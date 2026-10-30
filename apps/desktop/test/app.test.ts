@@ -2793,6 +2793,37 @@ describe.each([
       await expectNoNewErrors(session, mark);
     });
 
+    test('COCKPIT-65 AC11 — a project whose folder exists but cannot be listed keeps the muted "<path> is not a git repository." line, with no "Folder not found", no error screen and the other projects still listed', async () => {
+      const { page } = session;
+      await clearProjects();
+      const other = makeLightRepo('ws-listable');
+      const unreadable = makeLightRepo('ws-unreadable');
+      folders.push(other, unreadable);
+      await addRepository(session, other);
+      await addRepository(session, unreadable);
+      const mark = await errorMark(session);
+
+      // The folder is still there, but nothing under its parent can be reached any more.
+      chmodSync(unreadable.parent, 0o000);
+      try {
+        await page.reload();
+        await page.getByText(versionLabel).waitFor();
+        const message = `${unreadable.root} is not a git repository.`;
+        await waitForLine(page, message);
+
+        const lines = await sidebarLines(page);
+        expect(lines).not.toContain('Folder not found');
+        expect(lines).toContain('Projects');
+        expect(await entryTitles(page)).toEqual(expect.arrayContaining([other.root, unreadable.root]));
+        expect(await isBelowProjectsHeader(page, { text: message })).toBe(true);
+        expect(projectsInState(session.dataDir)).toContainEqual({ path: unreadable.root });
+        await sleep(300);
+        await expectNoNewErrors(session, mark);
+      } finally {
+        chmodSync(unreadable.parent, 0o755);
+      }
+    });
+
     test.runIf(mode === 'built app')('AC13 — with 30 projects the Projects header and the footer stay in the window and the list scrolls to its last entry', async () => {
       const { page } = session;
       await clearProjects();
