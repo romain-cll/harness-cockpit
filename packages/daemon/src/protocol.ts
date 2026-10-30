@@ -25,6 +25,17 @@ export interface SpawnOptions {
 
 export type SessionEventName = 'working' | 'waiting' | 'finished';
 
+/** What `cockpit setup` reports of a setup run. */
+export type SetupEventName = 'setup-running' | 'setup-done' | 'setup-failed';
+
+/** The last setup event a session reported, as `list` gives it. */
+export type SetupState = 'running' | 'done' | 'failed';
+
+/** What a client of the status endpoint sends: a status, a setup event, or the agent's exit (`null` for a signal). */
+export type SessionReport =
+  | { sessionId: string; event: SessionEventName | SetupEventName }
+  | { sessionId: string; event: 'exited'; exitCode: number | null };
+
 export interface TerminalInfo {
   id: number;
   kind: TerminalKind;
@@ -35,6 +46,10 @@ export interface TerminalInfo {
   workspace?: string;
   /** The last status the session reported. */
   status?: SessionEventName;
+  /** The last setup event the session reported. */
+  setup?: SetupState;
+  /** The exit code of the agent, once the session reported `exited` (`null` for a signal). */
+  exitCode?: number | null;
 }
 
 export interface Hello {
@@ -76,7 +91,7 @@ export type Message =
   | { id: number; error: string }
   | { type: 'data'; terminal: number; seq: number; data: string }
   | ({ type: 'exit'; terminal: number } & TerminalExit)
-  | { type: 'status'; sessionId: string; event: SessionEventName };
+  | ({ type: 'status' } & SessionReport);
 
 /** Splits a stream into its JSON lines. A line that does not parse is dropped. */
 export function lineReader(onMessage: (message: unknown) => void): (chunk: Buffer | string) => void {

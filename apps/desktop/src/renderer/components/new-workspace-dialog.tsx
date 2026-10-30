@@ -1,8 +1,6 @@
-import { useRouter } from '@tanstack/react-router';
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import type { AvailableHarness, BranchesResult, Project, StartSessionResult } from '../../shared/api';
 import { startSession } from '@/components/live-terminals';
-import { setUpWorkspace } from '@/components/workspace-setups';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
@@ -21,12 +19,10 @@ export function NewWorkspaceDialog({
   project: Project;
   onClose: () => void;
   /**
-   * Called once the workspace exists; `start` is what starting its session came to, when one was asked
-   * and there was no setup to run first (the setup page takes it from there).
+   * Called once the workspace exists; `start` is what starting its session came to, when one was asked.
    */
   onCreated: (start?: StartSessionResult) => Promise<void>;
 }) {
-  const router = useRouter();
   const [branches, setBranches] = useState<BranchesResult>();
   const [name, setName] = useState('');
   const [base, setBase] = useState<string | null>(null);
@@ -63,11 +59,9 @@ export function NewWorkspaceDialog({
       if (result.status === 'refused') {
         setMessage(result.message);
       } else {
-        const { path, name: workspaceName } = result.workspace;
-        const chosen = agent === NO_AGENT ? undefined : { harness: agent, prompt };
-        const setup = await setUpWorkspace(router, project.path, { path, name: workspaceName }, chosen);
-        const start =
-          setup === 'ran' || !chosen ? undefined : await startSession(chosen.harness, { workspace: { project: project.path, path }, prompt });
+        const { path } = result.workspace;
+        // The session's terminal runs the repository's setup first, then the agent.
+        const start = agent === NO_AGENT ? undefined : await startSession(agent, { workspace: { project: project.path, path }, prompt, setup: true });
         await onCreated(start);
       }
     } finally {

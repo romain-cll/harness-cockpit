@@ -1,7 +1,7 @@
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { Terminal as Headless } from '@xterm/headless';
 import { spawn, type IPty } from 'node-pty';
-import { SCROLLBACK, type Attached, type SessionEventName, type SpawnOptions, type TerminalExit, type TerminalInfo } from './protocol';
+import { SCROLLBACK, type Attached, type SessionEventName, type SessionReport, type SetupState, type SpawnOptions, type TerminalExit, type TerminalInfo } from './protocol';
 
 /** Who receives what a terminal produces: one connection. */
 export interface Subscriber {
@@ -142,11 +142,13 @@ export function createTerminals(onEnd: () => void) {
       }
     },
 
-    /** Records a session's status; `false` when no terminal runs that session. */
-    report(sessionId: string, event: SessionEventName): boolean {
+    /** Records what a session reported; `false` when no terminal runs that session. */
+    report(report: SessionReport): boolean {
       for (const { info } of terminals.values()) {
-        if (info.sessionId !== sessionId) continue;
-        info.status = event;
+        if (info.sessionId !== report.sessionId) continue;
+        if (report.event === 'exited') info.exitCode = report.exitCode;
+        else if (report.event.startsWith('setup-')) info.setup = report.event.slice('setup-'.length) as SetupState;
+        else info.status = report.event as SessionEventName;
         return true;
       }
       return false;

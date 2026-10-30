@@ -3,9 +3,12 @@ import { FitAddon } from '@xterm/addon-fit';
 import { Terminal as XTerm } from '@xterm/xterm';
 import type {
   AttachedTerminal,
+  ListedTerminal,
   PtyExit,
   RunCommandsResult,
+  SessionEvent,
   SessionStatus,
+  SetupState,
   StartSessionOptions,
   StartSessionResult,
 } from '../../shared/api';
@@ -41,6 +44,14 @@ const statuses = new Map<string, string>();
 // The accessible name of each session's dot: what it last reported while it runs, how it ended once
 // it did; none for a running session that reported nothing. Replaced, never mutated.
 let dots: ReadonlyMap<string, string> = new Map();
+// How each session's agent ended, once `cockpit setup` reported it (the dot's name): it stays whatever
+// the shell the agent left does.
+const agentEnds = new Map<string, string>();
+// The last setup state each session reported, and the workspace (worktree path) each session runs in.
+const setups = new Map<string, SetupState>();
+const sessionWorkspaces = new Map<string, string>();
+// Workspace path -> `running` or `failed`. Replaced, never mutated.
+let workspaceSetups: ReadonlyMap<string, 'running' | 'failed'> = new Map();
 
 const STATUS_DOTS: Record<SessionStatus, string> = { working: 'Working', waiting: 'Needs input', finished: 'Ready' };
 
@@ -52,17 +63,29 @@ function publish() {
   running = new Set([...sessionTerminals].filter(([, { exited }]) => !exited).map(([id]) => id));
   dots = new Map(
     [...sessionTerminals].flatMap(([id, { exit }]) => {
-      const dot = exit ? endDot(exit) : statuses.get(id);
+      const dot = agentEnds.get(id) ?? (exit ? endDot(exit) : statuses.get(id));
       return dot ? [[id, dot] as const] : [];
+    }),
+  );
+  workspaceSetups = new Map(
+    [...sessionTerminals].flatMap(([id, { exited }]) => {
+      const setup = setups.get(id);
+      const workspace = sessionWorkspaces.get(id);
+      return !exited && (setup === 'running' || setup === 'failed') && workspace !== undefined ? [[workspace, setup] as const] : [];
     }),
   );
   for (const listener of listeners) listener();
 }
 
-window.api.sessions.onStatus((id, status) => {
-  if (!sessionTerminals.has(id)) return;
-  statuses.set(id, STATUS_DOTS[status]);
+window.api.sessions.onStatus((id, event: SessionEvent, exitCode) => {
+  if (event === 'exited') agentEnds.set(id, endDot({ exitCode: exitCode ?? null, signal: null }));
+  else if (event === 'setup-running') setups.set(id, 'running');
+  else if (event === 'setup-failed') setups.set(id, 'failed');
+  else if (event === 'setup-done') setups.set(id, 'done');
+  else statuses.set(id, STATUS_DOTS[event]);
   publish();
+  // A session this page did not start through the store (`sessions.start` called directly): attach to it.
+  if (!sessionTerminals.has(id)) void adoptSession(id);
 });
 
 /** What `start` resolves with when the pty already runs: its id and its screen (see `attachLiveTerminal`). */
@@ -145,6 +168,7 @@ export function createLiveTerminal(start: (size: { cols: number; rows: number })
         covered = seq;
       }
       ptyId = id;
+      restored.add(id);
       // The terminal may have been resized while the pty was starting, when there was none to resize yet.
       if (term.cols !== requested.cols || term.rows !== requested.rows) pty.resize(id, term.cols, term.rows);
       for (const event of early) if (event.id === id && (event.seq === undefined || event.seq > covered)) event.apply();
@@ -188,24 +212,39 @@ export async function restoreTerminals(again = false): Promise<LiveTerminal[]> {
   if (restoredOnce && !again) return [];
   restoredOnce = true;
   const listed = (await window.api.pty.list()).filter(({ id }) => !restored.has(id));
-  const attached = await Promise.all(
-    listed.map(async (terminal) => {
-      restored.add(terminal.id);
-      const { entry, started } = attachLiveTerminal(terminal.id);
-      try {
-        await started;
-      } catch {
-        closeLiveTerminal(entry);
-        return undefined;
-      }
-      if (terminal.sessionId === undefined) return entry;
-      sessionTerminals.set(terminal.sessionId, entry);
-      if (terminal.status) statuses.set(terminal.sessionId, STATUS_DOTS[terminal.status]);
-      return undefined;
-    }),
-  );
+  const attached = await Promise.all(listed.map(restoreTerminal));
   publish();
   return attached.filter((entry) => entry !== undefined);
+}
+
+// Attaches to a terminal the daemon runs. A shell is returned for the terminal page to show; a session
+// goes into the store with what it reported, and nothing is returned.
+async function restoreTerminal(terminal: ListedTerminal): Promise<LiveTerminal | undefined> {
+  restored.add(terminal.id);
+  const { entry, started } = attachLiveTerminal(terminal.id);
+  try {
+    await started;
+  } catch {
+    closeLiveTerminal(entry);
+    return undefined;
+  }
+  if (terminal.sessionId === undefined) return entry;
+  sessionTerminals.set(terminal.sessionId, entry);
+  // What the page heard since it asked for the list is newer than the list.
+  if (terminal.status && !statuses.has(terminal.sessionId)) statuses.set(terminal.sessionId, STATUS_DOTS[terminal.status]);
+  if (terminal.setup && !setups.has(terminal.sessionId)) setups.set(terminal.sessionId, terminal.setup);
+  if (terminal.workspace !== undefined) sessionWorkspaces.set(terminal.sessionId, terminal.workspace);
+  if (terminal.exitCode !== undefined && !agentEnds.has(terminal.sessionId)) {
+    agentEnds.set(terminal.sessionId, endDot({ exitCode: terminal.exitCode, signal: null }));
+  }
+  return undefined;
+}
+
+async function adoptSession(sessionId: string): Promise<void> {
+  const terminal = (await window.api.pty.list()).find((each) => each.sessionId === sessionId && !restored.has(each.id));
+  if (!terminal) return;
+  await restoreTerminal(terminal);
+  publish();
 }
 
 /** Ends the terminal's process, or the one a pending start will resolve with, and disposes it. */
@@ -223,6 +262,9 @@ export const getRunningIds = () => running;
 
 /** The accessible name of each session's dot, by session id. */
 export const getSessionDots = () => dots;
+
+/** The setup state (`running` or `failed`) of each workspace whose session runs, by worktree path; a done setup has none. */
+export const getWorkspaceSetups = () => workspaceSetups;
 
 export const getSessionTerminal = (id: string) => sessionTerminals.get(id);
 
@@ -246,25 +288,27 @@ export async function startSession(harness: string, options?: StartSessionOption
     throw error;
   }
   const result = answer.result!;
-  if (result.status === 'started') sessionTerminals.set(result.session.id, entry);
+  if (result.status === 'started') {
+    sessionTerminals.set(result.session.id, entry);
+    if (options?.workspace) sessionWorkspaces.set(result.session.id, options.workspace.path);
+  }
   publish();
   return result;
 }
 
 /**
- * Runs the `setup` or `teardown` commands of a workspace in a terminal of its own. `none`: the config
- * holds no such command. `refused`: they could not run (the message says why). Otherwise the terminal
+ * Runs `cockpit teardown` for a workspace in a terminal of its own. `none`: the config
+ * holds no teardown command. `refused`: they could not run (the message says why). Otherwise the terminal
  * and its `exit`; the caller closes the terminal (which ends the commands if they still run).
  */
-export async function runWorkspaceCommands(
+export async function runWorkspaceTeardown(
   project: string,
   path: string,
-  which: 'setup' | 'teardown',
 ): Promise<{ status: 'none' } | { status: 'refused'; message: string } | { status: 'started'; entry: LiveTerminal; exit: Promise<PtyExit> }> {
   // What `workspaces.runCommands` answered, which the terminal's start cannot return.
   const answer: { result?: RunCommandsResult } = {};
   const { entry, started, exit } = createLiveTerminal(async (size) => {
-    const result = await window.api.workspaces.runCommands(project, path, which, size);
+    const result = await window.api.workspaces.runCommands(project, path, 'teardown', size);
     answer.result = result;
     if (result.status !== 'started') throw new Error(result.status === 'refused' ? result.message : 'no commands to run');
     return result.ptyId;
@@ -280,14 +324,14 @@ export async function runWorkspaceCommands(
 }
 
 /**
- * Whether setup or teardown commands passed. node-pty reports a process killed by a signal as
+ * Whether the teardown passed. node-pty reports a process killed by a signal as
  * `exitCode: 0` with the signal set, so the exit code alone does not tell.
  */
 export const passed = ({ exitCode, signal }: PtyExit) => exitCode === 0 && !signal;
 
-/** The status line of commands that did not pass: their exit code, or that a signal or a pty host death ended them. */
-export function failureLine(what: 'Setup' | 'Teardown', { exitCode, signal }: PtyExit): string {
-  return exitCode === null || signal ? `${what} ended before it finished.` : `${what} failed with exit code ${exitCode}`;
+/** The status line of a teardown that did not pass: its exit code, or that a signal or a pty host death ended it. */
+export function failureLine({ exitCode, signal }: PtyExit): string {
+  return exitCode === null || signal ? 'Teardown ended before it finished.' : `Teardown failed with exit code ${exitCode}`;
 }
 
 /** Ends the running sessions among `ids` (their workspace or project is gone) and drops their terminals. */
@@ -298,6 +342,9 @@ export function endSessions(ids: string[]): void {
     closeLiveTerminal(entry);
     sessionTerminals.delete(id);
     statuses.delete(id);
+    setups.delete(id);
+    agentEnds.delete(id);
+    sessionWorkspaces.delete(id);
   }
   publish();
 }

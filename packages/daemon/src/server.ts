@@ -3,8 +3,8 @@ import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import { clearStaleSocket, daemonFiles } from './paths';
-import { encode, lineReader, PROTOCOL_VERSION, UPGRADE, type Hello, type Message, type Request, type SessionEventName } from './protocol';
-import { SESSION_EVENTS } from './status';
+import { encode, lineReader, PROTOCOL_VERSION, UPGRADE, type Hello, type Message, type Request, type SessionEventName, type SessionReport, type SetupEventName } from './protocol';
+import { SESSION_EVENTS, SETUP_EVENTS } from './status';
 import { createTerminals, type Subscriber } from './terminals';
 
 export interface DaemonOptions {
@@ -61,9 +61,9 @@ export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon>
     for (const { socket } of connections) if (!socket.destroyed) socket.write(encode(message));
   };
 
-  const server = createServer((req, res) => handle(req, res, token, (sessionId, event) => {
-    if (!terminals.report(sessionId, event)) return false;
-    broadcast({ type: 'status', sessionId, event });
+  const server = createServer((req, res) => handle(req, res, token, (report) => {
+    if (!terminals.report(report)) return false;
+    broadcast({ type: 'status', ...report });
     return true;
   }));
 
@@ -207,7 +207,7 @@ function handle(
   req: IncomingMessage,
   res: ServerResponse,
   token: string,
-  onSessionEvent: (sessionId: string, event: SessionEventName) => boolean,
+  onSessionEvent: (report: SessionReport) => boolean,
 ): void {
   if (!authorized(req.headers.authorization, token)) {
     res.writeHead(401).end();
@@ -237,13 +237,13 @@ function handle(
     if (res.headersSent) return;
     const parsed = parseEvent(Buffer.concat(chunks).toString('utf8'));
     if (typeof parsed === 'string') return reply(res, 400, { error: parsed });
-    if (!onSessionEvent(parsed.sessionId, parsed.event)) return reply(res, 404, { error: 'unknown session' });
+    if (!onSessionEvent(parsed)) return reply(res, 404, { error: 'unknown session' });
     res.writeHead(204).end();
   });
 }
 
-/** The event, or the reason the body is refused. */
-function parseEvent(text: string): { sessionId: string; event: SessionEventName } | string {
+/** The report, or the reason the body is refused. */
+function parseEvent(text: string): SessionReport | string {
   let value: unknown;
   try {
     value = JSON.parse(text);
@@ -251,11 +251,17 @@ function parseEvent(text: string): { sessionId: string; event: SessionEventName 
     return 'body is not JSON';
   }
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return 'body is not an object';
-  const { sessionId, event, ...others } = value as Record<string, unknown>;
+  const { sessionId, event, exitCode, ...others } = value as Record<string, unknown>;
   if (Object.keys(others).length > 0) return `unexpected field: ${Object.keys(others)[0]}`;
   if (typeof sessionId !== 'string') return 'sessionId must be a string';
-  if (!SESSION_EVENTS.includes(event as SessionEventName)) return `event must be one of ${SESSION_EVENTS.join(', ')}`;
-  return { sessionId, event: event as SessionEventName };
+  if (event === 'exited') {
+    if (exitCode !== null && !Number.isInteger(exitCode)) return 'exitCode must be an integer or null';
+    return { sessionId, event, exitCode: exitCode as number | null };
+  }
+  if ('exitCode' in (value as object)) return 'unexpected field: exitCode';
+  const events: readonly unknown[] = [...SESSION_EVENTS, ...SETUP_EVENTS];
+  if (!events.includes(event)) return `event must be one of ${[...SESSION_EVENTS, ...SETUP_EVENTS, 'exited'].join(', ')}`;
+  return { sessionId, event: event as SessionEventName | SetupEventName };
 }
 
 function reply(res: ServerResponse, status: number, body: { error: string }): void {
