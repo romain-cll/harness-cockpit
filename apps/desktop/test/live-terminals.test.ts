@@ -11,13 +11,22 @@ vi.mock('@xterm/xterm', () => ({
     rows = 24;
     options: Record<string, unknown> = {};
     written: string[] = [];
+    private resized: Array<(size: { cols: number; rows: number }) => void> = [];
     loadAddon() {}
     write(data: string) {
       this.written.push(data);
     }
-    resize() {}
     onData() {}
-    onResize() {}
+    onResize(listener: (size: { cols: number; rows: number }) => void) {
+      this.resized.push(listener);
+    }
+    // As xterm.js does: nothing when the size is unchanged, else every `onResize` listener.
+    resize(cols: number, rows: number) {
+      if (cols === this.cols && rows === this.rows) return;
+      this.cols = cols;
+      this.rows = rows;
+      for (const listener of this.resized) listener({ cols, rows });
+    }
     dispose() {}
   },
 }));
@@ -53,6 +62,7 @@ const offExit = vi.fn();
 const kill = vi.fn();
 const start = vi.fn();
 let listed: ListedTerminal[] = [];
+const resize = vi.fn();
 
 beforeEach(() => {
   dataListeners.length = 0;
@@ -63,6 +73,7 @@ beforeEach(() => {
   kill.mockClear();
   start.mockReset();
   listed = [];
+  resize.mockReset();
   vi.stubGlobal('matchMedia', () => ({ addEventListener() {} }));
   vi.stubGlobal('window', {
     api: {
@@ -70,7 +81,7 @@ beforeEach(() => {
         onData: (listener: DataListener) => (dataListeners.push(listener), offData),
         onExit: (listener: ExitListener) => (exitListeners.push(listener), offExit),
         write() {},
-        resize() {},
+        resize,
         kill,
         list: async () => listed,
         attach: async () => ({ cols: 80, rows: 24, screen: '', seq: 0 }),
@@ -82,7 +93,7 @@ beforeEach(() => {
 
 interface Store {
   createLiveTerminal(start: (size: { cols: number; rows: number }) => Promise<number>): {
-    entry: unknown;
+    entry: { term: { cols: number; rows: number; resize(cols: number, rows: number): void } };
     started: Promise<void>;
     exit: Promise<{ exitCode: number | null; signal: number | null }>;
   };
@@ -375,5 +386,54 @@ describe('agent exit and setup states', () => {
     // The shell of s4 exiting later leaves the dot.
     for (const listener of exitListeners) listener(10, { exitCode: 0, signal: null });
     expect(getSessionDots().get('s4')).toBe('Exited 3');
+  });
+});
+
+// The size a live terminal's pty ends up with, whatever the order in which the view fits the
+// terminal (on mount, then from its ResizeObserver) and the spawn resolves (COCKPIT-76). The fake
+// terminal's `resize` fires its `onResize` listeners, as xterm.js does.
+describe('size of a live terminal’s pty', () => {
+  type Step = 'fit 63x26' | 'fit 60x25' | 'fit 80x24' | 'resolve';
+
+  const permutations = <T,>(items: T[]): T[][] =>
+    items.length <= 1
+      ? [items]
+      : items.flatMap((item, i) => permutations([...items.slice(0, i), ...items.slice(i + 1)]).map((rest) => [item, ...rest]));
+
+  // Every order of two fits and the spawn resolving, each step followed or not by the microtasks
+  // it queues (a fit can land between the spawn resolving and the code that reads its id).
+  const cases = [
+    ['fit 63x26', 'fit 60x25'],
+    ['fit 63x26', 'fit 80x24'],
+  ].flatMap((fits) =>
+    permutations<Step>([...(fits as Step[]), 'resolve']).flatMap((order) =>
+      [0, 1, 2, 3, 4, 5, 6, 7].map((flushes) => order.map((step, i) => ({ step, flush: Boolean(flushes & (1 << i)) }))),
+    ),
+  );
+
+  const label = (steps: Array<{ step: Step; flush: boolean }>) =>
+    steps.map(({ step, flush }) => (flush ? `${step}, flush` : step)).join(' → ');
+
+  test.each(cases.map((steps) => [label(steps), steps] as const))('AC4 — %s: the pty ends at the size the terminal has', async (_label, steps) => {
+    const { createLiveTerminal } = await loadStore();
+    let resolveSpawn!: (id: number) => void;
+    let spawnedAt: { cols: number; rows: number } | undefined;
+    const { entry, started } = createLiveTerminal((size) => {
+      spawnedAt = { ...size };
+      return new Promise<number>((resolve) => (resolveSpawn = resolve));
+    });
+
+    for (const { step, flush } of steps) {
+      if (step === 'resolve') resolveSpawn(7);
+      else entry.term.resize(...(step.slice(4).split('x').map(Number) as [number, number]));
+      if (flush) await Promise.resolve();
+    }
+    await started;
+
+    // No resize reaches a pty before the spawn told its id, nor another pty.
+    for (const [id] of resize.mock.calls) expect(id).toBe(7);
+    const last = resize.mock.calls.at(-1);
+    const ptySize = last ? { cols: last[1], rows: last[2] } : spawnedAt;
+    expect(ptySize).toEqual({ cols: entry.term.cols, rows: entry.term.rows });
   });
 });
