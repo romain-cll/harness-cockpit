@@ -3,7 +3,7 @@ import { mkdir, readFile, realpath } from 'node:fs/promises';
 import { basename, isAbsolute, join } from 'node:path';
 import { checkGit, git, succeeds, WorkspaceError } from './git';
 
-export { WorkspaceError } from './git';
+export { checkGit, WorkspaceError } from './git';
 export type { WorkspaceErrorCode } from './git';
 export * from './changes';
 

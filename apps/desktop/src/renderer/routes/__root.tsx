@@ -1,33 +1,36 @@
 import { createRootRoute, Outlet, useNavigate, useParams, useRouter } from '@tanstack/react-router';
 import { useEffect } from 'react';
 import { AppSidebar } from '@/components/app-sidebar';
+import { useSidebarCollapsed } from '@/components/collapsed';
 import { ChangesPanel, useChangesOpen, workspaceOf } from '@/components/changes-panel';
 import { restoreTerminals } from '@/components/live-terminals';
 import { restoreTabs } from '@/components/terminal-tabs';
 
 export const Route = createRootRoute({
   loader: async () => {
-    const [version, projects, sessions, daemon] = await Promise.all([
+    const [version, projects, sessions, daemon, git] = await Promise.all([
       window.api.getVersion(),
       window.api.projects.list(),
       window.api.sessions.list(),
       window.api.daemon.status(),
+      window.api.projects.git(),
       // The shells and sessions the daemons run come back with their screens, once per page load.
       restoreTerminals().then(restoreTabs),
     ]);
-    return { version, projects, sessions, daemon };
+    return { version, projects, sessions, daemon, git };
   },
   component: RootLayout,
 });
 
 function RootLayout() {
-  const { version, projects, sessions, daemon } = Route.useLoaderData();
+  const { version, projects, sessions, daemon, git } = Route.useLoaderData();
   const router = useRouter();
   const navigate = useNavigate();
   // The Changes sidebar belongs to the page of a session that runs in a workspace.
   const { sessionId } = useParams({ strict: false });
   const workspace = workspaceOf(sessions.find(({ id }) => id === sessionId), projects);
   const changesOpen = useChangesOpen();
+  const sidebarHidden = useSidebarCollapsed();
   // Worktrees may be added or removed outside the app: list them again when the window gains focus.
   useEffect(() => {
     const refresh = () => void router.invalidate();
@@ -46,8 +49,8 @@ function RootLayout() {
   );
   return (
     <div className="flex h-screen">
-      <AppSidebar version={version} projects={projects} sessions={sessions} daemon={daemon} />
-      <main className="flex min-w-0 flex-1 flex-col">
+      {!sidebarHidden && <AppSidebar version={version} projects={projects} sessions={sessions} daemon={daemon} git={git} />}
+      <main className="flex min-w-0 flex-1 flex-col bg-background p-2">
         <Outlet />
       </main>
       {changesOpen && workspace && <ChangesPanel key={workspace.workspace.path} project={workspace.project} workspace={workspace.workspace} />}

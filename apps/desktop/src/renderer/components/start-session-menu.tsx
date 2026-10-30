@@ -20,7 +20,7 @@ export function StartSessionMenu({
   return (
     <DropdownMenu onOpenChange={(open) => open && void window.api.sessions.harnesses().then(setHarnesses)}>
       <DropdownMenuTrigger render={<Button variant="ghost" size="icon-xs" aria-label={label} className={className} />}>
-        <PlusIcon />
+        <PlusIcon className="size-3.5" />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-auto">
         {harnesses === undefined && <DropdownMenuItem disabled>Detecting agent CLIs…</DropdownMenuItem>}
