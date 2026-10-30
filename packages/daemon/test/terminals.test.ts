@@ -236,7 +236,7 @@ describe('commands that ignore SIGHUP (AC3)', () => {
     client.close();
 
     await until(() => !isAlive(pid), 'the commands process to be gone', 3000);
-    expect(await other.client.list()).toEqual([]);
+    await until(async () => (await other.client.list()).length === 0, 'the commands terminal to leave the list');
   });
 });
 
