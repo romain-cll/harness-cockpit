@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -577,7 +578,12 @@ function describeFailure(error: WorkspaceError, path: string): string {
 // A project with its workspaces, which git tells: the linked worktrees, the main one being the project.
 async function toProject({ path }: { path: string }): Promise<Project> {
   const project = { path, name: basename(path) };
-  if (!statSync(path, { throwIfNoEntry: false })) return { ...project, workspaces: [], missing: true };
+  // Only an absent folder is "not found"; any other failure (EACCES, EIO…) goes on to git, as before.
+  const gone = await stat(path).then(
+    () => false,
+    (error: NodeJS.ErrnoException) => error.code === 'ENOENT' || error.code === 'ENOTDIR',
+  );
+  if (gone) return { ...project, workspaces: [], missing: true };
   try {
     const worktrees = await listWorktrees(path, { env: await shellEnv });
     const workspaces = worktrees
