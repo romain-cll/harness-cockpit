@@ -1081,6 +1081,9 @@ describe('daemon: built app, notification with no window', () => {
     const created = await open!.evaluate(([root, name]) => (window as unknown as ApiWindow).api.workspaces!.create!(root, name, 'main'), [root, 'nowin-ws'] as const);
     expect(created.status).toBe('created');
     const path = (created as { workspace: { path: string } }).workspace.path;
+    // An earlier terminal in the workspace (a shell), so that the tab a fresh window selects by itself
+    // (the first) is not the notified session's.
+    await open!.evaluate((path) => (window as unknown as ApiWindow).api.pty!.spawn!({ cols: 80, rows: 24, workspace: path }), path);
     const started = await open!.evaluate(
       ([root, path]) => (window as unknown as ApiWindow).api.sessions!.start!('claude-code', { cols: 80, rows: 24 }, { workspace: { project: root, path } }),
       [root, path] as const,
@@ -1112,9 +1115,12 @@ describe('daemon: built app, notification with no window', () => {
 
     const page = (await pagesOf(session!)).find((candidate) => landed(candidate.url()))!;
     expect(page, 'the new window\'s page').toBeDefined();
-    const selected = page.locator('[role="tab"][aria-selected="true"]');
-    await selected.first().waitFor({ timeout: UI_TIMEOUT });
-    expect((await selected.allTextContents()).map((text) => text.trim())).toEqual(['Claude Code 1']);
+    const tabs = page.locator('[role="tab"]');
+    await poll(() => tabs.count(), (count) => count === 2, UI_TIMEOUT);
+    // The shell comes first, the notified session second; the session's tab is the selected one.
+    expect((await tabs.last().textContent())?.trim()).toBe('Claude Code 1');
+    await page.locator('[role="tab"][aria-selected="true"]', { hasText: 'Claude Code 1' }).waitFor({ timeout: UI_TIMEOUT });
+    expect(await tabs.first().getAttribute('aria-selected'), 'the shell\'s tab is not selected').toBe('false');
   });
 });
 
