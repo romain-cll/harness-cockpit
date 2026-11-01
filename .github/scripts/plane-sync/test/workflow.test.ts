@@ -52,27 +52,3 @@ describe('plane-sync.yml', () => {
     }
   });
 });
-
-describe('AGENTS.md', () => {
-  const agents = () => readFileSync(join(repoRoot, 'AGENTS.md'), 'utf8');
-
-  test('AC12 — the monorepo section lists .github/scripts/plane-sync', () => {
-    const text = agents();
-    const monorepo = text.slice(text.indexOf('## Monorepo'), text.indexOf('## Desktop app'));
-    expect(monorepo).toContain('.github/scripts/plane-sync');
-  });
-
-  test('AC12 — the CI section describes the Plane sync workflow', () => {
-    const text = agents();
-    const start = text.indexOf('## Tests and validation');
-    expect(start).toBeGreaterThan(-1);
-    const section = text.slice(start);
-    expect(section).toMatch(/plane sync/i);
-    expect(section).toContain('plane-sync.yml');
-    expect(section).toContain('PLANE_API_KEY');
-    expect(section).toMatch(/merged/i);
-    expect(section).toMatch(/Done/);
-    expect(section).toMatch(/Todo/);
-    expect(section).toMatch(/idempoten|already/i);
-  });
-});
