@@ -1070,6 +1070,52 @@ describe('daemon: built app, notification with no window', () => {
     expect(urls).toHaveLength(1);
     expect(await poll(async () => (await windowUrls(session!))[0]?.endsWith(`/sessions/${id}`), Boolean, UI_TIMEOUT)).toBe(true);
   });
+
+  test('AC24 — with no window open, clicking the notification of a workspace session opens a window on that workspace\'s page with the session\'s tab selected', async () => {
+    // The window the previous test's click opened is the only page left; the first one was destroyed.
+    const open = (await pagesOf(session!)).find((page) => page.url().startsWith('app://'));
+    expect(open, 'a window is open').toBeDefined();
+    const root = makeRepoWithSetup({}).root;
+    await stubPicker(session!, root);
+    await open!.evaluate(() => (window as unknown as ApiWindow).api.projects!.add!());
+    const created = await open!.evaluate(([root, name]) => (window as unknown as ApiWindow).api.workspaces!.create!(root, name, 'main'), [root, 'nowin-ws'] as const);
+    expect(created.status).toBe('created');
+    const path = (created as { workspace: { path: string } }).workspace.path;
+    const started = await open!.evaluate(
+      ([root, path]) => (window as unknown as ApiWindow).api.sessions!.start!('claude-code', { cols: 80, rows: 24 }, { workspace: { project: root, path } }),
+      [root, path] as const,
+    );
+    expect(started.status).toBe('started');
+    const id = started.session.id as string;
+
+    await session!.evaluateInMain(`(() => {
+      const { BrowserWindow } = require('electron');
+      globalThis.__notified.length = 0;
+      for (const window of BrowserWindow.getAllWindows()) window.destroy();
+    })()`);
+    await poll(() => windowUrls(session!), (urls) => urls.length === 0, UI_TIMEOUT);
+
+    const socket = must(daemonFile(home, 'sock'), 'the daemon sock');
+    expect(await postEvent(socket, tokenFor(socket), { sessionId: id, event: 'waiting' })).toBe(204);
+    await poll(() => session!.evaluateInMain<number>('globalThis.__notified.length'), (count) => count > 0, UI_TIMEOUT);
+    expect(await session!.evaluateInMain<string>('globalThis.__notified.at(-1).title')).toBe('Claude Code 1');
+
+    await session!.evaluateInMain(`globalThis.__notified.at(-1).emit('click')`);
+    const landed = (url: string) => {
+      if (!url.startsWith('app://')) return false;
+      const parsed = new URL(url);
+      return parsed.pathname === '/workspace' && parsed.searchParams.get('path') === path;
+    };
+    const urls = await poll(() => windowUrls(session!), (found) => found.length === 1 && landed(found[0]!), UI_TIMEOUT);
+    expect(urls).toHaveLength(1);
+    expect(landed(urls[0]!), `the window is on the workspace page: ${urls[0]}`).toBe(true);
+
+    const page = (await pagesOf(session!)).find((candidate) => landed(candidate.url()))!;
+    expect(page, 'the new window\'s page').toBeDefined();
+    const selected = page.locator('[role="tab"][aria-selected="true"]');
+    await selected.first().waitFor({ timeout: UI_TIMEOUT });
+    expect((await selected.allTextContents()).map((text) => text.trim())).toEqual(['Claude Code 1']);
+  });
 });
 
 // --- Packaged app and dev server: one smoke path each ---------------------------
