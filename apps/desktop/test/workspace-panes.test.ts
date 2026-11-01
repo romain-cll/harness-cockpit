@@ -411,6 +411,21 @@ async function captureRow(page: Page, pattern: RegExp, terminal: Terminal): Prom
   throw new Error(`no terminal row matches ${pattern}`);
 }
 
+// The `cwd:<path>` line the stub prints, read across the rows it wraps over in a narrow pane.
+async function expectCwd(terminal: Terminal, path: string) {
+  const want = `cwd:${path}`;
+  const read = async () => {
+    const rows = await rowsOf(terminal);
+    const first = rows.findIndex((row) => row.startsWith('cwd:'));
+    if (first < 0) return '';
+    if (rows[first]!.length >= want.length) return rows[first]!;
+    let text = rows[first]!;
+    for (let next = first + 1; next < rows.length && text.length < want.length; next++) text += rows[next]!;
+    return text.length === want.length ? text : text.slice(0, want.length + 1);
+  };
+  expect(await poll(read, (found) => found === want, 15_000)).toBe(want);
+}
+
 const waitForPrompt = (page: Page, terminal: Terminal) =>
   page.waitForFunction(
     (element) => [...element.querySelectorAll('.xterm-rows > div')].some((row) => (row.textContent ?? '').trim() !== ''),
@@ -1302,12 +1317,24 @@ describe('workspace panes: built app', () => {
   test('AC12 — "Detect again" runs every found harness\'s --version once more: a stub added to a PATH folder appears (without a version when it prints none), one removed disappears, and the other Start session menus show the same; with none left the menu says "No agent CLI found" and "Terminal" still works', async () => {
     const { page } = session;
     await openWorkspace(page, 'alpha', ws.alpha);
+    // Waits for every menu to be gone, so the next click never meets an open popup.
+    const closeMenus = async () => {
+      for (let attempt = 0; attempt < 3 && (await page.getByRole('menu').count()) > 0; attempt++) {
+        await page.keyboard.press('Escape');
+        await poll(() => page.getByRole('menu').count(), (count) => count === 0, 2_000);
+      }
+      await page.getByRole('menu').first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+    };
+    // The popup mounts a moment after the click: read the items once the first one is there.
+    const readMenuItems = async () => {
+      await menuItems(page).first().waitFor({ timeout: UI_TIMEOUT });
+      await detectionDone(page);
+      return (await menuItems(page).allInnerTexts()).map(normalized);
+    };
     const readMenu = async () => {
       await openNewTabMenu(page);
-      await detectionDone(page);
-      const items = await topLevelItems(page);
-      await page.keyboard.press('Escape');
-      await page.getByRole('menu').first().waitFor({ state: 'hidden', timeout: UI_TIMEOUT });
+      const items = await readMenuItems();
+      await closeMenus();
       return items;
     };
     const detectAgain = async () => {
@@ -1316,49 +1343,58 @@ describe('workspace panes: built app', () => {
       await detectionDone(page);
       const submenu = await openHarnessSubmenu(page);
       await submenu.getByRole('menuitem').filter({ hasText: 'Detect again' }).click({ timeout: UI_TIMEOUT });
+      await closeMenus();
       return before;
     };
+    const restoreStubs = () => {
+      for (const name of ['claude', 'codex']) {
+        if (existsSync(join(fx.bin, `${name}.off`))) renameSync(join(fx.bin, `${name}.off`), join(fx.bin, name));
+      }
+      for (const name of ['opencode', 'opencode.off', 'opencode.noversion']) rmSync(join(fx.bin, name), { force: true });
+    };
 
-    expect(await readMenu()).toEqual(['Claude Code', 'Codex', 'Open harness', 'Terminal']);
-    fx.install('opencode');
-    writeFileSync(join(fx.bin, 'opencode.noversion'), '');
-    const before = await detectAgain();
-    await poll(async () => versionRuns(fx).length, (count) => count >= before + 3, UI_TIMEOUT);
-    // Each found harness once more.
-    expect(versionRuns(fx).slice(before).sort()).toEqual(['claude --version', 'codex --version', 'opencode --version']);
-    expect(await readMenu()).toEqual(['Claude Code', 'Codex', 'OpenCode', 'Open harness', 'Terminal']);
-    await openNewTabMenu(page);
-    await detectionDone(page);
-    const submenu = await openHarnessSubmenu(page);
-    expect((await submenu.getByRole('menuitem').allInnerTexts()).map(normalized)).toEqual(['Claude Code 9.9.9', 'Codex 9.9.9', 'OpenCode', 'Detect again']);
-    await page.keyboard.press('Escape');
-    await page.keyboard.press('Escape');
+    try {
+      expect(await readMenu()).toEqual(['Claude Code', 'Codex', 'Open harness', 'Terminal']);
+      fx.install('opencode');
+      writeFileSync(join(fx.bin, 'opencode.noversion'), '');
+      const before = await detectAgain();
+      await poll(async () => versionRuns(fx).length, (count) => count >= before + 3, UI_TIMEOUT);
+      // Each found harness once more.
+      expect(versionRuns(fx).slice(before).sort()).toEqual(['claude --version', 'codex --version', 'opencode --version']);
+      expect(await readMenu()).toEqual(['Claude Code', 'Codex', 'OpenCode', 'Open harness', 'Terminal']);
+      await openNewTabMenu(page);
+      await detectionDone(page);
+      const submenu = await openHarnessSubmenu(page);
+      expect((await submenu.getByRole('menuitem').allInnerTexts()).map(normalized)).toEqual(['Claude Code 9.9.9', 'Codex 9.9.9', 'OpenCode', 'Detect again']);
+      await closeMenus();
 
-    // The Sessions header's menu and the workspace row's menu show the same result.
-    await page.getByRole('button', { name: 'Start session', exact: true }).click({ timeout: UI_TIMEOUT });
-    await detectionDone(page);
-    expect((await menuItems(page).allInnerTexts()).map(normalized)).toEqual(['Claude Code', 'Codex', 'OpenCode']);
-    await page.keyboard.press('Escape');
-    await workspaceRow(page, 'alpha').hover({ timeout: UI_TIMEOUT });
-    await page.getByRole('button', { name: 'Start session in alpha', exact: true }).click({ timeout: UI_TIMEOUT });
-    await detectionDone(page);
-    expect((await menuItems(page).allInnerTexts()).map(normalized)).toEqual(['Claude Code', 'Codex', 'OpenCode']);
-    await page.keyboard.press('Escape');
+      // The Sessions header's menu and the workspace row's menu show the same result.
+      await page.getByRole('button', { name: 'Start session', exact: true }).click({ timeout: UI_TIMEOUT });
+      await page.getByRole('menu').first().waitFor({ timeout: UI_TIMEOUT });
+      expect(await readMenuItems()).toEqual(['Claude Code', 'Codex', 'OpenCode']);
+      await closeMenus();
+      await workspaceRow(page, 'alpha').hover({ timeout: UI_TIMEOUT });
+      await page.getByRole('button', { name: 'Start session in alpha', exact: true }).click({ timeout: UI_TIMEOUT });
+      await page.getByRole('menu').first().waitFor({ timeout: UI_TIMEOUT });
+      expect(await readMenuItems()).toEqual(['Claude Code', 'Codex', 'OpenCode']);
+      await closeMenus();
 
-    // Removing the stubs: they disappear, and with none left, nothing but "Terminal" starts.
-    for (const name of ['claude', 'codex', 'opencode']) renameSync(join(fx.bin, name), join(fx.bin, `${name}.off`));
-    await detectAgain();
-    await poll(async () => (await readMenu()).includes('No agent CLI found'), Boolean, UI_TIMEOUT);
-    await openNewTabMenu(page);
-    await detectionDone(page);
-    const none = page.getByRole('menuitem').filter({ hasText: 'No agent CLI found' });
-    expect(await none.count()).toBe(1);
-    expect(await none.first().isDisabled()).toBe(true);
-    expect(await menuItemNamed(page, 'Terminal').isDisabled()).toBe(false);
-    await page.keyboard.press('Escape');
+      // Removing the stubs: they disappear, and with none left, nothing but "Terminal" starts.
+      for (const name of ['claude', 'codex', 'opencode']) renameSync(join(fx.bin, name), join(fx.bin, `${name}.off`));
+      await detectAgain();
+      await poll(async () => (await readMenu()).includes('No agent CLI found'), Boolean, UI_TIMEOUT);
+      await openNewTabMenu(page);
+      await detectionDone(page);
+      const none = page.getByRole('menuitem').filter({ hasText: 'No agent CLI found' });
+      expect(await none.count()).toBe(1);
+      expect(await none.first().isDisabled()).toBe(true);
+      expect(await menuItemNamed(page, 'Terminal').isDisabled()).toBe(false);
+      await closeMenus();
+    } finally {
+      await closeMenus().catch(() => undefined);
+      restoreStubs();
+    }
 
-    for (const name of ['claude', 'codex', 'opencode']) renameSync(join(fx.bin, `${name}.off`), join(fx.bin, name));
-    unlinkSync(join(fx.bin, 'opencode'));
     const restored = await detectAgain();
     await poll(async () => versionRuns(fx).length, (count) => count > restored, UI_TIMEOUT);
     await poll(readMenu, (items) => items.join() === 'Claude Code,Codex,Open harness,Terminal', UI_TIMEOUT);
@@ -1508,7 +1544,7 @@ describe('workspace panes: built app', () => {
 
     await toggle.click({ timeout: UI_TIMEOUT });
     expect(await toggle.getAttribute('aria-pressed')).toBe('true');
-    await page.getByText('against main', { exact: false }).waitFor({ timeout: UI_TIMEOUT });
+    await page.getByText('against main', { exact: true }).waitFor({ timeout: UI_TIMEOUT });
     const panel = await page.evaluate(() => {
       const found = [...document.querySelectorAll<HTMLElement>('body *')].find((element) => {
         const box = element.getBoundingClientRect();
@@ -1541,10 +1577,12 @@ describe('workspace panes: built app', () => {
     await page.getByRole('menuitem', { name: 'Delete workspace…' }).click({ timeout: UI_TIMEOUT });
     const confirm = page.getByRole('alertdialog').or(page.getByRole('dialog')).filter({ hasText: 'Delete gamma?' });
     await confirm.getByRole('button', { name: 'Delete', exact: true }).click({ timeout: UI_TIMEOUT });
-    await confirm.filter({ hasText: 'has uncommitted changes' }).waitFor({ timeout: 15_000 });
+    // At the dirty step the dialog's title turns into "gamma has uncommitted changes".
+    const dirty = page.getByRole('alertdialog').or(page.getByRole('dialog')).filter({ hasText: 'has uncommitted changes' });
+    await dirty.waitFor({ timeout: 15_000 });
     // The uncommitted-changes step ends nothing.
     expect(isAlive(shellId) && isAlive(agent)).toBe(true);
-    await confirm.getByRole('button', { name: 'Delete anyway', exact: true }).click({ timeout: UI_TIMEOUT });
+    await dirty.getByRole('button', { name: 'Delete anyway', exact: true }).click({ timeout: UI_TIMEOUT });
     await workspaceRow(page, 'gamma').waitFor({ state: 'detached', timeout: 15_000 });
     expect(await endsWithin(shellId), 'the shell is gone within 5 s').toBe(true);
     expect(await endsWithin(agent), 'the agent is gone within 5 s').toBe(true);
@@ -1729,7 +1767,7 @@ async function smokePath(session: Session, fx: Fixture) {
     await expectLabels(page, 0, ['Terminal', 'Claude Code 1'], 'Claude Code 1');
     const agent = await terminalOf(page, 0);
     await waitForRow(page, 'ready', agent);
-    expect((await captureRow(page, /^cwd:(.+)$/, agent))[0]).toBe(path);
+    await expectCwd(agent, path);
     expect(sessionNamed(session.dataDir, 'Claude Code 1', path)).toMatchObject({ project: repo.root });
   } finally {
     rmSync(repo.parent, { recursive: true, force: true });
