@@ -105,7 +105,8 @@ interface Store {
   getSessionDots(): ReadonlyMap<string, string>;
   /** Workspace path -> `running` or `failed`, from the running sessions' last setup state; a done setup has no entry. */
   getWorkspaceSetups(): ReadonlyMap<string, 'running' | 'failed'>;
-  restoreTerminals(): Promise<unknown>;
+  restoreTerminals(): Promise<Array<{ entry: unknown; workspace: string; sessionId?: string }>>;
+  agentRuns(id: string): boolean;
 }
 
 // A variable specifier: the test project does not include the app sources, so tsc leaves it alone.
@@ -386,6 +387,50 @@ describe('agent exit and setup states', () => {
     // The shell of s4 exiting later leaves the dot.
     for (const listener of exitListeners) listener(10, { exitCode: 0, signal: null });
     expect(getSessionDots().get('s4')).toBe('Exited 3');
+  });
+});
+
+// COCKPIT-70: what a restore gives the workspace page to show as tabs.
+describe('restoreTerminals — the terminals of a workspace', () => {
+  const shell = (id: number, extra: Partial<ListedTerminal> = {}): ListedTerminal => ({ id, kind: 'shell', cwd: '/w1', cols: 80, rows: 24, workspace: '/w1', ...extra });
+
+  test('the shells and sessions that run in a workspace come back in the order listed, with their workspace and session id; a shell of no workspace is left alone', async () => {
+    listed = [
+      shell(1),
+      { id: 2, kind: 'session', cwd: '/w1', cols: 80, rows: 24, sessionId: 's1', workspace: '/w1' },
+      shell(3, { workspace: undefined }),
+      shell(4, { workspace: '/w2' }),
+      { id: 5, kind: 'session', cwd: '/outside', cols: 80, rows: 24, sessionId: 's2' },
+    ];
+    vi.resetModules();
+    const { restoreTerminals, getSessionTerminal } = await loadStore();
+
+    const restored = await restoreTerminals();
+
+    expect(restored.map(({ workspace, sessionId }) => [workspace, sessionId])).toEqual([
+      ['/w1', undefined],
+      ['/w1', 's1'],
+      ['/w2', undefined],
+    ]);
+    // A session outside any project is in the store for its own page, and is not a tab.
+    expect(getSessionTerminal('s2')).toBeDefined();
+    expect(getSessionTerminal('s1')).toBe(restored[1]!.entry);
+  });
+
+  test('a session runs until its agent exits: the exit `cockpit setup` reported, or its terminal ending, ends it', async () => {
+    listed = [
+      { id: 1, kind: 'session', cwd: '/w1', cols: 80, rows: 24, sessionId: 'runs', workspace: '/w1' },
+      { id: 2, kind: 'session', cwd: '/w1', cols: 80, rows: 24, sessionId: 'agent-left', workspace: '/w1', exitCode: 3 },
+    ];
+    vi.resetModules();
+    const { restoreTerminals, agentRuns } = await loadStore();
+
+    await restoreTerminals();
+
+    expect(agentRuns('runs')).toBe(true);
+    expect(agentRuns('agent-left')).toBe(false);
+    for (const listener of exitListeners) listener(1, { exitCode: 0, signal: null });
+    expect(agentRuns('runs')).toBe(false);
   });
 });
 

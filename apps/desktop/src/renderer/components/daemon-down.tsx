@@ -1,9 +1,8 @@
 import { useRouter } from '@tanstack/react-router';
 import { TriangleAlertIcon } from 'lucide-react';
 import { useSyncExternalStore } from 'react';
-import { restoreTerminals } from '@/components/live-terminals';
-import { restoreTabs } from '@/components/terminal-tabs';
 import { Button } from '@/components/ui/button';
+import { restoreFromDaemon } from '@/components/workspace-panes';
 import type { DaemonStatus } from '../../shared/api';
 
 // Whether "Try again" is waiting for the service. The failure view and the sidebar's line both go
@@ -35,7 +34,7 @@ export function DaemonDown({ status }: { status: Extract<DaemonStatus, { status:
   async function retry() {
     setRetrying(true);
     try {
-      if ((await window.api.daemon.retry()).status === 'running') restoreTabs(await restoreTerminals(true));
+      if ((await window.api.daemon.retry()).status === 'running') await restoreFromDaemon(true);
       await router.invalidate();
     } finally {
       setRetrying(false);

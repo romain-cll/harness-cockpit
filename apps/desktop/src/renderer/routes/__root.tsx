@@ -1,10 +1,9 @@
-import { createRootRoute, Outlet, useNavigate, useParams, useRouter } from '@tanstack/react-router';
+import { createRootRoute, Outlet, useLocation, useNavigate, useRouter } from '@tanstack/react-router';
 import { useEffect } from 'react';
 import { AppSidebar } from '@/components/app-sidebar';
 import { useSidebarCollapsed } from '@/components/collapsed';
 import { ChangesPanel, useChangesOpen, workspaceOf } from '@/components/changes-panel';
-import { restoreTerminals } from '@/components/live-terminals';
-import { restoreTabs } from '@/components/terminal-tabs';
+import { restoreFromDaemon, selectSessionTab } from '@/components/workspace-panes';
 
 export const Route = createRootRoute({
   loader: async () => {
@@ -14,9 +13,10 @@ export const Route = createRootRoute({
       window.api.sessions.list(),
       window.api.daemon.status(),
       window.api.projects.git(),
-      // The shells and sessions the daemons run come back with their screens, once per page load.
-      restoreTerminals().then(restoreTabs),
     ]);
+    // The shells and sessions the daemons run come back with their screens, once per page load. The page
+    // does not wait for them: a daemon that does not answer must not keep it from opening.
+    void restoreFromDaemon();
     return { version, projects, sessions, daemon, git };
   },
   component: RootLayout,
@@ -26,9 +26,9 @@ function RootLayout() {
   const { version, projects, sessions, daemon, git } = Route.useLoaderData();
   const router = useRouter();
   const navigate = useNavigate();
-  // The Changes sidebar belongs to the page of a session that runs in a workspace.
-  const { sessionId } = useParams({ strict: false });
-  const workspace = workspaceOf(sessions.find(({ id }) => id === sessionId), projects);
+  // The Changes sidebar belongs to the workspace page.
+  const { pathname, search } = useLocation();
+  const workspace = workspaceOf(pathname === '/workspace' ? (search as { path?: string }).path : undefined, projects);
   const changesOpen = useChangesOpen();
   const sidebarHidden = useSidebarCollapsed();
   // Worktrees may be added or removed outside the app: list them again when the window gains focus.
@@ -42,10 +42,19 @@ function RootLayout() {
     () => window.api.sessions.onStatus((sessionId) => sessions.some(({ id }) => id === sessionId) || void router.invalidate()),
     [router, sessions],
   );
-  // A clicked notification opens its session's page.
+  // A clicked notification opens its session's page, or its workspace's with the session's tab selected.
   useEffect(
-    () => window.api.sessions.onOpen((sessionId) => void navigate({ to: '/sessions/$sessionId', params: { sessionId } })),
-    [navigate],
+    () =>
+      window.api.sessions.onOpen((sessionId) => {
+        const session = sessions.find(({ id }) => id === sessionId);
+        if (session?.project && workspaceOf(session.directory, projects)) {
+          selectSessionTab(session.directory, sessionId);
+          void navigate({ to: '/workspace', search: { path: session.directory } });
+        } else {
+          void navigate({ to: '/sessions/$sessionId', params: { sessionId } });
+        }
+      }),
+    [navigate, sessions, projects],
   );
   return (
     <div className="flex h-screen">

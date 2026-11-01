@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import type { AvailableHarness, BranchesResult, Project, StartSessionResult } from '../../shared/api';
+import type { AvailableHarness, BranchesResult, Project, StartSessionResult, Workspace } from '../../shared/api';
 import { startSession } from '@/components/live-terminals';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
@@ -21,7 +21,7 @@ export function NewWorkspaceDialog({
   /**
    * Called once the workspace exists; `start` is what starting its session came to, when one was asked.
    */
-  onCreated: (start?: StartSessionResult) => Promise<void>;
+  onCreated: (workspace: Workspace, start?: StartSessionResult) => Promise<void>;
 }) {
   const [branches, setBranches] = useState<BranchesResult>();
   const [name, setName] = useState('');
@@ -62,7 +62,7 @@ export function NewWorkspaceDialog({
         const { path } = result.workspace;
         // The session's terminal runs the repository's setup first, then the agent.
         const start = agent === NO_AGENT ? undefined : await startSession(agent, { workspace: { project: project.path, path }, prompt, setup: true });
-        await onCreated(start);
+        await onCreated(result.workspace, start);
       }
     } finally {
       setBusy(false);

@@ -245,66 +245,9 @@ async function focusedPane(page: Page): Promise<Pane> {
   return pane;
 }
 
-const isSamePane = (a: Pane, b: Pane) => a.evaluate((one, other) => one === other, b);
-
-async function isOneOf(pane: Pane, panes: Pane[]): Promise<boolean> {
-  for (const other of panes) if (await isSamePane(pane, other)) return true;
-  return false;
-}
-
-// Waits until a visible terminal that is not one of `previous` holds the keyboard
-// focus, and returns it.
-async function newlyFocusedPane(page: Page, previous: Pane[]): Promise<Pane> {
-  const deadline = Date.now() + UI_TIMEOUT;
-  for (;;) {
-    const active = await activePane(page);
-    if (active && !(await isOneOf(active, previous))) return active;
-    if (Date.now() > deadline) throw new Error('No new terminal has the keyboard focus');
-    await sleep(100);
-  }
-}
-
-const boxOf = (pane: Pane) =>
-  pane.evaluate((element) => {
-    const { left, top, right, bottom, width, height } = element.getBoundingClientRect();
-    return { left, top, right, bottom, width, height };
-  });
-type Box = Awaited<ReturnType<typeof boxOf>>;
-
-// The area a terminal's pane is given by its tab's layout: its terminal snaps to whole rows inside it.
-const slotOf = (pane: Pane) =>
-  pane.evaluate((element) => {
-    const { left, top, right, bottom, width, height } = element.closest('.group\\/pane')!.getBoundingClientRect();
-    return { left, top, right, bottom, width, height };
-  });
-
-// Waits until the terminals stop moving: a terminal is refitted to its area a
-// moment after the area changes, and a terminal's box follows its rows.
-async function settle(...panes: Pane[]) {
-  const read = async () => JSON.stringify(await Promise.all(panes.map(boxOf)));
-  let last = await read();
-  const deadline = Date.now() + UI_TIMEOUT;
-  for (;;) {
-    await sleep(250);
-    const now = await read();
-    if (now === last || Date.now() > deadline) return;
-    last = now;
-  }
-}
-
-// Whether two boxes are the same area, give or take `tolerance` px per edge.
-const sameArea = (a: Box, b: Box, tolerance = 2) =>
-  (['left', 'top', 'right', 'bottom'] as const).every((edge) => Math.abs(a[edge] - b[edge]) <= tolerance);
-
 async function goHome(page: Page) {
   await page.getByRole('link', { name: 'Home', exact: true }).click({ timeout: UI_TIMEOUT });
   await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
-}
-
-// Goes to the terminal page through the sidebar's link, without touching the terminals.
-async function goToTerminalPage(page: Page) {
-  await page.getByRole('link', { name: 'Terminal', exact: true }).click({ timeout: UI_TIMEOUT });
-  await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
 }
 
 // Ends every shell of the daemon (COCKPIT-55: the shells outlive the page, so a reload shows them
@@ -321,15 +264,59 @@ async function endShells(page: Page) {
   });
 }
 
-// Reloads the page on Home (the tabs outlive a visit, and, once the shells are ended, a reload starts
-// over), then opens the terminal page through the sidebar: each call opens a new page lifetime
-// (one tab, one shell), and focuses the terminal.
-async function openTerminal(page: Page) {
+// COCKPIT-70: the Terminal page is gone; a shell tab of a workspace page stands in for it where a test needs
+// one terminal. A repository and a workspace are made once per session. Each call reloads on Home (the
+// panes outlive a visit, and, once the shells are ended, a reload starts over), opens the workspace page
+// through its sidebar row, starts a "Terminal" tab and focuses its terminal.
+const terminalWorkspaces = new WeakMap<Session, { path: string; root: string }>();
+
+async function openTerminal(session: Session) {
+  const { page } = session;
+  let path = terminalWorkspaces.get(session)?.path;
+  if (!path) {
+    const repo = makeRepo('terminal-repo');
+    await addRepository(session, repo);
+    const created = await page.evaluate(
+      ([project, name]) =>
+        (window as unknown as { api: { workspaces: { create(project: string, name: string, base: string): Promise<{ status: string }> } } }).api.workspaces.create(
+          project!,
+          name!,
+          'main',
+        ),
+      [repo.root, 'term'] as const,
+    );
+    expect(created.status).toBe('created');
+    await dispatchFocus(page);
+    path = worktreePath(session, repo, 'term');
+    terminalWorkspaces.set(session, { path, root: repo.root });
+    await poll(() => entryTitles(page), (titles) => titles.includes(path!), UI_TIMEOUT);
+  }
   await goHome(page);
   await endShells(page);
   await page.reload();
   await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
-  await goToTerminalPage(page);
+  await openShellTab(page, path);
+}
+
+// Ends the shells and removes the repository `openTerminal` made, so that the tests that follow list only their own
+// projects.
+async function dropTerminalWorkspace(session: Session) {
+  const found = terminalWorkspaces.get(session);
+  if (!found) return;
+  terminalWorkspaces.delete(session);
+  const { page } = session;
+  await endShells(page);
+  await page.evaluate((root) => (window as unknown as { api: { projects: { remove(path: string): Promise<void> } } }).api.projects.remove(root), found.root);
+  await dispatchFocus(page);
+  await poll(() => entryTitles(page), (titles) => !titles.includes(found.root), UI_TIMEOUT);
+}
+
+// Opens the page of a workspace through its sidebar row, starts a "Terminal" tab and focuses its terminal.
+async function openShellTab(page: Page, workspacePath: string) {
+  await page.getByTitle(workspacePath, { exact: true }).first().click({ timeout: UI_TIMEOUT });
+  await page.getByRole('tablist').first().waitFor({ timeout: UI_TIMEOUT });
+  await page.getByRole('button', { name: 'New tab', exact: true }).first().click({ timeout: UI_TIMEOUT });
+  await page.getByRole('menuitem', { name: 'Terminal', exact: true }).click({ timeout: UI_TIMEOUT });
   await focusTerminal(page);
 }
 
@@ -379,63 +366,6 @@ async function waitForRow(page: Page, text: string | RegExp, pane?: Pane) {
   );
 }
 
-// COCKPIT-63: runs a terminal check and, when it fails, appends to its error what `diagnose`
-// reports, so a flaky failure carries its evidence. A failing diagnostic is reported, never thrown.
-async function withDiagnostic<T>(check: () => Promise<T>, diagnose: () => Promise<string>): Promise<T> {
-  try {
-    return await check();
-  } catch (error) {
-    let report: string;
-    try {
-      report = await diagnose();
-    } catch (failure) {
-      report = `diagnostic failed: ${failure instanceof Error ? failure.stack : String(failure)}`;
-    }
-    if (error instanceof Error) error.message += `\n--- diagnostic ---\n${report}`;
-    throw error;
-  }
-}
-
-const nonEmpty = (rows: string[]) => rows.map((row, index) => [index, row] as const).filter(([, row]) => row !== '');
-
-// What a pane shows at the failure, two animation frames later and 1 s later (the pause runs only
-// once the check has failed), how long after `since`, and, when `home` is given, every shell of the
-// daemon with its sequence number and the screen `attach` serializes. The daemon client says no
-// `hello` (`list` and `attach` need none, and another build would supersede the daemon) and spawns
-// nothing; `attach` only subscribes.
-async function terminalDiagnostic(page: Page, pane: Pane, since: number, home?: string): Promise<string> {
-  const lines: string[] = [];
-  const elapsed = Date.now() - since;
-  const view = await pane.evaluate((element) => {
-    const screen = element.querySelector('.xterm-screen')?.getBoundingClientRect();
-    return {
-      rows: element.querySelectorAll('.xterm-rows > div').length,
-      screen: screen ? `${Math.round(screen.width)}x${Math.round(screen.height)}` : 'none',
-      connected: element.isConnected,
-      visibility: getComputedStyle(element).visibility,
-    };
-  });
-  lines.push(`elapsed since the action checked: ${elapsed} ms`, `view: ${JSON.stringify(view)}`);
-  lines.push(`rows at the check: ${JSON.stringify(nonEmpty(await rowsOf(pane)))}`);
-  await pane.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-  lines.push(`rows after two frames (+${Date.now() - since - elapsed} ms): ${JSON.stringify(nonEmpty(await rowsOf(pane)))}`);
-  await sleep(1_000);
-  lines.push(`rows after 1 s (+${Date.now() - since - elapsed} ms): ${JSON.stringify(nonEmpty(await rowsOf(pane)))}`);
-  if (home) {
-    const { connectDaemon } = await import('@cockpit/daemon');
-    const client = await connectDaemon(daemonSocketIn(home));
-    try {
-      for (const terminal of await client.list()) {
-        const { seq, cols, rows, screen } = await client.attach(terminal.id);
-        lines.push(`daemon terminal ${terminal.id} (${terminal.kind}, ${cols}x${rows}, seq ${seq}): ${JSON.stringify(screen)}`);
-      }
-    } finally {
-      client.close();
-    }
-  }
-  return lines.join('\n');
-}
-
 // Waits for a row matching `pattern` and returns its capture groups.
 async function captureRow(page: Page, pattern: RegExp, pane?: Pane): Promise<string[]> {
   const target = pane ?? (await focusedPane(page));
@@ -475,74 +405,6 @@ async function terminalSize(page: Page, pane?: Pane): Promise<[number, number]> 
   return [r!, c!];
 }
 
-// Like `terminalSize`, for a read repeated many times on one screen: the answer carries a tag
-// unique to this call (`size-<n> <rows> <cols>`) and the call waits for that row, so old answers
-// scrolling off a full screen never hide the new one.
-let sizeReads = 0;
-async function taggedTerminalSize(page: Page, pane: Pane): Promise<[number, number]> {
-  const tag = `size-${sizeReads++}`;
-  await typeLine(page, `printf '${tag} %s\\n' "$(stty size)"`);
-  const answer = new RegExp(`^${tag} (\\d+) (\\d+)$`);
-  await page.waitForFunction(
-    ([element, source]) => [...element.querySelectorAll('.xterm-rows > div')].some((row) => new RegExp(source).test(row.textContent ?? '')),
-    [pane, answer.source] as const,
-    { timeout: 15_000 },
-  );
-  const found = (await rowsOf(pane)).map((row) => answer.exec(row)).find(Boolean)!;
-  return [Number(found[1]), Number(found[2])];
-}
-
-// The `[rows, cols]` the terminal displays: its rendered rows, and the width of
-// the wrapped rows of a long line of one digit the shell prints. Each call prints
-// another digit, so the lines of an earlier call on the same screen are not mistaken
-// for this one.
-let lineCount = 0;
-async function displayedSize(page: Page, pane: Pane): Promise<[number, number]> {
-  const digit = String(1 + (lineCount++ % 9));
-  await typeLine(page, `printf '%0600d\\n' 0 | tr 0 ${digit}`);
-  // The line wraps over several rows: wait until they hold all 600 digits.
-  const line = new RegExp(`^${digit}+$`);
-  const total = (rows: string[]) => rows.filter((row) => line.test(row)).reduce((sum, row) => sum + row.length, 0);
-  const rows = await poll(() => rowsOf(pane), (found) => total(found) >= 600, 15_000);
-  expect(total(rows), 'the whole line is displayed').toBe(600);
-  const cols = Math.max(...rows.filter((row) => line.test(row)).map((row) => row.length));
-  return [rows.length, cols];
-}
-
-// What `stty size` answers in a terminal must be what the terminal displays. On a mismatch only,
-// `stty size` is read again for up to 5 s, which tells a late resize (LATE: it matches in the end,
-// one line says so) from a lost one (LOST: the failure holds every size seen); each re-read is
-// tagged, so it still works once the screen is full. A match on the
-// first answer re-reads nothing and writes nothing.
-async function expectSizeMatchesDisplay(page: Page, pane: Pane) {
-  await focusPane(pane);
-  await waitForPrompt(page, pane);
-  const first = await terminalSize(page, pane);
-  const shown = await displayedSize(page, pane);
-  const matches = (size: [number, number]) => size[0] === shown[0] && size[1] === shown[1];
-  if (matches(first)) return;
-
-  let rereads = 0;
-  const last = await poll(
-    async () => {
-      rereads++;
-      // With poll's own 100 ms, about 250 ms between re-reads bounds the lines they print.
-      await sleep(150);
-      return taggedTerminalSize(page, pane);
-    },
-    matches,
-    5_000,
-  );
-  if (matches(last)) {
-    console.log(`late resize: displayed ${shown[0]} ${shown[1]}, first answer ${first[0]} ${first[1]}, matched after ${rereads} re-reads`);
-    return;
-  }
-  expect(
-    last,
-    `the shell is told the rows and columns the terminal displays: displayed ${shown[0]} ${shown[1]}, first answer ${first[0]} ${first[1]}, last answer ${last[0]} ${last[1]} after ${rereads} re-reads: LOST`,
-  ).toEqual(shown);
-}
-
 // Types `echo pid-$$` in a terminal and returns the shell's process id. With a
 // pane, it clicks it first; without, it types where the keyboard already is.
 async function pidOf(page: Page, pane?: Pane): Promise<number> {
@@ -556,102 +418,6 @@ async function pidOf(page: Page, pane?: Pane): Promise<number> {
 
 // Whether the process is gone within `timeout` ms.
 const endsWithin = async (pid: number, timeout = 5_000) => !(await poll(() => isAlive(pid), (alive) => !alive, timeout));
-
-// --- Tabs and splits ---------------------------------------------------------
-
-const newTerminalButton = (page: Page) => page.getByRole('button', { name: 'New terminal', exact: true }).first();
-const newTerminal = (page: Page) => newTerminalButton(page).click({ timeout: UI_TIMEOUT });
-const tabNamed = (page: Page, number: number) => page.getByRole('tab', { name: `Terminal ${number}`, exact: true });
-const selectTab = (page: Page, number: number) => tabNamed(page, number).click({ timeout: UI_TIMEOUT });
-const closeTab = (page: Page, number: number) =>
-  page.getByRole('button', { name: `Close Terminal ${number}`, exact: true }).click({ timeout: UI_TIMEOUT });
-
-interface TabsShown {
-  names: string[];
-  selected: string | undefined;
-}
-
-// The tabs of the tab bar, in order, and the selected one.
-const tabsShown = (page: Page): Promise<TabsShown> =>
-  page.getByRole('tab').evaluateAll((tabs) => {
-    const names = tabs.map((tab) => (tab.textContent ?? '').trim());
-    return { names, selected: names[tabs.findIndex((tab) => tab.getAttribute('aria-selected') === 'true')] };
-  });
-
-// Waits for the tab bar to show exactly these tabs, with this one selected.
-async function expectTabs(page: Page, names: string[], selected: string | undefined) {
-  const expected = { names, selected };
-  const shown = await poll(() => tabsShown(page), (tabs) => JSON.stringify(tabs) === JSON.stringify(expected), UI_TIMEOUT);
-  expect(shown).toEqual(expected);
-}
-
-// The "Split right", "Split down" or "Close terminal" button of a terminal: the
-// one in the pane's own toolbar, found by the DOM when the toolbar sits next to
-// the terminal, else by the position nearest to the terminal.
-async function paneButton(pane: Pane, label: 'Split right' | 'Split down' | 'Close terminal') {
-  await pane.hover({ timeout: UI_TIMEOUT });
-  const handle = await pane.evaluateHandle((element, label) => {
-    const selector = `button[aria-label="${label}"]`;
-    const shown = (button: Element) => {
-      const { width, height } = button.getBoundingClientRect();
-      return width > 0 && height > 0 && getComputedStyle(button).visibility === 'visible';
-    };
-    for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
-      if (ancestor.querySelectorAll('.xterm').length > 1) break;
-      const own = [...ancestor.querySelectorAll(selector)].filter(shown);
-      if (own.length === 1) return own[0]!;
-    }
-    const terminal = element.getBoundingClientRect();
-    const distance = (button: Element) => {
-      const { left, top, width, height } = button.getBoundingClientRect();
-      const x = left + width / 2;
-      const y = top + height / 2;
-      return Math.hypot(Math.max(terminal.left - x, 0, x - terminal.right), Math.max(terminal.top - y, 0, y - terminal.bottom));
-    };
-    return [...document.querySelectorAll(selector)].filter(shown).sort((a, b) => distance(a) - distance(b))[0] ?? null;
-  }, label);
-  const button = handle.asElement();
-  if (!button) throw new Error(`No "${label}" button for this terminal`);
-  return button;
-}
-
-async function clickPaneButton(pane: Pane, label: 'Split right' | 'Split down' | 'Close terminal') {
-  await (await paneButton(pane, label)).click({ timeout: UI_TIMEOUT });
-}
-
-// Splits a terminal and returns the new one, which must hold the keyboard focus.
-async function splitPane(page: Page, pane: Pane, direction: 'right' | 'down'): Promise<Pane> {
-  const before = await visiblePanes(page);
-  await clickPaneButton(pane, direction === 'right' ? 'Split right' : 'Split down');
-  const created = await newlyFocusedPane(page, before);
-  expect(await visiblePanes(page)).toHaveLength(before.length + 1);
-  await settle(...before, created);
-  return created;
-}
-
-// Opens a new tab and returns its terminal, which must hold the keyboard focus.
-async function openTab(page: Page): Promise<Pane> {
-  const before = await visiblePanes(page);
-  await newTerminal(page);
-  return newlyFocusedPane(page, before);
-}
-
-// Two tabs, the second one split in two: the shells' pids, in creation order.
-async function openTwoTabsOneSplit(page: Page): Promise<number[]> {
-  await openTerminal(page);
-  const pids = [await pidOf(page)];
-  await openTab(page);
-  pids.push(await pidOf(page));
-  const second = await focusedPane(page);
-  await splitPane(page, second, 'right');
-  pids.push(await pidOf(page));
-  for (const pid of pids) expect(isAlive(pid)).toBe(true);
-  return pids;
-}
-
-// The "New terminal" button of the empty state, not the one of the page header.
-const emptyStateNewTerminal = (page: Page) =>
-  page.getByText('No terminal open', { exact: true }).locator('..').getByRole('button', { name: 'New terminal', exact: true });
 
 // The pid of the daemon (COCKPIT-55; it was the pty utility process), read from the parent of a probe shell (ended
 // before the call returns, so it leaves nothing under the host).
@@ -678,53 +444,6 @@ async function killPtyHost(page: Page): Promise<number> {
   await waitForExit(page, id);
   return id;
 }
-
-// Makes the main process hold every `pty:spawn` answer until `releasePtySpawn`, so
-// a test can change a terminal's size while its shell is still starting. Uses the
-// handler table of Electron's `ipcMain` (private), because the app has no hook for it.
-const holdPtySpawn = (session: Session) =>
-  session.evaluateInMain(`(() => {
-    const handlers = require('electron').ipcMain._invokeHandlers;
-    const original = handlers.get('pty:spawn');
-    if (!original) throw new Error('the main process has no pty:spawn handler');
-    const gate = new Promise((resolve) => { globalThis.__releasePtySpawn = resolve; });
-    globalThis.__originalPtySpawn = original;
-    handlers.set('pty:spawn', async (...args) => {
-      await gate;
-      return original(...args);
-    });
-  })()`);
-
-// Lets the held spawns go on and puts the real handler back.
-const releasePtySpawn = (session: Session) =>
-  session.evaluateInMain(`(() => {
-    const original = globalThis.__originalPtySpawn;
-    if (original) require('electron').ipcMain._invokeHandlers.set('pty:spawn', original);
-    globalThis.__releasePtySpawn?.();
-    delete globalThis.__originalPtySpawn;
-    delete globalThis.__releasePtySpawn;
-  })()`);
-
-// Replaces the main process's `pty:spawn` handler (the handler table of Electron's
-// `ipcMain` is private, the app has no hook for it). `body` is the source of the
-// new handler; the original is in scope as `original`, e.g.
-// `async (...args) => original(...args)`.
-const replacePtySpawn = (session: Session, body: string) =>
-  session.evaluateInMain(`(() => {
-    const handlers = require('electron').ipcMain._invokeHandlers;
-    const original = globalThis.__replacedPtySpawn ?? handlers.get('pty:spawn');
-    if (!original) throw new Error('the main process has no pty:spawn handler');
-    globalThis.__replacedPtySpawn = original;
-    handlers.set('pty:spawn', (${body}));
-  })()`);
-
-// Puts the original `pty:spawn` handler back.
-const restorePtySpawn = (session: Session) =>
-  session.evaluateInMain(`(() => {
-    const original = globalThis.__replacedPtySpawn;
-    if (original) require('electron').ipcMain._invokeHandlers.set('pty:spawn', original);
-    delete globalThis.__replacedPtySpawn;
-  })()`);
 
 // The console errors of the navigation tests that are not the refusal of the
 // file:// URL they tried: Chromium words it `Not allowed to load local resource:
@@ -884,7 +603,7 @@ interface SidebarEntry {
 const sidebarEntries = (page: Page): Promise<SidebarEntry[]> =>
   page.evaluate(() => {
     const section = [...document.querySelectorAll('aside section')].find((candidate) => candidate.querySelector('h2')?.textContent === 'Projects');
-    const titled = [...(section?.querySelectorAll('div[title]') ?? [])] as HTMLElement[];
+    const titled = [...(section?.querySelectorAll('div[title], a[title]') ?? [])] as HTMLElement[];
     return titled
       .filter((element) => !titled.some((other) => other !== element && other.contains(element) && other.title === element.title))
       .map((element) => ({ title: element.title, text: (element.textContent ?? '').trim() }));
@@ -1202,7 +921,7 @@ const gitAlertOf = (page: Page) =>
     if (!title || !detail) return null;
     let box: HTMLElement | null = title;
     while (box && box.tagName !== 'ASIDE' && !(box.contains(detail) && box.querySelector('svg.lucide-triangle-alert'))) box = box.parentElement;
-    const terminal = [...document.querySelectorAll('aside a')].find((link) => (link.textContent ?? '').trim() === 'Terminal');
+    const terminal = [...document.querySelectorAll('aside a')].find((link) => (link.textContent ?? '').trim() === 'Home');
     const projects = [...document.querySelectorAll('aside button')].find((button) => (button.textContent ?? '').trim() === 'Projects');
     const icon = box && box.tagName !== 'ASIDE' ? box.querySelector('svg.lucide-triangle-alert') : null;
     if (!box || !icon || !terminal || !projects) return { icon: false, top: 0, bottom: 0, terminalBottom: 0, projectsTop: 0, iconRgb: [0, 0, 0] };
@@ -1391,6 +1110,11 @@ describe.each([
     if (session) expect(existsSync(session.dataDir)).toBe(false);
   });
 
+  // The repository `openTerminal` made goes after each test, so the tests that follow list only their own projects.
+  afterEach(async () => {
+    if (session) await dropTerminalWorkspace(session);
+  });
+
   test('shows the home page and the version from the main process', async () => {
     const { page } = session;
     await page.getByText(versionLabel).waitFor();
@@ -1556,53 +1280,9 @@ describe.each([
     },
   );
 
-  test.runIf(full)('terminal AC1 — the Terminal link opens a page with a heading, a tab bar and an xterm.js terminal under the header', async () => {
-    const { page } = session;
-    await page.getByRole('link', { name: 'Home', exact: true }).click({ timeout: UI_TIMEOUT });
-    await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
-    await page.getByRole('link', { name: 'Terminal', exact: true }).click({ timeout: UI_TIMEOUT });
-
-    await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
-    expect(await page.getByRole('link', { name: 'Terminal', exact: true }).getAttribute('aria-current')).toBe('page');
-    await page.locator('.xterm').waitFor({ state: 'visible', timeout: UI_TIMEOUT });
-
-    // The header holds the tab bar: the selected tab "Terminal 1" and a "New terminal" button.
-    const header = page.locator('main header');
-    await header.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
-    await header.getByRole('tab', { name: 'Terminal 1', exact: true }).waitFor({ timeout: UI_TIMEOUT });
-    await header.getByRole('button', { name: 'New terminal', exact: true }).waitFor({ timeout: UI_TIMEOUT });
-    await expectTabs(page, ['Terminal 1'], 'Terminal 1');
-    expect(await visiblePanes(page)).toHaveLength(1);
-
-    // It fills the page: right under the header, down to the window bottom and
-    // across the main area, give or take one cell and the scrollbar.
-    const boxes = await page.evaluate(() => {
-      const box = (selector: string) => {
-        const { top, bottom, width } = document.querySelector(selector)!.getBoundingClientRect();
-        return { top, bottom, width };
-      };
-      return { header: box('main header'), main: box('main'), terminal: box('.xterm') };
-    });
-    expect(boxes.terminal.width).toBeGreaterThan(0);
-    expect(boxes.terminal.top).toBeGreaterThanOrEqual(boxes.header.bottom - 1);
-    expect(boxes.terminal.top).toBeLessThan(boxes.header.bottom + 20);
-    expect(boxes.terminal.bottom).toBeGreaterThan(boxes.main.bottom - 40);
-    expect(boxes.terminal.width).toBeGreaterThan(boxes.main.width - 40);
-  });
-
-  test.runIf(inIsolatedShell)('terminal AC2 — typing a command shows its output', async () => {
-    const { page } = session;
-    await openTerminal(page);
-
-    await typeLine(page, 'echo cockpit-$((6*7))');
-
-    // The echoed command line shows `$((6*7))`: only the shell prints `cockpit-42`.
-    await waitForRow(page, 'cockpit-42');
-  });
-
   test.runIf(full)('terminal AC3 — resizing the viewport resizes the pty to the terminal columns and rows', async () => {
     const { page } = session;
-    await openTerminal(page);
+    await openTerminal(session);
     const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
     const screenWidth = () => page.evaluate(() => document.querySelector('.xterm-screen')!.getBoundingClientRect().width);
     const renderedRows = async () => (await terminalRows(page)).length;
@@ -1629,7 +1309,7 @@ describe.each([
 
   test.runIf(full)('terminal AC4 — exit shows the exit code, and later keys do nothing', async () => {
     const { page } = session;
-    await openTerminal(page);
+    await openTerminal(session);
 
     await typeLine(page, 'exit 3');
     await waitForRow(page, '[Process exited with code 3]');
@@ -1645,7 +1325,7 @@ describe.each([
 
   test.runIf(full)('terminal AC5 — copy puts the selected word in the clipboard data as text/plain', async () => {
     const { page } = session;
-    await openTerminal(page);
+    await openTerminal(session);
     await typeLine(page, 'echo copy-me-123');
     await waitForRow(page, 'copy-me-123');
 
@@ -1669,7 +1349,7 @@ describe.each([
 
   test.runIf(full)('terminal AC6 — pasting text then pressing Enter runs it', async () => {
     const { page } = session;
-    await openTerminal(page);
+    await openTerminal(session);
 
     await page.evaluate(() => {
       const clipboardData = new DataTransfer();
@@ -1683,7 +1363,7 @@ describe.each([
 
   test.runIf(full)('terminal AC7 — text, background and ANSI red follow the tokens as the color scheme changes', async () => {
     const { page } = session;
-    await openTerminal(page);
+    await openTerminal(session);
     await page.emulateMedia({ colorScheme: 'dark' });
     await typeLine(page, "printf '\\033[31mred\\033[0m\\n'");
     await page.locator('.xterm-rows span.xterm-fg-1', { hasText: 'red' }).first().waitFor({ timeout: 15_000 });
@@ -1705,508 +1385,6 @@ describe.each([
   });
 
   // --- Several terminals: tabs, splits and lifecycle (COCKPIT-24) -------------
-
-  test.runIf(full)('tabs AC2 — "New terminal" adds the next tab, selected, with a new shell that has the focus; the previous shell keeps running and can be typed in again', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const first = await focusedPane(page);
-    const firstPid = await pidOf(page, first);
-    await typeLine(page, 'echo first-marker-$((20+1))');
-    await waitForRow(page, 'first-marker-21', first);
-
-    await newTerminal(page);
-    await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 2');
-    // The keyboard is in the new terminal already: no click before typing.
-    const second = await newlyFocusedPane(page, [first]);
-    expect(await visiblePanes(page)).toHaveLength(1);
-    const secondPid = await pidOf(page);
-    expect(secondPid).not.toBe(firstPid);
-    expect(isAlive(firstPid)).toBe(true);
-    expect(await rowsOf(second)).not.toContain('first-marker-21');
-
-    await selectTab(page, 1);
-    await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 1');
-    expect(await first.isVisible()).toBe(true);
-    expect(await rowsOf(first)).toContain('first-marker-21');
-    await focusPane(first);
-    await typeLine(page, 'echo back-$((3*5))');
-    await waitForRow(page, 'back-15', first);
-    expect(isAlive(firstPid)).toBe(true);
-    expect(isAlive(secondPid)).toBe(true);
-  });
-
-  test.runIf(full)('tabs AC3 — "Split right" and "Split down" divide the terminal into two halves of equal width or height, the original keeps its shell and output, the new half has the focus; splits nest', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const a = await focusedPane(page);
-    const aPid = await pidOf(page, a);
-    await typeLine(page, 'echo a-marker-$((10+1))');
-    await waitForRow(page, 'a-marker-11', a);
-    await settle(a);
-    const whole = await boxOf(a);
-
-    const b = await splitPane(page, a, 'right');
-    const aBox = await boxOf(a);
-    const bBox = await boxOf(b);
-    expect(Math.abs(aBox.width - bBox.width), 'equal widths').toBeLessThanOrEqual(2);
-    expect(Math.abs(aBox.top - bBox.top)).toBeLessThanOrEqual(2);
-    expect(Math.abs(aBox.height - bBox.height)).toBeLessThanOrEqual(2);
-    expect(Math.abs(aBox.height - whole.height), 'full height').toBeLessThanOrEqual(2);
-    expect(aBox.left, 'the original is the first half').toBeLessThan(bBox.left);
-    expect(aBox.right, 'side by side').toBeLessThanOrEqual(bBox.left + 2);
-    expect(aBox.width + bBox.width, 'the two halves share the area').toBeGreaterThan(whole.width - 24);
-    expect(aBox.width + bBox.width).toBeLessThanOrEqual(whole.width + 2);
-
-    // The original terminal was not rebuilt: same element, same shell, same output.
-    expect(await a.evaluate((element) => element.isConnected)).toBe(true);
-    expect(await rowsOf(a)).toContain('a-marker-11');
-    expect(isAlive(aPid)).toBe(true);
-    // The new half runs a new shell and the keyboard is in it.
-    const bPid = await pidOf(page);
-    expect(bPid).not.toBe(aPid);
-    expect(await rowsOf(b)).not.toContain('a-marker-11');
-
-    // A half can be split again.
-    const c = await splitPane(page, b, 'down');
-    const bBox2 = await boxOf(b);
-    const cBox = await boxOf(c);
-    expect(Math.abs(bBox2.height - cBox.height), 'equal heights').toBeLessThanOrEqual(2);
-    expect(Math.abs(bBox2.width - cBox.width)).toBeLessThanOrEqual(2);
-    expect(Math.abs(bBox2.left - cBox.left)).toBeLessThanOrEqual(2);
-    expect(bBox2.top).toBeLessThan(cBox.top);
-    expect(bBox2.bottom, 'stacked').toBeLessThanOrEqual(cBox.top + 2);
-    expect(Math.abs(bBox2.width - bBox.width), 'inside the half it split').toBeLessThanOrEqual(2);
-    expect(bBox2.height + cBox.height).toBeGreaterThan(bBox.height - 24);
-    expect(sameArea(await boxOf(a), aBox), 'the first half is untouched').toBe(true);
-    expect(await b.evaluate((element) => element.isConnected)).toBe(true);
-    expect(isAlive(bPid)).toBe(true);
-    expect(await rowsOf(b), 'the split terminal keeps its shell and output').toContain(`pid-${bPid}`);
-    const cPid = await pidOf(page);
-    expect(new Set([aPid, bPid, cPid]).size).toBe(3);
-  });
-
-  // In A | (B / C), closing C: B takes C's area, A is untouched, the keyboard is in B. The other
-  // modes check the focus after "Close terminal" in the terminal smoke path.
-  test.runIf(full)('tabs AC4 — in a nested split A | (B / C), closing C gives its area to B, leaves A untouched and puts the keyboard in B', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const a = await focusedPane(page);
-    const aPid = await pidOf(page, a);
-    const b = await splitPane(page, a, 'right');
-    const bPid = await pidOf(page);
-    await typeLine(page, 'echo b-marker-$((10+5))');
-    await waitForRow(page, 'b-marker-15', b);
-    const c = await splitPane(page, b, 'down');
-    const cPid = await pidOf(page);
-    // The expected areas come from the panes' own slots, not from the terminals, which snap to whole rows.
-    const aBox = await boxOf(a);
-    const aSlot = await slotOf(a);
-    const bSlot = await slotOf(b);
-    const cSlot = await slotOf(c);
-    const slot: Box = { left: bSlot.left, top: bSlot.top, right: cSlot.right, bottom: cSlot.bottom, width: bSlot.width, height: cSlot.bottom - bSlot.top };
-
-    await clickPaneButton(c, 'Close terminal');
-
-    expect(await endsWithin(cPid)).toBe(true);
-    await poll(async () => (await visiblePanes(page)).length, (count) => count === 2, UI_TIMEOUT);
-    const grown = await poll(() => slotOf(b), (box) => sameArea(box, slot), UI_TIMEOUT);
-    expect(sameArea(grown, slot), 'the sibling takes the closed terminal\'s whole area').toBe(true);
-    // Its terminal fills that area, short of it by less than one row (plus the view's padding).
-    const rowHeight = await b.evaluate((element) => element.querySelector('.xterm-rows > div')!.getBoundingClientRect().height);
-    const fills = (box: Box) => box.top >= slot.top && box.bottom <= slot.bottom && slot.height - box.height < rowHeight + 10;
-    expect(fills(await poll(() => boxOf(b), fills, UI_TIMEOUT)), 'the sibling\'s terminal fills its area').toBe(true);
-    expect(sameArea(await boxOf(a), aBox), 'the other half is untouched').toBe(true);
-    expect(sameArea(await slotOf(a), aSlot), 'the other half\'s area is untouched').toBe(true);
-    expect(await rowsOf(b), 'the sibling keeps its output').toContain('b-marker-15');
-    expect(isAlive(aPid)).toBe(true);
-    expect(isAlive(bPid)).toBe(true);
-
-    // No click: the text goes where the keyboard is.
-    const active = await poll(() => activePane(page), Boolean, UI_TIMEOUT);
-    expect(active, 'a visible terminal holds the keyboard focus').not.toBeNull();
-    expect(await isSamePane(active!, b), 'the sibling B holds the focus').toBe(true);
-    await typeLine(page, 'echo sibling-$((6*7))');
-    await waitForRow(page, 'sibling-42', b);
-    expect(await rowsOf(a), 'A did not receive the typed text').not.toContain('sibling-42');
-    expect((await rowsOf(a)).join('\n')).not.toContain('echo sibling-');
-
-    // The layout is now A | B. Closing A, the first child, gives the keyboard to B too.
-    const whole: Box = { left: aSlot.left, top: slot.top, right: slot.right, bottom: slot.bottom, width: slot.right - aSlot.left, height: slot.height };
-    await clickPaneButton(a, 'Close terminal');
-
-    expect(await endsWithin(aPid), 'the first child\'s shell ends within 5 s').toBe(true);
-    await poll(async () => (await visiblePanes(page)).length, (count) => count === 1, UI_TIMEOUT);
-    const whole2 = await poll(() => slotOf(b), (box) => sameArea(box, whole), UI_TIMEOUT);
-    expect(sameArea(whole2, whole), 'B takes the whole area').toBe(true);
-    expect(isAlive(bPid)).toBe(true);
-    const active2 = await poll(() => activePane(page), Boolean, UI_TIMEOUT);
-    expect(await isSamePane(active2!, b), 'B holds the focus after the first child closed').toBe(true);
-    await typeLine(page, 'echo first-closed-$((8*8))');
-    await waitForRow(page, 'first-closed-64', b);
-  });
-
-  test.runIf(full)('tabs AC5 — closing a tab ends all its shells, selects the tab on its left (the new first one for the first), numbers are not reused, and an empty page offers "New terminal"; survive AC4 — the empty page is kept across Home and back, and its own "New terminal" button opens the next number', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const pid1 = await pidOf(page);
-    await openTab(page);
-    const pid2 = await pidOf(page);
-    await splitPane(page, await focusedPane(page), 'right');
-    const pid2b = await pidOf(page);
-    await openTab(page);
-    const pid3 = await pidOf(page);
-    await expectTabs(page, ['Terminal 1', 'Terminal 2', 'Terminal 3'], 'Terminal 3');
-
-    // A middle tab with two shells: both end, the selection moves to its left.
-    await selectTab(page, 2);
-    await closeTab(page, 2);
-    await expectTabs(page, ['Terminal 1', 'Terminal 3'], 'Terminal 1');
-    expect(await endsWithin(pid2), 'the first shell of the closed tab ends within 5 s').toBe(true);
-    expect(await endsWithin(pid2b), 'the second shell of the closed tab ends within 5 s').toBe(true);
-    expect(isAlive(pid1)).toBe(true);
-    expect(isAlive(pid3)).toBe(true);
-
-    // Numbers are never reused: the next tab is 4, not 2.
-    await openTab(page);
-    const pid4 = await pidOf(page);
-    await expectTabs(page, ['Terminal 1', 'Terminal 3', 'Terminal 4'], 'Terminal 4');
-
-    await closeTab(page, 4);
-    await expectTabs(page, ['Terminal 1', 'Terminal 3'], 'Terminal 3');
-    expect(await endsWithin(pid4)).toBe(true);
-
-    // The first tab: the selection goes to the new first tab.
-    await selectTab(page, 1);
-    await closeTab(page, 1);
-    await expectTabs(page, ['Terminal 3'], 'Terminal 3');
-    expect(await endsWithin(pid1)).toBe(true);
-    expect(isAlive(pid3)).toBe(true);
-
-    // The last tab: an empty state.
-    await closeTab(page, 3);
-    await expectTabs(page, [], undefined);
-    expect(await endsWithin(pid3)).toBe(true);
-    await page.getByText('No terminal open', { exact: true }).waitFor({ timeout: UI_TIMEOUT });
-    expect(await visiblePanes(page)).toHaveLength(0);
-    await newTerminalButton(page).waitFor({ state: 'visible', timeout: UI_TIMEOUT });
-
-    // The page shows the state it was left in: no tab, no terminal, and no tab opened for the user.
-    await goHome(page);
-    await goToTerminalPage(page);
-    await page.getByText('No terminal open', { exact: true }).waitFor({ timeout: UI_TIMEOUT });
-    await expectTabs(page, [], undefined);
-    expect(await visiblePanes(page)).toHaveLength(0);
-
-    // The empty state's own "New terminal" button (not the header's) opens Terminal N+1: the
-    // highest number used was 4.
-    await emptyStateNewTerminal(page).click({ timeout: UI_TIMEOUT });
-    await expectTabs(page, ['Terminal 5'], 'Terminal 5');
-    await page.getByText('No terminal open', { exact: true }).waitFor({ state: 'detached', timeout: UI_TIMEOUT });
-    const fresh = await newlyFocusedPane(page, []);
-    await waitForPrompt(page, fresh);
-    await typeLine(page, 'echo cockpit-$((6*7))');
-    await waitForRow(page, 'cockpit-42', fresh);
-  });
-
-  test.runIf(full)('tabs AC5 — closing the last terminal of a tab closes the tab, and the last tab leaves the empty state; survive AC4 — after Home and back the next tab continues the count of the page\'s lifetime', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const first = await focusedPane(page);
-    const pid1 = await pidOf(page, first);
-    const second = await openTab(page);
-    const pid2 = await pidOf(page);
-    await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 2');
-
-    await clickPaneButton(second, 'Close terminal');
-    await expectTabs(page, ['Terminal 1'], 'Terminal 1');
-    expect(await endsWithin(pid2)).toBe(true);
-    expect(isAlive(pid1)).toBe(true);
-
-    // Terminal 1 and 2 opened, 2 closed, Home and back: the next one is Terminal 3, not 2.
-    await goHome(page);
-    expect(isAlive(pid1)).toBe(true);
-    await goToTerminalPage(page);
-    await expectTabs(page, ['Terminal 1'], 'Terminal 1');
-    const third = await openTab(page);
-    await expectTabs(page, ['Terminal 1', 'Terminal 3'], 'Terminal 3');
-    const pid3 = await pidOf(page);
-
-    await clickPaneButton(third, 'Close terminal');
-    await expectTabs(page, ['Terminal 1'], 'Terminal 1');
-    expect(await endsWithin(pid3)).toBe(true);
-
-    await clickPaneButton(first, 'Close terminal');
-    await expectTabs(page, [], undefined);
-    expect(await endsWithin(pid1)).toBe(true);
-    await page.getByText('No terminal open', { exact: true }).waitFor({ timeout: UI_TIMEOUT });
-  });
-
-  test.runIf(full)('tabs AC6 — stty size equals the rows and columns displayed in a new tab, in both halves of a split and in a sibling that grew', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const tab = await openTab(page);
-    await expectSizeMatchesDisplay(page, tab);
-
-    const half = await splitPane(page, tab, 'right');
-    await expectSizeMatchesDisplay(page, half);
-    await expectSizeMatchesDisplay(page, tab);
-
-    const quarter = await splitPane(page, half, 'down');
-    await expectSizeMatchesDisplay(page, quarter);
-    await expectSizeMatchesDisplay(page, half);
-
-    await clickPaneButton(quarter, 'Close terminal');
-    await poll(async () => (await visiblePanes(page)).length, (count) => count === 2, UI_TIMEOUT);
-    await expectSizeMatchesDisplay(page, half);
-  });
-
-  test.runIf(full)('tabs AC6 — a terminal resized while its tab was hidden still gets its real size', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const first = await focusedPane(page);
-    await waitForPrompt(page, first);
-    await openTab(page);
-    const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
-    const rowsBefore = (await rowsOf(first)).length;
-
-    try {
-      await page.setViewportSize({ width: viewport.width - 300, height: viewport.height - 150 });
-      // The hidden terminal is refitted while its tab is not shown.
-      const rowsAfter = await poll(async () => (await rowsOf(first)).length, (count) => count !== rowsBefore, UI_TIMEOUT);
-      expect(rowsAfter, 'the hidden terminal was resized').not.toBe(rowsBefore);
-      await selectTab(page, 1);
-      await poll(() => first.isVisible(), Boolean, UI_TIMEOUT);
-      await expectSizeMatchesDisplay(page, first);
-    } finally {
-      await page.setViewportSize(viewport);
-    }
-  });
-
-  test.runIf(full)('tabs AC6 — a terminal resized while its shell is starting gets the size it ends up with', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
-    const hostPid = await ptyHostPid(page);
-    const onePid = await pidOf(page);
-    let tab: Pane | undefined;
-
-    await holdPtySpawn(session);
-    try {
-      tab = await openTab(page);
-      const rowsBefore = (await rowsOf(tab)).length;
-      await page.setViewportSize({ width: viewport.width - 300, height: viewport.height - 150 });
-      const rowsAfter = await poll(async () => (await rowsOf(tab!)).length, (count) => count !== rowsBefore, UI_TIMEOUT);
-      // The premise: the shell has not started yet, and the terminal is already resized.
-      expect(rowsAfter, 'the terminal was resized').not.toBe(rowsBefore);
-      expect((await rowsOf(tab)).some((row) => row.trim() !== ''), 'the shell is still starting').toBe(false);
-
-      // survive AC5: a tab opened while the spawn is held, then closed before it is released.
-      await openTab(page);
-      await expectTabs(page, ['Terminal 1', 'Terminal 2', 'Terminal 3'], 'Terminal 3');
-      await closeTab(page, 3);
-      await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 2');
-    } finally {
-      await releasePtySpawn(session);
-    }
-
-    try {
-      await waitForPrompt(page, tab);
-      await expectSizeMatchesDisplay(page, tab);
-      const twoPid = await pidOf(page, tab);
-      // survive AC5: the closed tab's shell, spawned late, does not stay under the pty host.
-      expect(
-        await poll(
-          () => childPidsOf(hostPid).sort((a, b) => a - b),
-          (children) => children.length === 2 && children.includes(onePid) && children.includes(twoPid),
-          5_000,
-        ),
-        'no shell of the closed tab is left under the pty host',
-      ).toEqual([onePid, twoPid].sort((a, b) => a - b));
-    } finally {
-      await page.setViewportSize(viewport);
-    }
-  });
-
-  // COCKPIT-46: the tabs and splits outlive a visit of the page. One test, since only the
-  // whole page shows elements moved across a route change.
-  test.runIf(full)('survive AC1, AC2, AC3 — tabs and splits keep their shells, output, selection and keyboard across Home and back, a command that ended meanwhile shows its output, and the terminals fit a window resized meanwhile', async () => {
-    const { page } = session;
-    const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
-    // The shell creates it after printing, so the test knows the command ended without a fixed wait.
-    const done = join(session.dataDir, 'later.flag');
-    rmSync(done, { force: true });
-
-    await openTerminal(page);
-    const one = await focusedPane(page);
-    const onePid = await pidOf(page, one);
-    await typeLine(page, 'echo m1-$((10+1))');
-    await waitForRow(page, 'm1-11', one);
-    const two = await openTab(page);
-    const twoPid = await pidOf(page);
-    await typeLine(page, 'echo m2-$((20+2))');
-    await waitForRow(page, 'm2-22', two);
-    const three = await splitPane(page, two, 'right');
-    const threePid = await pidOf(page);
-    await typeLine(page, 'echo m3-$((30+3))');
-    await waitForRow(page, 'm3-33', three);
-    const pids = [onePid, twoPid, threePid];
-    expect(new Set(pids).size).toBe(3);
-    await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 2');
-    // The keyboard is in the second half of Terminal 2, which runs a command that prints later.
-    await typeLine(page, `sleep 2; echo later-$((6*7)); : > '${done}'`);
-
-    try {
-      await goHome(page);
-      expect(existsSync(done), 'the command has not printed yet when the user leaves').toBe(false);
-      for (const pid of pids) expect(isAlive(pid), `shell ${pid} is alive while Home`).toBe(true);
-
-      // The window is resized while the terminals are not on the page.
-      await page.setViewportSize({ width: viewport.width - 300, height: viewport.height - 150 });
-      expect(await poll(() => existsSync(done), Boolean, 15_000), 'the command ended while Home').toBe(true);
-      for (const pid of pids) expect(isAlive(pid), `shell ${pid} is alive after the command ended`).toBe(true);
-
-      await goToTerminalPage(page);
-      const shown = Date.now();
-      for (const pid of pids) expect(isAlive(pid), `shell ${pid} is alive after coming back`).toBe(true);
-      await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 2');
-      expect(await visiblePanes(page)).toHaveLength(2);
-      await withDiagnostic(
-        () => waitForRow(page, 'm2-22', two),
-        () => terminalDiagnostic(page, two, shown, session.cockpitHome),
-      );
-      await withDiagnostic(
-        () => waitForRow(page, 'm3-33', three),
-        () => terminalDiagnostic(page, three, shown, session.cockpitHome),
-      );
-      // AC2: the output of the command that ended while the user was away.
-      await withDiagnostic(
-        () => waitForRow(page, 'later-42', three),
-        () => terminalDiagnostic(page, three, shown, session.cockpitHome),
-      );
-
-      // The keyboard is where it was: no click before typing.
-      const active = await poll(() => activePane(page), Boolean, UI_TIMEOUT);
-      expect(active, 'a visible terminal holds the keyboard focus').not.toBeNull();
-      expect(await isSamePane(active!, three), 'the terminal that had the keyboard has it again').toBe(true);
-      await typeLine(page, 'echo kb-$((3*3))');
-      await waitForRow(page, 'kb-9', three);
-      expect(await rowsOf(two)).not.toContain('kb-9');
-
-      // A command in each of the other two terminals.
-      await focusPane(two);
-      await typeLine(page, 'echo cmd-two-$((2*2))');
-      await waitForRow(page, 'cmd-two-4', two);
-
-      // AC3: stty size is what the terminal displays, in the shown terminals...
-      await expectSizeMatchesDisplay(page, three);
-      await expectSizeMatchesDisplay(page, two);
-
-      // ...and in the other tab's terminal, once that tab is selected.
-      await selectTab(page, 1);
-      await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 1');
-      await poll(() => one.isVisible(), Boolean, UI_TIMEOUT);
-      await waitForRow(page, 'm1-11', one);
-      await focusPane(one);
-      await typeLine(page, 'echo cmd-one-$((1+1))');
-      await waitForRow(page, 'cmd-one-2', one);
-      await expectSizeMatchesDisplay(page, one);
-      for (const pid of pids) expect(isAlive(pid)).toBe(true);
-    } finally {
-      await page.setViewportSize(viewport);
-    }
-  });
-
-  test.runIf(full)('daemon AC4 — after Home and back, reloading the page keeps every shell of every tab running: the page shows one tab per shell, in creation order, each with its output and taking a new command', async () => {
-    const { page } = session;
-    const pids = await openTwoTabsOneSplit(page);
-
-    await goHome(page);
-    await goToTerminalPage(page);
-    await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 2');
-    for (const pid of pids) expect(isAlive(pid)).toBe(true);
-
-    await page.reload();
-    await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
-
-    for (const pid of pids) expect(isAlive(pid), `shell ${pid} is still running`).toBe(true);
-    // One tab per running shell, without the split.
-    await poll(async () => (await tabsShown(page)).names.length, (count) => count >= pids.length, UI_TIMEOUT);
-    const shown: number[] = [];
-    for (const name of (await tabsShown(page)).names) {
-      await page.getByRole('tab', { name, exact: true }).click({ timeout: UI_TIMEOUT });
-      shown.push(await pidOf(page));
-    }
-    for (const pid of pids) expect(shown).toContain(pid);
-  });
-
-  // The spawn itself fails: the terminal says so, the other tabs go on, and the next spawn works.
-  test.runIf(full)('survive AC9 — a failing spawn shows [Could not start the shell: …] in the new tab, the other tabs keep working, and a new tab runs commands once spawn works again', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const first = await focusedPane(page);
-    await pidOf(page, first);
-
-    await replacePtySpawn(session, `async () => { throw new Error('refused by the test'); }`);
-    let broken: Pane;
-    try {
-      broken = await openTab(page);
-      // Typed into the terminal whose shell never started: nothing runs it, nowhere.
-      await typeLine(page, 'echo lost-$((1+1))');
-      await waitForRow(page, /^\[Could not start the shell: .*refused by the test.*\]$/, broken);
-      await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 2');
-
-      await selectTab(page, 1);
-      await poll(() => first.isVisible(), Boolean, UI_TIMEOUT);
-      await focusPane(first);
-      await typeLine(page, 'echo still-$((3*5))');
-      await waitForRow(page, 'still-15', first);
-      expect((await rowsOf(first)).some((row) => row.includes('lost-2'))).toBe(false);
-      expect((await rowsOf(broken)).some((row) => row.includes('lost-2'))).toBe(false);
-    } finally {
-      await restorePtySpawn(session);
-    }
-
-    const fresh = await openTab(page);
-    await waitForPrompt(page, fresh);
-    await typeLine(page, 'echo cockpit-$((6*7))');
-    await waitForRow(page, 'cockpit-42', fresh);
-    await expectTabs(page, ['Terminal 1', 'Terminal 2', 'Terminal 3'], 'Terminal 3');
-  });
-
-  // The app is given launchd's environment: the terminal's shell must get the
-  // login shell's PATH (`await shellEnv`), not launchd's. The shell is a login
-  // shell and re-reads the user's startup files, so its PATH may be reordered or
-  // extended: every directory of the login-shell PATH must appear in it.
-  test.runIf(launch === launchLaunchd)('terminal AC12 — the terminal shell gets the login shell PATH, not the launchd PATH', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const expected = normalizeFnm(await getShellPath(page));
-    expect(expected).not.toBe(LAUNCHD_PATH);
-    const directories = expected.split(':').filter(Boolean);
-
-    // The developer's login shell starts slowly and drops what is typed before
-    // its prompt: wait for the prompt.
-    await page.waitForFunction(
-      () => [...document.querySelectorAll('.xterm-rows > div')].some((row) => (row.textContent ?? '').trim() !== ''),
-      undefined,
-      { timeout: 20_000 },
-    );
-    await typeLine(page, 'printf %s "$PATH"');
-
-    // A long PATH wraps over several rows: the rows after the typed command are
-    // joined (a wrapped row is full, so no padding comes between its parts), and
-    // the shell's prompt, if any, follows the PATH.
-    const printed = () =>
-      page.evaluate(() => {
-        const rows = [...document.querySelectorAll('.xterm-rows > div')].map((row) => (row.textContent ?? '').replace(/\u00a0/g, ' '));
-        const command = rows.findLastIndex((row) => /printf %s "\$PATH"\s*$/.test(row));
-        return command < 0 ? '' : rows.slice(command + 1).join('');
-      });
-    const missingFrom = (text: string) => directories.filter((directory) => !normalizeFnm(text).includes(directory));
-    const output = await poll(printed, (text) => missingFrom(text).length === 0, 20_000);
-    expect(missingFrom(output)).toEqual([]);
-    expect(output.startsWith(LAUNCHD_PATH)).toBe(false);
-  });
 
   // The picker is stubbed in the main process (`session.evaluateInMain`). The
   // tests share the session and run in order: the repository added by AC1 is
@@ -3010,16 +2188,6 @@ describe.each([
       return path;
     }
 
-    // Creates a workspace through the dialog (the base is the preselected one).
-    async function createWorkspace(name: string) {
-      const { page } = session;
-      const dialog = await openNewWorkspaceDialog(page, repo);
-      await fillNewWorkspace(page, dialog, { name });
-      await createButton(dialog).click({ timeout: UI_TIMEOUT });
-      await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
-      return worktreePath(session, repo, name);
-    }
-
     // Opens the deletion dialog of a workspace and confirms it.
     async function confirmDeletion(path: string) {
       const { page } = session;
@@ -3035,29 +2203,6 @@ describe.each([
       const path = join(repo.root, file);
       return existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean) : [];
     };
-
-    test('AC9 — with Agent None, Create makes the workspace and nothing else: the setup commands do not run, no terminal opens, the page does not change, and the sidebar has no Setup link or label', async () => {
-      const { page } = session;
-      await goHome(page);
-      const ran = join(repo.root, 'setup-ran-ac9');
-      writeConfig(repo, { setup: [`touch "${ran}"`] });
-      await collectPtyData(page);
-
-      const urlBefore = page.url();
-      const path = await createWorkspace('no-agent-no-setup');
-
-      await waitListed(path);
-      expect(existsSync(path)).toBe(true);
-      expect(page.url()).toBe(urlBefore);
-      expect(await visiblePanes(page)).toHaveLength(0);
-      expect(await setupLabel(page, path)).toBeNull();
-      expect(await setupLinkCount(page)).toBe(0);
-      expect(await page.getByRole('button', { name: /Retry setup|Start anyway/ }).count()).toBe(0);
-      // Nothing the setup would have printed reached a terminal, and its command did not run.
-      await ptyHostPid(page);
-      expect(await collectedPtyData(page)).not.toContain('cockpit setup');
-      expect(existsSync(ran)).toBe(false);
-    });
 
     test('AC13, AC17, setup through the CLI AC11 — Delete runs `cockpit teardown` in a terminal of the dialog (header, "$ <command>" lines in order with their output, "✓ Teardown done", environment, worktree as cwd), and once it exits 0 the folder, the worktree, the branch and the row go', async () => {
       const { page } = session;
@@ -3298,7 +2443,7 @@ describe.each([
       expect(onDisk.hasGit).toBe(true);
     });
 
-    test('smoke path (b), workspace scripts AC19, setup through the CLI AC11 — workspaces: "New workspace…" creates a worktree under COCKPIT_HOME from the preselected base main and lists it, with no setup (no agent); "Delete workspace…" runs `cockpit teardown`, which writes the login-shell PATH and the worktree path, then removes the folder, the worktree, the branch and the row', async () => {
+    test('smoke path (b), workspace scripts AC19, setup through the CLI AC11 — workspaces: "New workspace…" creates a worktree under COCKPIT_HOME from the preselected base main and lists it, its page opens with a shell tab that runs the setup (no agent); "Delete workspace…" runs `cockpit teardown`, which writes the login-shell PATH and the worktree path, then removes the folder, the worktree, the branch and the row', async () => {
       const { page } = session;
       const repo = makeRepo('smoke-workspace');
       folders.push(repo);
@@ -3310,7 +2455,6 @@ describe.each([
       await addRepository(session, repo);
       const path = worktreePath(session, repo, branch);
 
-      const urlBefore = page.url();
       const dialog = await openNewWorkspaceDialog(page, repo);
       await poll(() => selectedBase(dialog), (value) => value === 'main', UI_TIMEOUT);
       await nameField(dialog).fill(branch);
@@ -3322,9 +2466,9 @@ describe.each([
       expect(linkedWorktrees(repo)).toContainEqual({ path, branch });
       expect(localBranches(repo)).toContain(branch);
 
-      // No agent chosen: no setup ran, and none is shown.
-      expect(existsSync(join(repo.root, 'setup-ran'))).toBe(false);
-      expect(page.url()).toBe(urlBefore);
+      // No agent chosen (COCKPIT-70): the workspace page opens with a shell tab that runs `cockpit setup --shell`.
+      await page.waitForURL((url) => url.pathname === '/workspace' && url.searchParams.get('path') === path, { timeout: UI_TIMEOUT });
+      expect(await poll(() => existsSync(join(repo.root, 'setup-ran')), Boolean, UI_TIMEOUT), 'the setup ran in the shell tab').toBe(true);
 
       expect(existsSync(join(repo.root, 'teardown-out.txt'))).toBe(false);
       await startDeletion(page, path);
@@ -3416,7 +2560,7 @@ describe.each([
     // on, the page is read and driven through `page.evaluate` and the keyboard only.
     async function attemptNavigation(target: string) {
       const { page } = session;
-      await openTerminal(page);
+      await openTerminal(session);
       await watchNavigations();
       const appUrl = await page.evaluate(() => location.href);
       await typeLine(page, 'echo pid-$$');
@@ -3430,11 +2574,8 @@ describe.each([
         await waitForAttempt(target);
 
         expect(await page.evaluate(() => location.href)).toBe(appUrl);
-        expect(
-          await page.evaluate(() =>
-            [...document.querySelectorAll('h1, h2, h3, [role="heading"]')].some((heading) => heading.textContent?.trim() === 'Terminal'),
-          ),
-        ).toBe(true);
+        // Still on the workspace page: its tab bar is there.
+        expect(await page.evaluate(() => document.querySelector('[role="tablist"]') !== null)).toBe(true);
         expect(isAlive(pid!)).toBe(true);
 
         await page.evaluate(() => (document.querySelector('.xterm-helper-textarea') as HTMLElement | null)?.focus());
@@ -3444,7 +2585,7 @@ describe.each([
         // Load the app page again, whether or not the page left it, so the pending
         // navigation is gone and the next test can click.
         await page.goto(appUrl);
-        await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
+        await page.getByRole('tablist').first().waitFor({ timeout: UI_TIMEOUT });
       }
     }
 
@@ -3475,7 +2616,7 @@ describe.each([
     // terminals end with their page), and the app page shows it again.
     async function expectShellSurvivesNavigationTo(path: string) {
       const { page } = session;
-      await openTerminal(page);
+      await openTerminal(session);
       const appUrl = await page.evaluate(() => location.href);
       const pid = await pidOf(page);
       expect(isAlive(pid)).toBe(true);
@@ -3492,7 +2633,7 @@ describe.each([
         expect(session.isRunning()).toBe(true);
       } finally {
         await page.goto(appUrl);
-        await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
+        await page.getByRole('tablist').first().waitFor({ timeout: UI_TIMEOUT });
       }
       expect(isAlive(pid)).toBe(true);
       expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
@@ -3512,179 +2653,9 @@ describe.each([
     });
   });
 
-  // The host is stopped before the terminal page opens, so the spawn of the first
-  // tab's shell cannot resolve while the keys are typed: they must be held, then
-  // reach the shell in order. The first tab of a new visit is the one to use: its
-  // spawn is sent after the SIGSTOP whatever ran before, and it is the terminal
-  // "just opened" of the criterion. It runs before any test that kills the host.
-  test.runIf(full)('early keys AC1 — keys typed into a tab before its shell is spawned reach it once the pty host resumes', async () => {
-    const { page } = session;
-    // The host's pid, from the parent of a shell it runs (as the host-kill test).
-    const id = await spawnShell(page);
-    await ptyWrite(page, id, 'echo ppid-$PPID\n');
-    await waitForOutput(page, id, /ppid-\d+/);
-    const hostPid = Number(/ppid-(\d+)/.exec(await outputOf(page, id))![1]);
-    expect(hostPid).not.toBe(session.pid);
-    await ptyKill(page, id);
-    await waitForExit(page, id);
-
-    process.kill(hostPid, 'SIGSTOP');
-    let pane: Pane;
-    try {
-      await openTerminal(page);
-      pane = await focusedPane(page);
-      await typeLine(page, 'echo early-$((6*7))');
-    } finally {
-      process.kill(hostPid, 'SIGCONT');
-    }
-
-    // The echoed command line shows `$((6*7))`: only the shell prints `early-42`.
-    await waitForRow(page, 'early-42', pane);
-  });
-
-  // The smoke path of tabs and splits in the dev server and the packaged app (the
-  // launchd-environment mode keeps the developer's shell out of the terminal
-  // tests): a split in both directions, the focus after "Close terminal", a tab
-  // opened and closed, then the pty host killed and a new terminal that runs a
-  // command (tabs AC13). The built app runs the full block above (tabs AC5 and AC8
-  // cover AC13 there). It kills the pty host last, so nothing runs after it.
-  test.runIf(!full && inIsolatedShell)('smoke path (c) — terminal tabs: splits, "Close terminal" gives the focus to the sibling, a closed tab ends its shell, Home and back keeps the shells, and after the pty host dies a new terminal runs commands', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const a = await focusedPane(page);
-    const aPid = await pidOf(page, a);
-    const b = await splitPane(page, a, 'right');
-    const bPid = await pidOf(page, b);
-    const c = await splitPane(page, b, 'down');
-    const cPid = await pidOf(page, c);
-    expect(new Set([aPid, bPid, cPid]).size).toBe(3);
-
-    // In A | (B / C), closing C: its shell ends, and the keyboard is in B, not A.
-    await clickPaneButton(c, 'Close terminal');
-    expect(await endsWithin(cPid)).toBe(true);
-    await poll(async () => (await visiblePanes(page)).length, (count) => count === 2, UI_TIMEOUT);
-    const active = await poll(() => activePane(page), Boolean, UI_TIMEOUT);
-    expect(active, 'a visible terminal holds the keyboard focus').not.toBeNull();
-    expect(await isSamePane(active!, b), 'the sibling B holds the focus').toBe(true);
-    await typeLine(page, 'echo sibling-$((6*7))');
-    await waitForRow(page, 'sibling-42', b);
-    expect((await rowsOf(a)).join('\n')).not.toContain('echo sibling-');
-    expect(isAlive(aPid)).toBe(true);
-
-    // A second tab, then closed: its shell ends, the first tab is selected again.
-    await openTab(page);
-    const tabPid = await pidOf(page);
-    await expectTabs(page, ['Terminal 1', 'Terminal 2'], 'Terminal 2');
-    await closeTab(page, 2);
-    await expectTabs(page, ['Terminal 1'], 'Terminal 1');
-    expect(await endsWithin(tabPid)).toBe(true);
-    expect(isAlive(aPid) && isAlive(bPid)).toBe(true);
-
-    // Home and back (COCKPIT-46): the shells and their output are kept, B still takes a command.
-    await goHome(page);
-    expect(isAlive(aPid) && isAlive(bPid)).toBe(true);
-    await goToTerminalPage(page);
-    await expectTabs(page, ['Terminal 1'], 'Terminal 1');
-    expect(isAlive(aPid) && isAlive(bPid)).toBe(true);
-    expect(await rowsOf(a)).toContain(`pid-${aPid}`);
-    expect(await rowsOf(b)).toContain(`pid-${bPid}`);
-    await focusPane(b);
-    await typeLine(page, 'echo back-$((3*5))');
-    await waitForRow(page, 'back-15', b);
-
-    // The pty host dies: the remaining terminals end, and a new terminal runs commands (tabs AC13).
-    await killPtyHost(page);
-    await waitForRow(page, '[Process ended]', a);
-    await waitForRow(page, '[Process ended]', b);
-    const fresh = await openTab(page);
-    await waitForPrompt(page, fresh);
-    await typeLine(page, 'echo cockpit-$((6*7))');
-    await waitForRow(page, 'cockpit-42', fresh);
-    expect(isAlive(tabPid)).toBe(false);
-    await selectTab(page, 1);
-    await poll(() => a.isVisible(), Boolean, UI_TIMEOUT);
-    expect(await rowsOf(a)).toContain('[Process ended]');
-    await expectNoErrors(session);
-  });
-
-  // These kill the pty host and rely on the next spawn starting it again, so they
-  // come after every test that does not need to.
-  test.runIf(full)('tabs AC8 — when the pty host dies every terminal shows [Process ended], and a new tab or a new half runs a shell again', async () => {
-    const { page } = session;
-    await openTerminal(page);
-    const first = await focusedPane(page);
-    await pidOf(page, first);
-    await openTab(page);
-    const second = await focusedPane(page);
-    await pidOf(page, second);
-    const third = await splitPane(page, second, 'down');
-    await pidOf(page, third);
-
-    await killPtyHost(page);
-
-    // Every terminal of every tab: the selected one, then the first tab.
-    for (const pane of await visiblePanes(page)) await waitForRow(page, '[Process ended]', pane);
-    await selectTab(page, 1);
-    await poll(() => first.isVisible(), Boolean, UI_TIMEOUT);
-    await waitForRow(page, '[Process ended]', first);
-
-    // A new tab: its shell runs commands.
-    const fresh = await openTab(page);
-    await waitForPrompt(page, fresh);
-    await typeLine(page, 'echo cockpit-$((6*7))');
-    await waitForRow(page, 'cockpit-42', fresh);
-    await expectTabs(page, ['Terminal 1', 'Terminal 2', 'Terminal 3'], 'Terminal 3');
-
-    // A split of an ended terminal: the new half runs commands, the ended one stays ended.
-    await selectTab(page, 1);
-    await poll(() => first.isVisible(), Boolean, UI_TIMEOUT);
-    const half = await splitPane(page, first, 'right');
-    await waitForPrompt(page, half);
-    await typeLine(page, 'echo cockpit-$((7*8))');
-    await waitForRow(page, 'cockpit-56', half);
-    expect(await rowsOf(first)).toContain('[Process ended]');
-    expect((await rowsOf(first)).some((row) => row.includes('cockpit-'))).toBe(false);
-
-    await selectTab(page, 2);
-    await poll(() => second.isVisible(), Boolean, UI_TIMEOUT);
-    for (const pane of await visiblePanes(page)) {
-      expect(await rowsOf(pane)).toContain('[Process ended]');
-      expect((await rowsOf(pane)).some((row) => row.includes('cockpit-'))).toBe(false);
-    }
-    await expectNoErrors(session);
-  });
-
-  // The pty host is killed here and started again by the next spawn, so the tests
-  // that follow work all the same.
-  test.runIf(full)('AC4 — survives the pty host being killed, and reports the open sessions as exited (terminal AC10: the open terminal shows [Process ended])', async () => {
-    const { page } = session;
-    // The terminal page is open with a running shell.
-    await openTerminal(page);
-    await typeLine(page, 'echo up-$((1+1))');
-    await waitForRow(page, 'up-2');
-
-    const id = await spawnShell(page);
-    await ptyWrite(page, id, 'echo ppid-$PPID\n');
-    await waitForOutput(page, id, /ppid-\d+/);
-    const hostPid = Number(/ppid-(\d+)/.exec(await outputOf(page, id))![1]);
-
-    // The host is a process of its own, not the main process.
-    expect(hostPid).not.toBe(session.pid);
-
-    process.kill(hostPid, 'SIGKILL');
-
-    await waitForExit(page, id);
-    expect(await exitsOf(page, id)).toEqual([{ exitCode: null, signal: null }]);
-    await waitForRow(page, '[Process ended]');
-    await page.getByRole('heading', { name: 'Terminal' }).waitFor();
-    await page.getByText(versionLabel).waitFor();
-    expect(session.isRunning()).toBe(true);
-    expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
-    expect(await page.pageErrors()).toEqual([]);
-    expect(await consoleErrorsOf(page)).toEqual([]);
-  });
-
-  // That the old ids stay inert is a unit test (packages/pty).
+  // Last of the session on purpose: the refusal must come without any error, and
+  // an app that lets the failure through would log one that the "logs no error"
+  // checks of the tests above would then report in their place.
   test.runIf(full)('tabs AC9 — once the pty host is dead, spawn resolves with an id no session used', async () => {
     const { page } = session;
     // Kills the host (again): `old` is the last session it ran.
@@ -3700,9 +2671,6 @@ describe.each([
     expect(await consoleErrorsOf(page)).toEqual([]);
   });
 
-  // Last of the session on purpose: the refusal must come without any error, and
-  // an app that lets the failure through would log one that the "logs no error"
-  // checks of the tests above would then report in their place.
   test.runIf(full)('workspaces AC20 — a failing save refuses the add with "Cockpit could not save its data: <error>", lists nothing, leaves state.json as it was and logs no error', async () => {
     const { page } = session;
     const repo = makeLightRepo('ws-save');
@@ -4024,14 +2992,14 @@ describe('built app with no git on the login shell PATH', () => {
     expect(existsSync(join(session.dataDir, 'state.json.tmp'))).toBe(false);
   });
 
-  test('COCKPIT-65 AC10 — an amber alert with a triangle-alert icon sits under the Home and Terminal links and above the Projects header, and projects.git() answers "missing"', async () => {
+  test('COCKPIT-65 AC10 — an amber alert with a triangle-alert icon sits under the Home link and above the Projects header, and projects.git() answers "missing"', async () => {
     const { page } = session;
     await page.getByText(versionLabel).waitFor();
     expect(await projectsGit(page)).toBe('missing');
     const alert = await poll(() => gitAlertOf(page), (found) => found !== null, UI_TIMEOUT);
     expect(alert, 'the alert shows').not.toBeNull();
     expect(alert!.icon, 'a triangle-alert icon').toBe(true);
-    expect(alert!.top, 'under the Terminal link').toBeGreaterThanOrEqual(alert!.terminalBottom - 1);
+    expect(alert!.top, 'under the Home link').toBeGreaterThanOrEqual(alert!.terminalBottom - 1);
     expect(alert!.bottom, 'above the Projects header').toBeLessThanOrEqual(alert!.projectsTop + 1);
     const [r, g, b] = alert!.iconRgb;
     expect(r! >= 150 && r! > g! && g! >= 70 && g! > b! && b! <= 80, `the icon is amber, got rgb(${r}, ${g}, ${b})`).toBe(true);
@@ -4249,13 +3217,35 @@ async function openStartMenu(page: Page) {
   await page.getByRole('menuitem').filter({ hasNotText: LOADING_ITEM }).first().waitFor({ timeout: UI_TIMEOUT });
 }
 
-// Waits for the session page of a session other than `previous`.
-async function waitForSessionPage(page: Page, previous: string | undefined, pageName: string): Promise<string> {
+// The sessions the app stores, read through the page.
+const storedSessions = (page: Page) =>
+  page.evaluate(
+    () => (window as unknown as { api: { sessions: { list(): Promise<StoredSession[]> } } }).api.sessions.list(),
+  );
+
+// Waits for the page of a new session called `pageName`. Outside any project that is its page
+// (`/sessions/<id>`, `previous` being the id of the session page that was open before, if any). In a workspace
+// (COCKPIT-70, `known` being the ids of the sessions stored before the start) it is the workspace page, the
+// session being a tab with that label. Returns the session's id.
+async function waitForSessionPage(page: Page, previous: string | undefined, pageName: string, known?: Set<string>): Promise<string> {
+  if (known) {
+    const fresh = await poll(
+      async () => (await storedSessions(page)).find((stored) => stored.name === pageName && stored.project !== undefined && !known.has(stored.id)),
+      Boolean,
+      UI_TIMEOUT,
+    );
+    expect(fresh, `${pageName} is stored for a workspace`).toBeTruthy();
+    await poll(() => new URL(page.url()).searchParams.get('path'), (path) => path === fresh!.directory, UI_TIMEOUT);
+    await page.getByRole('tab', { name: pageName, exact: true }).waitFor({ timeout: UI_TIMEOUT });
+    return fresh!.id;
+  }
   await page.getByRole('heading', { name: pageName, exact: true }).waitFor({ timeout: UI_TIMEOUT });
   const id = await poll(() => (sessionIdOf(page) === previous ? undefined : sessionIdOf(page)), Boolean, UI_TIMEOUT);
   expect(id, `the URL ${page.url()} is /sessions/<id> of a new session`).toBeTruthy();
   return id!;
 }
+
+const storedSessionIds = async (page: Page) => new Set((await storedSessions(page)).map((stored) => stored.id));
 
 // Picks a harness in the "Start session" menu and waits for its session page.
 async function startSession(page: Page, harnessName: string, pageName: string): Promise<string> {
@@ -4333,11 +3323,18 @@ function postSessionEvent(socketPath: string, { authorization, body }: { authori
 
 const controlTokenIn = (cockpitHome: string) => readFileSync(daemonSocketIn(cockpitHome).replace(/\.sock$/, '.token'), 'utf8');
 
-// The status dot of a session's row (`role="img"`, wherever the row is in the sidebar): its accessible
-// name and its `title`, or `null` when the row has none.
+// The status dot of a session's row (`role="img"`, wherever the row is in the sidebar): its accessible name
+// and its `title`, or `null` when the row has none. A session of a workspace has no row of its own
+// (COCKPIT-70): the row of its workspace shows the icon of its most urgent session, which is its own when it is
+// the only one.
 const dotOf = (page: Page, id: string) =>
-  page.evaluate((id) => {
-    const dot = document.querySelector(`aside a[href$="/sessions/${id}"]`)?.closest('li')?.querySelector('[role="img"][aria-label]');
+  page.evaluate(async (id) => {
+    const own = document.querySelector(`aside a[href$="/sessions/${id}"]`)?.closest('li') ?? null;
+    const stored = (await (window as unknown as { api: { sessions: { list(): Promise<Array<{ id: string; directory: string; project?: string }>> } } }).api.sessions.list()).find(
+      (each) => each.id === id,
+    );
+    const row = own ?? (stored?.project ? ([...document.querySelectorAll('aside a[title]')].find((link) => link.getAttribute('title') === stored.directory) ?? null) : null);
+    const dot = row?.querySelector('[role="img"][aria-label]');
     return dot ? { label: dot.getAttribute('aria-label'), title: dot.getAttribute('title') } : null;
   }, id);
 
@@ -4472,12 +3469,12 @@ async function createWorkspaceWithAgent(
   options: { name: string; agent: string; prompt?: string },
   pageName: string,
 ): Promise<string> {
-  const previous = sessionIdOf(page);
+  const known = await storedSessionIds(page);
   const dialog = await openNewWorkspaceDialog(page, repo);
   await fillNewWorkspace(page, dialog, options);
   await createButton(dialog).click({ timeout: UI_TIMEOUT });
   await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
-  return waitForSessionPage(page, previous, pageName);
+  return waitForSessionPage(page, undefined, pageName, known);
 }
 
 // Puts the pointer over the page's bottom right corner, away from the sidebar's rows.
@@ -4496,18 +3493,19 @@ async function openWorkspaceStartMenu(page: Page, workspacePath: string, workspa
 }
 
 async function startInWorkspace(page: Page, workspacePath: string, workspaceName: string, harnessName: string, pageName: string) {
-  const previous = sessionIdOf(page);
+  const known = await storedSessionIds(page);
   await openWorkspaceStartMenu(page, workspacePath, workspaceName);
   await page.getByRole('menuitem', { name: harnessName, exact: true }).click({ timeout: UI_TIMEOUT });
-  return waitForSessionPage(page, previous, pageName);
+  return waitForSessionPage(page, undefined, pageName, known);
 }
 
-const waitForWorkspaceLinks = (page: Page, workspacePath: string, expected: Array<[name: string, ended: boolean]>) =>
-  poll(
-    async () => (await sessionLinks(page, { workspace: workspacePath })).map((entry) => [entry.name, entry.ended]),
-    (entries) => JSON.stringify(entries) === JSON.stringify(expected),
-    UI_TIMEOUT,
-  );
+// The labels of the tabs of the workspace page that is open, in order (COCKPIT-70: a workspace's sessions are the
+// tabs of its page, not rows of the sidebar).
+const workspaceTabs = (page: Page) =>
+  page.getByRole('tab').evaluateAll((tabs) => tabs.map((tab) => (tab.getAttribute('title') ?? tab.textContent ?? '').trim()));
+
+const waitForWorkspaceTabs = (page: Page, expected: string[]) =>
+  poll(() => workspaceTabs(page), (tabs) => JSON.stringify(tabs) === JSON.stringify(expected), UI_TIMEOUT);
 
 // The pids of the stubs running as sessions (`pgrep -f` on their own command: the stub script, run by
 // its interpreter or not). A pattern that is not anchored would also match the command line of
@@ -5086,7 +4084,7 @@ describe('sessions: built app', () => {
     await dismissDialogs(page);
   });
 
-  test('workspace sessions AC5 — Create with Agent Claude Code and Prompt "fix the tests" creates the worktree, opens the session page and runs the harness there with that one argument', async () => {
+  test('workspace sessions AC5 — Create with Agent Claude Code and Prompt "fix the tests" creates the worktree, opens the workspace page and runs the harness there with that one argument', async () => {
     const { page } = session;
     const foldersBefore = sessionFoldersIn(session.cockpitHome);
     const id = await createWorkspaceWithAgent(page, repo, { name: 'fix-tests', agent: 'Claude Code', prompt: 'fix the tests' }, 'Claude Code 1');
@@ -5102,7 +4100,7 @@ describe('sessions: built app', () => {
     expect(isAlive(stub.pid)).toBe(true);
     ws.fix.pid = stub.pid;
 
-    expect(await waitForWorkspaceLinks(page, path, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+    expect(await waitForWorkspaceTabs(page, ['Claude Code 1'])).toEqual(['Claude Code 1']);
     expect((await sessionEntries(page)).map((entry) => entry.id)).not.toContain(id);
     const stored = sessionsInState(session.dataDir).find((entry) => entry.id === id);
     expect(stored).toEqual({
@@ -5127,7 +4125,7 @@ describe('sessions: built app', () => {
     expect(stub.argCount).toBe(0);
     expect(stub.args).toBe('');
     ws.blank.pid = stub.pid;
-    expect(await waitForWorkspaceLinks(page, path, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+    expect(await waitForWorkspaceTabs(page, ['Claude Code 1'])).toEqual(['Claude Code 1']);
   });
 
   test('workspace sessions AC1 — the "Start session in <workspace>" button shows on hover and on focus next to the "…" button, and opens the harness menu', async () => {
@@ -5170,7 +4168,7 @@ describe('sessions: built app', () => {
     await page.getByRole('menuitem').first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
   });
 
-  test('workspace sessions AC2 — picking Claude Code in the menu runs the harness in the worktree with no argument and the login shell PATH, lists it under the workspace and stores it with its project, with no session folder', async () => {
+  test('workspace sessions AC2 — picking Claude Code in the menu runs the harness in the worktree with no argument and the login shell PATH, shows it as a tab of the workspace page and stores it with its project, with no session folder', async () => {
     const { page } = session;
     const foldersBefore = sessionFoldersIn(session.cockpitHome);
 
@@ -5187,7 +4185,7 @@ describe('sessions: built app', () => {
     expect(isAlive(stub.pid)).toBe(true);
     ws.plus.pids.push(stub.pid);
 
-    expect(await waitForWorkspaceLinks(page, ws.plus.path, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+    expect(await waitForWorkspaceTabs(page, ['Claude Code 1'])).toEqual(['Claude Code 1']);
     expect((await sessionEntries(page)).map((entry) => entry.id)).not.toContain(id);
     expect(sessionsInState(session.dataDir).find((entry) => entry.id === id)).toEqual({
       id,
@@ -5209,19 +4207,17 @@ describe('sessions: built app', () => {
     expect(env.socket).toBe(daemonSocketIn(session.cockpitHome));
   });
 
-  test('workspace sessions AC3 — sessions are numbered per workspace, newest first, and apart from the Sessions section', async () => {
+  test('workspace sessions AC3 — sessions are numbered per workspace, as tabs of its page, and apart from the Sessions section', async () => {
     const { page } = session;
     const id = await startInWorkspace(page, ws.plus.path, 'ws-plus', 'Claude Code', 'Claude Code 2');
     ws.plus.ids.push(id);
     ws.plus.pids.push((await readStub(page)).pid);
 
-    expect(await waitForWorkspaceLinks(page, ws.plus.path, [['Claude Code 2', false], ['Claude Code 1', false]])).toEqual([
-      ['Claude Code 2', false],
-      ['Claude Code 1', false],
-    ]);
-    expect((await sessionLinks(page, { workspace: ws.plus.path })).map((entry) => entry.id)).toEqual([id, ws.plus.ids[0]]);
+    expect(await waitForWorkspaceTabs(page, ['Claude Code 1', 'Claude Code 2'])).toEqual(['Claude Code 1', 'Claude Code 2']);
+    const namesIn = (path: string) => sessionsInState(session.dataDir).filter((entry) => entry.directory === path).map((entry) => entry.name);
+    expect(namesIn(ws.plus.path)).toEqual(['Claude Code 1', 'Claude Code 2']);
     // Another workspace keeps its own count.
-    expect((await sessionLinks(page, { workspace: ws.fix.path })).map((entry) => entry.name)).toEqual(['Claude Code 1']);
+    expect(namesIn(ws.fix.path)).toEqual(['Claude Code 1']);
 
     // The Sessions header counts the sessions outside any project only.
     const outside = sessionsInState(session.dataDir).filter((entry) => entry.harness === 'claude-code' && entry.project === undefined);
@@ -5230,7 +4226,7 @@ describe('sessions: built app', () => {
     const headerId = await startSession(page, 'Claude Code', name);
     expect((await sessionEntries(page))[0]).toMatchObject({ id: headerId, name });
     expect(sessionsInState(session.dataDir).find((entry) => entry.id === headerId)?.project).toBeUndefined();
-    expect((await sessionLinks(page, { workspace: ws.plus.path })).map((entry) => entry.name)).toEqual(['Claude Code 2', 'Claude Code 1']);
+    expect(namesIn(ws.plus.path)).toEqual(['Claude Code 1', 'Claude Code 2']);
   });
 
   test('workspace sessions AC7 — a save that fails after the spawn keeps the new workspace and its files, shows "Could not start Claude Code: …" under the Projects header, leaves no harness process and the sessions unchanged', async () => {
@@ -5381,7 +4377,7 @@ describe('sessions: built app', () => {
     expect(sessionsInState(session.dataDir).map((entry) => entry.id)).toContain(ws.fix.id);
   });
 
-  test('workspace sessions AC10 — removing the project ends its workspaces\' running sessions and hides them; adding it again lists them as "Ended", and state.json held them throughout', async () => {
+  test('workspace sessions AC10 — removing the project ends its workspaces\' running sessions; adding it again shows its workspaces with no tab, and state.json held the sessions throughout', async () => {
     const { page } = session;
     const running = [ws.blank.pid, ...ws.plus.pids];
     for (const pid of running) expect(isAlive(pid)).toBe(true);
@@ -5395,12 +4391,13 @@ describe('sessions: built app', () => {
     for (const id of [ws.blank.id, ...ws.plus.ids]) expect(shown).not.toContain(id);
     expect(sessionsInState(session.dataDir)).toEqual(sessionsBefore);
 
+    // Added again, the workspaces come back with no tab: the processes ended, and a session that ended is not shown.
     await addRepository(session, repo);
-    expect(await waitForWorkspaceLinks(page, ws.blank.path, [['Claude Code 1', true]])).toEqual([['Claude Code 1', true]]);
-    expect(await waitForWorkspaceLinks(page, ws.plus.path, [['Claude Code 2', true], ['Claude Code 1', true]])).toEqual([
-      ['Claude Code 2', true],
-      ['Claude Code 1', true],
-    ]);
+    for (const path of [ws.blank.path, ws.plus.path]) {
+      await page.getByTitle(path, { exact: true }).first().click({ timeout: UI_TIMEOUT });
+      await page.getByText('No tab open', { exact: true }).waitFor({ timeout: UI_TIMEOUT });
+      expect(await workspaceTabs(page)).toEqual([]);
+    }
     expect(sessionsInState(session.dataDir)).toEqual(sessionsBefore);
   });
 
@@ -5724,7 +4721,7 @@ describe('sessions: built app', () => {
       expect(label!.isRightOfTheName).toBe(true);
       expect(label!.rightGap, 'right-aligned in the row').toBeLessThan(80);
       expect(await setupLinkCount(page)).toBe(0);
-      expect((await sessionLinks(page, { workspace: path })).map((entry) => entry.id)).toEqual([id]);
+      expect(await workspaceTabs(page)).toEqual(['Claude Code 1']);
       // The environment the first command saw, and no agent yet.
       const [env] = await poll(() => readRecords(repo, 'setup-env.txt'), (found) => found.length > 0, UI_TIMEOUT);
       expect(env).toMatchObject({ root: repo.root, ws: path, name: 'setup-cli', pwd: path });
@@ -5802,7 +4799,7 @@ describe('sessions: built app', () => {
       await typeLine(page, 'cockpit setup --then claude');
       await waitForRow(page, 'ready');
       expect((await readStub(page)).cwd).toBe(path);
-      expect(sessionIdOf(page)).toBe(id);
+      expect(storedIn(path).map((entry) => entry.id)).toEqual([id]);
       await typeLine(page, 'quit');
       await waitForRow(page, /^\[Claude Code exited with code 0\]$/);
     }, 90_000);
@@ -5841,15 +4838,15 @@ describe('sessions: built app', () => {
       expect(await setupLabel(page, path)).toBeNull();
     }, 60_000);
 
-    test('AC10 — "cockpit setup" typed in a Terminal page shell, inside a linked worktree, is found and runs as in AC1; the shell is no session, so nothing is reported and no label changes', async () => {
+    test('AC10 — "cockpit setup" typed in a shell tab of a workspace page is found and runs as in AC1; the shell is no session, so nothing is reported and no label changes', async () => {
       const { page } = session;
       await removeAllWorkspaces();
       const path = await createPlainWorkspace(session, repo, 'term-setup');
       writeConfig(repo, { setup: ['echo from-terminal'] });
 
-      await openTerminal(page);
+      await openShellTab(page, path);
       await waitForRow(page, loginPrompt);
-      await typeLine(page, `cd ${path} && cockpit setup`);
+      await typeLine(page, 'cockpit setup');
 
       await waitForRow(page, '✓ Setup done');
       const rows = (await terminalRows(page)).filter(Boolean);
@@ -6160,6 +5157,13 @@ async function selectChangedFile(page: Page, name: string) {
 
 // Opens a session's page through its link in the left sidebar.
 async function openSessionById(page: Page, id: string) {
+  const stored = (await storedSessions(page)).find((each) => each.id === id);
+  if (stored?.project) {
+    // A session of a workspace is a tab of the workspace's page.
+    await page.getByTitle(stored.directory, { exact: true }).first().click({ timeout: UI_TIMEOUT });
+    await page.getByRole('tab', { name: stored.name, exact: true }).click({ timeout: UI_TIMEOUT });
+    return;
+  }
   await page.locator(`a[href="/sessions/${id}"]`).first().click({ timeout: UI_TIMEOUT });
   await poll(() => sessionIdOf(page), (current) => current === id, UI_TIMEOUT);
 }
@@ -6491,15 +5495,11 @@ describe('changes sidebar: built app', () => {
     expect(Math.abs(restored - widthBefore)).toBeLessThanOrEqual(10);
   });
 
-  test('changes AC10 — no button and no sidebar on Home, the Terminal page or a session outside any project; back on a workspace page the sidebar shows again, open', async () => {
+  test('changes AC10 — no button and no sidebar on Home or a session outside any project; back on a workspace page the sidebar shows again, open', async () => {
     const { page } = session;
     await setChangesOpen(page, true);
 
     await goHome(page);
-    expect(await changesToggle(page).count()).toBe(0);
-    expect(await markChangesPanel(page)).toBe(false);
-
-    await goToTerminalPage(page);
     expect(await changesToggle(page).count()).toBe(0);
     expect(await markChangesPanel(page)).toBe(false);
 
@@ -7458,7 +6458,7 @@ describe('session status: built app', () => {
     for (const id of silent) await expectDot(page, id, null, 0);
   });
 
-  test('AC7 — the same under a workspace: the dot shows on the session listed under the workspace row', async () => {
+  test('AC7 — the same under a workspace: the icon shows on the workspace row', async () => {
     const { page } = session;
     await addRepository(session, repo);
     const path = await createPlainWorkspace(session, repo, 'status-ws');
@@ -7471,7 +6471,6 @@ describe('session status: built app', () => {
     await waitForRow(page, 'hooked:UserPromptSubmit');
 
     await expectDot(page, known.workspace.id, 'Working');
-    expect((await sessionLinks(page, { workspace: path })).map((entry) => entry.status)).toEqual(['Working']);
     // The sessions of the Sessions section are not touched.
     expect((await sessionEntries(page)).find((entry) => entry.id === known.second.id)?.status).toBe(null);
   });
@@ -7686,8 +6685,15 @@ const STATUS_ICON = /lucide-(contrast|circle-dot|circle-check|circle-x|circle-da
 // accessible name and whether it sits left of the session's name.
 const statusIconOf = (page: Page, id: string, name: string) =>
   page.evaluate(
-    ({ id, name, source }) => {
-      const link = document.querySelector(`aside a[href$="/sessions/${id}"]`);
+    async ({ id, name, source }) => {
+      let link = document.querySelector(`aside a[href$="/sessions/${id}"]`);
+      if (!link) {
+        // A session of a workspace has no row of its own: its workspace's row shows the icon.
+        const stored = (await (window as unknown as { api: { sessions: { list(): Promise<Array<{ id: string; directory: string; project?: string }>> } } }).api.sessions.list()).find(
+          (each) => each.id === id,
+        );
+        if (stored?.project) link = [...document.querySelectorAll('aside a[title]')].find((each) => each.getAttribute('title') === stored.directory) ?? null;
+      }
       if (!link) return null;
       const svg = [...link.querySelectorAll('svg')].find((element) => new RegExp(source).test(element.getAttribute('class') ?? ''));
       if (!svg) return null;
@@ -7834,7 +6840,7 @@ describe('redesign foundation: built app', () => {
     ).toEqual({ x: 14, y: 16 });
   });
 
-  test('COCKPIT-65 AC4 — the sidebar is 220 px wide: a 28 px top strip 8 px from the top with "Hide sidebar" at its right, then Home, Terminal, Projects, Sessions and the muted version line at the bottom', async () => {
+  test('COCKPIT-65 AC4 — the sidebar is 220 px wide: a 28 px top strip 8 px from the top with "Hide sidebar" at its right, then Home, Projects, Sessions and the muted version line at the bottom', async () => {
     const { page } = session;
     await goHome(page);
     const box = async (locator: ReturnType<Page['locator']>) => (await locator.boundingBox())!;
@@ -7860,13 +6866,12 @@ describe('redesign foundation: built app', () => {
     const tops = {
       hide: hideBox.y,
       home: (await box(page.locator('aside').getByRole('link', { name: 'Home', exact: true }))).y,
-      terminal: (await box(page.locator('aside').getByRole('link', { name: 'Terminal', exact: true }))).y,
       projects: (await box(page.getByRole('button', { name: 'Projects', exact: true }))).y,
       sessions: (await box(page.getByRole('button', { name: 'Sessions', exact: true }))).y,
       version: (await box(page.locator('aside').getByText(versionLabel))).y,
     };
     const order = Object.entries(tops).sort(([, a], [, b]) => a - b).map(([name]) => name);
-    expect(order).toEqual(['hide', 'home', 'terminal', 'projects', 'sessions', 'version']);
+    expect(order).toEqual(['hide', 'home', 'projects', 'sessions', 'version']);
 
     const version = page.locator('aside').getByText(versionLabel);
     const versionBox = await box(version);
@@ -7880,8 +6885,8 @@ describe('redesign foundation: built app', () => {
 
   test('COCKPIT-65 AC5 — nothing in the sidebar is heavier than 400 and every Lucide icon in it has a stroke width of 1.25, with a project, a workspace, sessions and the selected row shown', async () => {
     const { page } = session;
-    await page.locator(`aside a[href$="/sessions/${ids.workspace}"]`).click({ timeout: UI_TIMEOUT });
-    await page.locator(`aside a[href$="/sessions/${ids.workspace}"][aria-current="page"]`).waitFor({ timeout: UI_TIMEOUT });
+    await page.getByTitle(alphaWorkspace, { exact: true }).first().click({ timeout: UI_TIMEOUT });
+    await page.locator('aside a[aria-current="page"]').filter({ hasText: 'feat-a' }).waitFor({ timeout: UI_TIMEOUT });
     expect(await badgeOf(page, alpha.root, alpha.name), 'the project badge shows').not.toBeNull();
     const facts = await page.evaluate(() => {
       const elements = [...document.querySelectorAll('aside *')] as Element[];
@@ -7952,8 +6957,6 @@ describe('redesign foundation: built app', () => {
     expect(open.expanded).toBe('true');
     expect((await chevronOf(page, `Collapse ${bravo.name}`)).expanded).toBe('true');
     expect(await visibleTitles(page)).toEqual(expect.arrayContaining([alphaWorkspace, bravoWorkspace]));
-    const alphaSession = page.locator(`aside a[href$="/sessions/${ids.workspace}"]`);
-    expect(await alphaSession.isVisible()).toBe(true);
 
     await page.getByRole('button', { name: expanded, exact: true }).click({ timeout: UI_TIMEOUT });
     const closed = await chevronOf(page, collapsed);
@@ -7962,14 +6965,12 @@ describe('redesign foundation: built app', () => {
     const titles = await visibleTitles(page);
     expect(titles).toContain(alpha.root);
     expect(titles, 'the workspace rows of the project are hidden').not.toContain(alphaWorkspace);
-    expect(await alphaSession.isVisible(), 'and their sessions').toBe(false);
     expect(titles, 'another project is unaffected').toContain(bravoWorkspace);
     expect((await chevronOf(page, `Collapse ${bravo.name}`)).expanded).toBe('true');
 
     await page.getByRole('button', { name: collapsed, exact: true }).click({ timeout: UI_TIMEOUT });
     expect((await chevronOf(page, expanded)).expanded).toBe('true');
     expect(await visibleTitles(page)).toContain(alphaWorkspace);
-    expect(await alphaSession.isVisible()).toBe(true);
 
     // The colour is picked from the path: it does not change.
     await page.getByRole('button', { name: expanded, exact: true }).click({ timeout: UI_TIMEOUT });
@@ -8043,7 +7044,8 @@ describe('redesign foundation: built app', () => {
     const top = 'Claude Code 1';
     const unreported = { kind: 'circle-dashed', token: '--muted-foreground', label: null };
     await expectStatusIcon(page, ids.top, top, unreported);
-    await expectStatusIcon(page, ids.workspace, top, unreported);
+    // A session of a workspace has no row: its workspace's row shows the icon.
+    await expectStatusIcon(page, ids.workspace, 'feat-a', unreported);
 
     await reportStatus(session, ids.top, 'working');
     await expectStatusIcon(page, ids.top, top, { kind: 'contrast', token: '--status-working', label: 'Working' });
@@ -8051,9 +7053,9 @@ describe('redesign foundation: built app', () => {
     await expectStatusIcon(page, ids.top, top, { kind: 'circle-dot', token: '--status-waiting', label: 'Needs input' });
     await reportStatus(session, ids.top, 'finished');
     await expectStatusIcon(page, ids.top, top, { kind: 'circle-check', token: '--status-ready', label: 'Ready' });
-    // The row under a workspace is drawn the same way.
+    // The row of a workspace is drawn the same way.
     await reportStatus(session, ids.workspace, 'working');
-    await expectStatusIcon(page, ids.workspace, top, { kind: 'contrast', token: '--status-working', label: 'Working' });
+    await expectStatusIcon(page, ids.workspace, 'feat-a', { kind: 'contrast', token: '--status-working', label: 'Working' });
 
     await openSessionEntry(page, top);
     await focusTerminal(page);
@@ -8061,11 +7063,11 @@ describe('redesign foundation: built app', () => {
     await waitForRow(page, '[Process exited with code 3]');
     await expectStatusIcon(page, ids.top, top, { kind: 'circle-x', token: '--status-exited', label: 'Exited 3' });
 
-    await page.locator(`aside a[href$="/sessions/${ids.workspace}"]`).click({ timeout: UI_TIMEOUT });
+    await page.getByTitle(alphaWorkspace, { exact: true }).first().click({ timeout: UI_TIMEOUT });
     await focusTerminal(page);
     await typeLine(page, 'quit');
     await waitForRow(page, '[Process exited with code 0]');
-    await expectStatusIcon(page, ids.workspace, top, { kind: 'circle-dashed', token: '--muted-foreground', label: 'Ended' });
+    await expectStatusIcon(page, ids.workspace, 'feat-a', { kind: 'circle-dashed', token: '--muted-foreground', label: 'Ended' });
   });
 });
 
@@ -8106,7 +7108,7 @@ describe('sessions smoke path: dev server', () => {
     await expectControlEndpoint(session, fx, REPOSITORY_CLI);
   });
 
-  test('workspace sessions smoke path, changes AC16 — a new workspace with Claude Code and a prompt runs the stub in the worktree with the prompt, lists the session under the workspace and stores it, and the Changes sidebar shows a file written in the worktree with its diff', async () => {
+  test('workspace sessions smoke path, changes AC16 — a new workspace with Claude Code and a prompt runs the stub in the worktree with the prompt, shows the session as a tab of the workspace page and stores it, and the Changes sidebar shows a file written in the worktree with its diff', async () => {
     const { page } = session;
     const repo = makeRepo('smoke-agent-ws');
     const origin = addOrigin(repo);
@@ -8123,7 +7125,7 @@ describe('sessions smoke path: dev server', () => {
       expect(stub.argCount).toBe(1);
       expect(stub.args).toBe('fix the tests');
       expectSetupSpawnedWithDetectedPath(fx, REPOSITORY_CLI);
-      expect(await waitForWorkspaceLinks(page, path, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+      expect(await waitForWorkspaceTabs(page, ['Claude Code 1'])).toEqual(['Claude Code 1']);
       const stored = await poll(() => sessionsInState(session.dataDir), (list) => list.some((entry) => entry.id === id), UI_TIMEOUT);
       expect(stored.find((entry) => entry.id === id)).toMatchObject({ name: 'Claude Code 1', directory: path, project: repo.root });
       // Changes sidebar (COCKPIT-34 AC16): a file written in the worktree shows with its diff.
@@ -8628,7 +7630,7 @@ describe('packaged app sessions after a restart', () => {
       expect(wsStub.argCount).toBe(1);
       expect(wsStub.args).toBe('fix the tests');
       expectSetupSpawnedWithDetectedPath(fx, PACKAGED_CLI());
-      expect(await waitForWorkspaceLinks(first.page, wsPath, [['Claude Code 1', false]])).toEqual([['Claude Code 1', false]]);
+      expect(await waitForWorkspaceTabs(first.page, ['Claude Code 1'])).toEqual(['Claude Code 1']);
       const storedWs = await poll(() => sessionsInState(dataDir), (list) => list.some((entry) => entry.id === wsId), UI_TIMEOUT);
       expect(storedWs.find((entry) => entry.id === wsId)).toMatchObject({ name: 'Claude Code 1', directory: wsPath, project: repo.root });
 

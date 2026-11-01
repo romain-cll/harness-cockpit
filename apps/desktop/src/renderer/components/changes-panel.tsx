@@ -1,6 +1,6 @@
 import { GitCompareIcon } from 'lucide-react';
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import type { BranchStatusResult, ChangedFile, ChangesResult, FileDiff, Project, Session, Workspace } from '../../shared/api';
+import type { BranchStatusResult, ChangedFile, ChangesResult, FileDiff, Project, Workspace } from '../../shared/api';
 import { DiffView } from '@/components/diff-view';
 import { ShipSection } from '@/components/ship-section';
 import { Button } from '@/components/ui/button';
@@ -22,12 +22,13 @@ function subscribe(listener: () => void) {
 
 export const useChangesOpen = () => useSyncExternalStore(subscribe, () => open);
 
-/** The workspace a session runs in: its project and listed worktree, `undefined` for any other session. */
-export function workspaceOf(session: Session | undefined, projects: Project[]) {
-  if (!session?.project) return undefined;
-  const project = projects.find(({ path }) => path === session.project);
-  const workspace = project?.workspaces.find(({ path }) => path === session.directory);
-  return project && workspace ? { project, workspace } : undefined;
+/** The project and listed workspace whose worktree is `path`, `undefined` for any other path. */
+export function workspaceOf(path: string | undefined, projects: Project[]) {
+  for (const project of projects) {
+    const workspace = project.workspaces.find((each) => each.path === path);
+    if (workspace) return { project, workspace };
+  }
+  return undefined;
 }
 
 /** The "Changes" button of a workspace page's header. */

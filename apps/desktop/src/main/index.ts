@@ -494,8 +494,14 @@ function startTerminals() {
 
   ipcMain.handle('pty:spawn', (event, request: PtySpawnRequest) => {
     if (!isFromApp(event)) throw new Error('pty:spawn refused: unexpected origin');
+    // A shell of a workspace runs in its worktree; with `setup` it is `cockpit setup --shell`.
+    const { workspace, setup, ...options } = request;
+    const spawning: PtySpawnRequest =
+      workspace === undefined
+        ? options
+        : { cwd: workspace, ...(setup && { command: cliPath, args: ['setup', '--shell'] }), ...options };
     // The reply of a page that is gone reaches no one: the handler does not reject for it.
-    return spawnFor(event.sender, request, { kind: 'shell' }).catch((error: unknown) => {
+    return spawnFor(event.sender, spawning, { kind: 'shell', workspace }).catch((error: unknown) => {
       if (error instanceof PageGoneError) return -1;
       throw error;
     });
@@ -963,11 +969,13 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
   let detection: Promise<DetectedHarness[]> | undefined;
   const detected = () => (detection ??= shellEnv.then((env) => detectHarnesses(env)));
 
-  ipcMain.handle('sessions:harnesses', async (event) => {
+  // `again` runs the detection again and replaces the result every later caller shares.
+  ipcMain.handle('sessions:harnesses', async (event, options?: { again?: boolean }) => {
     if (!isFromApp(event)) throw new Error('sessions:harnesses refused: unexpected origin');
-    return (await detected()).map(({ id }) => {
+    if (options?.again) detection = undefined;
+    return (await detected()).map(({ id, version }) => {
       const { name } = harnesses.find((harness) => harness.id === id)!;
-      return { id, name };
+      return { id, name, version };
     });
   });
 

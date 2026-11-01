@@ -6,6 +6,7 @@ import { toggleSessions, useSessionsCollapsed } from '@/components/collapsed';
 import { useRetrying } from '@/components/daemon-down';
 import { getRunningIds, getSessionDots, startSession, subscribe } from '@/components/live-terminals';
 import { StartSessionMenu } from '@/components/start-session-menu';
+import { useRestoring } from '@/components/workspace-panes';
 
 /** The classes of a 28 px sidebar row, with its icons at 14 px unless they set a size of their own. */
 export const rowClass =
@@ -31,22 +32,29 @@ function statusIcon(label: string) {
   }
 }
 
+/** The 14 px status icon of a row, named by `label`; a muted dashed circle without a name when there is none. */
+export function StatusIcon({ label }: { label: string | undefined }) {
+  const { Icon, color } = label ? statusIcon(label) : { Icon: CircleDashedIcon, color: 'text-muted-foreground' };
+  return label ? (
+    <span role="img" aria-label={label} title={label} className={`flex shrink-0 ${color}`}>
+      <Icon aria-hidden={false} className="size-3.5" />
+    </span>
+  ) : (
+    <Icon aria-hidden="true" className={`size-3.5 ${color}`} />
+  );
+}
+
 // A session's link, with a status icon: what its agent last reported while it runs (a muted dashed
 // circle without a name before its first report), "Ended" or "Exited N" once its process ended.
 export function SessionLink({ session }: { session: Session }) {
   const dots = useSyncExternalStore(subscribe, getSessionDots);
   const running = useSyncExternalStore(subscribe, getRunningIds);
-  const label = dots.get(session.id) ?? (running.has(session.id) ? undefined : 'Ended');
-  const { Icon, color } = label ? statusIcon(label) : { Icon: CircleDashedIcon, color: 'text-muted-foreground' };
+  // The terminals of the previous page are still being attached to: no session is ended yet.
+  const restoring = useRestoring();
+  const label = dots.get(session.id) ?? (running.has(session.id) || restoring ? undefined : 'Ended');
   return (
     <Link to="/sessions/$sessionId" params={{ sessionId: session.id }} className={linkRowClass}>
-      {label ? (
-        <span role="img" aria-label={label} title={label} className={`flex shrink-0 ${color}`}>
-          <Icon className="size-3.5" />
-        </span>
-      ) : (
-        <Icon aria-hidden="true" className={`size-3.5 ${color}`} />
-      )}
+      <StatusIcon label={label} />
       <span className="truncate">{session.name}</span>
     </Link>
   );
