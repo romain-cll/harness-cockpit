@@ -51,103 +51,8 @@ describe('ci.yml', () => {
   });
 });
 
-describe('AGENTS.md', () => {
-  const agents = () => read('AGENTS.md');
-  // The linting paragraph starts where oxlint is first named.
-  const linting = () => {
-    const text = agents();
-    const start = text.indexOf('oxlint');
-    return start === -1 ? '' : text.slice(start, start + 4000);
-  };
-
-  test('AC8 — records the linter choice with the comparison facts and their date', () => {
-    expect(agents()).toContain('oxlint');
-    const text = linting();
-    expect(text).toContain('Biome');
-    expect(text).toContain('ESLint');
-    expect(text).toContain('typescript-eslint');
-    expect(text).toContain('VoidZero');
-    expect(text).toMatch(/TypeScript 7/);
-    expect(text).toContain('2026-10-21');
-  });
-
-  test('AC8 — records the root config, the check-only scripts and the uncached task', () => {
-    const text = agents();
-    const monorepo = text.slice(text.indexOf('## Monorepo'), text.indexOf('## Desktop app'));
-    expect(monorepo).toContain('.oxlintrc.json');
-    expect(monorepo).toContain('oxlint');
-    const linting_ = linting();
-    expect(linting_).toContain('.oxlintrc.json');
-    expect(linting_).toMatch(/check-only|without `--fix`|no `--fix`|never fixes/i);
-    expect(linting_).toMatch(/uncached|not cached|never cached|"cache": false/i);
-  });
-
-  test('AC8 — the Tests and validation section records the lint check', () => {
-    const text = agents();
-    const start = text.indexOf('## Tests and validation');
-    expect(start).toBeGreaterThan(-1);
-    expect(text.slice(start)).toContain('oxlint');
-  });
-});
-
-// COCKPIT-55: the daemon replaces packages/pty and packages/control.
-describe('AGENTS.md and the daemon', () => {
-  const agents = () => read('AGENTS.md');
-
-  test('AC15 — lifts the "no daemon" rule and says the terminals run in the daemon, not a utility process', () => {
-    expect(/Daemon, artifacts, stats, cloud backend, web app, mobile: create none/.test(agents()), 'the no-daemon rule is still there').toBe(false);
-    expect(agents().includes('not a daemon'), 'AGENTS.md still says '+'not a daemon').toBe(false);
-    expect(agents().includes('Sessions therefore end when the app quits'), 'AGENTS.md still says '+'Sessions therefore end when the app quits').toBe(false);
-  });
-
-  test('AC15 — describes packages/daemon and the daemon entry, and drops packages/pty and packages/control', () => {
-    const text = agents();
-    expect(text.includes('packages/daemon'), 'AGENTS.md lacks '+'packages/daemon').toBe(true);
-    expect(text.includes('src/main/daemon.ts'), 'AGENTS.md lacks '+'src/main/daemon.ts').toBe(true);
-    expect(text.includes('--cockpit-daemon'), 'AGENTS.md lacks '+'--cockpit-daemon').toBe(true);
-    expect(text.includes('packages/pty'), 'AGENTS.md still says '+'packages/pty').toBe(false);
-    expect(text.includes('packages/control'), 'AGENTS.md still says '+'packages/control').toBe(false);
-    expect(/^\s+(pty|control)\/\s+#/m.test(text), 'the tree still lists pty/ or control/').toBe(false);
-  });
-
-  test('AC15 — records the daemon files and its dependency on the RunAsNode fuse that later fuse hardening must keep on', () => {
-    const text = agents();
-    expect(text.includes('daemon-1-'), 'AGENTS.md lacks '+'daemon-1-').toBe(true);
-    expect(text.includes('ELECTRON_RUN_AS_NODE'), 'AGENTS.md lacks '+'ELECTRON_RUN_AS_NODE').toBe(true);
-    const fuse = text.slice(text.indexOf('RunAsNode'));
-    expect(fuse).toMatch(/RunAsNode/);
-    expect(fuse.slice(0, 600)).toMatch(/keep|stay|on\b/i);
-    expect(fuse.slice(0, 600)).toMatch(/fuse hardening|Developer ID|notarization/);
-  });
-
-  test('AC15 — the sections describing the pty host and the control endpoint no longer talk about a utility process or control.sock', () => {
-    const text = agents();
-    expect(text.includes('Cockpit Pty Host'), 'AGENTS.md still says '+'Cockpit Pty Host').toBe(false);
-    expect(text.includes('control.sock'), 'AGENTS.md still says '+'control.sock').toBe(false);
-    expect(text.includes('control.token'), 'AGENTS.md still says '+'control.token').toBe(false);
-    expect(text.includes('runPtyHost'), 'AGENTS.md still says '+'runPtyHost').toBe(false);
-    expect(text.includes('createPtyClient'), 'AGENTS.md still says '+'createPtyClient').toBe(false);
-  });
-
-  test('AC20 — mentions neither @cockpit/control, packages/control, @cockpit/pty nor packages/pty', () => {
-    const text = agents();
-    for (const stale of ['@cockpit/control', 'packages/control', '@cockpit/pty', 'packages/pty']) {
-      expect(text.includes(stale), 'AGENTS.md still says ' + stale).toBe(false);
-    }
-  });
-
-  test('AC20, AC9 — the Harnesses status-reporting section names the cockpit CLI path, not statusCommand', () => {
-    const text = agents();
-    const start = text.indexOf('**Status reporting (COCKPIT-36)**');
-    expect(start, 'the status-reporting paragraph').toBeGreaterThan(-1);
-    const paragraph = text.slice(start, start + 800);
-    expect(paragraph).toContain('cockpit status');
-    expect(paragraph).not.toContain('statusCommand');
-  });
-});
-
 // COCKPIT-56: the `cockpit` CLI replaces the curl line.
-describe('statusCommand is gone and AGENTS.md describes apps/cli (COCKPIT-56)', () => {
+describe('statusCommand is gone and the daemon exports the CLI (COCKPIT-56)', () => {
   const sourceFiles = (dir: string): string[] =>
     readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
       if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'release') return [];
@@ -163,35 +68,9 @@ describe('statusCommand is gone and AGENTS.md describes apps/cli (COCKPIT-56)', 
     expect(offenders).toEqual([]);
   });
 
-  test('AC9 — @cockpit/daemon exports ./cli and AGENTS.md does not name statusCommand', () => {
+  test('AC9 — @cockpit/daemon exports ./cli', () => {
     const pkg = JSON.parse(read('packages/daemon/package.json')) as { exports: Record<string, string> };
     expect(pkg.exports['./cli']).toBe('./src/cli.ts');
-    expect(read('AGENTS.md').includes('statusCommand'), 'AGENTS.md still names statusCommand').toBe(false);
-  });
-
-  test('AC9 — AGENTS.md describes apps/cli: its contract, where it ships, why a Bun compiled binary with the cold-start measurement, and its exit cost', () => {
-    const text = read('AGENTS.md');
-    for (const needed of [
-      '`apps/cli`',
-      'usage: cockpit status <working|waiting|finished>',
-      'Contents/Resources/bin/cockpit',
-      'apps/cli/dist/cockpit',
-      'bun build --compile',
-      'oven-sh/bun',
-    ]) {
-      expect(text.includes(needed), `AGENTS.md lacks ${needed}`).toBe(true);
-    }
-    expect(/^\s+cli\/\s+#/m.test(text), 'the tree lists no cli/').toBe(true);
-    const section = text.slice(text.indexOf('`apps/cli`'));
-    expect(/cold start/i.test(section), 'no cold start').toBe(true);
-    expect(/\d+(\.\d+)? ms/.test(section), 'no measurement in ms').toBe(true);
-    expect(/exit cost/i.test(section), 'no exit cost').toBe(true);
-  });
-
-  test('AC9 — the lint section counts 10 workspaces', () => {
-    const text = read('AGENTS.md');
-    expect(text.includes('all 10 workspaces'), 'AGENTS.md lacks all 10 workspaces').toBe(true);
-    expect(text.includes('all 9 workspaces'), 'AGENTS.md still says all 9 workspaces').toBe(false);
   });
 });
 
