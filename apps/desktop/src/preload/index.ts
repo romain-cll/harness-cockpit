@@ -57,7 +57,7 @@ const api: Api = {
       ipcRenderer.invoke('workspaces:create-pull-request', project, path, title, body),
   },
   sessions: {
-    harnesses: () => ipcRenderer.invoke('sessions:harnesses'),
+    harnesses: (options) => ipcRenderer.invoke('sessions:harnesses', options),
     list: () => ipcRenderer.invoke('sessions:list'),
     start: (harness, size, options) => ipcRenderer.invoke('sessions:start', harness, size, options),
     onStatus: (listener) => subscribe('sessions:status', listener),

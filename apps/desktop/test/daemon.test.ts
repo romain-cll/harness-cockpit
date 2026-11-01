@@ -26,7 +26,7 @@ import { makeTestDir } from './run-root';
 // full block (a launch per scenario, the app quit or killed and launched again on the same folders,
 // builds played through COCKPIT_TEST_DAEMON_BUILD); the packaged app and the dev server run one
 // smoke path each. A fake login shell puts a stub `claude` on the PATH, so no real CLI runs, and
-// hands the `/terminal` page a real /bin/sh.
+// hands the shell tabs of a workspace page a real /bin/sh.
 
 // --- Fixture -----------------------------------------------------------------
 
@@ -189,14 +189,35 @@ async function typeLine(page: Page, text: string, nth = 0) {
   await page.keyboard.press('Enter');
 }
 
-const goToTerminalPage = async (page: Page) => {
-  await page.getByRole('link', { name: 'Terminal', exact: true }).click({ timeout: UI_TIMEOUT });
-  await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
+// COCKPIT-70: shells live in the tabs of a workspace page. A workspace of a repository the session adds is made through
+// `window.api` (no daemon is needed), and its page is opened through its sidebar row.
+async function makeWorkspace(session: Session, name: string, repoRoot?: string): Promise<{ path: string; root: string }> {
+  const { page } = session;
+  const root = repoRoot ?? makeRepoWithSetup({}).root;
+  await stubPicker(session, root);
+  await page.evaluate(() => (window as unknown as ApiWindow).api.projects!.add!());
+  const created = await page.evaluate(([root, name]) => (window as unknown as ApiWindow).api.workspaces!.create!(root, name, 'main'), [root, name] as const);
+  expect(created.status).toBe('created');
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+  const path = (created as { workspace: { path: string } }).workspace.path;
+  await page.getByTitle(path, { exact: true }).first().waitFor({ timeout: UI_TIMEOUT });
+  return { path, root };
+}
+
+const goToWorkspacePage = async (page: Page, path: string) => {
+  await page.getByTitle(path, { exact: true }).first().click({ timeout: UI_TIMEOUT });
+  await page.getByRole('tablist').first().waitFor({ timeout: UI_TIMEOUT });
+};
+
+// Starts a "Terminal" tab in the first pane of the workspace page.
+const newShellTab = async (page: Page) => {
+  await page.getByRole('button', { name: 'New tab', exact: true }).first().click({ timeout: UI_TIMEOUT });
+  await page.getByRole('menuitem', { name: 'Terminal', exact: true }).click({ timeout: UI_TIMEOUT });
 };
 
 const tabNames = (page: Page) => page.getByRole('tab').evaluateAll((tabs) => tabs.map((tab) => (tab.textContent ?? '').trim()));
 
-const selectTab = (page: Page, name: string) => page.getByRole('tab', { name, exact: true }).click({ timeout: UI_TIMEOUT });
+const selectTab = (page: Page, index: number) => page.getByRole('tab').nth(index).click({ timeout: UI_TIMEOUT });
 
 // The pid a shell prints (`echo pid-$$`), typed in the terminal that is shown.
 async function shellPid(page: Page, nth = 0): Promise<number> {
@@ -265,6 +286,14 @@ function makeRepoWithSetup(config: unknown = { teardown: ['echo setup-running; e
   return { parent, root };
 }
 
+// A linked worktree made with git itself (the app lists it like one it made).
+function addWorktree(root: string, branch: string, path: string) {
+  execFileSync('git', ['worktree', 'add', '-b', branch, path], {
+    cwd: root,
+    env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' },
+  });
+}
+
 const stubPicker = (session: Session, pick: string) =>
   session.evaluateInMain(`(() => { require('electron').dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [${JSON.stringify(pick)}] }); })()`);
 
@@ -311,7 +340,7 @@ describe('daemon: built app', () => {
   let env: NodeJS.ProcessEnv;
   let session: Session | undefined;
   let repo: { parent: string; root: string } | undefined;
-  const known = { daemon: 0, session: '', sessionPid: 0, shells: [] as number[] };
+  const known = { daemon: 0, session: '', sessionPid: 0, shells: [] as number[], workspace: '' };
 
   beforeAll(() => {
     fx = makeFixture();
@@ -352,9 +381,11 @@ describe('daemon: built app', () => {
     known.daemon = pid;
   });
 
-  test('AC13 — a shell of /terminal gets COCKPIT_SOCKET (the daemon\'s .sock) and no session id; a session gets its own id and the socket; no pty environment holds ELECTRON_RUN_AS_NODE; the hook reaches the daemon (dot) and an unknown id gets 404', async () => {
+  test('AC13 — a shell of a workspace page gets COCKPIT_SOCKET (the daemon\'s .sock) and no session id; a session gets its own id and the socket; no pty environment holds ELECTRON_RUN_AS_NODE; the hook reaches the daemon (dot) and an unknown id gets 404', async () => {
     const { page } = session!;
-    await goToTerminalPage(page);
+    known.workspace = (await makeWorkspace(session!, 'daemon-ws')).path;
+    await goToWorkspacePage(page, known.workspace);
+    await newShellTab(page);
     // The socket is long: its name and whether it sits in COCKPIT_HOME are printed, not the whole path.
     await typeLine(
       page,
@@ -365,7 +396,7 @@ describe('daemon: built app', () => {
     known.shells.push(await shellPid(page));
 
     // A second tab, a second shell.
-    await page.getByRole('button', { name: 'New terminal', exact: true }).first().click({ timeout: UI_TIMEOUT });
+    await newShellTab(page);
     await expectScreen(page, /^sh-[\d.]+\$$/m);
     await typeLine(page, 'echo marker-two-$((6*7))');
     await expectScreen(page, /^marker-two-42$/m);
@@ -389,7 +420,7 @@ describe('daemon: built app', () => {
     expect(alive).toEqual([true, true, true, true]);
   });
 
-  test('AC1, AC3, AC5 — the app launched again reuses the daemon (same pid, no second one); the session shows no "Ended" dot and its last status, its page shows the marker and takes a line; /terminal shows one tab per shell in creation order, each with its marker and running a new command', async () => {
+  test('AC1, AC3, AC5 — the app launched again reuses the daemon (same pid, no second one); the session shows no "Ended" dot and its last status, its page shows the marker and takes a line; the workspace page shows one tab per shell in creation order, each with its marker and running a new command', async () => {
     session = await launchBuiltOn(env, dataDir, home);
     const { page } = session;
     await page.getByText(versionLabel).waitFor();
@@ -403,13 +434,13 @@ describe('daemon: built app', () => {
     await typeLine(page, 'after-quit');
     await expectScreen(page, /^got:after-quit$/m);
 
-    await goToTerminalPage(page);
+    await goToWorkspacePage(page, known.workspace);
     await poll(() => tabNames(page), (names) => names.length === 2, UI_TIMEOUT);
-    expect(await tabNames(page)).toEqual(['Terminal 1', 'Terminal 2']);
-    await selectTab(page, 'Terminal 1');
+    expect(await tabNames(page)).toEqual(['Terminal', 'Terminal']);
+    await selectTab(page, 0);
     await expectScreen(page, /^sock=<daemon-1-.+\.sock> home=<ok> sid=<unset> ras=<unset>$/m);
     expect(await shellPid(page)).toBe(known.shells[0]);
-    await selectTab(page, 'Terminal 2');
+    await selectTab(page, 1);
     await expectScreen(page, /^marker-two-42$/m);
     expect(await shellPid(page)).toBe(known.shells[1]);
     // One terminal per tab: no split came back.
@@ -437,31 +468,32 @@ describe('daemon: built app', () => {
 
   test('AC4, AC6 — a reload keeps every process and shows one tab per shell without the split; a closed tab ends its shell and is not shown again', async () => {
     const { page } = session!;
-    await goToTerminalPage(page);
-    await selectTab(page, 'Terminal 1');
-    await page.locator('.xterm:visible').first().hover({ timeout: UI_TIMEOUT });
-    await page.locator('button[aria-label="Split right"]:visible').first().click({ force: true, timeout: UI_TIMEOUT });
+    await goToWorkspacePage(page, known.workspace);
+    await selectTab(page, 0);
+    await page.getByRole('tab').nth(0).click({ button: 'right', timeout: UI_TIMEOUT });
+    await page.getByRole('menuitem', { name: 'Split right', exact: true }).click({ timeout: UI_TIMEOUT });
     await poll(() => page.locator('.xterm:visible').count(), (count) => count === 2, UI_TIMEOUT);
     // The pane that owns the split shell is the second visible terminal.
     const splitPid = await shellPid(page, 1);
     expect(splitPid).not.toBe(known.shells[0]);
 
     await page.reload();
-    await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
+    await page.getByRole('tablist').first().waitFor({ timeout: UI_TIMEOUT });
 
     for (const pid of [...known.shells, splitPid, known.sessionPid]) expect(isAlive(pid), `process ${pid}`).toBe(true);
     await poll(() => tabNames(page), (names) => names.length === 3, UI_TIMEOUT);
-    expect(await tabNames(page)).toEqual(['Terminal 1', 'Terminal 2', 'Terminal 3']);
+    expect(await tabNames(page)).toEqual(['Terminal', 'Terminal', 'Terminal']);
     expect(await page.locator('.xterm:visible').count()).toBe(1);
 
     // Closing the last tab ends its shell; after a reload only two are left.
-    await page.getByRole('button', { name: 'Close Terminal 3', exact: true }).click({ timeout: UI_TIMEOUT });
+    await selectTab(page, 2);
+    await page.getByRole('button', { name: 'Close Terminal', exact: true }).nth(2).click({ timeout: UI_TIMEOUT });
     await poll(() => isAlive(splitPid), (alive) => !alive, 5_000);
     expect(isAlive(splitPid)).toBe(false);
     await page.reload();
-    await page.getByRole('heading', { name: 'Terminal' }).waitFor({ timeout: UI_TIMEOUT });
+    await page.getByRole('tablist').first().waitFor({ timeout: UI_TIMEOUT });
     await poll(() => tabNames(page), (names) => names.length === 2, UI_TIMEOUT);
-    expect(await tabNames(page)).toEqual(['Terminal 1', 'Terminal 2']);
+    expect(await tabNames(page)).toEqual(['Terminal', 'Terminal']);
     expect(isAlive(known.shells[0]!) && isAlive(known.sessionPid)).toBe(true);
   });
 
@@ -476,7 +508,7 @@ describe('daemon: built app', () => {
     await poll(() => windowUrls(session!), (urls) => urls.length === 1, UI_TIMEOUT);
     const [reopened] = (await poll(() => pagesOf(session!), (pages) => pages.length > 0, UI_TIMEOUT)).slice(-1);
     await reopened!.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
-    await goToTerminalPage(reopened!);
+    await goToWorkspacePage(reopened!, known.workspace);
     await poll(() => tabNames(reopened!), (names) => names.length === 2, UI_TIMEOUT);
     expect(await shellPid(reopened!)).toBe(known.shells[0]);
     await expectDot(reopened!, known.session, 'Working');
@@ -492,9 +524,9 @@ describe('daemon: built app', () => {
     await livePage.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
     await poll(() => isAlive(first), (alive) => !alive, 5_000);
     expect(isAlive(first), 'the setup ends with its page').toBe(false);
-    await goToTerminalPage(livePage);
+    await goToWorkspacePage(livePage, known.workspace);
     await poll(() => tabNames(livePage), (names) => names.length === 2, UI_TIMEOUT);
-    expect(await tabNames(livePage)).toEqual(['Terminal 1', 'Terminal 2']);
+    expect(await tabNames(livePage)).toEqual(['Terminal', 'Terminal']);
 
     const second = await startSetup(live, repo, 'setup-kill');
     await killApp(session!);
@@ -516,15 +548,15 @@ describe('daemon: built app', () => {
     await expectScreen(page, /^marker-before-quit$/m);
     await typeLine(page, 'from-newer');
     await expectScreen(page, /^got:from-newer$/m);
-    await goToTerminalPage(page);
+    await goToWorkspacePage(page, known.workspace);
     await poll(() => tabNames(page), (names) => names.length === 2, UI_TIMEOUT);
-    await selectTab(page, 'Terminal 2');
+    await selectTab(page, 1);
     await expectScreen(page, /^marker-two-42$/m);
     await typeLine(page, 'echo from-newer-$((6*7))');
     await expectScreen(page, /^from-newer-42$/m);
 
     // A new terminal runs in the new build's daemon.
-    await page.getByRole('button', { name: 'New terminal', exact: true }).first().click({ timeout: UI_TIMEOUT });
+    await newShellTab(page);
     const fresh = await shellPid(page);
     const newerPid = must(daemonPid(home, newer), 'the daemon pid');
     expect(newerPid).not.toBe(known.daemon);
@@ -536,9 +568,9 @@ describe('daemon: built app', () => {
     await page.locator(`aside a[href$="/sessions/${known.session}"]`).click({ timeout: UI_TIMEOUT });
     await typeLine(page, 'exit');
     await expectDot(page, known.session, 'Exited 3');
-    await goToTerminalPage(page);
-    for (const name of ['Terminal 1', 'Terminal 2']) {
-      await selectTab(page, name);
+    await goToWorkspacePage(page, known.workspace);
+    for (const index of [0, 1]) {
+      await selectTab(page, index);
       await typeLine(page, 'exit');
     }
 
@@ -688,7 +720,7 @@ describe('daemon: built app, the daemon cannot start', () => {
   const failureView = (page: Page) => page.getByText("Cockpit's background service could not start", { exact: true });
   const SUBTITLE = 'Terminals and agents run in this service. Your projects and workspaces are untouched.';
 
-  test('AC10 — COCKPIT_HOME a regular file: the window opens; stderr names the path; /terminal and a session page show the failure view; the Sessions section says so; spawn and sessions.start are refused with the reason; projects can still be added and removed', async () => {
+  test('AC10 — COCKPIT_HOME a regular file: the window opens; stderr names the path; a workspace page and a session page show the failure view; the Sessions section says so; spawn and sessions.start are refused with the reason; projects can still be added and removed', async () => {
     const fx = makeFixture();
     const home = join(dataDir, 'h');
     writeFileSync(home, 'a file, not a folder');
@@ -703,7 +735,7 @@ describe('daemon: built app, the daemon cannot start', () => {
       const reason = reasonOf(session.output());
       expect(reason).toContain(home);
 
-      // The failure view: title, subtitle, the reason in monospace and "Try again", on /terminal and on a session page.
+      // The failure view: title, subtitle, the reason in monospace and "Try again", on a workspace page and on a session page.
       const expectFailureView = async () => {
         await failureView(page).waitFor({ timeout: UI_TIMEOUT });
         await page.getByText(SUBTITLE, { exact: true }).waitFor({ timeout: UI_TIMEOUT });
@@ -711,8 +743,16 @@ describe('daemon: built app, the daemon cannot start', () => {
         await page.getByRole('button', { name: 'Try again', exact: true }).waitFor({ timeout: UI_TIMEOUT });
         expect(await page.getByRole('button', { name: 'Show log', exact: true }).count(), 'no log file exists').toBe(0);
       };
-      await goToTerminalPage(page);
+      // Projects can be added though the daemon is down (worktrees need the home folder: this one is made with git).
+      await stubPicker(session, repo.root);
+      expect((await page.evaluate(() => (window as unknown as ApiWindow).api.projects!.add!())).status).toBe('added');
+      expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).projects.map((p: { path: string }) => p.path)).toEqual([repo.root]);
+      const worktree = join(fx.root, 'wt-view');
+      addWorktree(repo.root, 'view', worktree);
+      await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+      await page.getByTitle(worktree, { exact: true }).first().click({ timeout: UI_TIMEOUT });
       await expectFailureView();
+      expect(await page.locator('[role="tablist"]').count(), 'the view replaces the panes').toBe(0);
       await page.locator('aside').getByRole('link', { name: seeded.name }).click({ timeout: UI_TIMEOUT });
       await page.waitForURL(new RegExp(`/sessions/${seeded.id}$`), { timeout: UI_TIMEOUT });
       await page.getByRole('heading', { name: seeded.name }).waitFor({ timeout: UI_TIMEOUT });
@@ -728,10 +768,7 @@ describe('daemon: built app, the daemon cannot start', () => {
       expect(started.message).toContain(reason);
       expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).sessions, 'only the seeded session').toEqual([seeded]);
 
-      // Projects can still be added and removed (worktrees need the home folder, so no workspace is made).
-      await stubPicker(session, repo.root);
-      expect((await page.evaluate(() => (window as unknown as ApiWindow).api.projects!.add!())).status).toBe('added');
-      expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).projects.map((p: { path: string }) => p.path)).toEqual([repo.root]);
+      // Projects can still be removed.
       await page.evaluate((root) => (window as unknown as ApiWindow).api.projects!.remove!(root), repo.root);
       expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).projects ?? []).toEqual([]);
       expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
@@ -754,7 +791,11 @@ describe('daemon: built app, the daemon cannot start', () => {
       await page.getByText(versionLabel).waitFor();
       const reason = reasonOf(session.output());
       expect(reason).toContain(socket);
-      await goToTerminalPage(page);
+      // The home folder exists, so a workspace can be made: its page shows the failure view.
+      repo ??= makeRepoWithSetup();
+      const root = repo.root;
+      const view = await makeWorkspace(session, 'view-ws', root);
+      await page.getByTitle(view.path, { exact: true }).first().click({ timeout: UI_TIMEOUT });
       await failureView(page).waitFor({ timeout: UI_TIMEOUT });
 
       // "Show log": the log file exists, shell.openPath receives it.
@@ -763,10 +804,6 @@ describe('daemon: built app, the daemon cannot start', () => {
       expect(await poll(() => session!.evaluateInMain<string[]>('globalThis.__opened'), (opened) => opened.length > 0, UI_TIMEOUT)).toEqual([join(home, `daemon-1-${build}.log`)]);
 
       // Projects and workspaces are untouched: the home folder exists, so a worktree can be made and deleted.
-      repo ??= makeRepoWithSetup();
-      const root = repo.root;
-      await stubPicker(session, root);
-      expect((await page.evaluate(() => (window as unknown as ApiWindow).api.projects!.add!())).status).toBe('added');
       const created = await page.evaluate((root) => (window as unknown as ApiWindow).api.workspaces!.create!(root, 'still-works', 'main'), root);
       expect(created.status).toBe('created');
       const worktree = await poll(
@@ -796,7 +833,7 @@ describe('daemon: built app, the daemon cannot start', () => {
       await page.getByRole('button', { name: 'Try again', exact: true }).click({ timeout: UI_TIMEOUT });
       await failureView(page).waitFor({ state: 'detached', timeout: UI_TIMEOUT });
       expect(await page.locator('aside').getByText("Cockpit's background service could not start", { exact: false }).count()).toBe(0);
-      await page.getByRole('button', { name: 'New terminal', exact: true }).first().click({ timeout: UI_TIMEOUT });
+      await newShellTab(page);
       await typeLine(page, 'echo cockpit-$((6*7))');
       await expectScreen(page, /^cockpit-42$/m);
       expect(isAlive(must(daemonPid(home, build), 'the daemon pid'))).toBe(true);
@@ -833,6 +870,7 @@ describe('daemon: built app, a daemon that does not answer', () => {
     const first = await launchBuiltOn(baseEnv(build), dataDir, home);
     await first.page.getByText(versionLabel).waitFor();
     const pid = must(daemonPid(home, build), 'the daemon pid');
+    const workspace = await makeWorkspace(first, 'stopped-ws');
     await quitApp(first);
     process.kill(pid, 'SIGSTOP');
 
@@ -842,7 +880,7 @@ describe('daemon: built app, a daemon that does not answer', () => {
     const socket = join(home, `daemon-1-${build}.sock`);
     const reason = `Cockpit's background service did not answer within 5 s: ${socket}`;
 
-    await goToTerminalPage(page);
+    await page.getByTitle(workspace.path, { exact: true }).first().click({ timeout: UI_TIMEOUT });
     await failureView(page).waitFor({ timeout: 10_000 });
     await page.locator('code, pre, [class*="mono"]').filter({ hasText: reason }).first().waitFor({ timeout: UI_TIMEOUT });
     await page.locator('aside').getByText(`Cockpit's background service could not start: ${reason}`, { exact: true }).waitFor({ timeout: UI_TIMEOUT });
@@ -855,7 +893,7 @@ describe('daemon: built app, a daemon that does not answer', () => {
     process.kill(pid, 'SIGCONT');
     await page.getByRole('button', { name: 'Try again', exact: true }).click({ timeout: UI_TIMEOUT });
     await failureView(page).waitFor({ state: 'detached', timeout: UI_TIMEOUT });
-    await page.getByRole('button', { name: 'New terminal', exact: true }).first().click({ timeout: UI_TIMEOUT });
+    await newShellTab(page);
     await typeLine(page, 'echo cockpit-$((6*7))');
     await expectScreen(page, /^cockpit-42$/m);
     expect(isAlive(pid), 'the same daemon').toBe(true);
@@ -871,14 +909,16 @@ describe('daemon: built app, a daemon that does not answer', () => {
     const first = await launchBuiltOn(baseEnv(older), dataDir, home);
     await first.page.getByText(versionLabel).waitFor();
     const pid = must(daemonPid(home, older), 'the older daemon pid');
+    const workspace = await makeWorkspace(first, 'older-ws');
     await quitApp(first);
     process.kill(pid, 'SIGSTOP');
 
     session = await launchBuiltOn(baseEnv(newer), dataDir, home);
     const { page } = session;
     await page.getByText(versionLabel).waitFor();
-    await goToTerminalPage(page);
-    await page.getByRole('button', { name: 'New terminal', exact: true }).first().click({ timeout: 15_000 });
+    await goToWorkspacePage(page, workspace.path);
+    await page.getByRole('button', { name: 'New tab', exact: true }).first().click({ timeout: 15_000 });
+    await page.getByRole('menuitem', { name: 'Terminal', exact: true }).click({ timeout: UI_TIMEOUT });
     await typeLine(page, 'echo cockpit-$((6*7))');
     await expectScreen(page, /^cockpit-42$/m);
 
@@ -947,8 +987,9 @@ describe('daemon: built app, requests from another origin', () => {
     expect(daemonFile(home, 'pid', build)).toBeUndefined();
     expect(session.output().slice(outputBefore.length)).not.toMatch(MAIN_PROCESS_ERROR);
 
-    // The app's own "Try again" does start it.
-    await goToTerminalPage(page);
+    // The app's own "Try again" does start it (on the page of a workspace, made now that the cause is gone).
+    const workspace = await makeWorkspace(session, 'origin-ws');
+    await page.getByTitle(workspace.path, { exact: true }).first().click({ timeout: UI_TIMEOUT });
     await page.getByRole('button', { name: 'Try again', exact: true }).click({ timeout: UI_TIMEOUT });
     await poll(() => daemonPid(home, build), Boolean, UI_TIMEOUT);
     expect(daemonProcessesOf(build)).toHaveLength(1);
@@ -1060,7 +1101,9 @@ describe('daemon: packaged app smoke path', () => {
     const daemon = must(daemonPid(home), 'the daemon pid');
     expect(commandOf(daemon)).toContain('--cockpit-daemon');
 
-    await goToTerminalPage(page);
+    const workspace = await makeWorkspace(session, 'smoke-ws');
+    await goToWorkspacePage(page, workspace.path);
+    await newShellTab(page);
     await typeLine(page, 'echo marker-shell-$((6*7))');
     await expectScreen(page, /^marker-shell-42$/m);
     const shell = await shellPid(page);
@@ -1077,7 +1120,7 @@ describe('daemon: packaged app smoke path', () => {
     await page.locator(`aside a[href$="/sessions/${id}"]`).click({ timeout: UI_TIMEOUT });
     await expectScreen(page, /^marker-before-quit$/m);
     expect(await dotOf(page, id)).not.toBe('Ended');
-    await goToTerminalPage(page);
+    await goToWorkspacePage(page, workspace.path);
     await expectScreen(page, /^marker-shell-42$/m);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
   });
@@ -1103,7 +1146,9 @@ describe('daemon: dev server smoke path', () => {
     expect(isAlive(pid)).toBe(true);
     expect(commandOf(pid)).toContain('--cockpit-daemon');
 
-    await goToTerminalPage(page);
+    const workspace = await makeWorkspace(session, 'dev-ws');
+    await goToWorkspacePage(page, workspace.path);
+    await newShellTab(page);
     await typeLine(page, 'echo cockpit-$((6*7))');
     await expectScreen(page, /^cockpit-42$/m);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);

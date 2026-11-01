@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router';
-import { HouseIcon, PanelLeftCloseIcon, SquareTerminalIcon, TriangleAlertIcon } from 'lucide-react';
+import { HouseIcon, PanelLeftCloseIcon, TriangleAlertIcon } from 'lucide-react';
 import type { DaemonStatus, Project, Session } from '../../shared/api';
 import { toggleSidebar } from '@/components/collapsed';
 import { Projects } from '@/components/projects';
@@ -31,10 +31,6 @@ export function AppSidebar({
         <Link to="/" className={linkRowClass}>
           <HouseIcon />
           Home
-        </Link>
-        <Link to="/terminal" className={linkRowClass}>
-          <SquareTerminalIcon />
-          Terminal
         </Link>
       </nav>
       {git === 'missing' && (

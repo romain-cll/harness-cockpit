@@ -18,9 +18,16 @@ export interface PtySpawnOptions {
  * the main process: `command` is the user's `$SHELL` (`/bin/zsh` when unset) run
  * as a login shell (`-l` is the default shell's only: a `command` without `args`
  * runs with no argument), `cwd` the home directory, and `env` the login shell's
- * environment with `TERM=xterm-256color` and `COLORTERM=truecolor`.
+ * environment with `TERM=xterm-256color` and `COLORTERM=truecolor`. With a `workspace`, `cwd` is
+ * the worktree.
  */
-export type PtySpawnRequest = Pick<PtySpawnOptions, 'cols' | 'rows'> & Partial<PtySpawnOptions>;
+export type PtySpawnRequest = Pick<PtySpawnOptions, 'cols' | 'rows'> &
+  Partial<PtySpawnOptions> & {
+    /** The linked worktree the terminal belongs to: its `cwd` unless one is given, and the daemon lists it with it. */
+    workspace?: string;
+    /** With `workspace`: run `cockpit setup --shell` (the repository's setup, then the login shell) instead of the login shell. */
+    setup?: boolean;
+  };
 
 /** A terminal the daemon is running that the page can show again; `status` is what its session last reported. */
 export interface ListedTerminal {
@@ -204,6 +211,8 @@ export interface StartSessionOptions {
 export interface AvailableHarness {
   id: string;
   name: string;
+  /** What `--version` printed, `null` when it printed no version. */
+  version: string | null;
 }
 
 /** What starting a session came to; `started` carries the id of its pty, `refused` the message to show. */
@@ -294,8 +303,11 @@ export interface Api {
   };
   /** Agent CLIs, run in a folder of their own outside any project or in a workspace of a project. */
   sessions: {
-    /** The detected agent CLIs, in catalogue order. */
-    harnesses(): Promise<AvailableHarness[]>;
+    /**
+     * The detected agent CLIs, in catalogue order. Detection runs once per launch; with `again` it runs
+     * again (each found CLI's `--version`) and replaces the result every caller shares.
+     */
+    harnesses(options?: { again?: boolean }): Promise<AvailableHarness[]>;
     /** The stored sessions, newest first. */
     list(): Promise<Session[]>;
     /**

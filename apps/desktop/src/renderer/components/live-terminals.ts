@@ -202,24 +202,36 @@ export const attachLiveTerminal = (id: number) =>
 const restored = new Set<number>();
 let restoredOnce = false;
 
+/** A terminal the page attached to again, for the workspace page to show as a tab. */
+export interface RestoredTerminal {
+  entry: LiveTerminal;
+  /** The worktree it runs in. */
+  workspace: string;
+  /** Set for a session, absent for a shell. */
+  sessionId?: string;
+}
+
 /**
  * Attaches to the shells and sessions the daemons are running. Called once per page load (`again`
  * to do it for the ptys not attached yet, after the daemon was started by hand). Each session goes
- * to the store, with the status it last reported; the shells come back in creation order, for the
- * terminal page to show one tab each. A terminal that ended meanwhile is left out.
+ * to the store, with the status it last reported. The terminals of a workspace come back in
+ * creation order, for the workspace page to show one tab each. A terminal that ended meanwhile is
+ * left out, and so is a shell that belongs to no workspace (the page shows none).
  */
-export async function restoreTerminals(again = false): Promise<LiveTerminal[]> {
+export async function restoreTerminals(again = false): Promise<RestoredTerminal[]> {
   if (restoredOnce && !again) return [];
   restoredOnce = true;
-  const listed = (await window.api.pty.list()).filter(({ id }) => !restored.has(id));
+  const listed = (await window.api.pty.list()).filter(
+    ({ id, sessionId, workspace }) => !restored.has(id) && (sessionId !== undefined || workspace !== undefined),
+  );
   const attached = await Promise.all(listed.map(restoreTerminal));
   publish();
-  return attached.filter((entry) => entry !== undefined);
+  return attached.filter((terminal) => terminal !== undefined);
 }
 
-// Attaches to a terminal the daemon runs. A shell is returned for the terminal page to show; a session
-// goes into the store with what it reported, and nothing is returned.
-async function restoreTerminal(terminal: ListedTerminal): Promise<LiveTerminal | undefined> {
+// Attaches to a terminal the daemon runs. A session goes into the store with what it reported; the
+// terminal is returned when it runs in a workspace.
+async function restoreTerminal(terminal: ListedTerminal): Promise<RestoredTerminal | undefined> {
   restored.add(terminal.id);
   const { entry, started } = attachLiveTerminal(terminal.id);
   try {
@@ -228,16 +240,18 @@ async function restoreTerminal(terminal: ListedTerminal): Promise<LiveTerminal |
     closeLiveTerminal(entry);
     return undefined;
   }
-  if (terminal.sessionId === undefined) return entry;
-  sessionTerminals.set(terminal.sessionId, entry);
-  // What the page heard since it asked for the list is newer than the list.
-  if (terminal.status && !statuses.has(terminal.sessionId)) statuses.set(terminal.sessionId, STATUS_DOTS[terminal.status]);
-  if (terminal.setup && !setups.has(terminal.sessionId)) setups.set(terminal.sessionId, terminal.setup);
-  if (terminal.workspace !== undefined) sessionWorkspaces.set(terminal.sessionId, terminal.workspace);
-  if (terminal.exitCode !== undefined && !agentEnds.has(terminal.sessionId)) {
-    agentEnds.set(terminal.sessionId, endDot({ exitCode: terminal.exitCode, signal: null }));
+  const { sessionId, workspace } = terminal;
+  if (sessionId !== undefined) {
+    sessionTerminals.set(sessionId, entry);
+    // What the page heard since it asked for the list is newer than the list.
+    if (terminal.status && !statuses.has(sessionId)) statuses.set(sessionId, STATUS_DOTS[terminal.status]);
+    if (terminal.setup && !setups.has(sessionId)) setups.set(sessionId, terminal.setup);
+    if (workspace !== undefined) sessionWorkspaces.set(sessionId, workspace);
+    if (terminal.exitCode !== undefined && !agentEnds.has(sessionId)) {
+      agentEnds.set(sessionId, endDot({ exitCode: terminal.exitCode, signal: null }));
+    }
   }
-  return undefined;
+  return workspace === undefined ? undefined : { entry, workspace, ...(sessionId !== undefined && { sessionId }) };
 }
 
 async function adoptSession(sessionId: string): Promise<void> {
@@ -259,6 +273,9 @@ export function subscribe(listener: () => void): () => void {
 
 /** The ids of the sessions whose agent is still running. */
 export const getRunningIds = () => running;
+
+/** Whether the session's agent runs: its terminal does and `cockpit setup` did not report the agent's exit. */
+export const agentRuns = (id: string) => running.has(id) && !agentEnds.has(id);
 
 /** The accessible name of each session's dot, by session id. */
 export const getSessionDots = () => dots;

@@ -1,5 +1,5 @@
-import { useRouter } from '@tanstack/react-router';
-import { ChevronDownIcon, ChevronRightIcon, GitBranchIcon, MoreHorizontalIcon, PlusIcon, TriangleAlertIcon } from 'lucide-react';
+import { Link, useRouter } from '@tanstack/react-router';
+import { ChevronDownIcon, ChevronRightIcon, MoreHorizontalIcon, PlusIcon, TriangleAlertIcon } from 'lucide-react';
 import { useState, useSyncExternalStore, type ReactNode } from 'react';
 import type { AppsResult, AvailableApp, OpenWorkspaceResult, Project, Session, StartSessionResult, Workspace } from '../../shared/api';
 import { toggleProject, toggleProjects, useCollapsedProjects, useProjectsCollapsed } from '@/components/collapsed';
@@ -7,7 +7,7 @@ import { DeleteWorkspaceDialog } from '@/components/delete-workspace-dialog';
 import { NewWorkspaceDialog } from '@/components/new-workspace-dialog';
 import { endSessions, getWorkspaceSetups, startSession, subscribe } from '@/components/live-terminals';
 import { projectColour } from '@/components/project-colour';
-import { rowClass, SessionLink } from '@/components/sessions';
+import { linkRowClass, rowClass, StatusIcon } from '@/components/sessions';
 import { StartSessionMenu } from '@/components/start-session-menu';
 import { Button } from '@/components/ui/button';
 import {
@@ -20,6 +20,8 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { addSessionTab, closeWorkspace, openShellTab, setProjectsMessage, useProjectsMessage, useWorkspaceStatus } from '@/components/workspace-panes';
+import { cn } from 'cn';
 
 // The workspace whose Delete dialog is open. Module-level so that the Changes sidebar can open it
 // (`requestDeleteWorkspace`) as the workspace's "…" menu does.
@@ -41,7 +43,7 @@ export const requestDeleteWorkspace = (project: Project, workspace: Workspace) =
 
 // An entry of the list: its row (`after` follows the name, the `trailing` label is right-aligned), and the
 // "…" menu shown on hover and focus, next to the `extra` button (shown the same way, left of it) when
-// there is one. `onOpenChange` hears the menu open and close.
+// there is one. `onOpenChange` hears the menu open and close. `row` replaces the plain row, for a link.
 function Entry({
   title,
   icon,
@@ -50,27 +52,37 @@ function Entry({
   label,
   extra,
   trailing,
+  row,
   onOpenChange,
   children,
 }: {
   title: string;
   icon: ReactNode;
-  name: string;
+  name: ReactNode;
   after?: ReactNode;
   label: string;
   extra?: ReactNode;
   trailing?: ReactNode;
+  row?: (props: { className: string; children: ReactNode }) => ReactNode;
   onOpenChange?: (open: boolean) => void;
   children: ReactNode;
 }) {
+  const content = (
+    <>
+      {icon}
+      {name} {after} {trailing}
+    </>
+  );
+  const className = extra ? 'pr-14' : 'pr-8';
   return (
     <div className="group/entry relative">
-      <div title={title} className={`${rowClass} ${extra ? 'pr-14' : 'pr-8'}`}>
-        {icon}
-        <span className="truncate">{name}</span>
-        {after}
-        {trailing}
-      </div>
+      {row ? (
+        row({ className, children: content })
+      ) : (
+        <div title={title} className={`${rowClass} ${className}`}>
+          {content}
+        </div>
+      )}
       {extra}
       <DropdownMenu onOpenChange={onOpenChange}>
         <DropdownMenuTrigger
@@ -134,10 +146,22 @@ function SetupLabel({ state }: { state?: 'running' | 'failed' }) {
   );
 }
 
+// A workspace's row: a link to its page, with the icon of its most urgent session.
+function WorkspaceName({ workspace }: { workspace: Workspace }) {
+  const status = useWorkspaceStatus(workspace.path);
+  return (
+    <>
+      <StatusIcon label={status} />
+      <span className={cn('truncate', !status && 'text-muted-foreground')}>{workspace.name}</span>
+    </>
+  );
+}
+
 export function Projects({ projects, sessions }: { projects: Project[]; sessions: Session[] }) {
   const router = useRouter();
   // Why the last add or start was refused, or that a deletion kept its branch; cleared by the next add, start or deletion that succeeds.
-  const [message, setMessage] = useState<string>();
+  const message = useProjectsMessage();
+  const setMessage = setProjectsMessage;
   const [creatingIn, setCreatingIn] = useState<Project>();
   const deleting = useSyncExternalStore(subscribeDeleting, () => deletion);
   const setups = useSyncExternalStore(subscribe, getWorkspaceSetups);
@@ -160,18 +184,20 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
   async function remove(project: Project) {
     await window.api.projects.remove(project.path);
     endSessions(sessionsIn(project).map(({ id }) => id));
+    for (const { path } of project.workspaces) closeWorkspace(path);
     await router.invalidate();
   }
 
-  // Shows what starting a session came to: its page, or why it was refused.
+  // Shows what starting a session came to: its tab on the workspace's page, or why it was refused.
   async function started(result: StartSessionResult) {
     if (result.status === 'refused') {
       setMessage(result.message);
       return;
     }
     setMessage(undefined);
+    addSessionTab(result.session);
     await router.invalidate();
-    await router.navigate({ to: '/sessions/$sessionId', params: { sessionId: result.session.id } });
+    await router.navigate({ to: '/workspace', search: { path: result.session.directory } });
   }
 
   // Shows why opening a worktree was refused or failed; a success clears the message.
@@ -212,7 +238,7 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
                       {project.name.charAt(0).toUpperCase()}
                     </span>
                   }
-                  name={project.name}
+                  name={<span className="truncate">{project.name}</span>}
                   after={
                     project.missing ? (
                       <TriangleAlertIcon className="size-3.5 text-destructive" />
@@ -247,15 +273,25 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
                 )}
                 {project.error && <p className="px-2 py-1 pl-8 text-xs break-words text-muted-foreground">{project.error}</p>}
                 {expanded && project.workspaces.length > 0 && (
-                  <ul className="flex flex-col gap-px pl-[22px]">
+                  <ul className="flex flex-col gap-px">
                     {project.workspaces.map((workspace) => (
                       <li key={workspace.path}>
                         <Entry
                           title={workspace.path}
-                          icon={<GitBranchIcon />}
-                          name={workspace.name}
+                          icon={null}
+                          name={<WorkspaceName workspace={workspace} />}
                           label={`Actions for ${workspace.name}`}
                           trailing={<SetupLabel state={setups.get(workspace.path)} />}
+                          row={({ className, children }) => (
+                            <Link
+                              to="/workspace"
+                              search={{ path: workspace.path }}
+                              title={workspace.path}
+                              className={cn(linkRowClass, 'pl-[30px]', className)}
+                            >
+                              {children}
+                            </Link>
+                          )}
                           onOpenChange={(open) => open && void window.api.workspaces.apps().then(setApps)}
                           extra={
                             <StartSessionMenu
@@ -274,13 +310,6 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
                           />
                           <DropdownMenuItem onClick={() => setDeleting({ project, workspace })}>Delete workspace…</DropdownMenuItem>
                         </Entry>
-                        <ul className="flex flex-col gap-px pl-[22px]">
-                          {sessionsIn(project, workspace.path).map((session) => (
-                            <li key={session.id}>
-                              <SessionLink session={session} />
-                            </li>
-                          ))}
-                        </ul>
                       </li>
                     ))}
                   </ul>
@@ -294,10 +323,16 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
         <NewWorkspaceDialog
           project={creatingIn}
           onClose={() => setCreatingIn(undefined)}
-          onCreated={async (start) => {
+          onCreated={async (workspace, start) => {
             await router.invalidate();
             setCreatingIn(undefined);
-            if (start) await started(start);
+            if (start) {
+              await started(start);
+            } else {
+              // No agent: a shell tab runs the setup, then the login shell.
+              openShellTab(workspace.path, { setup: true });
+              await router.navigate({ to: '/workspace', search: { path: workspace.path } });
+            }
           }}
         />
       )}
@@ -309,6 +344,7 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
           onRemoved={async (branchKept) => {
             setMessage(branchKept ? `Branch ${deleting.workspace.branch} was kept: it is not merged.` : undefined);
             endSessions(sessionsIn(deleting.project, deleting.workspace.path).map(({ id }) => id));
+            closeWorkspace(deleting.workspace.path);
             await router.invalidate();
             setDeleting(undefined);
           }}
