@@ -1,10 +1,9 @@
 import { existsSync, watch, type FSWatcher } from 'node:fs';
-import { copyFile, mkdtemp, rm, utimes } from 'node:fs/promises';
+import { copyFile, mkdtemp, readFile, rm, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { checkGit, git, succeeds, WorkspaceError } from './git';
-import { listBranches, type GitEnv } from './index';
+import { checkGit, git, listBranches, succeeds, WorkspaceError, type GitEnv } from './git';
 
 export interface ChangedFile {
   path: string;
@@ -44,11 +43,29 @@ const output = (args: string[], cwd: string, env?: NodeJS.ProcessEnv) =>
   );
 
 /**
+ * The branch being rebased while a rebase is stopped (HEAD is detached then), read as git's own
+ * `git-prompt.sh` does, from `rebase-merge/head-name` or `rebase-apply/head-name`; `null` otherwise.
+ */
+async function rebasedBranch(worktree: string, env?: NodeJS.ProcessEnv): Promise<string | null> {
+  for (const directory of ['rebase-merge', 'rebase-apply']) {
+    const path = await output(['rev-parse', '--git-path', `${directory}/head-name`], worktree, env);
+    if (path === null) return null;
+    try {
+      const name = (await readFile(resolve(worktree, path), 'utf8')).trim();
+      if (name.startsWith('refs/heads/')) return name.slice('refs/heads/'.length);
+    } catch {
+      // No such rebase in progress.
+    }
+  }
+  return null;
+}
+
+/**
  * The recorded base of the workspace's branch (see `createWorktree`) when it still resolves to a
  * commit, else the project's default base. Resolves to the base and its merge-base with HEAD.
  */
 async function resolveBase(worktree: string, env?: NodeJS.ProcessEnv): Promise<{ base: string; mergeBase: string }> {
-  const branch = await output(['symbolic-ref', '--quiet', '--short', 'HEAD'], worktree, env);
+  const branch = (await output(['symbolic-ref', '--quiet', '--short', 'HEAD'], worktree, env)) ?? (await rebasedBranch(worktree, env));
   const recorded = branch ? await output(['config', '--get', `branch.${branch}.cockpitBase`], worktree, env) : null;
   const base =
     recorded && (await succeeds(['rev-parse', '--verify', '--quiet', `${recorded}^{commit}`], { cwd: worktree, env }))
@@ -58,6 +75,11 @@ async function resolveBase(worktree: string, env?: NodeJS.ProcessEnv): Promise<{
   const mergeBase = (await git(['merge-base', base, 'HEAD'], { cwd: worktree, env })).trim();
   return { base, mergeBase };
 }
+
+const fsFailed = (action: string, error: unknown) =>
+  new WorkspaceError('FS_FAILED', `cannot ${action}: ${(error as NodeJS.ErrnoException).code ?? (error as Error).message}`, {
+    cause: error,
+  });
 
 /**
  * Runs `task` with the environment of a temporary copy of the worktree's index in which the
@@ -70,10 +92,20 @@ async function withUntrackedVisible<T>(
   task: (env: NodeJS.ProcessEnv) => Promise<T>,
 ): Promise<T> {
   const index = resolve(worktree, (await git(['rev-parse', '--git-path', 'index'], { cwd: worktree, env })).trim());
-  const folder = await mkdtemp(join(tmpdir(), 'cockpit-index-'));
+  let folder: string;
+  try {
+    folder = await mkdtemp(join(tmpdir(), 'cockpit-index-'));
+  } catch (error) {
+    throw fsFailed('create a temporary folder', error);
+  }
   try {
     const indexEnv = { ...(env ?? process.env), GIT_INDEX_FILE: join(folder, 'index') };
-    await copyFile(index, indexEnv.GIT_INDEX_FILE);
+    try {
+      await copyFile(index, indexEnv.GIT_INDEX_FILE);
+    } catch (error) {
+      // Git reads a missing index (`git worktree add --no-checkout`) as empty: start from none.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw fsFailed('copy the index', error);
+    }
     await git(['add', '-N', '--', '.'], { cwd: worktree, env: indexEnv });
     return await task(indexEnv);
   } finally {
@@ -140,7 +172,7 @@ export async function fileDiff(worktree: string, file: ChangedFile, { env }: Git
   let patch: string;
   try {
     patch = await withUntrackedVisible(worktree, env, (indexEnv) =>
-      git(['--literal-pathspecs', 'diff', '--no-ext-diff', '-M', mergeBase, '--', ...paths], {
+      git(['--literal-pathspecs', 'diff', '--no-ext-diff', '--no-color', '-M', mergeBase, '--', ...paths], {
         cwd: worktree,
         env: indexEnv,
         maxBuffer: MAX_DIFF_BYTES,

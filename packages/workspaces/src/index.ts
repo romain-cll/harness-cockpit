@@ -1,47 +1,11 @@
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, realpath } from 'node:fs/promises';
 import { basename, isAbsolute, join } from 'node:path';
-import { checkGit, git, succeeds, WorkspaceError } from './git';
+import { checkGit, git, list, succeeds, WorkspaceError, type GitEnv, type Worktree } from './git';
 
-export { checkGit, WorkspaceError } from './git';
-export type { WorkspaceErrorCode } from './git';
+export { checkGit, listBranches, WorkspaceError } from './git';
+export type { Branches, GitEnv, WorkspaceErrorCode, Worktree } from './git';
 export * from './changes';
-
-export type GitEnv = { env?: NodeJS.ProcessEnv };
-
-export interface Worktree {
-  path: string;
-  /** The checked out commit. */
-  head: string | null;
-  /** The short branch name, `null` on a detached HEAD. */
-  branch: string | null;
-  /** Whether this is the main working tree. */
-  main: boolean;
-}
-
-/** The main working tree comes first. */
-async function list(repo: string, env?: NodeJS.ProcessEnv): Promise<Worktree[]> {
-  if (!(await succeeds(['rev-parse', '--show-toplevel'], { cwd: repo, env }))) {
-    throw new WorkspaceError('NOT_A_REPOSITORY', `not a git repository: ${repo}`);
-  }
-  const output = await git(['worktree', 'list', '--porcelain', '-z'], { cwd: repo, env });
-  const worktrees: Worktree[] = [];
-  let current: Worktree | undefined;
-  // Fields end with NUL, and an empty field ends a record.
-  for (const field of output.split('\0')) {
-    if (field === '') {
-      current = undefined;
-    } else if (field.startsWith('worktree ')) {
-      current = { path: field.slice('worktree '.length), head: null, branch: null, main: worktrees.length === 0 };
-      worktrees.push(current);
-    } else if (current && field.startsWith('HEAD ')) {
-      current.head = field.slice('HEAD '.length);
-    } else if (current && field.startsWith('branch ')) {
-      current.branch = field.slice('branch '.length).replace(/^refs\/heads\//, '');
-    }
-  }
-  return worktrees;
-}
 
 async function repositoryRoot(path: string, env?: NodeJS.ProcessEnv): Promise<string> {
   const [main] = await list(path, env);
@@ -77,51 +41,6 @@ export async function listWorktrees(repo: string, { env }: GitEnv = {}): Promise
   return list(repo, env);
 }
 
-export interface Branches {
-  /** Short names of the local branches. */
-  local: string[];
-  /** `origin/<branch>` remote-tracking branches, without `origin/HEAD`. */
-  remote: string[];
-  /** The branch a new workspace starts from unless told otherwise, `null` when there is none. */
-  defaultBase: string | null;
-}
-
-/**
- * The local and `origin/*` branches of the repository, as they are: nothing is fetched. The default
- * base is `origin/D` when it exists, else the local `D`, else `null`, where `D` is the branch
- * `origin/HEAD` points at or, without it, the one checked out in the main working tree.
- */
-export async function listBranches(repo: string, { env }: GitEnv = {}): Promise<Branches> {
-  await checkGit(env);
-  const [main] = await list(repo, env);
-  if (!main) throw new WorkspaceError('GIT_FAILED', `git worktree list found no worktree in ${repo}`);
-
-  const output = await git(
-    ['for-each-ref', '--format=%(refname)%00%(symref)', 'refs/heads', 'refs/remotes/origin'],
-    { cwd: main.path, env },
-  );
-  const local: string[] = [];
-  const remote: string[] = [];
-  for (const line of output.split('\n')) {
-    const [ref = '', symref = ''] = line.split('\0');
-    if (symref !== '') continue;
-    if (ref.startsWith('refs/heads/')) local.push(ref.slice('refs/heads/'.length));
-    else if (ref.startsWith('refs/remotes/origin/')) remote.push(ref.slice('refs/remotes/'.length));
-  }
-
-  let target: string | null = main.branch;
-  try {
-    const head = (await git(['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], { cwd: main.path, env })).trim();
-    target = head.replace(/^refs\/remotes\/origin\//, '');
-  } catch (error) {
-    // Exit 1 means `origin/HEAD` is not a symbolic ref (or is missing): fall back to the checked out branch.
-    if (!(error instanceof WorkspaceError && error.code === 'GIT_FAILED')) throw error;
-  }
-  const defaultBase =
-    target === null ? null : remote.includes(`origin/${target}`) ? `origin/${target}` : local.includes(target) ? target : null;
-  return { local, remote, defaultBase };
-}
-
 const queues = new Map<string, Promise<void>>();
 
 /** Runs `task` after the earlier ones for `key` settle, whatever their outcome. */
@@ -143,7 +62,8 @@ function serialised<T>(key: string, task: () => Promise<T>): Promise<T> {
  * it creates `branch` from it; without, it checks out the existing local `branch`, and refuses a
  * name that is not a local branch (a tag, a SHA, a remote-only name). All or nothing: if git fails,
  * the worktree and the branch this call created are removed, and the original `GIT_FAILED` is
- * rethrown; a root that cannot be created is `GIT_FAILED` too. A name git refuses is `INVALID_BRANCH_NAME`. Calls for one repository run one at a time,
+ * rethrown. A name git refuses is `INVALID_BRANCH_NAME`. `root` is created only after every check
+ * passed; one that cannot be created is `FS_FAILED`, naming the errno code. Calls for one repository run one at a time,
  * so of two creating the same branch, the second gets `BRANCH_EXISTS`.
  */
 export async function createWorktree({
@@ -159,19 +79,9 @@ export async function createWorktree({
   base?: string;
 } & GitEnv): Promise<Worktree> {
   if (!isAbsolute(requestedRoot)) throw new TypeError(`root must be an absolute path: ${requestedRoot}`);
-  // Canonical, so the paths built from it match the ones git reports (symbolic links, macOS `/var`).
-  let root: string;
-  try {
-    await mkdir(requestedRoot, { recursive: true });
-    root = await realpath(requestedRoot);
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new WorkspaceError('GIT_FAILED', `cannot create ${requestedRoot}: ${reason}`, { cause: error });
-  }
   await checkGit(env);
   const main = await repositoryRoot(repo, env);
   const project = `${basename(main)}-${createHash('sha256').update(main).digest('hex').slice(0, 8)}`;
-  const path = join(root, project, branch);
 
   return serialised(main, async () => {
     // `--branch` expands shorthands such as `@{-1}`: a name it rewrites is not a branch name.
@@ -183,6 +93,17 @@ export async function createWorktree({
       throw new WorkspaceError('GIT_FAILED', `no local branch to check out: ${branch}`);
     }
     if (base !== undefined && exists) throw new WorkspaceError('BRANCH_EXISTS', `branch already exists: ${branch}`);
+    // Canonical, so the paths built from it match the ones git reports (symbolic links, macOS `/var`).
+    // Created only now that every check passed, so a refusal leaves no folder behind.
+    let root: string;
+    try {
+      await mkdir(requestedRoot, { recursive: true });
+      root = await realpath(requestedRoot);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? (error instanceof Error ? error.message : String(error));
+      throw new WorkspaceError('FS_FAILED', `cannot create ${requestedRoot}: ${code}`, { cause: error });
+    }
+    const path = join(root, project, branch);
     const registered = (await findLinked(await list(main, env), path)) !== undefined;
 
     try {
