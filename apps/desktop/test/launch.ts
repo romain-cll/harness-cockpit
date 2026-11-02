@@ -1,3 +1,4 @@
+import { afterEach, beforeEach } from 'vitest';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -177,10 +178,63 @@ export function daemonSocketIn(home: string): string {
 // Attaches to a running Electron over the Chrome DevTools Protocol and returns
 // its first window. Reloads it so the page's console output is captured from the
 // start.
+// COCKPIT-80 diagnosis (throwaway): the page's `[ck80]` console lines; each menu's lifecycle (open, closing,
+// exit transition, removal) logged by an observer installed in every document; dumped after a failing test,
+// the menu removals after every test.
+export const ck80Log: string[] = [];
+const CK80_MENUS = `(() => {
+  const seen = new Map();
+  const log = (text) => console.debug('[ck80] ' + Date.now() + ' ' + text);
+  const label = (menu) => menu.id + '(' + (menu.getAttribute('data-align') || '-') + ',' + (menu.getAttribute('data-slot') || '-') + ')';
+  const start = () => new MutationObserver((records) => {
+    for (const record of records) {
+      if (record.type === 'attributes' && record.target.getAttribute && record.target.getAttribute('role') === 'menu') {
+        const menu = record.target;
+        const has = menu.hasAttribute(record.attributeName);
+        const entry = seen.get(menu) || {};
+        if (record.attributeName === 'data-closed' && has) entry.closed = Date.now();
+        seen.set(menu, entry);
+        log('menu ' + label(menu) + ' ' + record.attributeName + (has ? ' set' : ' removed') + '; menus in DOM ' + document.querySelectorAll('[role=menu]').length);
+      }
+      for (const node of record.removedNodes || []) {
+        if (!(node instanceof Element)) continue;
+        const menus = node.matches('[role=menu]') ? [node] : [...node.querySelectorAll('[role=menu]')];
+        for (const menu of menus) {
+          const entry = seen.get(menu) || {};
+          log('MENU REMOVED ' + label(menu) + (entry.closed ? ' ' + (Date.now() - entry.closed) + ' ms after data-closed' : ' (no data-closed seen)'));
+        }
+      }
+      for (const node of record.addedNodes || []) {
+        if (!(node instanceof Element)) continue;
+        const menus = node.matches('[role=menu]') ? [node] : [...node.querySelectorAll('[role=menu]')];
+        for (const menu of menus) { seen.set(menu, {}); log('menu added ' + label(menu) + '; menus in DOM ' + document.querySelectorAll('[role=menu]').length); }
+      }
+    }
+  }).observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-closed', 'data-open', 'data-ending-style', 'data-starting-style'] });
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else start();
+})();`;
+
+beforeEach(({ task }) => {
+  ck80Log.splice(0);
+  ck80Log.push(`[ck80] ${Date.now()} TEST START ${task.name.slice(0, 60)}`);
+});
+afterEach(({ task }) => {
+  const lines = ck80Log.splice(0);
+  if (task.result?.state === 'fail') console.error(`[ck80] FAILED ${task.name.slice(0, 80)}\n  ${lines.join('\n  ')}`);
+  else {
+    const removals = lines.filter((line) => line.includes('MENU REMOVED')).map((line) => line.replace(/^\[ck80\] \d+ /, ''));
+    if (removals.length > 0) console.error(`[ck80] passed ${task.name.slice(0, 50)}: ${removals.join(' | ')}`);
+  }
+});
+
 export async function attach(endpoint: string): Promise<{ browser: Browser; page: Page }> {
   const browser = await chromium.connectOverCDP(endpoint);
   const context = browser.contexts()[0]!;
   const page = context.pages()[0] ?? (await context.waitForEvent('page'));
+  page.on('console', (message) => {
+    if (message.text().startsWith('[ck80]')) ck80Log.push(message.text());
+  });
+  await page.addInitScript(CK80_MENUS);
   // The window's target starts as `about:blank` while its first navigation to the
   // app is pending: a reload racing that navigation waits for a load that never
   // comes. Wait until the page is on the app's URL and loaded.

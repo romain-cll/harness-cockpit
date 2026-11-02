@@ -1,7 +1,7 @@
 import { basename } from 'node:path';
 import { expect } from 'vitest';
 import { type Locator, type Page } from 'playwright-core';
-import { UI_TIMEOUT, poll } from './launch';
+import { UI_TIMEOUT, ck80Log, poll } from './launch';
 
 // COCKPIT-66: the New workspace page (the composer at `/`) as the tests drive it, shared by the test
 // files that create workspaces and sessions. The project, agent and base selects have no accessible
@@ -30,7 +30,9 @@ export const messageOf = async (page: Page) => {
 };
 
 export const openPopup = async (page: Page, trigger: Locator) => {
+  ck80Log.push(`[ck80] ${Date.now()} test openPopup click; menus in DOM ${await page.locator('[role="menu"]').count()}`);
   await trigger.click({ timeout: UI_TIMEOUT });
+  ck80Log.push(`[ck80] ${Date.now()} test openPopup clicked`);
   const menu = page.getByRole('menu');
   await menu.waitFor({ timeout: UI_TIMEOUT });
   return menu;
@@ -62,8 +64,10 @@ export async function openComposerFromSidebar(page: Page, project: string) {
       await page.getByTitle(project, { exact: true }).first().hover({ timeout: 3_000 });
       await page.getByRole('button', { name: `Actions for ${basename(project)}`, exact: true }).click({ timeout: 3_000 });
       await page.getByRole('menuitem', { name: 'New workspace…' }).click({ timeout: 3_000 });
+      ck80Log.push(`[ck80] ${Date.now()} test clicked New workspace…`);
     }
     await promptBox(page).waitFor({ timeout: UI_TIMEOUT });
+    ck80Log.push(`[ck80] ${Date.now()} test prompt box visible`);
   } catch {
     await closePopups(page);
     await openComposer(page, project);

@@ -20,6 +20,11 @@ jobs:
     # desktop session for the Electron tests.
     runs-on: macos-latest
     timeout-minutes: 20
+    # COCKPIT-80 diagnosis (throwaway): five identical runs in parallel.
+    strategy:
+      fail-fast: false
+      matrix:
+        copy: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v7
 
@@ -43,4 +48,26 @@ jobs:
 
       # `test` launches the desktop app four ways: the dev script, the built app,
       # the packaged app and the packaged app with the environment of launchd.
-      - run: bun turbo run build typecheck lint test
+      - run: bun turbo run build typecheck lint test --continue
+
+  # COCKPIT-80 diagnosis (throwaway): what the first /usr/bin/git costs on a fresh runner: the xcrun
+  # shim's lookup, or the first run of Xcode's git binary. Two orders, so neither warms the other.
+  probe:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        order: [shim-first, binary-first]
+    steps:
+      - run: |
+          t() { local s=$(perl -MTime::HiRes=time -e 'printf "%.3f", time'); "$@" >/dev/null 2>&1; local e=$(perl -MTime::HiRes=time -e 'printf "%.3f", time'); echo "$(perl -e "printf '%5d', ($e-$s)*1000") ms  $*"; }
+          XGIT="$(xcode-select -p)/usr/bin/git"
+          uptime
+          ls -la "$(getconf DARWIN_USER_TEMP_DIR)" | grep -i xcrun || echo "no xcrun cache in DARWIN_USER_TEMP_DIR yet"
+          if [ "${{ matrix.order }}" = shim-first ]; then
+            t xcrun --find git; t xcrun --find git; t env -i PATH=/usr/bin:/bin /usr/bin/git --version; t "$XGIT" --version
+          else
+            t "$XGIT" --version; t "$XGIT" --version; t xcrun --find git; t env -i PATH=/usr/bin:/bin /usr/bin/git --version
+          fi
+          ls -la "$(getconf DARWIN_USER_TEMP_DIR)" | grep -i xcrun || echo "no xcrun cache in DARWIN_USER_TEMP_DIR"
