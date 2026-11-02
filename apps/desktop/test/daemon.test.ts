@@ -20,6 +20,7 @@ import {
   waitForGroupGone,
   type Session,
 } from './launch';
+import { sendFromComposer } from './composer';
 import { makeTestDir } from './run-root';
 
 // COCKPIT-55: terminals and sessions live in a daemon that outlives the app. The built app runs the
@@ -227,13 +228,11 @@ async function shellPid(page: Page, nth = 0): Promise<number> {
   return Number(new RegExp(`^pid${marker}-(\\d+)$`, 'm').exec(screen)![1]);
 }
 
+// Starts a session outside any project through the composer (COCKPIT-66): "No project", Claude Code and a prompt.
 async function startSession(page: Page): Promise<string> {
-  await page.getByRole('button', { name: 'Start session', exact: true }).click({ timeout: UI_TIMEOUT });
-  await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).click({ timeout: UI_TIMEOUT });
-  const id = await poll(() => /^\/sessions\/([^/]+)$/.exec(new URL(page.url()).pathname)?.[1], Boolean, UI_TIMEOUT);
-  expect(id).toBeTruthy();
+  const id = await sendFromComposer(page, 'none', { prompt: 'start', agent: 'Claude Code' });
   await expectScreen(page, /^ready$/m);
-  return id!;
+  return id;
 }
 
 // The row of a session in the sidebar: whether it shows a dot, and the dot's accessible name.
@@ -626,7 +625,7 @@ describe('daemon: built app, setup states and agent exits after a relaunch', () 
     const { page } = session;
     await page.getByText(versionLabel).waitFor();
 
-    // A workspace and a session in it started as the New workspace dialog does: `cockpit setup`, which fails.
+    // A workspace and a session in it started as the composer does: `cockpit setup`, which fails.
     await stubPicker(session, repo.root);
     await page.evaluate(() => (window as unknown as ApiWindow).api.projects!.add!());
     const created = await page.evaluate(([root, name]) => (window as unknown as ApiWindow).api.workspaces!.create!(root, name, 'main'), [repo.root, 'relaunch-ws'] as const);

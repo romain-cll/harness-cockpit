@@ -30,6 +30,25 @@ import {
   waitForGroupGone,
   type Session,
 } from './launch';
+import {
+  agentSelect,
+  basePopup,
+  baseSelect,
+  chooseBase,
+  detectAgain,
+  itemTexts,
+  openPopup,
+  createButton,
+  messageOf,
+  openComposer,
+  projectSelect,
+  promptBox,
+  searchBranches,
+  sendFromComposer,
+  textOf,
+  useAgent,
+  waitForBase,
+} from './composer';
 import { makeTestDir } from './run-root';
 
 // Launches the app the four ways it runs: the dev server, the built app, the
@@ -246,8 +265,8 @@ async function focusedPane(page: Page): Promise<Pane> {
 }
 
 async function goHome(page: Page) {
-  await page.getByRole('link', { name: 'Home', exact: true }).click({ timeout: UI_TIMEOUT });
-  await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
+  await page.getByRole('link', { name: 'New workspace', exact: true }).click({ timeout: UI_TIMEOUT });
+  await page.getByRole('heading', { name: 'New workspace', exact: true }).waitFor({ timeout: UI_TIMEOUT });
 }
 
 // Ends every shell of the daemon (COCKPIT-55: the shells outlive the page, so a reload shows them
@@ -294,7 +313,7 @@ async function openTerminal(session: Session) {
   await goHome(page);
   await endShells(page);
   await page.reload();
-  await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
+  await page.getByRole('heading', { name: 'New workspace', exact: true }).waitFor({ timeout: UI_TIMEOUT });
   await openShellTab(page, path);
 }
 
@@ -804,46 +823,27 @@ const expectNoNewErrors = async (session: Session, mark: { errors: number; outpu
   expect(written).not.toContain('Error occurred in handler');
 };
 
-// --- New workspace dialog
+// --- New workspace composer (COCKPIT-66; the helpers are in ./composer)
 
-const newWorkspaceDialog = (page: Page, project: TempRepo) =>
-  page.getByRole('dialog', { name: `New workspace in ${project.name}` });
-const nameField = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('textbox', { name: 'Name', exact: true });
-const baseSelect = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('combobox', { name: 'Base', exact: true });
-const createButton = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('button', { name: 'Create', exact: true });
-
-async function openNewWorkspaceDialog(page: Page, project: TempRepo) {
-  await openMenu(page, project.root);
-  await page.getByRole('menuitem', { name: 'New workspace…' }).click({ timeout: UI_TIMEOUT });
-  const dialog = newWorkspaceDialog(page, project);
-  await dialog.waitFor({ timeout: UI_TIMEOUT });
-  return dialog;
-}
-
-// What the Base select shows as its value.
-const selectedBase = async (dialog: ReturnType<Page['locator']>) => (await baseSelect(dialog).innerText()).trim();
-
-// Opens the Base select, reads its options per group ("Local", "Remote"), closes it.
-async function readBaseOptions(page: Page, dialog: ReturnType<Page['locator']>) {
-  await baseSelect(dialog).click({ timeout: UI_TIMEOUT });
-  const listbox = page.getByRole('listbox');
-  await listbox.waitFor({ timeout: UI_TIMEOUT });
+// The groups of the base popup ("Local", "Remote") with their branches, read from its lines.
+function baseGroups(lines: string[]) {
   const groups: Record<string, string[]> = {};
   let current: string | undefined;
-  for (const line of await linesOf(listbox)) {
+  for (const line of lines) {
     if (line === 'Local' || line === 'Remote') groups[(current = line)] = [];
     else if (current) groups[current]!.push(line);
   }
-  await page.keyboard.press('Escape');
-  await listbox.waitFor({ state: 'hidden', timeout: UI_TIMEOUT });
-  expect(await dialog.isVisible(), 'closing the Base select keeps the dialog open').toBe(true);
   return groups;
 }
 
-async function chooseBase(page: Page, dialog: ReturnType<Page['locator']>, base: string) {
-  await baseSelect(dialog).click({ timeout: UI_TIMEOUT });
-  await page.getByRole('option', { name: base, exact: true }).click({ timeout: UI_TIMEOUT });
-  await poll(() => selectedBase(dialog), (value) => value === base, UI_TIMEOUT);
+// Opens the base select, reads its options per group, closes it.
+async function readBaseOptions(page: Page) {
+  await baseSelect(page).click({ timeout: UI_TIMEOUT });
+  await searchBranches(page).waitFor({ timeout: UI_TIMEOUT });
+  const popup = (await basePopup(page))!;
+  await page.keyboard.press('Escape');
+  await searchBranches(page).waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+  return baseGroups(popup.lines);
 }
 
 // --- Delete workspace dialog
@@ -1118,9 +1118,9 @@ describe.each([
   test('shows the home page and the version from the main process', async () => {
     const { page } = session;
     await page.getByText(versionLabel).waitFor();
-    await page.getByRole('heading', { name: 'Home' }).waitFor();
+    await page.getByRole('heading', { name: 'New workspace', exact: true }).waitFor();
     expect(await page.title()).toBe('Cockpit');
-    expect(await page.getByRole('link', { name: 'Home' }).getAttribute('aria-current')).toBe('page');
+    expect(await page.getByRole('link', { name: 'New workspace', exact: true }).getAttribute('aria-current')).toBe('page');
   });
 
   test('keeps Node out of the renderer', async () => {
@@ -1516,16 +1516,13 @@ describe.each([
   // delete. Worktrees the app creates land under the launch's COCKPIT_HOME.
   describe.runIf(full)('workspaces', () => {
     let clone: TempClone;
-    let noDefault: TempRepo;
     const folders: TempRepo[] = [];
-    const loginBranch = 'feature/login';
+    const loginBranch = 'feature-login';
     const enterBranch = 'second-by-enter';
 
     beforeAll(() => {
       clone = makeClone('ws-clone');
-      noDefault = makeRepo('ws-no-default');
-      gitIn(noDefault.root, 'checkout', '--detach');
-      folders.push(clone, clone.upstream, noDefault);
+      folders.push(clone, clone.upstream);
     });
 
     // A failing test must not leave a menu or a dialog that blocks the tests after it.
@@ -1559,7 +1556,7 @@ describe.each([
     const waitListed = (path: string) => poll(() => isListed(path), Boolean, UI_TIMEOUT);
     const waitUnlisted = (path: string) => poll(() => isListed(path), (listed) => !listed, UI_TIMEOUT);
 
-    test('AC1 — the project menu holds "New workspace…" above "Remove from Cockpit", and opens a dialog titled "New workspace in <project>" with an empty, focused Name and a Base select', async () => {
+    test('AC1, COCKPIT-66 AC3 — the project menu holds "New workspace…" above "Remove from Cockpit", and "New workspace…" goes to the composer for that project, with no dialog', async () => {
       const { page } = session;
       await page.getByText(versionLabel).waitFor();
       await addRepository(session, clone);
@@ -1571,24 +1568,12 @@ describe.each([
       expect(items[1]!.split('\n')[0]!.trim()).toBe('Remove from Cockpit');
       await page.getByRole('menuitem', { name: 'New workspace…' }).click({ timeout: UI_TIMEOUT });
 
-      const dialog = newWorkspaceDialog(page, clone);
-      await dialog.waitFor({ timeout: UI_TIMEOUT });
-      const lines = await linesOf(dialog);
-      expect(lines).toContain(`New workspace in ${clone.name}`);
-      expect(lines).toContain('Name');
-      expect(lines).toContain('Base');
-      expect(await nameField(dialog).inputValue()).toBe('');
-      const focused = await poll(
-        () => nameField(dialog).evaluate((element) => element === document.activeElement),
-        Boolean,
-        UI_TIMEOUT,
-      );
-      expect(focused, 'the Name field has the focus').toBe(true);
-      expect(await baseSelect(dialog).count()).toBe(1);
-      await dismissDialogs(page);
+      await poll(() => new URL(page.url()).searchParams.get('project'), (value) => value === clone.root, UI_TIMEOUT);
+      expect(await textOf(projectSelect(page))).toContain(clone.name);
+      expect(await openDialogs(page).count()).toBe(0);
     });
 
-    test('AC2 — the Base select lists local branches under "Local" and origin/* branches under "Remote" (no origin/HEAD), preselects origin/main and runs no fetch', async () => {
+    test('AC2 — the base select lists local branches under "Local" and origin/* branches under "Remote" (no origin/HEAD), preselects origin/main and runs no fetch', async () => {
       const { page } = session;
       // A commit only a fetch would bring in.
       gitIn(clone.upstream.root, 'commit', '--allow-empty', '-m', 'newer on origin');
@@ -1596,57 +1581,19 @@ describe.each([
       const fetchHead = join(clone.root, '.git', 'FETCH_HEAD');
       const fetchHeadBefore = existsSync(fetchHead);
 
-      const dialog = await openNewWorkspaceDialog(page, clone);
-      expect(await poll(() => selectedBase(dialog), (value) => value === 'origin/main', UI_TIMEOUT)).toBe('origin/main');
-      const groups = await readBaseOptions(page, dialog);
+      await openComposer(page, clone.root);
+      await waitForBase(page, 'origin/main');
+      const groups = await readBaseOptions(page);
 
       expect(Object.keys(groups)).toEqual(['Local', 'Remote']);
       expect([...groups.Local!].sort()).toEqual(['local-topic', 'main', 'topic/nested']);
       expect([...groups.Remote!].sort()).toEqual(['origin/develop', 'origin/feature/x', 'origin/main', 'origin/release/1.0']);
-      expect(await selectedBase(dialog)).toBe('origin/main');
+      expect(await textOf(baseSelect(page))).toBe('origin/main');
       expect(gitIn(clone.root, 'rev-parse', 'refs/remotes/origin/main')).toBe(originMain);
       expect(existsSync(fetchHead)).toBe(fetchHeadBefore);
-      await dismissDialogs(page);
     });
 
-    test('AC4 — "Create" is disabled while Name is empty or only whitespace', async () => {
-      const { page } = session;
-      const dialog = await openNewWorkspaceDialog(page, clone);
-      await poll(() => selectedBase(dialog), (value) => value === 'origin/main', UI_TIMEOUT);
-
-      expect(await createButton(dialog).isDisabled()).toBe(true);
-      await nameField(dialog).fill('   ');
-      expect(await createButton(dialog).isDisabled()).toBe(true);
-      await nameField(dialog).fill('\t  \t');
-      expect(await createButton(dialog).isDisabled()).toBe(true);
-      await nameField(dialog).fill('something');
-      expect(await createButton(dialog).isDisabled()).toBe(false);
-      await nameField(dialog).fill('');
-      expect(await createButton(dialog).isDisabled()).toBe(true);
-      await dismissDialogs(page);
-    });
-
-    test('AC3 — without a default base nothing is preselected and "Create" stays disabled until a base is chosen', async () => {
-      const { page } = session;
-      await addRepository(session, noDefault);
-
-      const dialog = await openNewWorkspaceDialog(page, noDefault);
-      const groups = await readBaseOptions(page, dialog);
-      expect(groups.Local).toContain('main');
-      expect(await selectedBase(dialog), 'no base is preselected').not.toBe('main');
-      expect(await selectedBase(dialog)).not.toBe('');
-      await nameField(dialog).fill('some-work');
-      expect(await createButton(dialog).isDisabled()).toBe(true);
-
-      await chooseBase(page, dialog, 'main');
-      expect(await createButton(dialog).isDisabled()).toBe(false);
-      await dismissDialogs(page);
-
-      await removeThroughMenu(page, noDefault.root);
-      await waitForEntries(page, [clone.root]);
-    });
-
-    test('AC5 — "Create" (or Enter in Name) creates the branch from origin/main and the worktree under $COCKPIT_HOME, closes the dialog and lists the workspace; the name is trimmed', async () => {
+    test('AC5 — sending the composer creates the branch (the prompt\'s slug) from origin/main and the worktree under $COCKPIT_HOME, lists the workspace and opens its session page; Enter does the same', async () => {
       const { page } = session;
       const originMain = gitIn(clone.root, 'rev-parse', 'origin/main');
       expect(gitIn(clone.root, 'rev-parse', 'main'), 'local main differs from origin/main').not.toBe(originMain);
@@ -1654,11 +1601,7 @@ describe.each([
       expect(await session.evaluateInMain<string>('process.env.COCKPIT_HOME')).toBe(session.cockpitHome);
       expect(session.cockpitHome.startsWith(`${session.dataDir}/`)).toBe(true);
 
-      const dialog = await openNewWorkspaceDialog(page, clone);
-      await poll(() => selectedBase(dialog), (value) => value === 'origin/main', UI_TIMEOUT);
-      await nameField(dialog).fill(`  ${loginBranch}  `);
-      await createButton(dialog).click({ timeout: UI_TIMEOUT });
-      await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
+      await sendFromComposer(page, clone, { prompt: '  Feature login  ' });
 
       const path = worktreePath(session, clone, loginBranch);
       expect(existsSync(join(path, 'README.md'))).toBe(true);
@@ -1671,12 +1614,8 @@ describe.each([
       expect(row!.text).toContain(loginBranch);
       expect(await isBelowProjectsHeader(page, { title: path })).toBe(true);
 
-      // Enter in the Name field does the same.
-      const second = await openNewWorkspaceDialog(page, clone);
-      await poll(() => selectedBase(second), (value) => value === 'origin/main', UI_TIMEOUT);
-      await nameField(second).fill(enterBranch);
-      await nameField(second).press('Enter');
-      await second.waitFor({ state: 'hidden', timeout: 15_000 });
+      // Enter in the prompt does the same.
+      await sendFromComposer(page, clone, { prompt: 'Second by enter', enter: true });
 
       const secondPath = worktreePath(session, clone, enterBranch);
       expect(existsSync(join(secondPath, 'README.md'))).toBe(true);
@@ -1688,67 +1627,30 @@ describe.each([
       await waitForEntries(page, [clone.root, ...linkedWorktrees(clone).map((worktree) => worktree.path)]);
     });
 
-    test('AC6 — a name that is already a local branch keeps the dialog open with "A branch named <name> already exists." and creates nothing', async () => {
-      const { page } = session;
-      const before = { git: gitState(clone), listing: worktreeListing(clone) };
-
-      const dialog = await openNewWorkspaceDialog(page, clone);
-      await poll(() => selectedBase(dialog), (value) => value === 'origin/main', UI_TIMEOUT);
-      await nameField(dialog).fill(loginBranch);
-      await createButton(dialog).click({ timeout: UI_TIMEOUT });
-      await waitForDialogLine(dialog, (line) => line === `A branch named ${loginBranch} already exists.`);
-      await sleep(300);
-
-      expect(await dialog.isVisible()).toBe(true);
-      expect(gitState(clone)).toEqual(before.git);
-      expect(worktreeListing(clone)).toEqual(before.listing);
-      await dismissDialogs(page);
-    });
-
-    test('AC7 — a name git refuses keeps the dialog open with "<name> is not a valid branch name." and creates nothing', async () => {
-      const { page } = session;
-      const before = { git: gitState(clone), listing: worktreeListing(clone) };
-
-      const dialog = await openNewWorkspaceDialog(page, clone);
-      await poll(() => selectedBase(dialog), (value) => value === 'origin/main', UI_TIMEOUT);
-      for (const name of ['my feature', 'a..b']) {
-        await nameField(dialog).fill(name);
-        await createButton(dialog).click({ timeout: UI_TIMEOUT });
-        await waitForDialogLine(dialog, (line) => line === `${name} is not a valid branch name.`);
-        await sleep(300);
-
-        expect(await dialog.isVisible()).toBe(true);
-        expect(gitState(clone)).toEqual(before.git);
-        expect(worktreeListing(clone)).toEqual(before.listing);
-      }
-      await dismissDialogs(page);
-    });
-
-    test('AC8 — a base deleted after the dialog opened keeps it open with the error message and creates nothing', async () => {
+    test('AC8 — a base deleted after the composer opened shows the error message in the composer and creates nothing', async () => {
       const { page } = session;
       const develop = gitIn(clone.root, 'rev-parse', 'refs/remotes/origin/develop');
       const before = { git: gitState(clone), listing: worktreeListing(clone) };
 
-      const dialog = await openNewWorkspaceDialog(page, clone);
-      await chooseBase(page, dialog, 'origin/develop');
-      await nameField(dialog).fill('orphan-base');
-      const linesBefore = await linesOf(dialog);
+      await openComposer(page, clone.root);
+      await useAgent(page, 'Terminal');
+      await chooseBase(page, 'origin/develop');
+      await promptBox(page).fill('orphan base');
       gitIn(clone.root, 'update-ref', '-d', 'refs/remotes/origin/develop');
       try {
-        await createButton(dialog).click({ timeout: UI_TIMEOUT });
-        // A new line that names the base git could not find.
-        const message = await waitForDialogLine(dialog, (line) => !linesBefore.includes(line) && line.includes('origin/develop'));
-        expect(message.length).toBeGreaterThan(0);
+        await createButton(page).click({ timeout: UI_TIMEOUT });
+        // A message that names the base git could not find.
+        const message = await poll(() => messageOf(page), (found) => found.includes('origin/develop'), UI_TIMEOUT);
+        expect(message).toContain('origin/develop');
         await sleep(300);
 
-        expect(await dialog.isVisible()).toBe(true);
+        expect(new URL(page.url()).pathname).toBe('/');
         expect(localBranches(clone)).not.toContain('orphan-base');
         expect(worktreeListing(clone)).toEqual(before.listing);
       } finally {
         gitIn(clone.root, 'update-ref', 'refs/remotes/origin/develop', develop);
       }
       expect(gitState(clone)).toEqual(before.git);
-      await dismissDialogs(page);
     });
 
     // A workspace added with git itself (on a new branch from origin/main), listed after a reload.
@@ -1984,7 +1886,7 @@ describe.each([
       expect(existsSync(lateReload), 'removing a project deletes no worktree').toBe(true);
     });
 
-    test('AC12, AC8, COCKPIT-65 AC11 — a project whose folder is gone stays listed with a red alert icon after its name, a red "Folder not found" line, its path in muted text and no workspace, logs no error, offers an unusable New workspace dialog and is removed by its "Remove from Cockpit" button', async () => {
+    test('AC12, AC8, COCKPIT-65 AC11 — a project whose folder is gone stays listed with a red alert icon after its name, a red "Folder not found" line, its path in muted text and no workspace, logs no error, offers an unusable composer and is removed by its "Remove from Cockpit" button', async () => {
       const { page } = session;
       await clearProjects();
       const vanishing = makeLightRepo('ws-vanishing');
@@ -2010,13 +1912,12 @@ describe.each([
       expect(missing.pathColor, 'the path is muted').toBe(await mutedColor(page));
       expect(projectsInState(session.dataDir)).toContainEqual({ path: vanishing.root });
 
-      // AC8: listing the branches fails, the dialog says so and "Create" stays disabled.
-      const dialog = await openNewWorkspaceDialog(page, vanishing);
-      const linesNow = await waitForDialogLine(dialog, (found) => found.includes(vanishing.root));
-      expect(linesNow.length).toBeGreaterThan(0);
-      await nameField(dialog).fill('anything');
-      expect(await createButton(dialog).isDisabled()).toBe(true);
-      await dismissDialogs(page);
+      // AC8: listing the branches fails, the composer says so and "Create workspace" stays disabled.
+      await openComposer(page, vanishing.root);
+      await promptBox(page).fill('anything');
+      expect(await poll(() => messageOf(page), Boolean, UI_TIMEOUT)).not.toBe('');
+      expect(await createButton(page).isDisabled()).toBe(true);
+      await goHome(page);
 
       // The button removes it as the "…" menu does: the entry and the state's entry go, the disk is untouched.
       await page.locator('aside').getByRole('button', { name: 'Remove from Cockpit', exact: true }).click({ timeout: UI_TIMEOUT });
@@ -2443,7 +2344,7 @@ describe.each([
       expect(onDisk.hasGit).toBe(true);
     });
 
-    test('smoke path (b), workspace scripts AC19, setup through the CLI AC11 — workspaces: "New workspace…" creates a worktree under COCKPIT_HOME from the preselected base main and lists it, its page opens with a shell tab that runs the setup (no agent); "Delete workspace…" runs `cockpit teardown`, which writes the login-shell PATH and the worktree path, then removes the folder, the worktree, the branch and the row', async () => {
+    test('smoke path (b), workspace scripts AC19, setup through the CLI AC11 — workspaces: the composer with "Terminal" creates a worktree under COCKPIT_HOME from the base main and lists it, its page opens with a shell tab that runs the setup (no agent); "Delete workspace…" runs `cockpit teardown`, which writes the login-shell PATH and the worktree path, then removes the folder, the worktree, the branch and the row', async () => {
       const { page } = session;
       const repo = makeRepo('smoke-workspace');
       folders.push(repo);
@@ -2455,11 +2356,8 @@ describe.each([
       await addRepository(session, repo);
       const path = worktreePath(session, repo, branch);
 
-      const dialog = await openNewWorkspaceDialog(page, repo);
-      await poll(() => selectedBase(dialog), (value) => value === 'main', UI_TIMEOUT);
-      await nameField(dialog).fill(branch);
-      await createButton(dialog).click({ timeout: UI_TIMEOUT });
-      await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
+      // "Terminal" instead of an agent: no real CLI starts (the launchd launch finds the user's own).
+      await sendFromComposer(page, repo, { prompt: 'Smoke ws', base: 'main' });
       await waitForEntries(page, [repo.root, path]);
 
       expect(existsSync(join(path, 'README.md'))).toBe(true);
@@ -2793,7 +2691,7 @@ describe('packaged app state file', () => {
 
   async function expectHomePageWithoutError(session: Session) {
     await session.page.getByText(versionLabel).waitFor();
-    await session.page.getByRole('heading', { name: 'Home' }).waitFor();
+    await session.page.getByRole('heading', { name: 'New workspace', exact: true }).waitFor();
     expect(await consoleErrorsOf(session.page)).toEqual([]);
     expect(await session.page.pageErrors()).toEqual([]);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
@@ -2992,7 +2890,7 @@ describe('built app with no git on the login shell PATH', () => {
     expect(existsSync(join(session.dataDir, 'state.json.tmp'))).toBe(false);
   });
 
-  test('COCKPIT-65 AC10 — an amber alert with a triangle-alert icon sits under the Home link and above the Projects header, and projects.git() answers "missing"', async () => {
+  test('COCKPIT-65 AC10 — an amber alert with a triangle-alert icon sits under the New workspace link and above the Projects header, and projects.git() answers "missing"', async () => {
     const { page } = session;
     await page.getByText(versionLabel).waitFor();
     expect(await projectsGit(page)).toBe('missing');
@@ -3207,15 +3105,10 @@ const waitForSessionEntries = (page: Page, expected: Array<[name: string, ended:
     UI_TIMEOUT,
   );
 
-const START_MENU = 'Start session';
-
 const LOADING_ITEM = 'Detecting agent CLIs…';
 
-// Opens the menu and waits until it lists the harnesses (or says there is none).
-async function openStartMenu(page: Page) {
-  await page.getByRole('button', { name: START_MENU, exact: true }).click({ timeout: UI_TIMEOUT });
-  await page.getByRole('menuitem').filter({ hasNotText: LOADING_ITEM }).first().waitFor({ timeout: UI_TIMEOUT });
-}
+// The prompt the sessions the tests start outside any project are given: the composer needs one.
+const STARTED_PROMPT = 'start';
 
 // The sessions the app stores, read through the page.
 const storedSessions = (page: Page) =>
@@ -3247,12 +3140,12 @@ async function waitForSessionPage(page: Page, previous: string | undefined, page
 
 const storedSessionIds = async (page: Page) => new Set((await storedSessions(page)).map((stored) => stored.id));
 
-// Picks a harness in the "Start session" menu and waits for its session page.
+// Starts a session outside any project through the composer ("No project", `harnessName` as the agent,
+// `STARTED_PROMPT` as the prompt) and waits for its page.
 async function startSession(page: Page, harnessName: string, pageName: string): Promise<string> {
-  const previous = sessionIdOf(page);
-  await openStartMenu(page);
-  await page.getByRole('menuitem', { name: harnessName, exact: true }).click({ timeout: UI_TIMEOUT });
-  return waitForSessionPage(page, previous, pageName);
+  const id = await sendFromComposer(page, 'none', { prompt: STARTED_PROMPT, agent: harnessName });
+  await page.getByRole('heading', { name: pageName, exact: true }).waitFor({ timeout: UI_TIMEOUT });
+  return id;
 }
 
 async function openSessionEntry(page: Page, name: string) {
@@ -3406,19 +3299,6 @@ function expectSetupSpawnedWithDetectedPath(fx: SessionsFixture, cli: string, bi
   expect(lines[0]).not.toMatch(new RegExp(` --then ${binary}( |$)`));
 }
 
-// Whether the deepest element whose text starts with `text` sits below the
-// "Sessions" header of the sidebar.
-const isBelowSessionsHeader = (page: Page, text: string) =>
-  page.evaluate((text) => {
-    const all = [...document.querySelectorAll('aside *')] as HTMLElement[];
-    const deepest = (matches: (element: HTMLElement) => boolean) =>
-      all.filter(matches).filter((element) => !all.some((other) => other !== element && element.contains(other) && matches(other)))[0];
-    const header = deepest((element) => (element.textContent ?? '').trim() === 'Sessions');
-    const found = deepest((element) => (element.textContent ?? '').trim().startsWith(text));
-    if (!header || !found) return false;
-    return found.getBoundingClientRect().top >= header.getBoundingClientRect().bottom - 1;
-  }, text);
-
 // The processes whose parent is `pid`.
 const childPidsOf = (pid: number): number[] =>
   execFileSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8' })
@@ -3441,40 +3321,17 @@ async function expectNoErrors(session: Session) {
 
 // --- Sessions in a workspace (COCKPIT-28) ------------------------------------
 
-const agentSelect = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('combobox', { name: 'Agent', exact: true });
-const promptField = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('textbox', { name: 'Prompt', exact: true });
-
-async function chooseAgent(page: Page, dialog: ReturnType<Page['locator']>, agent: string) {
-  await agentSelect(dialog).click({ timeout: UI_TIMEOUT });
-  await page.getByRole('option', { name: agent, exact: true }).click({ timeout: UI_TIMEOUT });
-  await poll(async () => (await agentSelect(dialog).innerText()).trim(), (value) => value === agent, UI_TIMEOUT);
-}
-
-// Fills the New workspace dialog (base: the preselected one) without clicking "Create".
-async function fillNewWorkspace(
-  page: Page,
-  dialog: ReturnType<Page['locator']>,
-  { name, agent, prompt }: { name: string; agent?: string; prompt?: string },
-) {
-  await poll(() => selectedBase(dialog), (value) => value !== '' && !/select a base/i.test(value), UI_TIMEOUT);
-  await nameField(dialog).fill(name);
-  if (agent) await chooseAgent(page, dialog, agent);
-  if (prompt !== undefined) await promptField(dialog).fill(prompt);
-}
-
-// Creates a workspace with an agent through the dialog and waits for the new session's page.
+// Creates a workspace through the composer with `agent` and `prompt` (the branch is the prompt's slug, which
+// the caller knows) and waits for the new session's page.
 async function createWorkspaceWithAgent(
   page: Page,
   repo: TempRepo,
-  options: { name: string; agent: string; prompt?: string },
+  options: { agent: string; prompt: string },
   pageName: string,
 ): Promise<string> {
-  const known = await storedSessionIds(page);
-  const dialog = await openNewWorkspaceDialog(page, repo);
-  await fillNewWorkspace(page, dialog, options);
-  await createButton(dialog).click({ timeout: UI_TIMEOUT });
-  await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
-  return waitForSessionPage(page, undefined, pageName, known);
+  const id = await sendFromComposer(page, repo, options);
+  await page.getByRole('heading', { name: pageName, exact: true }).waitFor({ timeout: UI_TIMEOUT });
+  return id;
 }
 
 // Puts the pointer over the page's bottom right corner, away from the sidebar's rows.
@@ -3670,14 +3527,13 @@ const workspacesApi = (page: Page, call: 'reveal' | 'open', args: unknown[]) =>
     [call, args] as const,
   );
 
-// Creates a workspace without an agent through the dialog and waits until it is listed.
+// Makes a workspace with git itself (branch `name`, from main, in the folder the app would use) and waits
+// until the sidebar lists it: the tests that use it are about what is done to a workspace, not its creation.
 async function createPlainWorkspace(session: Session, repo: TempRepo, name: string): Promise<string> {
   const { page } = session;
-  const dialog = await openNewWorkspaceDialog(page, repo);
-  await fillNewWorkspace(page, dialog, { name });
-  await createButton(dialog).click({ timeout: UI_TIMEOUT });
-  await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
   const path = worktreePath(session, repo, name);
+  gitIn(repo.root, 'worktree', 'add', '--quiet', '-b', name, path, 'main');
+  await dispatchFocus(page);
   await poll(() => entryTitles(page), (titles) => titles.includes(path), UI_TIMEOUT);
   expect(await entryTitles(page)).toContain(path);
   return path;
@@ -3737,42 +3593,33 @@ describe('sessions: built app', () => {
     }
   });
 
-  test('workspace sessions AC4, AC14 — the New workspace dialog opens with Agent "None" and a disabled Prompt; no --version ran at startup nor on the dialog open', async () => {
+  // The runs of the stubs' `--version` once the detection of the first render and the one "Detect again" ran.
+  let detectedRuns: string[] = [];
+
+  test('COCKPIT-66 AC11 — the first render of the New workspace page detects the harnesses: each stub ran `--version` once, none at startup before it, and the agent select shows the first', async () => {
     const { page } = session;
     await addRepository(session, repo);
+    await openComposer(page, repo.root);
+    await poll(() => textOf(agentSelect(page)), (text) => text === 'Claude Code', 15_000);
 
-    const dialog = await openNewWorkspaceDialog(page, repo);
-    const lines = await linesOf(dialog);
-    expect(lines).toContain('Agent');
-    expect(lines).toContain('Prompt');
-    expect((await agentSelect(dialog).innerText()).trim()).toBe('None');
-    expect(await promptField(dialog).isDisabled()).toBe(true);
-    // Detection waits for the select to open (or a menu): neither the startup nor the dialog
-    // ran anything. The log is cumulative, so this one check covers both.
-    await sleep(500);
-    expect(stubRuns(fx)).toEqual([]);
-    await dismissDialogs(page);
+    expect(versionRuns(fx)).toEqual(['claude --version', 'codex --version']);
+    expect(startRuns(fx)).toEqual([]);
   });
 
-  // Detection runs on this first open and takes about 1 s. A start the page calls while it
-  // runs, then a reload, must start nothing once detection ends: `sessions:start` reads the
-  // page's ending count at its entry (the pending-spawn case is `survive AC8` below).
-  test('workspace sessions AC13, AC12 — the first "Start session" menu open shows one disabled "Detecting agent CLIs…" item; a start called and a reload during detection start nothing, no folder, no stored session and no handler error', async () => {
+  // "Detect again" runs the detection again (each `--version` sleeps 1 s). A start the page calls while
+  // it runs, then a reload, must start nothing once detection ends: `sessions:start` reads the page's
+  // ending count at its entry (the pending-spawn case is `survive AC8` below).
+  test('workspace sessions AC13, AC12, COCKPIT-66 AC14 — while "Detect again" runs the agent select says "Detecting…"; a start called and a reload during detection start nothing, no folder, no stored session and no handler error', async () => {
     const { page } = session;
     expect(await sidebarLines(page)).toContain('Sessions');
     const before = {
       state: stateSnapshot(session.dataDir),
       folders: sessionFoldersIn(session.cockpitHome),
-      runs: stubRuns(fx),
+      starts: startRuns(fx),
     };
-    expect(before.runs).toEqual([]);
 
-    await page.getByRole('button', { name: START_MENU, exact: true }).click({ timeout: UI_TIMEOUT });
-    const items = page.getByRole('menuitem');
-    await items.first().waitFor({ timeout: UI_TIMEOUT });
-    expect(await items.count()).toBe(1);
-    expect((await items.first().innerText()).trim()).toBe(LOADING_ITEM);
-    expect(await items.first().isDisabled()).toBe(true);
+    await detectAgain(page);
+    expect(await poll(() => textOf(agentSelect(page)), (text) => text === 'Detecting…', 2_000)).toBe('Detecting…');
 
     // Detection is running: the start waits for it, and the page is reloaded meanwhile.
     await page.evaluate(() => {
@@ -3783,36 +3630,39 @@ describe('sessions: built app', () => {
     await page.reload();
     await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
 
-    // The end of AC13: the menu lists the harnesses once detection has ended.
-    await openStartMenu(page);
-    expect((await items.allInnerTexts()).map((text) => text.trim())).toEqual(['Claude Code', 'Codex']);
+    // The end of AC13: the agent menu lists the harnesses once detection has ended.
+    await promptBox(page).waitFor({ timeout: UI_TIMEOUT });
+    await poll(() => textOf(agentSelect(page)), (text) => text === 'Claude Code', 15_000);
+    const menu = await openPopup(page, agentSelect(page));
+    expect(await itemTexts(menu)).toEqual(['Claude Code 9.9.9', 'Codex 9.9.9', 'Terminal', 'Detect again']);
     await page.keyboard.press('Escape');
-    await items.first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
 
     // The host answers in order: once it ran a probe shell it has handled a spawn the start would have sent.
     const hostPid = await ptyHostPid(page);
     expect(stubPids(fx)).toEqual([]);
     expect(await poll(() => childPidsOf(hostPid), (children) => children.length === 0, 5_000)).toEqual([]);
-    expect(startRuns(fx)).toEqual([]);
+    expect(startRuns(fx)).toEqual(before.starts);
     expect(sessionFoldersIn(session.cockpitHome)).toEqual(before.folders);
     expect(stateSnapshot(session.dataDir)).toEqual(before.state);
     expect(session.output()).not.toContain('Error occurred in handler');
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+    detectedRuns = versionRuns(fx);
+    expect(detectedRuns).toEqual(['claude --version', 'claude --version', 'codex --version', 'codex --version']);
   });
 
-  test('AC1, workspace sessions AC14 — the menu lists Claude Code then Codex; each --version ran once, and a second open runs none', async () => {
+  test('AC1, workspace sessions AC14, COCKPIT-66 AC12 — the agent menu lists Claude Code then Codex, then Terminal; opening it runs no --version', async () => {
     const { page } = session;
-    expect(versionRuns(fx)).toEqual(['claude --version', 'codex --version']);
+    expect(versionRuns(fx)).toEqual(detectedRuns);
 
-    await openStartMenu(page);
-    expect((await page.getByRole('menuitem').allInnerTexts()).map((text) => text.trim())).toEqual(['Claude Code', 'Codex']);
+    const menu = await openPopup(page, agentSelect(page));
+    expect((await itemTexts(menu)).slice(0, 3)).toEqual(['Claude Code 9.9.9', 'Codex 9.9.9', 'Terminal']);
     await sleep(500);
-    expect(versionRuns(fx)).toEqual(['claude --version', 'codex --version']);
+    expect(versionRuns(fx)).toEqual(detectedRuns);
     await page.keyboard.press('Escape');
-    await page.getByRole('menuitem').first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+    await menu.waitFor({ state: 'detached', timeout: UI_TIMEOUT });
   });
 
-  test('AC3 — picking Claude Code opens its page, runs the stub in a new folder and stores the session', async () => {
+  test('AC3 — sending the composer with no project and Claude Code opens its page, runs the stub in a new folder with the prompt as its argument and stores the session', async () => {
     const { page } = session;
     const id = await startSession(page, 'Claude Code', 'Claude Code 1');
     known.claude1.id = id;
@@ -3821,8 +3671,8 @@ describe('sessions: built app', () => {
     const stub = await readStub(page);
     // The stub prints its physical path (`pwd -P`); the temporary folder may sit behind a symlink.
     expect(stub.cwd).toBe(realpathSync(home));
-    expect(stub.argCount).toBe(0);
-    expect(stub.args).toBe('');
+    expect(stub.argCount).toBe(1);
+    expect(stub.args).toBe(STARTED_PROMPT);
     expect(stub.term).toBe('xterm-256color');
     expect(isAlive(stub.pid)).toBe(true);
     known.claude1.pid = stub.pid;
@@ -3881,8 +3731,8 @@ describe('sessions: built app', () => {
   });
 
   test('workspace sessions AC14 — a session start runs no --version', async () => {
-    expect(versionRuns(fx)).toEqual(['claude --version', 'codex --version']);
-    expect(startRuns(fx)).toContain('claude ');
+    expect(versionRuns(fx)).toEqual(detectedRuns);
+    expect(startRuns(fx)).toContain(`claude ${STARTED_PROMPT}`);
   });
 
   test('AC4 — a line typed in the terminal reaches the harness and its answer shows', async () => {
@@ -4016,13 +3866,11 @@ describe('sessions: built app', () => {
   // A folder named `state.json.tmp` in the data folder makes `saveState` fail
   // after the spawn succeeded, which runs the whole rollback. (A removed stub
   // would not do: node-pty does not throw on a missing executable.)
-  test('AC16 — with a folder named state.json.tmp in the data folder, picking Claude Code is refused under the Sessions header and changes nothing', async () => {
+  test('AC16 — with a folder named state.json.tmp in the data folder, sending the composer with no project is refused in the composer and changes nothing', async () => {
     const { page } = session;
-    // The menu detected the stubs (AC1) and keeps the answer.
-    await openStartMenu(page);
-    expect((await page.getByRole('menuitem').allInnerTexts()).map((text) => text.trim())).toEqual(['Claude Code', 'Codex']);
-    await page.keyboard.press('Escape');
-    await page.getByRole('menuitem').first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+    // The first render detected the stubs and the page keeps the answer.
+    await openComposer(page, 'none');
+    await useAgent(page, 'Claude Code');
 
     // The pty host runs (AC15 killed it, this spawn starts a new one) with no pty of its own.
     const probe = await spawnShell(page);
@@ -4039,12 +3887,12 @@ describe('sessions: built app', () => {
     const blocker = join(session.dataDir, 'state.json.tmp');
     mkdirSync(blocker);
     try {
-      await openStartMenu(page);
-      await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).click({ timeout: UI_TIMEOUT });
+      await promptBox(page).fill(STARTED_PROMPT);
+      await createButton(page).click({ timeout: UI_TIMEOUT });
 
-      const lines = await poll(() => sidebarLines(page), (found) => found.some((line) => line.startsWith('Could not start Claude Code:')), UI_TIMEOUT);
-      expect(lines.some((line) => line.startsWith('Could not start Claude Code:'))).toBe(true);
-      expect(await isBelowSessionsHeader(page, 'Could not start Claude Code:')).toBe(true);
+      const message = await poll(() => messageOf(page), (found) => found.startsWith('Could not start Claude Code:'), UI_TIMEOUT);
+      expect(message.startsWith('Could not start Claude Code:')).toBe(true);
+      expect(new URL(page.url()).pathname).toBe('/');
 
       // The refusal comes after the rollback: the spawned pty is killed, the folder removed, no change in the state.
       expect(isAlive(hostPid)).toBe(true);
@@ -4061,38 +3909,15 @@ describe('sessions: built app', () => {
   // --- Sessions in a workspace (COCKPIT-28). They run in order on this launch, with the
   // repository added above.
 
-  test('workspace sessions AC4 — the Agent select lists None and the detected harnesses; a harness enables Prompt, None disables it again', async () => {
-    const { page } = session;
-    const dialog = await openNewWorkspaceDialog(page, repo);
-
-    await agentSelect(dialog).click({ timeout: UI_TIMEOUT });
-    const options = page.getByRole('option');
-    const listed = await poll(
-      async () => (await options.allInnerTexts()).map((text) => text.trim()),
-      (found) => found.length >= 3,
-      UI_TIMEOUT,
-    );
-    expect(listed).toEqual(['None', 'Claude Code', 'Codex']);
-    await page.keyboard.press('Escape');
-    await options.first().waitFor({ state: 'hidden', timeout: UI_TIMEOUT });
-
-    await chooseAgent(page, dialog, 'Claude Code');
-    expect(await promptField(dialog).isEnabled()).toBe(true);
-    await chooseAgent(page, dialog, 'None');
-    expect(await promptField(dialog).isDisabled()).toBe(true);
-    expect(versionRuns(fx)).toEqual(['claude --version', 'codex --version']);
-    await dismissDialogs(page);
-  });
-
-  test('workspace sessions AC5 — Create with Agent Claude Code and Prompt "fix the tests" creates the worktree, opens the workspace page and runs the harness there with that one argument', async () => {
+  test('workspace sessions AC5 — sending the composer with Claude Code and the prompt "fix the tests" creates the worktree on the branch fix-the-tests, opens the session page and runs the harness there with that one argument', async () => {
     const { page } = session;
     const foldersBefore = sessionFoldersIn(session.cockpitHome);
-    const id = await createWorkspaceWithAgent(page, repo, { name: 'fix-tests', agent: 'Claude Code', prompt: 'fix the tests' }, 'Claude Code 1');
-    const path = worktreePath(session, repo, 'fix-tests');
+    const id = await createWorkspaceWithAgent(page, repo, { agent: 'Claude Code', prompt: 'fix the tests' }, 'Claude Code 1');
+    const path = worktreePath(session, repo, 'fix-the-tests');
     ws.fix = { path, id, pid: 0 };
 
     expect(existsSync(join(path, 'README.md'))).toBe(true);
-    expect(linkedWorktrees(repo)).toContainEqual({ path, branch: 'fix-tests' });
+    expect(linkedWorktrees(repo)).toContainEqual({ path, branch: 'fix-the-tests' });
     const stub = await readStub(page);
     expect(stub.cwd).toBe(path);
     expect(stub.argCount).toBe(1);
@@ -4114,16 +3939,16 @@ describe('sessions: built app', () => {
     expect(sessionFoldersIn(session.cockpitHome)).toEqual(foldersBefore);
   });
 
-  test('workspace sessions AC6 — a Prompt of spaces only runs the harness in the new worktree with no argument', async () => {
+  test('workspace sessions AC6 — a second workspace created through the composer runs its own session, numbered from 1', async () => {
     const { page } = session;
-    const id = await createWorkspaceWithAgent(page, repo, { name: 'blank-prompt', agent: 'Claude Code', prompt: '   ' }, 'Claude Code 1');
-    const path = worktreePath(session, repo, 'blank-prompt');
+    const id = await createWorkspaceWithAgent(page, repo, { agent: 'Claude Code', prompt: 'second ws' }, 'Claude Code 1');
+    const path = worktreePath(session, repo, 'second-ws');
     ws.blank = { path, id, pid: 0 };
 
     const stub = await readStub(page);
     expect(stub.cwd).toBe(path);
-    expect(stub.argCount).toBe(0);
-    expect(stub.args).toBe('');
+    expect(stub.argCount).toBe(1);
+    expect(stub.args).toBe('second ws');
     ws.blank.pid = stub.pid;
     expect(await waitForWorkspaceTabs(page, ['Claude Code 1'])).toEqual(['Claude Code 1']);
   });
@@ -4229,7 +4054,7 @@ describe('sessions: built app', () => {
     expect(namesIn(ws.plus.path)).toEqual(['Claude Code 1', 'Claude Code 2']);
   });
 
-  test('workspace sessions AC7 — a save that fails after the spawn keeps the new workspace and its files, shows "Could not start Claude Code: …" under the Projects header, leaves no harness process and the sessions unchanged', async () => {
+  test('workspace sessions AC7 — a save that fails after the spawn keeps the new workspace and its files, shows "Could not start Claude Code: …" in the composer, leaves no harness process and the sessions unchanged', async () => {
     const { page } = session;
     const before = {
       state: stateSnapshot(session.dataDir),
@@ -4240,10 +4065,11 @@ describe('sessions: built app', () => {
     const blocker = join(session.dataDir, 'state.json.tmp');
     mkdirSync(blocker);
     try {
-      const dialog = await openNewWorkspaceDialog(page, repo);
-      await fillNewWorkspace(page, dialog, { name: 'save-fails', agent: 'Claude Code' });
-      await createButton(dialog).click({ timeout: UI_TIMEOUT });
-      await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
+      await openComposer(page, repo.root);
+      await useAgent(page, 'Claude Code');
+      await poll(() => textOf(baseSelect(page)), (text) => text !== '' && text !== 'Select a base', UI_TIMEOUT);
+      await promptBox(page).fill('save fails');
+      await createButton(page).click({ timeout: UI_TIMEOUT });
 
       const path = worktreePath(session, repo, 'save-fails');
       await poll(() => entryTitles(page), (titles) => titles.includes(path), UI_TIMEOUT);
@@ -4251,13 +4077,12 @@ describe('sessions: built app', () => {
       expect(existsSync(join(path, 'README.md'))).toBe(true);
       expect(linkedWorktrees(repo)).toContainEqual({ path, branch: 'save-fails' });
 
-      const lines = await poll(() => sidebarLines(page), (found) => found.some((line) => line.startsWith('Could not start Claude Code:')), UI_TIMEOUT);
-      const message = lines.find((line) => line.startsWith('Could not start Claude Code:'))!;
-      expect(message).toBeTruthy();
+      const message = await poll(() => messageOf(page), (found) => found.startsWith('Could not start Claude Code:'), UI_TIMEOUT);
+      expect(message.startsWith('Could not start Claude Code:')).toBe(true);
       // Only a save after a successful spawn raises it.
       expect(message).toContain('EISDIR');
-      expect(await isBelowProjectsHeader(page, { text: message })).toBe(true);
-      expect(await isBelowSessionsHeader(page, message)).toBe(false);
+      expect(new URL(page.url()).pathname).toBe('/');
+      expect(await promptBox(page).inputValue()).toBe('save fails');
 
       // The harness was spawned (the message carries the save error), then killed by the rollback.
       expect(await poll(() => stubPids(fx), (pids) => JSON.stringify(pids) === JSON.stringify(before.pids), 5_000)).toEqual(before.pids);
@@ -4357,10 +4182,10 @@ describe('sessions: built app', () => {
     const sessionsBefore = sessionsInState(session.dataDir);
 
     await startDeletion(page, ws.fix.path);
-    const dialog = deleteDialog(page, 'Delete fix-tests?');
+    const dialog = deleteDialog(page, 'Delete fix-the-tests?');
     await dialog.waitFor({ timeout: UI_TIMEOUT });
     await dialog.getByRole('button', { name: 'Delete', exact: true }).click({ timeout: UI_TIMEOUT });
-    const warning = deleteDialog(page, 'fix-tests has uncommitted changes');
+    const warning = deleteDialog(page, 'fix-the-tests has uncommitted changes');
     await warning.waitFor({ timeout: UI_TIMEOUT });
     await sleep(500);
     expect(isAlive(ws.fix.pid), 'the harness runs while the warning is shown').toBe(true);
@@ -4668,7 +4493,7 @@ describe('sessions: built app', () => {
     await openWorkspaceMenu(page, launcher.path, menu);
   });
 
-  // --- Setup through the CLI (COCKPIT-57). The New workspace dialog with an agent starts the session
+  // --- Setup through the CLI (COCKPIT-57). The composer with an agent starts the session
   // as `cockpit setup --shell --then <agent>` in the one terminal of its page. The stub `claude` logs
   // every run in `fx.runLog`, and `mark.sh <text>` appends a line to the same log, so the order of a
   // setup's last command and the stub's start shows in it. The login shell is interactive for these
@@ -4677,15 +4502,15 @@ describe('sessions: built app', () => {
 
   const storedIn = (directory: string) => sessionsInState(session.dataDir).filter((entry) => entry.directory === directory);
 
-  // Creates a workspace with Claude Code and a prompt through the dialog; resolves with its path and
-  // with the id of the session whose page opened.
-  async function createWorkspaceWithSetup(name: string, prompt: string): Promise<{ path: string; id: string }> {
+  // Creates a workspace with Claude Code and a prompt through the composer (the branch `name` is the prompt's
+  // slug: the prompt is `name` unless given); resolves with its path and with the id of the session whose page opened.
+  async function createWorkspaceWithSetup(name: string, prompt = name): Promise<{ path: string; id: string }> {
     const { page } = session;
     writeScripts(repo, {
       'mark.sh': `echo "$1" >> '${fx.runLog}'\n`,
       'check.sh': 'test -f "$COCKPIT_ROOT_PATH/$1" || exit 6\n',
     });
-    const id = await createWorkspaceWithAgent(page, repo, { name, agent: 'Claude Code', prompt }, 'Claude Code 1');
+    const id = await createWorkspaceWithAgent(page, repo, { agent: 'Claude Code', prompt }, 'Claude Code 1');
     return { path: worktreePath(session, repo, name), id };
   }
 
@@ -4706,10 +4531,10 @@ describe('sessions: built app', () => {
       writeConfig(repo, { setup: [record, wait, mark] });
       const before = { pids: stubPids(fx), runs: startRuns(fx) };
 
-      const { path, id } = await createWorkspaceWithSetup('setup-cli', prompt);
+      const { path, id } = await createWorkspaceWithSetup('say-hi-home-100-q', prompt);
 
       await waitForRow(page, `$ ${wait}`);
-      const header = 'cockpit setup · setup-cli · .cockpit/config.json';
+      const header = 'cockpit setup · say-hi-home-100-q · .cockpit/config.json';
       const rows = await terminalRows(page);
       expect(rows.indexOf(header)).toBeGreaterThanOrEqual(0);
       expect(rows.indexOf(header)).toBeLessThan(rows.indexOf(`$ ${record}`));
@@ -4724,7 +4549,7 @@ describe('sessions: built app', () => {
       expect(await workspaceTabs(page)).toEqual(['Claude Code 1']);
       // The environment the first command saw, and no agent yet.
       const [env] = await poll(() => readRecords(repo, 'setup-env.txt'), (found) => found.length > 0, UI_TIMEOUT);
-      expect(env).toMatchObject({ root: repo.root, ws: path, name: 'setup-cli', pwd: path });
+      expect(env).toMatchObject({ root: repo.root, ws: path, name: 'say-hi-home-100-q', pwd: path });
       await startedWaiter(repo, 'go-s1');
       expect(stubPids(fx)).toEqual(before.pids);
       expect(startRuns(fx)).toEqual(before.runs);
@@ -4755,7 +4580,7 @@ describe('sessions: built app', () => {
       writeConfig(repo, { setup: [count, check, 'echo after-failure'] });
       const before = { pids: stubPids(fx), runs: startRuns(fx) };
 
-      const { path, id } = await createWorkspaceWithSetup('setup-fails', 'p2');
+      const { path, id } = await createWorkspaceWithSetup('setup-fails');
 
       await waitForRow(page, `✗ Setup failed: ${check} exited with code 6`);
       await waitForRow(page, 'Claude Code was not started. Run `cockpit setup --then claude` to try again.');
@@ -4809,11 +4634,11 @@ describe('sessions: built app', () => {
       await removeAllWorkspaces();
       rmSync(join(repo.root, '.cockpit'), { recursive: true, force: true });
 
-      const { path, id } = await createWorkspaceWithSetup('agent-exit', 'p3');
+      const { path, id } = await createWorkspaceWithSetup('agent-exit');
 
       const stub = await readStub(page);
       expect(stub.cwd).toBe(path);
-      expect(stub.args).toBe('p3');
+      expect(stub.args).toBe('agent-exit');
       expect((await terminalRows(page)).some((row) => row.startsWith('cockpit setup'))).toBe(false);
       expect(await setupLabel(page, path)).toBeNull();
       await expectDot(page, id, null);
@@ -4900,7 +4725,7 @@ describe('sessions: built app', () => {
       writeFileSync(ignoring, '');
       let tree: number[] = [];
       try {
-        const { path } = await createWorkspaceWithSetup('kill-agent', 'p14');
+        const { path } = await createWorkspaceWithSetup('kill-agent');
         const stub = await readStub(page);
         const above = cliTreeAbove(stub.pid);
         const cli = above.cli;
@@ -4937,7 +4762,7 @@ describe('sessions: built app', () => {
       writeFileSync(ignoring, '');
       let tree: number[] = [];
       try {
-        const { path } = await createWorkspaceWithSetup('kill-shell', 'p14b');
+        const { path } = await createWorkspaceWithSetup('kill-shell');
         await waitForRow(page, '✗ Setup failed: exit 7 exited with code 7');
         await waitForRow(page, loginPrompt);
         await focusTerminal(page);
@@ -5684,10 +5509,10 @@ describe('changes sidebar: built app', () => {
     session = await launchBuiltWith({ ...fx.env(), ...GIT_APP_ENV });
     await session.page.getByText(versionLabel).waitFor();
     await addRepository(session, repo);
-    // Two workspaces with a running session each (created through the New workspace dialog, which records the base).
-    A.id = await createWorkspaceWithAgent(session.page, repo, { name: 'ws-a', agent: 'Claude Code' }, 'Claude Code 1');
+    // Two workspaces with a running session each (created through the composer, which records the base).
+    A.id = await createWorkspaceWithAgent(session.page, repo, { agent: 'Claude Code', prompt: 'ws-a' }, 'Claude Code 1');
     A.path = worktreePath(session, repo, 'ws-a');
-    B.id = await createWorkspaceWithAgent(session.page, repo, { name: 'ws-b', agent: 'Claude Code' }, 'Claude Code 1');
+    B.id = await createWorkspaceWithAgent(session.page, repo, { agent: 'Claude Code', prompt: 'ws-b' }, 'Claude Code 1');
     B.path = worktreePath(session, repo, 'ws-b');
     writeChanges(A.path);
   });
@@ -6345,7 +6170,7 @@ describe('changes sidebar: built app', () => {
       origin = addOrigin(ship);
       await addRepository(session, ship);
       for (const [workspace, name] of [[W1, 'ship-pr'], [W2, 'ship-flow'], [W3, 'ship-reject'], [W4, 'ship-outside']] as const) {
-        workspace.id = await createWorkspaceWithAgent(session.page, ship, { name, agent: 'Claude Code' }, 'Claude Code 1');
+        workspace.id = await createWorkspaceWithAgent(session.page, ship, { agent: 'Claude Code', prompt: name }, 'Claude Code 1');
         workspace.path = worktreePath(session, ship, name);
       }
       setGh(gh);
@@ -7054,8 +6879,9 @@ describe('session status: built app', () => {
     const expected = (id: 'claude-code' | 'codex' | 'opencode') => statusLaunch(id, { cli: REPOSITORY_CLI, pluginsDir: expectedPlugins, env: {} });
 
     const claude = readLaunch(fx, 'claude', known.claude.pid);
-    expect(claude.args.length).toBe(2);
-    expect(claude.args).toEqual((await expected('claude-code')).args);
+    // The status arguments first, then the prompt the composer was given.
+    expect(claude.args.length).toBe(3);
+    expect(claude.args).toEqual([...(await expected('claude-code')).args, STARTED_PROMPT]);
     expect(claude.openCodeConfig).toBe('unset');
     // COCKPIT-56 AC7: the hooks name the compiled CLI of the repository, which exists, and no curl.
     accessSync(REPOSITORY_CLI, constants.X_OK);
@@ -7065,11 +6891,11 @@ describe('session status: built app', () => {
 
     const codex = readLaunch(fx, 'codex', known.codex.pid);
     expect(codex.args.slice(0, 2)).toEqual(['--no-daemon', '-c']);
-    expect(codex.args).toEqual((await expected('codex')).args);
+    expect(codex.args).toEqual([...(await expected('codex')).args, STARTED_PROMPT]);
 
     const opencode = readLaunch(fx, 'opencode', known.opencode.pid);
     const folder = join(session.cockpitHome, 'plugins', 'opencode-status');
-    expect(opencode.args).toEqual(['--standalone']);
+    expect(opencode.args).toEqual(['--standalone', '--prompt', STARTED_PROMPT]);
     expect(JSON.parse(opencode.openCodeConfig)).toEqual({ plugins: [folder] });
     // The plugin the app wrote is the one statusLaunch writes for the same commands.
     const written = readFileSync(join(folder, 'server.js'), 'utf8');
@@ -7215,6 +7041,9 @@ describe('session status: built app', () => {
   test('AC13 — a harness whose binary was removed after detection is refused under the Sessions header: "Could not start Claude Code: <path> not found.", no folder, nothing spawned, state.json unchanged', async () => {
     const { page } = session;
     const binary = join(fx.bin, 'claude');
+    // A full page load resets the live store (the dots), so the entries are read after one, as the
+    // refused start's own page load will leave them.
+    await openComposer(page, 'none');
     // The menu detected the stubs at the first start and keeps the answer.
     const before = {
       state: stateSnapshot(session.dataDir),
@@ -7226,14 +7055,14 @@ describe('session status: built app', () => {
 
     renameSync(binary, `${binary}.gone`);
     try {
-      await openStartMenu(page);
-      expect((await page.getByRole('menuitem').allInnerTexts()).map((text) => text.trim())).toContain('Claude Code');
-      await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).click({ timeout: UI_TIMEOUT });
+      await openComposer(page, 'none');
+      await useAgent(page, 'Claude Code');
+      await promptBox(page).fill(STARTED_PROMPT);
+      await createButton(page).click({ timeout: UI_TIMEOUT });
 
       const message = `Could not start Claude Code: ${binary} not found.`;
-      const lines = await waitForLine(page, message);
-      expect(lines).toContain(message);
-      expect(await isBelowSessionsHeader(page, message)).toBe(true);
+      expect(await poll(() => messageOf(page), (found) => found === message, UI_TIMEOUT)).toBe(message);
+      expect(new URL(page.url()).pathname).toBe('/');
       expect(sessionFoldersIn(session.cockpitHome)).toEqual(before.folders);
       expect(startRuns(fx)).toEqual(before.runs);
       expect(launchFiles(fx)).toEqual(before.launches);
@@ -7498,7 +7327,7 @@ describe('redesign foundation: built app', () => {
     ).toEqual({ x: 14, y: 16 });
   });
 
-  test('COCKPIT-65 AC4 — the sidebar is 220 px wide: a 28 px top strip 8 px from the top with "Hide sidebar" at its right, then Home, Projects, Sessions and the muted version line at the bottom', async () => {
+  test('COCKPIT-65 AC4 — the sidebar is 220 px wide: a 28 px top strip 8 px from the top with "Hide sidebar" at its right, then New workspace, Projects, Sessions and the muted version line at the bottom', async () => {
     const { page } = session;
     await goHome(page);
     const box = async (locator: ReturnType<Page['locator']>) => (await locator.boundingBox())!;
@@ -7523,13 +7352,13 @@ describe('redesign foundation: built app', () => {
 
     const tops = {
       hide: hideBox.y,
-      home: (await box(page.locator('aside').getByRole('link', { name: 'Home', exact: true }))).y,
+      newWorkspace: (await box(page.locator('aside').getByRole('link', { name: 'New workspace', exact: true }))).y,
       projects: (await box(page.getByRole('button', { name: 'Projects', exact: true }))).y,
       sessions: (await box(page.getByRole('button', { name: 'Sessions', exact: true }))).y,
       version: (await box(page.locator('aside').getByText(versionLabel))).y,
     };
     const order = Object.entries(tops).sort(([, a], [, b]) => a - b).map(([name]) => name);
-    expect(order).toEqual(['hide', 'home', 'projects', 'sessions', 'version']);
+    expect(order).toEqual(['hide', 'newWorkspace', 'projects', 'sessions', 'version']);
 
     const version = page.locator('aside').getByText(versionLabel);
     const versionBox = await box(version);
@@ -7579,7 +7408,7 @@ describe('redesign foundation: built app', () => {
     expect(showBox.y + showBox.height / 2, 'centred on the 22 px line').toBeCloseTo(22, 0);
     expect(showBox.x, 'right of the traffic lights').toBeGreaterThanOrEqual(72);
     expect(await page.locator('main').getByRole('button', { name: 'Show sidebar', exact: true }).count(), 'in the main area').toBe(1);
-    const heading = (await page.getByRole('heading', { name: 'Home' }).boundingBox())!;
+    const heading = (await page.getByRole('heading', { name: 'New workspace', exact: true }).boundingBox())!;
     expect(heading.x, 'the page content starts right of the button').toBeGreaterThanOrEqual(showBox.x + showBox.width - 1);
     const shell = await shellOf(page);
     expect([shell.headerTop, shell.headerHeight]).toEqual([8, 28]);
@@ -7641,7 +7470,7 @@ describe('redesign foundation: built app', () => {
     expect(await badgeOf(page, bravo.root, bravo.name)).toEqual(badges.bravo);
   });
 
-  test('COCKPIT-65 AC7 — the "Projects" and "Sessions" header buttons hide and show their list, their "+" button and message lines stay, and a reload shows both lists', async () => {
+  test('COCKPIT-65 AC7 — the "Projects" and "Sessions" header buttons hide and show their list, their "+" button and the Projects message line stay, and a reload shows both lists', async () => {
     const { page } = session;
     const projects = page.getByRole('button', { name: 'Projects', exact: true });
     const sessions = page.getByRole('button', { name: 'Sessions', exact: true });
@@ -7650,20 +7479,10 @@ describe('redesign foundation: built app', () => {
     expect(await sessions.getAttribute('aria-expanded')).toBe('true');
     expect(await projects.locator('svg').count(), 'a caret').toBeGreaterThan(0);
 
-    // A message line under each header.
+    // A message line under the Projects header.
     const refusal = `${plain.root} is not in a git repository.`;
     await addProject(session, plain.root);
     await waitForLine(page, refusal);
-    const binary = join(fx.bin, 'claude');
-    const startFailure = `Could not start Claude Code: ${binary} not found.`;
-    renameSync(binary, `${binary}.gone`);
-    try {
-      await openStartMenu(page);
-      await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).click({ timeout: UI_TIMEOUT });
-      await waitForLine(page, startFailure);
-    } finally {
-      renameSync(`${binary}.gone`, binary);
-    }
 
     await projects.click({ timeout: UI_TIMEOUT });
     expect(await projects.getAttribute('aria-expanded')).toBe('false');
@@ -7681,7 +7500,6 @@ describe('redesign foundation: built app', () => {
     expect(await sessions.getAttribute('aria-expanded')).toBe('false');
     expect(await topSession.isVisible()).toBe(false);
     expect(await page.getByRole('button', { name: 'Start session', exact: true }).isVisible()).toBe(true);
-    expect(await sidebarLines(page), 'the message stays').toContain(startFailure);
     await sessions.click({ timeout: UI_TIMEOUT });
     expect(await sessions.getAttribute('aria-expanded')).toBe('true');
     expect(await topSession.isVisible()).toBe(true);
@@ -7773,11 +7591,11 @@ describe('sessions smoke path: dev server', () => {
     try {
       writeConfig(repo, { setup: ['echo smoke-setup'] });
       await addRepository(session, repo);
-      const id = await createWorkspaceWithAgent(page, repo, { name: 'smoke-agent', agent: 'Claude Code', prompt: 'fix the tests' }, 'Claude Code 1');
-      const path = worktreePath(session, repo, 'smoke-agent');
+      const id = await createWorkspaceWithAgent(page, repo, { agent: 'Claude Code', prompt: 'fix the tests' }, 'Claude Code 1');
+      const path = worktreePath(session, repo, 'fix-the-tests');
 
       // COCKPIT-57: `apps/cli/dist/cockpit setup` ran the setup in the terminal, then the stub.
-      await expectSetupThenAgent(page, 'smoke-agent', 'echo smoke-setup', 'smoke-setup');
+      await expectSetupThenAgent(page, 'fix-the-tests', 'echo smoke-setup', 'smoke-setup');
       const stub = await readStub(page);
       expect(stub.cwd).toBe(path);
       expect(stub.argCount).toBe(1);
@@ -7789,7 +7607,7 @@ describe('sessions smoke path: dev server', () => {
       // Changes sidebar (COCKPIT-34 AC16): a file written in the worktree shows with its diff.
       await expectChangesShowNewFile(page, path);
       // Ship section (COCKPIT-38): the stub's pull request shows, then a commit and a push reach origin.
-      await expectShipSmoke(page, gh, path, origin, 'smoke-agent');
+      await expectShipSmoke(page, gh, path, origin, 'fix-the-tests');
     } finally {
       rmSync(repo.parent, { recursive: true, force: true });
     }
@@ -7835,19 +7653,24 @@ describe('built app without any agent CLI on the login shell PATH', () => {
     if (dataDir) rmSync(dataDir, { recursive: true, force: true });
   });
 
-  test('AC2 — the "Start session" menu shows one disabled item "No agent CLI found"', async () => {
+  test('AC2, COCKPIT-66 AC13 — with no agent CLI the New workspace page\'s agent select shows "Terminal", its menu a disabled "No agent CLI found" item with the install hint above "Terminal", and no session starts', async () => {
     const { page } = session;
     const before = stateSnapshot(session.dataDir);
 
-    await openStartMenu(page);
+    await poll(() => textOf(agentSelect(page)), (text) => text === 'Terminal', 15_000);
+    const menu = await openPopup(page, agentSelect(page));
 
-    const items = page.getByRole('menuitem');
-    expect(await items.count()).toBe(1);
-    expect((await items.first().innerText()).trim()).toBe('No agent CLI found');
-    expect(await items.first().isDisabled()).toBe(true);
+    expect(await itemTexts(menu)).toEqual([
+      'No agent CLI found Install Claude Code, Codex or OpenCode, then detect again. Until then, the workspace opens with a terminal.',
+      'Terminal',
+      'Detect again',
+    ]);
+    const missing = menu.locator('[role^="menuitem"]').first();
+    expect(await missing.evaluate((item) => item.getAttribute('aria-disabled') === 'true' || item.hasAttribute('data-disabled'))).toBe(true);
 
-    await items.first().click({ force: true, timeout: UI_TIMEOUT }).catch(() => {});
+    await missing.click({ force: true, timeout: UI_TIMEOUT }).catch(() => {});
     await sleep(300);
+    await page.keyboard.press('Escape');
     expect(await sessionEntries(page)).toEqual([]);
     expect(sessionIdOf(page)).toBeUndefined();
     expect(stateSnapshot(session.dataDir)).toEqual(before);
@@ -8133,7 +7956,7 @@ describe('single instance: built app', () => {
     try {
       for (const other of [one, two]) {
         await other.page.getByText(versionLabel).waitFor();
-        await other.page.getByRole('heading', { name: 'Home' }).waitFor();
+        await other.page.getByRole('heading', { name: 'New workspace', exact: true }).waitFor();
         expect(other.output()).not.toContain("Cockpit's background service could not start");
         expect(other.output()).not.toMatch(MAIN_PROCESS_ERROR);
       }
@@ -8279,10 +8102,10 @@ describe('packaged app sessions after a restart', () => {
       // Workspace sessions smoke path: a new workspace with Claude Code and a prompt.
       writeConfig(repo, { setup: ['echo smoke-setup'] });
       await addRepository(first, repo);
-      const wsId = await createWorkspaceWithAgent(first.page, repo, { name: 'smoke-agent', agent: 'Claude Code', prompt: 'fix the tests' }, 'Claude Code 1');
-      const wsPath = worktreePath(first, repo, 'smoke-agent');
+      const wsId = await createWorkspaceWithAgent(first.page, repo, { agent: 'Claude Code', prompt: 'fix the tests' }, 'Claude Code 1');
+      const wsPath = worktreePath(first, repo, 'fix-the-tests');
       // COCKPIT-57: the bundle's `Contents/Resources/bin/cockpit setup` ran the setup, then the stub.
-      await expectSetupThenAgent(first.page, 'smoke-agent', 'echo smoke-setup', 'smoke-setup');
+      await expectSetupThenAgent(first.page, 'fix-the-tests', 'echo smoke-setup', 'smoke-setup');
       const wsStub = await readStub(first.page);
       expect(wsStub.cwd).toBe(wsPath);
       expect(wsStub.argCount).toBe(1);
@@ -8301,7 +8124,7 @@ describe('packaged app sessions after a restart', () => {
       // Changes sidebar smoke path (COCKPIT-34 AC16): a file written in the worktree shows with its diff.
       await expectChangesShowNewFile(first.page, wsPath);
       // Ship section smoke path (COCKPIT-38): the stub's pull request shows, then a commit and a push reach origin.
-      await expectShipSmoke(first.page, gh, wsPath, origin, 'smoke-agent');
+      await expectShipSmoke(first.page, gh, wsPath, origin, 'fix-the-tests');
       await expectNoErrors(first);
     } finally {
       await first.close();
