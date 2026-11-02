@@ -97,9 +97,11 @@ const localBranches = (repo: Repo) => git(repo.root, 'for-each-ref', '--format=%
 
 // The stub agent: logs every `--version` run, waits while `<stub>.gate` exists, prints `9.9.9` (nothing
 // with `<stub>.noversion`), and as a session logs its working directory and arguments (what the status
-// feature adds before them is set aside), prints the idle title, then one title per line of `<stub>.titles`
-// and creates `<stub>.titles-done`, and echoes what it reads until `exit`. It never pauses: `cockpit setup`'s
-// markers order its titles against anything printed before it started.
+// feature adds before them is set aside), prints the idle title, then one title per line of
+// `<stub>.titles.<folder>` and creates `<stub>.titles.<folder>.done`, `<folder>` being the name of its working
+// directory, and echoes what it reads until `exit`. It never pauses: `cockpit setup`'s markers order its titles
+// against anything printed before it started. The titles are per folder because a session's agent may start
+// after its test ended: it must not print the titles the next test meant for its own session.
 function stubScript(runLog: string) {
   return `#!/bin/sh
 if [ "$1" = "--version" ]; then
@@ -116,9 +118,10 @@ esac
 { echo "---"; echo "cwd=$(pwd -P)"; for a in "$@"; do echo "arg=$a"; done; } >> "$0.starts"
 printf '\\033]0;✳ Claude Code\\007'
 echo ready
-if [ -e "$0.titles" ]; then
-  while IFS= read -r title; do printf '\\033]0;%s\\007' "$title"; done < "$0.titles"
-  touch "$0.titles-done"
+titles="$0.titles.$(basename "$(pwd -P)")"
+if [ -e "$titles" ]; then
+  while IFS= read -r title; do printf '\\033]0;%s\\007' "$title"; done < "$titles"
+  touch "$titles.done"
 fi
 while IFS= read -r line; do
   [ "$line" = exit ] && exit 3
@@ -888,6 +891,9 @@ describe('new workspace page: built app', () => {
 
   // --- The workspace name from the agent's title ----------------------------------------------------
 
+  // The titles the stub prints in the worktree folder `folder` (the prompt's slug: a rename never moves it).
+  const titlesFor = (folder: string) => join(fx.bin, `claude.titles.${folder}`);
+
   // The main process has read every title the daemon sent so far: its `projects:list` runs on the per-repository
   // chain a rename would be queued on. Used after the stubs' last title, before asserting that nothing was renamed.
   const settleMain = (page: Page) =>
@@ -895,10 +901,9 @@ describe('new workspace page: built app', () => {
 
   test('AC21, AC22, AC23 — the first prompt-derived title renames the branch to its slug, sets cockpitName, keeps cockpitBase, leaves the folder and shows the name on the sidebar row within 5 s; the idle title and a second title change nothing; a session started from the workspace row renames nothing', async () => {
     const { page } = session;
-    const stub = join(fx.bin, 'claude');
-    writeFileSync(`${stub}.titles`, '✳ Fix the login redirect loop\n✳ Something else entirely\n');
-    rmSync(`${stub}.titles-done`, { force: true });
     const first = 'please-fix-the-login-redirect-loop';
+    const titles = titlesFor(first);
+    writeFileSync(titles, '✳ Fix the login redirect loop\n✳ Something else entirely\n');
     const renamed = 'fix-the-login-redirect-loop';
     const path = worktreeOf(clone, first);
 
@@ -923,7 +928,7 @@ describe('new workspace page: built app', () => {
     expect(await entryOf(page, path).getAttribute('title')).toBe(path);
 
     // A second prompt-derived title changes nothing.
-    await poll(() => existsSync(`${stub}.titles-done`), Boolean, 15_000);
+    await poll(() => existsSync(`${titles}.done`), Boolean, 15_000);
     await settleMain(page);
     expect(localBranches(clone)).toContain(renamed);
     expect(localBranches(clone)).not.toContain('something-else-entirely');
@@ -931,8 +936,8 @@ describe('new workspace page: built app', () => {
     expect(await entryOf(page, path).innerText()).toContain('Fix the login redirect loop');
 
     // A session started from the workspace row (no `nameFromTitle`) renames nothing, whatever its title.
-    writeFileSync(`${stub}.titles`, '✳ Started from the row\n');
-    rmSync(`${stub}.titles-done`, { force: true });
+    writeFileSync(titles, '✳ Started from the row\n');
+    rmSync(`${titles}.done`);
     const started = await page.evaluate(
       ([project, workspace]) =>
         (globalThis as unknown as { api: { sessions: { start(harness: string, size: object, options: object): Promise<{ status: string }> } } }).api.sessions.start(
@@ -943,7 +948,7 @@ describe('new workspace page: built app', () => {
       [clone.root, path] as const,
     );
     expect(started.status).toBe('started');
-    await poll(() => existsSync(`${stub}.titles-done`), Boolean, 15_000);
+    await poll(() => existsSync(`${titles}.done`), Boolean, 15_000);
     await settleMain(page);
     expect(localBranches(clone)).toContain(renamed);
     expect(localBranches(clone)).not.toContain('started-from-the-row');
@@ -966,9 +971,8 @@ describe('new workspace page: built app', () => {
 
   test('AC23 — a title printed by a setup command, before the agent started, never names the workspace: the stub\'s title does', async () => {
     const { page } = session;
-    const stub = join(fx.bin, 'claude');
-    writeFileSync(`${stub}.titles`, '✳ Fix the login redirect loop\n');
     const placeholder = 'title-during-the-setup';
+    writeFileSync(titlesFor(placeholder), '✳ Fix the login redirect loop\n');
     const renamed = 'fix-the-login-redirect-loop';
     const config = join(refuse.root, '.cockpit');
     mkdirSync(config, { recursive: true });
@@ -985,7 +989,6 @@ describe('new workspace page: built app', () => {
       await poll(() => localBranches(refuse), (branches) => branches.includes(renamed), 15_000);
     } finally {
       rmSync(config, { recursive: true, force: true });
-      rmSync(`${stub}.titles`, { force: true });
     }
 
     expect(localBranches(refuse)).not.toContain('setup-title');
