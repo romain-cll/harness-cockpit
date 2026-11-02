@@ -1,8 +1,12 @@
 import { spawn, spawnSync } from 'node:child_process';
+import { appendFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import { harnesses } from '@cockpit/harnesses';
 import { readWorkspaceConfig, shellInvocation } from '@cockpit/workspaces';
 import type { SetupEventName } from './protocol';
+
+// COCKPIT-80 diagnosis (throwaway): timestamped trace when CK80_TRACE names a file.
+export const ck80 = (line: string) => { const file = process.env.CK80_TRACE; if (file) try { appendFileSync(file, `${Date.now()} [${process.pid}] ${line}\n`); } catch {} };
 
 /** What `cockpit setup` tells the daemon: a setup event, then the agent's exit (`null` for a signal). */
 export type SetupReport = { event: SetupEventName } | { event: 'exited'; exitCode: number | null };
@@ -43,10 +47,16 @@ interface Outcome {
 
 /** Runs a process attached to this terminal and waits for it. Never rejects. */
 function run(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv): Promise<Outcome> {
+  const started = Date.now();
+  ck80(`run ${command} ${args.join(' ').slice(0, 60)} start`);
   return new Promise((resolve) => {
     const child = spawn(command, args, { cwd, env, stdio: 'inherit' });
+    child.once('spawn', () => ck80(`run ${basename(command)} spawned pid ${child.pid} after ${Date.now() - started} ms`));
     child.once('error', (error) => resolve({ code: null, signal: null, error: error.message }));
-    child.once('close', (code, signal) => resolve({ code, signal }));
+    child.once('close', (code, signal) => {
+      ck80(`run ${basename(command)} closed ${code}/${signal} after ${Date.now() - started} ms`);
+      resolve({ code, signal });
+    });
   });
 }
 
@@ -134,8 +144,11 @@ interface CommandsResult {
 /** Reads the commands of `kind` and runs them one by one; the first failure stops them. */
 async function runCommands(kind: Kind, io: SetupIo, env: NodeJS.ProcessEnv, onStart: () => void): Promise<CommandsResult> {
   let config;
+  const configStart = Date.now();
+  ck80('readWorkspaceConfig start');
   try {
     config = await readWorkspaceConfig({ repo: io.cwd, path: io.cwd, env });
+    ck80(`readWorkspaceConfig done in ${Date.now() - configStart} ms`);
   } catch (error) {
     return { ran: true, failure: { reason: error instanceof Error ? error.message : String(error), code: 1 } };
   }
@@ -177,10 +190,18 @@ async function runShell(io: SetupIo, env: NodeJS.ProcessEnv): Promise<number> {
  * the agent's end) leaves a usable prompt. Resolves to the exit code.
  */
 export function runSetup({ shell, agent }: SetupArguments, io: SetupIo, env: NodeJS.ProcessEnv): Promise<number> {
+  ck80(`runSetup start, process uptime ${Math.round(process.uptime() * 1000)} ms`);
   return inTerminal(async () => {
     // Reports go out in order, without holding the run back.
     let sent = Promise.resolve();
-    const send = (report: SetupReport) => void (sent = sent.then(() => io.report(report)));
+    const send = (report: SetupReport) => {
+      ck80(`report ${report.event} queued`);
+      void (sent = sent.then(() => {
+        const at = Date.now();
+        ck80(`report ${report.event} sending`);
+        return io.report(report).then(() => ck80(`report ${report.event} settled after ${Date.now() - at} ms`));
+      }));
+    };
 
     let status = 0;
     const { ran, failure } = await runCommands('setup', io, env, () => send({ event: 'setup-running' }));
@@ -198,7 +219,9 @@ export function runSetup({ shell, agent }: SetupArguments, io: SetupIo, env: Nod
     }
 
     if (shell) status = await runShell(io, env);
+    ck80('awaiting reports');
     await sent;
+    ck80(`runSetup end, status ${status}`);
     return status;
   });
 }

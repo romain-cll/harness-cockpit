@@ -7,7 +7,7 @@ import { homedir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { type ElementHandle, type Locator, type Page } from 'playwright-core';
-import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 import {
   MAIN_PROCESS_ERROR,
   UI_TIMEOUT,
@@ -22,6 +22,16 @@ import {
   type Session,
 } from './launch';
 import { makeTestDir } from './run-root';
+import { ck80Log } from './launch';
+import { loadavg } from 'node:os';
+
+// COCKPIT-80 diagnosis (throwaway): every test's renderer trace, passed or failed.
+beforeEach(({ task }) => {
+  ck80Log.push(`[ck80] ${Date.now()} TEST START ${task.name.slice(0, 60)} loadavg ${loadavg().map((n) => n.toFixed(2)).join(' ')}`);
+});
+afterEach(({ task }) => {
+  console.error(`[ck80] ${Date.now()} TEST END (${task.result?.state}) ${task.name.slice(0, 60)}\n  ${ck80Log.splice(0).join('\n  ')}`);
+});
 
 // COCKPIT-70: the workspace page, panes with tabs of agents and shells. The built app runs the full
 // block (a launch of its own, the tests below share it and run in order); the dev server and the
@@ -228,8 +238,10 @@ const onWorkspacePage = (page: Page, path: string) =>
   page.waitForURL((url) => url.pathname === '/workspace' && url.searchParams.get('path') === path, { timeout: UI_TIMEOUT });
 
 async function openWorkspace(page: Page, name: string, path: string) {
+  ck80Log.push(`[ck80] ${Date.now()} test openWorkspace ${name} click`);
   await workspaceRow(page, name).click({ timeout: UI_TIMEOUT });
   await onWorkspacePage(page, path);
+  ck80Log.push(`[ck80] ${Date.now()} test openWorkspace ${name} URL reached`);
 }
 
 async function goHome(page: Page) {
@@ -259,6 +271,19 @@ async function markPanes(page: Page): Promise<number> {
       .filter((button) => (button.getAttribute('aria-label') ?? button.textContent ?? '').trim() === 'New tab' && visible(button))
       .sort(order);
     buttons.forEach((button, index) => button.setAttribute('data-test-new', String(index)));
+    // COCKPIT-80 diagnosis (throwaway): which marked button leaves the DOM, and when.
+    const w = window as unknown as { __ck80mo?: MutationObserver };
+    if (!w.__ck80mo) {
+      const label = (node: Node) => (node instanceof Element ? `${node.tagName}#${node.id}.${String(node.className).slice(0, 50)}` : node.nodeName);
+      w.__ck80mo = new MutationObserver((records) => {
+        for (const record of records)
+          for (const node of record.removedNodes)
+            if (node instanceof Element && (node.matches('[data-test-new]') || node.querySelector('[data-test-new]')))
+              console.debug(`[ck80] ${Date.now()} DOM removed ${label(node)} holding a marked New tab button, from ${label(record.target)}; New tab buttons now ${[...document.querySelectorAll('button[aria-label="New tab"]')].map((b) => b.id).join(',')}`);
+      });
+      w.__ck80mo.observe(document.body, { childList: true, subtree: true });
+    }
+    console.debug(`[ck80] ${Date.now()} markPanes: ${lists.length} tablists, marked New tab ${buttons.map((b) => b.id).join(',')}; menus open ${document.querySelectorAll('[role="menu"]').length}; url ${location.href}`);
     return lists.length;
   });
 }
@@ -474,7 +499,9 @@ const menuItems = (page: Page) => page.getByRole('menu').first().getByRole('menu
 
 async function openNewTabMenu(page: Page, index = 0) {
   await markPanes(page);
+  ck80Log.push(`[ck80] ${Date.now()} test clicks [data-test-new="${index}"]`);
   await page.locator(`[data-test-new="${index}"]`).click({ timeout: UI_TIMEOUT });
+  ck80Log.push(`[ck80] ${Date.now()} test click done`);
   await page.getByRole('menu').first().waitFor({ timeout: UI_TIMEOUT });
 }
 

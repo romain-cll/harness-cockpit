@@ -1,6 +1,6 @@
 import { useRouter } from '@tanstack/react-router';
 import { Columns2Icon, CopyIcon, PanelLeftOpenIcon, PlusIcon, Rows2Icon, SquareTerminalIcon, XIcon } from 'lucide-react';
-import { useRef, useState, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type { Project, Session, StartSessionResult, Workspace } from '../../shared/api';
 import { toggleSidebar, useSidebarCollapsed } from '@/components/collapsed';
 import { HarnessIcon } from '@/components/harness-icon';
@@ -218,7 +218,9 @@ export function restoreFromDaemon(again = false): Promise<void> {
   // Once per page load (the root loader runs again at every change).
   if (restoredOnce && !again) return whenRestored();
   restoredOnce = true;
+  console.debug(`[ck80] ${Date.now()} restoreFromDaemon start again=${again}`);
   const run = restore(again).finally(() => {
+    console.debug(`[ck80] ${Date.now()} restoreFromDaemon end`);
     if (restoring === run) restoring = undefined;
     for (const listener of listeners) listener();
   });
@@ -286,8 +288,16 @@ async function startInPane(project: string, path: string, harness: string, pane:
 
 // --- The view --------------------------------------------------------------------
 
+let ck80Instances = 0;
+
 function NewTabMenu({ onHarness, onTerminal, onRefocus }: { onHarness: (harness: string) => void; onTerminal: () => void; onRefocus: () => void }) {
   const harnesses = useDetectedHarnesses();
+  // COCKPIT-80 diagnosis (throwaway).
+  const [instance] = useState(() => ++ck80Instances);
+  useEffect(() => {
+    console.debug(`[ck80] ${Date.now()} NewTabMenu#${instance} mount`);
+    return () => console.debug(`[ck80] ${Date.now()} NewTabMenu#${instance} unmount`);
+  }, [instance]);
   // Whether the menu started something: the new tab then keeps the keyboard, not the button.
   const started = useRef(false);
   const [open, setOpen] = useState(false);
@@ -480,6 +490,11 @@ function PaneView({
   onClose: (pane: string, tab: Tab) => void;
 }) {
   const router = useRouter();
+  // COCKPIT-80 diagnosis (throwaway).
+  useEffect(() => {
+    console.debug(`[ck80] ${Date.now()} PaneView ${pane.id} mount (${workspace.path})`);
+    return () => console.debug(`[ck80] ${Date.now()} PaneView ${pane.id} unmount`);
+  }, [pane.id, workspace.path]);
   const path = workspace.path;
   const top = box.top === 0;
   return (
@@ -530,6 +545,12 @@ function PaneView({
 export function WorkspacePanes({ project, workspace }: { project: Project; workspace: Workspace }) {
   const view = useSyncExternalStore(subscribeViews, () => viewOf(workspace.path));
   const waiting = useRestoring();
+  // COCKPIT-80 diagnosis (throwaway).
+  useEffect(() => {
+    console.debug(`[ck80] ${Date.now()} WorkspacePanes mount ${workspace.path}`);
+    return () => console.debug(`[ck80] ${Date.now()} WorkspacePanes unmount ${workspace.path}`);
+  }, [workspace.path]);
+  useEffect(() => console.debug(`[ck80] ${Date.now()} WorkspacePanes waiting=${waiting} panes=${panesOf(view.layout).map(({ id }) => id).join(',')}`), [waiting, view.layout]);
   const sidebarHidden = useSidebarCollapsed();
   // A running agent asks first; anything else closes at once.
   const [closing, setClosing] = useState<{ pane: string; tab: Tab }>();

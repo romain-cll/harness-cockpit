@@ -20,6 +20,11 @@ jobs:
     # desktop session for the Electron tests.
     runs-on: macos-latest
     timeout-minutes: 20
+    # COCKPIT-80 diagnosis (throwaway): five identical runs in parallel.
+    strategy:
+      fail-fast: false
+      matrix:
+        copy: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v7
 
@@ -43,4 +48,22 @@ jobs:
 
       # `test` launches the desktop app four ways: the dev script, the built app,
       # the packaged app and the packaged app with the environment of launchd.
-      - run: bun turbo run build typecheck lint test
+      - run: bun turbo run build typecheck lint test --continue
+
+      - if: always()
+        run: |
+          which -a git; ls -l /usr/bin/git; xcode-select -p; git --version; /usr/bin/git --version
+          sw_vers; sysctl -n hw.ncpu hw.memsize; uptime
+
+  # COCKPIT-80 diagnosis (throwaway): the cost of the first /usr/bin/git calls on a fresh runner,
+  # with the environment the CLI tests give the binary (no HOME, no TMPDIR) and with the runner's.
+  probe:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - run: |
+          t() { local s=$(perl -MTime::HiRes=time -e 'printf "%.3f", time'); "$@" >/dev/null 2>&1; local e=$(perl -MTime::HiRes=time -e 'printf "%.3f", time'); echo "$(perl -e "printf '%5d', ($e-$s)*1000") ms  $*"; }
+          for i in 1 2 3; do t env -i PATH=/usr/bin:/bin /usr/bin/git --version; done
+          for i in 1 2 3; do t env -i PATH=/usr/bin:/bin HOME=$HOME TMPDIR=$TMPDIR /usr/bin/git --version; done
+          for i in 1 2 3; do t /usr/bin/git --version; done
+          which -a git; xcode-select -p; uptime

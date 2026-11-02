@@ -177,10 +177,16 @@ export function daemonSocketIn(home: string): string {
 // Attaches to a running Electron over the Chrome DevTools Protocol and returns
 // its first window. Reloads it so the page's console output is captured from the
 // start.
+// COCKPIT-80 diagnosis (throwaway): the renderer's `[ck80]` console lines, in order.
+export const ck80Log: string[] = [];
+
 export async function attach(endpoint: string): Promise<{ browser: Browser; page: Page }> {
   const browser = await chromium.connectOverCDP(endpoint);
   const context = browser.contexts()[0]!;
   const page = context.pages()[0] ?? (await context.waitForEvent('page'));
+  page.on('console', (message) => {
+    if (message.text().startsWith('[ck80]')) ck80Log.push(message.text());
+  });
   // The window's target starts as `about:blank` while its first navigation to the
   // app is pending: a reload racing that navigation waits for a load that never
   // comes. Wait until the page is on the app's URL and loaded.

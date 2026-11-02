@@ -55,7 +55,10 @@ function run(args: string[], env: Record<string, string>) {
     child.stdout.on('data', (chunk) => (out += chunk));
     child.stderr.on('data', (chunk) => (err += chunk));
     child.on('error', fail);
-    child.on('close', (code) => done({ code, out, err, ms: Date.now() - started }));
+    child.on('close', (code) => {
+      console.error(`[ck80] binary.test ${args.join(' ')}: ${started} → ${Date.now()} = ${Date.now() - started} ms, pid ${child.pid}`);
+      done({ code, out, err, ms: Date.now() - started });
+    });
   });
 }
 

@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { request } from 'node:http';
 import { tokenPathOf } from './paths';
 import type { SessionEventName, SessionReport } from './protocol';
-import { parseSetupArguments, runSetup, runTeardown } from './setup';
+import { ck80, parseSetupArguments, runSetup, runTeardown } from './setup';
 import { SESSION_EVENTS } from './status';
 
 export interface CliIo {
@@ -30,6 +30,7 @@ const TIMEOUT_MS = 2_000;
  */
 export async function runCli(argv: readonly string[], env: NodeJS.ProcessEnv, { stdout, stderr, exit }: CliIo): Promise<void> {
   const [command, ...rest] = argv;
+  ck80(`runCli ${command}, process uptime ${Math.round(process.uptime() * 1000)} ms`);
   const socketPath = env.COCKPIT_SOCKET;
   const sessionId = env.COCKPIT_SESSION_ID;
   const send = (body: Omit<SessionReport, 'sessionId'>) =>
@@ -72,10 +73,16 @@ function report(socketPath: string, body: SessionReport): Promise<void> {
       (res) => {
         res.resume();
         res.on('error', () => {});
+        ck80(`report ${body.event} response ${res.statusCode}`);
         res.on('end', resolve);
       },
     );
-    const timer = setTimeout(() => req.destroy(), TIMEOUT_MS);
+    const timer = setTimeout(() => {
+      ck80(`report ${body.event} TIMEOUT_MS fired, destroying`);
+      req.destroy();
+    }, TIMEOUT_MS);
+    req.on('socket', () => ck80(`report ${body.event} socket`));
+    req.on('error', (error) => ck80(`report ${body.event} error ${error.message}`));
     req.on('close', () => {
       clearTimeout(timer);
       resolve();

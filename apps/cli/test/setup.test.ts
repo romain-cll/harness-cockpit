@@ -1,9 +1,9 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
-import { tmpdir } from 'node:os';
+import { loadavg, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 
 // COCKPIT-57: `cockpit setup` and `cockpit teardown`, the compiled binary itself: only Bun's runtime
 // shows the stdio inheritance, the signal handling and the exit codes of the children as a pty gives
@@ -42,9 +42,16 @@ let agent: string;
 let server: Server;
 let socket: string;
 let reports: Array<Record<string, unknown>> = [];
+// COCKPIT-80 diagnosis (throwaway): when each report reached the fake daemon.
+const arrivals: string[] = [];
+let traceCount = 0;
 
 const cleanups: Array<() => void> = [];
-afterEach(() => {
+beforeEach(({ task }) => {
+  console.error(`[ck80] ${Date.now()} test start: ${task.name.slice(0, 50)} loadavg ${loadavg().map((n) => n.toFixed(2)).join(' ')} reports so far ${reports.length}`);
+});
+afterEach(({ task }) => {
+  console.error(`[ck80] ${Date.now()} test end (${task.result?.state}): ${task.name.slice(0, 50)} reports ${JSON.stringify(reports)}\n  arrivals:\n  ${arrivals.splice(0).join('\n  ')}`);
   for (const cleanup of cleanups.splice(0).reverse()) cleanup();
   reports = [];
 });
@@ -104,6 +111,7 @@ echo shell-prompt
     req.on('end', () => {
       if (req.headers.authorization === `Bearer ${TOKEN}` && req.method === 'POST' && req.url === '/session-events') {
         reports.push(JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>);
+        arrivals.push(`${Date.now()} ${JSON.stringify(reports.at(-1))}`);
         res.statusCode = 204;
       } else {
         res.statusCode = 401;
@@ -143,17 +151,21 @@ async function cockpit(args: string[], { cwd = worktree, env = {} }: { cwd?: str
   const dir = mkdtempSync(join(tmpdir(), 'ck-'));
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
   const output = join(dir, 'output.txt');
+  const trace = join(root, `trace-${++traceCount}.txt`);
   const fd = openSync(output, 'w');
+  const started = Date.now();
   try {
     const code = await new Promise<number | null>((done, fail) => {
       const child = spawn(BINARY, args, {
         cwd,
         stdio: ['ignore', fd, fd],
-        env: { PATH: `${bin}:/usr/bin:/bin`, SHELL: shell, STUB_DIR: dir, ...gitEnv, ...env },
+        env: { PATH: `${bin}:/usr/bin:/bin`, SHELL: shell, STUB_DIR: dir, CK80_TRACE: trace, ...gitEnv, ...env },
       });
+      child.once('spawn', () => console.error(`[ck80] ${Date.now()} cockpit ${args.join(' ').slice(0, 40)} spawned pid ${child.pid} after ${Date.now() - started} ms`));
       const failsafe = setTimeout(() => child.kill('SIGKILL'), 30_000);
       child.on('error', fail);
       child.on('close', (exit) => {
+        console.error(`[ck80] ${Date.now()} cockpit pid ${child.pid} closed ${exit} after ${Date.now() - started} ms\n  trace:\n  ${existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').join('\n  ') : '(none)'}`);
         clearTimeout(failsafe);
         done(exit);
       });

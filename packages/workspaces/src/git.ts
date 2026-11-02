@@ -1,5 +1,9 @@
 import { execFile } from 'node:child_process';
+import { appendFileSync } from 'node:fs';
 import { promisify } from 'node:util';
+
+// COCKPIT-80 diagnosis (throwaway): timestamped trace when CK80_TRACE names a file.
+const ck80 = (line: string) => { const file = process.env.CK80_TRACE; if (file) try { appendFileSync(file, `${Date.now()} [${process.pid}] ${line}\n`); } catch {} };
 
 const execFileAsync = promisify(execFile);
 
@@ -41,10 +45,14 @@ export interface GitOptions {
  * executable included: with a `cwd`, ENOENT also means the folder is missing.
  */
 export async function git(args: string[], { cwd, env, maxBuffer }: GitOptions = {}): Promise<string> {
+  const started = Date.now();
+  ck80(`git ${args.join(' ')} start (PATH=${env?.PATH ?? process.env.PATH} HOME=${env?.HOME ?? '-'} TMPDIR=${env?.TMPDIR ?? '-'})`);
   try {
     const { stdout } = await execFileAsync('git', args, { cwd, env, ...(maxBuffer === undefined ? {} : { maxBuffer }) });
+    ck80(`git ${args[0]} done in ${Date.now() - started} ms`);
     return stdout;
   } catch (error) {
+    ck80(`git ${args[0]} failed in ${Date.now() - started} ms`);
     const failure = error as NodeJS.ErrnoException & { stderr?: string };
     throw new WorkspaceError(
       'GIT_FAILED',
