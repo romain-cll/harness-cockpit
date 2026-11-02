@@ -117,21 +117,75 @@ export const waitForNewSession = async (page: Page, previous?: string) => {
   return id!;
 };
 
+// The path of the workspace whose page (`/workspace?path=`) is open, if one is.
+export const workspacePathIn = (page: Page) => {
+  const url = new URL(page.url());
+  return url.pathname === '/workspace' ? (url.searchParams.get('path') ?? undefined) : undefined;
+};
+
+// Waits for the workspace page of `path` (any workspace without it).
+export const waitForWorkspacePage = async (page: Page, path?: string) => {
+  const found = await poll(() => workspacePathIn(page), (found) => found !== undefined && (path === undefined || found === path), 15_000);
+  expect(found, `the page ${page.url()} is the workspace page${path ? ` of ${path}` : ''}`).toBeTruthy();
+  return found!;
+};
+
+interface StoredSession {
+  id: string;
+  name: string;
+  directory: string;
+  project?: string;
+}
+
+// The sessions the app stores, read through the page.
+export const storedSessions = (page: Page) =>
+  page.evaluate(() => (globalThis as unknown as { api: { sessions: { list(): Promise<StoredSession[]> } } }).api.sessions.list());
+
+// The labels of the workspace page's tabs and the selected one (a tab's label is the session's name until its
+// program sets a title, then that title), `null` when no tab is selected.
+export const tabsOf = (page: Page) =>
+  page.evaluate(() => {
+    const label = (tab: Element) => (tab.getAttribute('title') ?? tab.querySelector('[title]')?.getAttribute('title') ?? tab.textContent ?? '').trim();
+    const tabs = [...document.querySelectorAll('[role="tab"]')];
+    return { labels: tabs.map(label), selected: tabs.filter((tab) => tab.getAttribute('aria-selected') === 'true').map(label) };
+  });
+
+// Waits for the new stored session of the workspace at `path` (not one of `known`) and for a selected tab.
+export async function waitForWorkspaceSession(page: Page, path: string, known: Set<string>) {
+  const stored = await poll(
+    async () => (await storedSessions(page)).find((each) => each.directory === path && !known.has(each.id)),
+    Boolean,
+    15_000,
+  );
+  expect(stored, `a session stored for ${path}`).toBeTruthy();
+  await poll(async () => (await tabsOf(page)).selected.length, (count) => count > 0, UI_TIMEOUT);
+  return stored!;
+}
+
 // Waits for the detection to end and picks `agent` unless it is the one shown.
 export async function useAgent(page: Page, agent: string) {
   await poll(() => textOf(agentSelect(page)), (text) => text !== 'Detecting…', 30_000);
   if ((await textOf(agentSelect(page))) !== agent) await pickAgent(page, agent);
 }
 
+export interface Sent {
+  /** The new session's id: the session of "No project", or the agent's tab of a workspace. Not with "Terminal" and a project. */
+  id?: string;
+  /** The workspace's path, with a project. */
+  path?: string;
+}
+
 // Fills the composer for `project` (`none` for no project) and sends it with Enter or the button: picks
 // `agent` ("Terminal" by default, so a real CLI of the developer's machine never starts), waits for the
-// base to be known and, with `base`, picks it. Resolves with the id of the session whose page opens.
+// base to be known and, with `base`, picks it. With "No project" the session's page opens (`id`); with a
+// project the workspace page opens (`path`), and with an agent its new session is the selected tab (`id`).
 export async function sendFromComposer(
   page: Page,
   project: { root: string } | 'none',
   { prompt, agent = 'Terminal', base, enter = false }: { prompt: string; agent?: string; base?: string; enter?: boolean },
-): Promise<string> {
+): Promise<Sent> {
   const previous = sessionIdIn(page);
+  const known = new Set((await storedSessions(page)).map((each) => each.id));
   await openComposerFromSidebar(page, project === 'none' ? 'none' : project.root);
   await useAgent(page, agent);
   if (project !== 'none') {
@@ -141,5 +195,8 @@ export async function sendFromComposer(
   await promptBox(page).fill(prompt);
   if (enter) await promptBox(page).press('Enter');
   else await createButton(page).click({ timeout: UI_TIMEOUT });
-  return waitForNewSession(page, previous);
+  if (project === 'none') return { id: await waitForNewSession(page, previous) };
+  const path = await waitForWorkspacePage(page);
+  if (agent === 'Terminal') return { path };
+  return { path, id: (await waitForWorkspaceSession(page, path, known)).id };
 }

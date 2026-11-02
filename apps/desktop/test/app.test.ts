@@ -921,7 +921,7 @@ const gitAlertOf = (page: Page) =>
     if (!title || !detail) return null;
     let box: HTMLElement | null = title;
     while (box && box.tagName !== 'ASIDE' && !(box.contains(detail) && box.querySelector('svg.lucide-triangle-alert'))) box = box.parentElement;
-    const terminal = [...document.querySelectorAll('aside a')].find((link) => (link.textContent ?? '').trim() === 'Home');
+    const terminal = [...document.querySelectorAll('aside a')].find((link) => (link.textContent ?? '').trim() === 'New workspace');
     const projects = [...document.querySelectorAll('aside button')].find((button) => (button.textContent ?? '').trim() === 'Projects');
     const icon = box && box.tagName !== 'ASIDE' ? box.querySelector('svg.lucide-triangle-alert') : null;
     if (!box || !icon || !terminal || !projects) return { icon: false, top: 0, bottom: 0, terminalBottom: 0, projectsTop: 0, iconRgb: [0, 0, 0] };
@@ -1593,7 +1593,7 @@ describe.each([
       expect(existsSync(fetchHead)).toBe(fetchHeadBefore);
     });
 
-    test('AC5 — sending the composer creates the branch (the prompt\'s slug) from origin/main and the worktree under $COCKPIT_HOME, lists the workspace and opens its session page; Enter does the same', async () => {
+    test('AC5 — sending the composer creates the branch (the prompt\'s slug) from origin/main and the worktree under $COCKPIT_HOME, lists the workspace and opens its workspace page; Enter does the same', async () => {
       const { page } = session;
       const originMain = gitIn(clone.root, 'rev-parse', 'origin/main');
       expect(gitIn(clone.root, 'rev-parse', 'main'), 'local main differs from origin/main').not.toBe(originMain);
@@ -2897,7 +2897,7 @@ describe('built app with no git on the login shell PATH', () => {
     const alert = await poll(() => gitAlertOf(page), (found) => found !== null, UI_TIMEOUT);
     expect(alert, 'the alert shows').not.toBeNull();
     expect(alert!.icon, 'a triangle-alert icon').toBe(true);
-    expect(alert!.top, 'under the Home link').toBeGreaterThanOrEqual(alert!.terminalBottom - 1);
+    expect(alert!.top, 'under the New workspace link').toBeGreaterThanOrEqual(alert!.terminalBottom - 1);
     expect(alert!.bottom, 'above the Projects header').toBeLessThanOrEqual(alert!.projectsTop + 1);
     const [r, g, b] = alert!.iconRgb;
     expect(r! >= 150 && r! > g! && g! >= 70 && g! > b! && b! <= 80, `the icon is amber, got rgb(${r}, ${g}, ${b})`).toBe(true);
@@ -3143,9 +3143,9 @@ const storedSessionIds = async (page: Page) => new Set((await storedSessions(pag
 // Starts a session outside any project through the composer ("No project", `harnessName` as the agent,
 // `STARTED_PROMPT` as the prompt) and waits for its page.
 async function startSession(page: Page, harnessName: string, pageName: string): Promise<string> {
-  const id = await sendFromComposer(page, 'none', { prompt: STARTED_PROMPT, agent: harnessName });
+  const { id } = await sendFromComposer(page, 'none', { prompt: STARTED_PROMPT, agent: harnessName });
   await page.getByRole('heading', { name: pageName, exact: true }).waitFor({ timeout: UI_TIMEOUT });
-  return id;
+  return id!;
 }
 
 async function openSessionEntry(page: Page, name: string) {
@@ -3322,16 +3322,16 @@ async function expectNoErrors(session: Session) {
 // --- Sessions in a workspace (COCKPIT-28) ------------------------------------
 
 // Creates a workspace through the composer with `agent` and `prompt` (the branch is the prompt's slug, which
-// the caller knows) and waits for the new session's page.
+// the caller knows) and waits for the workspace page with the new session as its selected tab.
 async function createWorkspaceWithAgent(
   page: Page,
   repo: TempRepo,
   options: { agent: string; prompt: string },
   pageName: string,
 ): Promise<string> {
-  const id = await sendFromComposer(page, repo, options);
-  await page.getByRole('heading', { name: pageName, exact: true }).waitFor({ timeout: UI_TIMEOUT });
-  return id;
+  const { id } = await sendFromComposer(page, repo, options);
+  await page.getByRole('tab', { name: pageName, exact: true }).waitFor({ timeout: UI_TIMEOUT });
+  return id!;
 }
 
 // Puts the pointer over the page's bottom right corner, away from the sidebar's rows.
@@ -3909,7 +3909,7 @@ describe('sessions: built app', () => {
   // --- Sessions in a workspace (COCKPIT-28). They run in order on this launch, with the
   // repository added above.
 
-  test('workspace sessions AC5 — sending the composer with Claude Code and the prompt "fix the tests" creates the worktree on the branch fix-the-tests, opens the session page and runs the harness there with that one argument', async () => {
+  test('workspace sessions AC5 — sending the composer with Claude Code and the prompt "fix the tests" creates the worktree on the branch fix-the-tests, opens the workspace page with the session as its selected tab and runs the harness there with that one argument', async () => {
     const { page } = session;
     const foldersBefore = sessionFoldersIn(session.cockpitHome);
     const id = await createWorkspaceWithAgent(page, repo, { agent: 'Claude Code', prompt: 'fix the tests' }, 'Claude Code 1');

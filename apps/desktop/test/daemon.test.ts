@@ -230,9 +230,9 @@ async function shellPid(page: Page, nth = 0): Promise<number> {
 
 // Starts a session outside any project through the composer (COCKPIT-66): "No project", Claude Code and a prompt.
 async function startSession(page: Page): Promise<string> {
-  const id = await sendFromComposer(page, 'none', { prompt: 'start', agent: 'Claude Code' });
+  const { id } = await sendFromComposer(page, 'none', { prompt: 'start', agent: 'Claude Code' });
   await expectScreen(page, /^ready$/m);
-  return id;
+  return id!;
 }
 
 // The row of a session in the sidebar: whether it shows a dot, and the dot's accessible name.

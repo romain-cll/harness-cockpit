@@ -28,7 +28,10 @@ import {
   textOf,
   waitForAgent,
   waitForBase,
+  storedSessions,
+  tabsOf,
   waitForNewSession,
+  waitForWorkspacePage,
 } from './composer';
 import { projectColour } from '../src/renderer/components/project-colour';
 
@@ -95,7 +98,8 @@ const localBranches = (repo: Repo) => git(repo.root, 'for-each-ref', '--format=%
 // The stub agent: logs every `--version` run, waits while `<stub>.gate` exists, prints `9.9.9` (nothing
 // with `<stub>.noversion`), and as a session logs its working directory and arguments (what the status
 // feature adds before them is set aside), prints the idle title, then one title per line of `<stub>.titles`
-// a second apart and creates `<stub>.titles-done`, and echoes what it reads until `exit`.
+// and creates `<stub>.titles-done`, and echoes what it reads until `exit`. It never pauses: `cockpit setup`'s
+// markers order its titles against anything printed before it started.
 function stubScript(runLog: string) {
   return `#!/bin/sh
 if [ "$1" = "--version" ]; then
@@ -113,8 +117,7 @@ esac
 printf '\\033]0;✳ Claude Code\\007'
 echo ready
 if [ -e "$0.titles" ]; then
-  while IFS= read -r title; do sleep 1; printf '\\033]0;%s\\007' "$title"; done < "$0.titles"
-  sleep 1
+  while IFS= read -r title; do printf '\\033]0;%s\\007' "$title"; done < "$0.titles"
   touch "$0.titles-done"
 fi
 while IFS= read -r line; do
@@ -244,6 +247,10 @@ const tokenColour = (page: Page, token: string, property: 'color' | 'backgroundC
 
 const waitForSessionPage = waitForNewSession;
 
+// The labels of the tabs of the workspace page and which are selected (a tab bears the session's name until
+// its program sets a title, then that title).
+const tabs = tabsOf;
+
 // The rows of the terminal on the page.
 const terminalRows = (page: Page) =>
   page
@@ -273,8 +280,6 @@ describe('new workspace page: built app', () => {
   const worktreesDirOf = (repo: Repo) => join(home, 'worktrees', `${repo.name}-${sha8(repo.root)}`);
   const listing = (repo: Repo) => (existsSync(worktreesDirOf(repo)) ? readdirSync(worktreesDirOf(repo)).sort() : []);
   const entryOf = (page: Page, path: string) => page.locator(`aside [title="${path}"]`).first();
-  const linkUnder = (page: Page, path: string, id: string) =>
-    page.locator('aside li').filter({ has: page.locator(`[title="${path}"]`) }).last().locator(`a[href$="/sessions/${id}"]`);
   const linkInSessions = (page: Page, id: string) =>
     page
       .locator('aside section')
@@ -337,7 +342,7 @@ describe('new workspace page: built app', () => {
     // A reload, a visit to another page and a second visit to this one run no `--version` again.
     await page.reload();
     await promptBox(page).waitFor({ timeout: UI_TIMEOUT });
-    await page.getByRole('link', { name: 'Terminal', exact: true }).click();
+    await page.getByRole('button', { name: 'Start session', exact: true }).click();
     await page.getByRole('link', { name: 'New workspace', exact: true }).click();
     await promptBox(page).waitFor({ timeout: UI_TIMEOUT });
     await waitForAgent(page, 'Claude Code');
@@ -349,7 +354,7 @@ describe('new workspace page: built app', () => {
 
   // --- Navigation -----------------------------------------------------------------------------------
 
-  test('AC1, AC2 — the home page is the "New workspace" heading (h1, 12 px, muted) above a centred composer, and the sidebar nav holds "New workspace" (square-pen, link to /, current) then "Terminal", with no "Home"', async () => {
+  test('AC1, AC2 — the home page is the "New workspace" heading (h1, 12 px, muted) above a centred composer, and the sidebar nav holds "New workspace" (square-pen, link to /, current) and nothing else: no "Home", no "Terminal"', async () => {
     const { page } = session;
     await openComposer(page);
     expect(new URL(page.url()).pathname).toBe('/');
@@ -367,12 +372,13 @@ describe('new workspace page: built app', () => {
     expect(headingBox.y + headingBox.height).toBeLessThanOrEqual(promptBoxRect.y);
 
     const links = page.locator('aside nav a');
-    expect((await links.allInnerTexts()).map(norm)).toEqual(['New workspace', 'Terminal']);
-    expect(await links.evaluateAll((all) => all.map((link) => new URL((link as HTMLAnchorElement).href).pathname))).toEqual(['/', '/terminal']);
+    expect((await links.allInnerTexts()).map(norm)).toEqual(['New workspace']);
+    expect(await links.evaluateAll((all) => all.map((link) => new URL((link as HTMLAnchorElement).href).pathname))).toEqual(['/']);
     expect(await links.nth(0).getAttribute('aria-current')).toBe('page');
-    expect(await links.nth(1).getAttribute('aria-current')).toBeNull();
     expect(await links.nth(0).locator('svg.lucide-square-pen').count()).toBe(1);
     expect(await page.locator('aside').getByRole('link', { name: 'Home' }).count()).toBe(0);
+    expect(await page.locator('aside').getByRole('link', { name: 'Terminal' }).count()).toBe(0);
+    // That `/terminal` is no route any more is COCKPIT-70's AC4 (the route tree).
   });
 
   test('AC5 — without a project param, or with a path that is not in the state, the project select shows the first project of the sidebar', async () => {
@@ -641,27 +647,7 @@ describe('new workspace page: built app', () => {
     await closePopups(page);
   }, 60_000);
 
-  test('AC13 — with no agent CLI detected the select shows "Terminal" and its menu a disabled "No agent CLI found" item with the install hint above "Terminal"; a CLI back on the PATH is found by "Detect again"', async () => {
-    const { page } = session;
-    await openComposer(page, clone.root);
-    removeStub(fx, 'claude');
-    removeStub(fx, 'opencode');
-    await detectAgain(page);
-    await waitForAgent(page, 'Terminal');
-
-    const menu = await openMenu(page, agentSelect(page));
-    expect(await itemTexts(menu)).toEqual([
-      'No agent CLI found Install Claude Code, Codex or OpenCode, then detect again. Until then, the workspace opens with a terminal.',
-      'Terminal',
-      'Detect again',
-    ]);
-    expect(await isDisabledItem(itemsOf(menu).first())).toBe(true);
-    await closePopups(page);
-
-    installStub(fx, 'claude');
-    await detectAgain(page);
-    await waitForAgent(page, 'Claude Code');
-  }, 60_000);
+  // AC13 (no agent CLI at all) runs on the launch without any, in app.test.ts.
 
   test('AC15 — the button is disabled for a blank prompt (spaces only) and enabled for a filled one, and Shift+Enter inserts a new line without sending', async () => {
     const { page } = session;
@@ -706,19 +692,18 @@ describe('new workspace page: built app', () => {
     } finally {
       rmSync(block, { force: true });
     }
-    const id = await waitForSessionPage(page);
+    await waitForWorkspacePage(page, worktreeOf(clone, 'blocked-send'));
     // The workspace's setup runs in this session's terminal: let it end so it does not write setup.log later.
     await waitForRow(page, '✓ Setup done');
     expect(adds()).toBe(before.adds + 1);
     expect(localBranches(clone)).toContain('blocked-send');
     expect(localBranches(clone)).not.toContain('blocked-send-2');
     expect(sessionsInState(dataDir)).toHaveLength(before.sessions + 1);
-    expect(sessionsInState(dataDir).at(-1)!.id).toBe(id);
   }, 60_000);
 
   // --- Send -----------------------------------------------------------------------------------------
 
-  test('AC16, AC18 — Enter sends: the worktree is created from the base under COCKPIT_HOME on the prompt\'s slug, `cockpit setup` runs and the agent starts in it with the trimmed prompt as one argument, the session is stored with its project and listed under the workspace, its page opens and the composer is cleared', async () => {
+  test('AC16, AC18 — Enter sends: the worktree is created from the base under COCKPIT_HOME on the prompt\'s slug, `cockpit setup` runs and the agent starts in it with the trimmed prompt as one argument, the session is stored with its project, the workspace page opens with the session as its one, selected tab and the composer is cleared', async () => {
     const { page } = session;
     const prompt = '  Fix the "login" $HOME redirect loop!  ';
     const branch = 'fix-the-login-home-redirect-loop';
@@ -732,7 +717,18 @@ describe('new workspace page: built app', () => {
     await promptBox(page).fill(prompt);
     await promptBox(page).press('Enter');
 
-    const id = await waitForSessionPage(page);
+    await waitForWorkspacePage(page, path);
+    const stored = await poll(
+      async () => sessionsInState(dataDir).find((each) => each.directory === path),
+      Boolean,
+      UI_TIMEOUT,
+    );
+    const id = stored!.id;
+    // The page is the workspace's, with the session as its one tab, selected.
+    await poll(async () => (await tabs(page)).selected.length, (count) => count === 1, UI_TIMEOUT);
+    const shown = await tabs(page);
+    expect(shown.labels).toHaveLength(1);
+    expect(shown.selected[0]).toMatch(/Claude Code/);
     expect(existsSync(path)).toBe(true);
     expect(git(clone.root, 'worktree', 'list', '--porcelain')).toContain(`worktree ${path}\n`);
     expect(gitOrNull(clone.root, 'config', '--get', `branch.${branch}.cockpitBase`)).toBe('origin/main');
@@ -754,18 +750,17 @@ describe('new workspace page: built app', () => {
     });
     expect(await entryOf(page, path).count()).toBe(1);
     expect(await entryOf(page, path).innerText()).toContain(branch);
-    expect(await linkUnder(page, path, id).count()).toBe(1);
 
     await page.getByRole('link', { name: 'New workspace', exact: true }).click();
     await promptBox(page).waitFor({ timeout: UI_TIMEOUT });
     expect(await promptBox(page).inputValue()).toBe('');
   }, 60_000);
 
-  test('AC17 — "Terminal" with a project creates the worktree and runs `cockpit setup --shell` as "Terminal 1" listed under the workspace: the setup, then the login shell, no agent', async () => {
+  test('AC17 — "Terminal" with a project creates the worktree and opens its workspace page with one shell tab showing the output of `cockpit setup --shell` (the setup, then the login shell, no agent); no session is stored', async () => {
     const { page } = session;
     const branch = 'run-the-tests';
     const path = worktreeOf(clone, branch);
-    const before = { claude: startsOf(fx, 'claude').length, shells: shellRuns(fx) };
+    const before = { claude: startsOf(fx, 'claude').length, shells: shellRuns(fx), sessions: sessionsInState(dataDir).length };
     await openComposer(page, clone.root);
     await waitForAgent(page, 'Claude Code');
     await pickAgent(page, 'Terminal');
@@ -773,21 +768,16 @@ describe('new workspace page: built app', () => {
     await promptBox(page).fill('Run the tests');
     await createButton(page).click({ timeout: UI_TIMEOUT });
 
-    const id = await waitForSessionPage(page);
-    await page.getByRole('heading', { name: 'Terminal 1', exact: true }).waitFor({ timeout: UI_TIMEOUT });
+    await waitForWorkspacePage(page, path);
     expect(existsSync(path)).toBe(true);
+    await poll(async () => (await tabs(page)).labels.length, (count) => count === 1, UI_TIMEOUT);
+    expect(await tabs(page)).toEqual({ labels: ['Terminal'], selected: ['Terminal'] });
     await waitForRow(page, `cockpit setup · ${branch} · .cockpit/config.json`);
     await waitForRow(page, '✓ Setup done');
     await waitForRow(page, 'login-shell>');
     expect(shellRuns(fx)).toBe(before.shells + 1);
     expect(startsOf(fx, 'claude')).toHaveLength(before.claude);
-    expect(sessionsInState(dataDir).find((stored) => stored.id === id)).toMatchObject({
-      harness: 'terminal',
-      name: 'Terminal 1',
-      directory: path,
-      project: clone.root,
-    });
-    expect(await linkUnder(page, path, id).count()).toBe(1);
+    expect(await storedSessions(page)).toHaveLength(before.sessions);
   }, 60_000);
 
   test('AC17, AC19 — "No project" with "Terminal" runs the login shell in a new folder under COCKPIT_HOME/sessions, and with an agent starts it there with the prompt as its argument, no worktree and no setup; both are listed in the Sessions section', async () => {
@@ -832,8 +822,7 @@ describe('new workspace page: built app', () => {
     await waitForBase(page, 'origin/main');
     await promptBox(page).fill('Run the tests!');
     await createButton(page).click({ timeout: UI_TIMEOUT });
-    await waitForSessionPage(page);
-    await poll(() => existsSync(worktreeOf(clone, 'run-the-tests-2')), Boolean, UI_TIMEOUT);
+    await waitForWorkspacePage(page, worktreeOf(clone, 'run-the-tests-2'));
     expect(localBranches(clone)).toContain('run-the-tests-2');
     expect(localBranches(clone)).toContain('run-the-tests');
   }, 60_000);
@@ -865,7 +854,7 @@ describe('new workspace page: built app', () => {
 
     rmSync(blocker);
     await createButton(page).click({ timeout: UI_TIMEOUT });
-    await waitForSessionPage(page);
+    await waitForWorkspacePage(page, worktreeOf(refuse, 'cannot-be-created'));
     expect(existsSync(worktreeOf(refuse, 'cannot-be-created'))).toBe(true);
     await page.getByRole('link', { name: 'New workspace', exact: true }).click();
     await promptBox(page).waitFor({ timeout: UI_TIMEOUT });
@@ -893,11 +882,16 @@ describe('new workspace page: built app', () => {
 
     installStub(fx, 'claude');
     await createButton(page).click({ timeout: UI_TIMEOUT });
-    await waitForSessionPage(page);
+    await waitForWorkspacePage(page, worktreeOf(refuse, 'start-fails-2'));
     expect(localBranches(refuse)).toContain('start-fails-2');
   }, 60_000);
 
   // --- The workspace name from the agent's title ----------------------------------------------------
+
+  // The main process has read every title the daemon sent so far: its `projects:list` runs on the per-repository
+  // chain a rename would be queued on. Used after the stubs' last title, before asserting that nothing was renamed.
+  const settleMain = (page: Page) =>
+    page.evaluate(() => (globalThis as unknown as { api: { projects: { list(): Promise<unknown> } } }).api.projects.list());
 
   test('AC21, AC22, AC23 — the first prompt-derived title renames the branch to its slug, sets cockpitName, keeps cockpitBase, leaves the folder and shows the name on the sidebar row within 5 s; the idle title and a second title change nothing; a session started from the workspace row renames nothing', async () => {
     const { page } = session;
@@ -913,7 +907,7 @@ describe('new workspace page: built app', () => {
     await waitForBase(page, 'origin/main');
     await promptBox(page).fill('Please fix the login redirect loop');
     await promptBox(page).press('Enter');
-    await waitForSessionPage(page);
+    await waitForWorkspacePage(page, path);
 
     // The idle title `✳ Claude Code` is printed first and renames nothing.
     await poll(() => localBranches(clone), (branches) => branches.includes(renamed), 15_000);
@@ -930,6 +924,7 @@ describe('new workspace page: built app', () => {
 
     // A second prompt-derived title changes nothing.
     await poll(() => existsSync(`${stub}.titles-done`), Boolean, 15_000);
+    await settleMain(page);
     expect(localBranches(clone)).toContain(renamed);
     expect(localBranches(clone)).not.toContain('something-else-entirely');
     expect(gitOrNull(clone.root, 'config', '--get', `branch.${renamed}.cockpitName`)).toBe('Fix the login redirect loop');
@@ -949,6 +944,7 @@ describe('new workspace page: built app', () => {
     );
     expect(started.status).toBe('started');
     await poll(() => existsSync(`${stub}.titles-done`), Boolean, 15_000);
+    await settleMain(page);
     expect(localBranches(clone)).toContain(renamed);
     expect(localBranches(clone)).not.toContain('started-from-the-row');
     expect(gitOrNull(clone.root, 'config', '--get', `branch.${renamed}.cockpitName`)).toBe('Fix the login redirect loop');
@@ -960,7 +956,7 @@ describe('new workspace page: built app', () => {
     expect((await page.consoleMessages({ filter: 'all' })).filter((message) => message.type() === 'error').map((message) => message.text())).toEqual([]);
   }, 90_000);
 
-  // Types a line on the keyboard of the session page's terminal, as a user does.
+  // Types a line on the keyboard of the visible terminal, as a user does.
   const typeLine = async (page: Page, text: string) => {
     await page.locator('.xterm:visible').first().click({ timeout: UI_TIMEOUT });
     await page.locator('.xterm:visible .xterm-helper-textarea').first().focus({ timeout: UI_TIMEOUT });
@@ -968,45 +964,38 @@ describe('new workspace page: built app', () => {
     await page.keyboard.press('Enter');
   };
 
-  test('AC23 — a title set during the setup renames nothing: the branch keeps the prompt\'s slug and no cockpitName is set, though the agent starts after it', async () => {
+  test('AC23 — a title printed by a setup command, before the agent started, never names the workspace: the stub\'s title does', async () => {
     const { page } = session;
     const stub = join(fx.bin, 'claude');
-    rmSync(`${stub}.titles`, { force: true });
-    const branch = 'title-during-the-setup';
+    writeFileSync(`${stub}.titles`, '✳ Fix the login redirect loop\n');
+    const placeholder = 'title-during-the-setup';
+    const renamed = 'fix-the-login-redirect-loop';
     const config = join(refuse.root, '.cockpit');
     mkdirSync(config, { recursive: true });
-    // A title that matches the harness's prompt pattern, printed by the setup command itself, which then
-    // keeps running until the test has seen it printed: the title is handled while the setup runs.
-    const release = join(fx.root, 'setup-title-release');
-    rmSync(release, { force: true });
-    writeFileSync(
-      join(config, 'config.json'),
-      JSON.stringify({ setup: [`printf '\\033]0;\\342\\234\\263 Setup title\\007'; echo title-printed; while [ ! -e '${release}' ]; do sleep 0.1; done`] }),
-    );
+    // A title that matches the harness's prompt pattern, printed by the setup command itself, before the agent starts.
+    writeFileSync(join(config, 'config.json'), JSON.stringify({ setup: [`printf '\\033]0;\\342\\234\\263 Setup title\\007'; echo title-printed`] }));
     try {
       await openComposer(page, refuse.root);
       await waitForAgent(page, 'Claude Code');
       await waitForBase(page, 'main');
       await promptBox(page).fill('Title during the setup');
       await promptBox(page).press('Enter');
-      await waitForSessionPage(page);
+      await waitForWorkspacePage(page, worktreeOf(refuse, placeholder));
       await waitForRow(page, 'title-printed');
-      writeFileSync(release, '');
-      await waitForRow(page, '✓ Setup done');
-      // The agent started after the setup: the title came first and renamed nothing.
-      await waitForRow(page, 'ready');
+      await poll(() => localBranches(refuse), (branches) => branches.includes(renamed), 15_000);
     } finally {
       rmSync(config, { recursive: true, force: true });
+      rmSync(`${stub}.titles`, { force: true });
     }
 
-    expect(localBranches(refuse)).toContain(branch);
     expect(localBranches(refuse)).not.toContain('setup-title');
-    expect(gitOrNull(refuse.root, 'config', '--get', `branch.${branch}.cockpitName`)).toBeNull();
-    expect(git(worktreeOf(refuse, branch), 'rev-parse', '--abbrev-ref', 'HEAD')).toBe(branch);
+    expect(localBranches(refuse)).not.toContain(placeholder);
+    expect(gitOrNull(refuse.root, 'config', '--get', `branch.${renamed}.cockpitName`)).toBe('Fix the login redirect loop');
+    expect(git(worktreeOf(refuse, placeholder), 'rev-parse', '--abbrev-ref', 'HEAD')).toBe(renamed);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
   }, 60_000);
 
-  test('AC23 — a title the login shell sets after the agent exited renames nothing: the branch keeps the prompt\'s slug and no cockpitName is set', async () => {
+  test('AC23 — a title the login shell sets after the agent exited, which printed no prompt-derived title, renames nothing: the branch keeps the prompt\'s slug and no cockpitName is set', async () => {
     const { page } = session;
     const branch = 'title-after-the-agent';
     await openComposer(page, refuse.root);
@@ -1014,7 +1003,7 @@ describe('new workspace page: built app', () => {
     await waitForBase(page, 'main');
     await promptBox(page).fill('Title after the agent');
     await promptBox(page).press('Enter');
-    await waitForSessionPage(page);
+    await waitForWorkspacePage(page, worktreeOf(refuse, branch));
     await waitForRow(page, 'ready');
 
     // The agent exits before it printed a prompt-derived title; the login shell then prints one.
@@ -1023,6 +1012,7 @@ describe('new workspace page: built app', () => {
     await waitForRow(page, 'login-shell>');
     await typeLine(page, "printf '\\033]0;\\342\\234\\263 Shell title\\007'; git branch --show-current; echo shell-title-done");
     await waitForRow(page, 'shell-title-done');
+    await settleMain(page);
 
     // The shell's own `git` ran after the title, in the worktree: it still sees the prompt's slug.
     await waitForRow(page, branch);
