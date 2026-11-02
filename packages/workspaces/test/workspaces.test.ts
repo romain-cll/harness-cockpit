@@ -971,6 +971,135 @@ describe('git availability', () => {
   });
 });
 
+// COCKPIT-42: nothing is created before the typed checks pass, and no git output size limit gets in the way.
+describe('createWorktree root', () => {
+  /** A folder to use as the whole `PATH`, optionally holding a `git` script. */
+  async function pathWith(gitScript?: string): Promise<string> {
+    const dir = await tempDir();
+    if (gitScript !== undefined) {
+      const file = join(dir, 'git');
+      await writeFile(file, gitScript);
+      await chmod(file, 0o755);
+    }
+    return dir;
+  }
+
+  const absent = async () => join(await tempDir(), 'worktrees', 'deep');
+
+  test.each([
+    ['GIT_MISSING', async () => ({ env: { ...testEnv, PATH: await pathWith() }, branch: 'topic', base: 'main' })],
+    [
+      'GIT_TOO_OLD',
+      async () => ({
+        env: { ...testEnv, PATH: await pathWith('#!/bin/sh\necho "git version 2.30.0"\n') },
+        branch: 'topic',
+        base: 'main',
+      }),
+    ],
+    ['INVALID_BRANCH_NAME', async () => ({ env: testEnv, branch: '@{-1}', base: 'main' })],
+    ['BRANCH_EXISTS', async () => ({ env: testEnv, branch: 'taken', base: 'main' })],
+    ['GIT_FAILED', async () => ({ env: testEnv, branch: 'no-such-branch', base: undefined })],
+  ] as const)('COCKPIT-42 AC1 — %s leaves a root that did not exist missing', async (code, setup) => {
+    const repo = await makeRepo();
+    git(repo, 'branch', 'taken');
+    const root = await absent();
+    const { env, branch, base } = await setup();
+
+    const error = await rejection(createWorktree({ repo, root, branch, base, env }));
+
+    expect(error.code).toBe(code);
+    expect(existsSync(root)).toBe(false);
+    expect(existsSync(dirname(root))).toBe(false);
+  });
+
+  test('COCKPIT-42 AC1 — NOT_A_REPOSITORY leaves a root that did not exist missing', async () => {
+    const folder = await tempDir();
+    const root = await absent();
+
+    const error = await rejection(createWorktree({ repo: folder, root, branch: 'topic', base: 'main', env: testEnv }));
+
+    expect(error.code).toBe('NOT_A_REPOSITORY');
+    expect(existsSync(root)).toBe(false);
+    expect(existsSync(dirname(root))).toBe(false);
+  });
+
+  const cockpitBase = (repo: string, branch: string) => {
+    try {
+      return git(repo, 'config', '--get', `branch.${branch}.cockpitBase`);
+    } catch {
+      return null;
+    }
+  };
+
+  test.runIf(process.getuid?.() !== 0).each([
+    ['EEXIST', 'a regular file', async () => {
+      const root = join(await tempDir(), 'root-is-a-file');
+      await writeFile(root, 'x');
+      return { root, cleanup: async () => {} };
+    }],
+    ['ENOTDIR', 'under a regular file', async () => {
+      const file = join(await tempDir(), 'a-file');
+      await writeFile(file, 'x');
+      return { root: join(file, 'worktrees'), cleanup: async () => {} };
+    }],
+    ['EACCES', 'under a folder without write permission', async () => {
+      const locked = join(await tempDir(), 'locked');
+      await mkdir(locked);
+      await chmod(locked, 0o555);
+      return { root: join(locked, 'worktrees'), cleanup: () => chmod(locked, 0o755) };
+    }],
+  ] as const)('COCKPIT-42 AC2 — a root that is %s rejects FS_FAILED naming the root and %s, creating nothing', async (errno, _where, setup) => {
+    const repo = await makeRepo();
+    const { root, cleanup } = await setup();
+    const before = { branches: git(repo, 'branch', '--list'), worktrees: git(repo, 'worktree', 'list', '--porcelain') };
+
+    try {
+      const error = await rejection(createWorktree({ repo, root, branch: 'topic', base: 'main', env: testEnv }));
+
+      expect(error.code).toBe('FS_FAILED');
+      expect(error.message).toContain(root);
+      expect(error.message).toContain(errno);
+      expect(git(repo, 'branch', '--list')).toBe(before.branches);
+      expect(git(repo, 'worktree', 'list', '--porcelain')).toBe(before.worktrees);
+      expect(cockpitBase(repo, 'topic')).toBeNull();
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+describe('git output larger than 1 MiB', () => {
+  test('COCKPIT-42 AC4 — removeWorktree without force rejects DIRTY_WORKTREE for a status over 1 MiB, and the worktree stays', async () => {
+    const repo = await makeRepo();
+    const path = await addWorktree(repo, 'many', 'many');
+    // 5,000 untracked files with 250-byte names: about 1.25 MB of `status --porcelain`.
+    await Promise.all(
+      Array.from({ length: 5_000 }, (_, index) => writeFile(join(path, String(index).padStart(5, '0').padEnd(250, 'x')), '')),
+    );
+
+    const error = await rejection(removeWorktree({ repo, path, env: testEnv }));
+
+    expect(error.code).toBe('DIRTY_WORKTREE');
+    expect(existsSync(path)).toBe(true);
+  });
+
+  test('COCKPIT-42 AC5 — createWorktree resolves when a post-checkout hook writes over 1 MiB and exits 0', async () => {
+    const repo = await makeRepo();
+    const root = await tempDir();
+    const hooks = await tempDir();
+    const hook = join(hooks, 'post-checkout');
+    await writeFile(hook, "#!/bin/sh\nhead -c 2097152 /dev/zero | tr '\\0' x\nexit 0\n");
+    await chmod(hook, 0o755);
+    git(repo, 'config', 'core.hooksPath', hooks);
+
+    const created = await createWorktree({ repo, root, branch: 'topic', base: 'main', env: testEnv });
+
+    expect(created.path).toBe(join(root, projectDir(repo), 'topic'));
+    expect(existsSync(created.path)).toBe(true);
+    expect((await listWorktrees(repo, { env: testEnv })).map((worktree) => worktree.path)).toContain(created.path);
+  });
+});
+
 describe('readWorkspaceConfig', () => {
   const rwc = (repo: string, path: string, env: NodeJS.ProcessEnv = testEnv) =>
     readWorkspaceConfig({ repo, path, env });
@@ -1236,6 +1365,16 @@ describe('Electron boundary', () => {
     expect(files.map((f) => basename(f)).sort()).toEqual(expect.arrayContaining(['git.ts', 'index.ts']));
 
     const pattern = /(from\s*|import\s*\(\s*|require\s*\(\s*|import\s+)['"`]electron(\/[^'"`]*)?['"`]/;
+    for (const file of files) {
+      expect(pattern.test(readFileSync(file, 'utf8')), file).toBe(false);
+    }
+  });
+
+  test('COCKPIT-42 AC12 — no source imports ./index', () => {
+    const files = sources(join(packageDir, 'src'));
+    expect(files.map((f) => basename(f)).sort()).toEqual(expect.arrayContaining(['changes.ts', 'git.ts', 'index.ts']));
+
+    const pattern = /(from\s*|import\s*\(\s*|require\s*\(\s*|import\s+)['"`]\.\/index(\.[cm]?[jt]s)?['"`]/;
     for (const file of files) {
       expect(pattern.test(readFileSync(file, 'utf8')), file).toBe(false);
     }

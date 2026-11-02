@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -243,6 +244,90 @@ describe('fileDiff', () => {
     const result = await fileDiff(worktree, file, { env: testEnv });
 
     expect(result).toEqual({ kind: 'tooLarge' });
+  });
+});
+
+// COCKPIT-42: a worktree without an index, a missing temporary folder, forced colors and a stopped rebase.
+describe('listChanges and fileDiff edge cases', () => {
+  test('COCKPIT-42 AC9 — a worktree without an index file reports the base\'s files as deleted, with no error', async () => {
+    const repo = await makeRepo();
+    const worktree = join(await tempDir(), 'no-checkout');
+    git(repo, 'worktree', 'add', '--no-checkout', '-b', 'no-checkout', '--', worktree, 'main');
+    expect(existsSync(join(git(worktree, 'rev-parse', '--absolute-git-dir'), 'index'))).toBe(false);
+
+    const changes = await listChanges(worktree, { env: testEnv });
+
+    expect(changes.base).toBe('main');
+    expect(changes.files.map(({ path, status }) => [path, status])).toEqual(
+      ['.gitignore', 'a.txt', 'b.txt', 'c.txt', 'd.txt', 'z.txt'].map((path) => [path, 'deleted']),
+    );
+    const diff = await fileDiff(worktree, changes.files.find((file) => file.path === 'a.txt')!, { env: testEnv });
+    expect(diff.kind).toBe('text');
+    expect((diff as { patch: string }).patch).toContain('deleted file mode');
+  });
+
+  test('COCKPIT-42 AC10 — listChanges rejects FS_FAILED when the temporary index folder cannot be created', async () => {
+    const repo = await makeRepo();
+    const worktree = await makeWorkspace(repo);
+    const tmpdirBefore = process.env.TMPDIR;
+    process.env.TMPDIR = join(await tempDir(), 'missing');
+
+    try {
+      const error = await rejection(listChanges(worktree, { env: testEnv }));
+      expect(error.code).toBe('FS_FAILED');
+    } finally {
+      if (tmpdirBefore === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = tmpdirBefore;
+    }
+  });
+
+  test('COCKPIT-42 AC11 — the patch holds no ANSI escape sequence when the repository forces colors, and keeps its hunk header', async () => {
+    const repo = await makeRepo();
+    git(repo, 'config', 'color.ui', 'always');
+    git(repo, 'config', 'color.diff', 'always');
+    const worktree = await makeWorkspace(repo);
+    await writeFile(join(worktree, 'a.txt'), lines('a', 10).replace('a 2\n', 'a two\n'));
+
+    const result = await fileDiff(worktree, await changedFile(worktree, 'a.txt'), { env: testEnv });
+
+    expect(result.kind).toBe('text');
+    const patch = (result as { patch: string }).patch;
+    expect(patch).not.toContain('\u001b');
+    expect(patch).toMatch(/^@@ /m);
+  });
+
+  test('COCKPIT-42 AC13 — while a rebase is stopped on a conflict (merge, then --apply backend), the base is the recorded one', async () => {
+    const repo = await makeRepo();
+    const root = await tempDir();
+    git(repo, 'branch', 'dev', 'main');
+    git(repo, 'switch', '-q', 'dev');
+    await writeFile(join(repo, 'a.txt'), lines('a', 10).replace('a 1\n', 'dev 1\n'));
+    git(repo, 'commit', '-qam', 'dev one');
+    git(repo, 'switch', '-q', 'main');
+    // The recorded base is `dev`, while the project's default base is `main`.
+    const { path: worktree } = await createWorktree({ repo, root, branch: 'feat', base: 'dev', env: testEnv });
+    await writeFile(join(worktree, 'a.txt'), lines('a', 10).replace('a 1\n', 'dev 1\n').replace('a 3\n', 'feat 3\n'));
+    git(worktree, 'commit', '-qam', 'feat three');
+    git(repo, 'switch', '-q', 'dev');
+    await writeFile(join(repo, 'a.txt'), lines('a', 10).replace('a 1\n', 'dev 1\n').replace('a 3\n', 'dev 3\n'));
+    git(repo, 'commit', '-qam', 'dev three');
+    git(repo, 'switch', '-q', 'main');
+    expect((await listChanges(worktree, { env: testEnv })).base).toBe('dev');
+
+    for (const backend of [[], ['--apply']]) {
+      let stopped = false;
+      try {
+        git(worktree, 'rebase', ...backend, 'dev');
+      } catch {
+        stopped = true;
+      }
+      expect(stopped, `rebase ${backend.join(' ')} stops on a conflict`).toBe(true);
+      try {
+        expect((await listChanges(worktree, { env: testEnv })).base, `rebase ${backend.join(' ')}`).toBe('dev');
+      } finally {
+        git(worktree, 'rebase', '--abort');
+      }
+    }
   });
 });
 
