@@ -2,7 +2,6 @@ import { useRouter } from '@tanstack/react-router';
 import { Columns2Icon, CopyIcon, PanelLeftOpenIcon, PlusIcon, Rows2Icon, SquareTerminalIcon, XIcon } from 'lucide-react';
 import { useRef, useState, useSyncExternalStore } from 'react';
 import type { Project, Session, StartSessionResult, Workspace } from '../../shared/api';
-import { ChangesToggle } from '@/components/changes-panel';
 import { toggleSidebar, useSidebarCollapsed } from '@/components/collapsed';
 import { HarnessIcon } from '@/components/harness-icon';
 import {
@@ -513,8 +512,6 @@ function PaneView({
             onTerminal={() => openShellTab(path, { pane: pane.id })}
             onRefocus={() => refocus(path)}
           />
-          {/* Room for the Changes button. */}
-          {top && box.left + box.width === 100 && <div className="w-[96px] shrink-0" />}
         </div>
       </div>
       <div className="relative min-h-0 flex-1">
@@ -551,9 +548,6 @@ export function WorkspacePanes({ project, workspace }: { project: Project; works
           <PanelLeftOpenIcon />
         </Button>
       )}
-      <div className="app-no-drag absolute top-[10px] right-2 z-10">
-        <ChangesToggle />
-      </div>
       {boxes(view.layout).map((box) => (
         <PaneView
           key={box.pane}

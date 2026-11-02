@@ -154,7 +154,7 @@ export interface PullRequest {
  * `subject` is the first line of HEAD's commit.
  */
 export type BranchStatusResult =
-  | { status: 'read'; branch: string | null; upstream: string | null; uncommitted: boolean; unpushed: boolean; subject: string }
+  | { status: 'read'; branch: string | null; upstream: string | null; uncommitted: boolean; unpushed: number; subject: string }
   | Refused;
 
 export type CommitResult = { status: 'committed' } | Refused;

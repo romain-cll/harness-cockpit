@@ -55,14 +55,14 @@ export function DiffView({ diff }: { diff: FileDiff }) {
   if (diff.kind === 'binary') return <p className="p-3 text-xs text-muted-foreground">Binary file</p>;
   if (diff.kind === 'tooLarge') return <p className="p-3 text-xs text-muted-foreground">Diff too large to display</p>;
   return (
-    <div className="w-max min-w-full font-mono text-xs">
+    <div className="w-max min-w-full font-mono text-[11px] text-foreground">
       {parsePatch(diff.patch).map((hunk, index) => (
-        <div key={index} className="border-b">
-          <div className="px-3 py-1 text-muted-foreground">{hunk.header}</div>
+        <div key={index}>
+          <div className="flex h-[22px] items-center bg-diff-hunk pl-[42px] whitespace-pre text-muted-foreground">{hunk.header}</div>
           {hunk.lines.map((line, number) => (
-            <div key={number} className={`flex whitespace-pre ${LINE_CLASSES[line.kind]}`}>
-              <span className="w-10 shrink-0 pr-2 text-right text-muted-foreground select-none">{line.number}</span>
-              <span className="w-4 shrink-0 select-none">{PREFIXES[line.kind]}</span>
+            <div key={number} className={`flex h-[18px] items-center whitespace-pre ${LINE_CLASSES[line.kind]}`}>
+              <span className="w-9 shrink-0 text-right text-subtle select-none">{line.number}</span>
+              <span className="ml-1.5 w-2 shrink-0 select-none">{PREFIXES[line.kind]}</span>
               <span>{line.text}</span>
             </div>
           ))}

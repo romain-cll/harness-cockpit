@@ -5000,34 +5000,27 @@ describe('sessions: built app', () => {
   });
 });
 
-// --- Changes sidebar (COCKPIT-34) --------------------------------------------
+// --- Changes sidebar (COCKPIT-34), the right bar since COCKPIT-67 --------------
 
-const changesToggle = (page: Page) => page.getByRole('button', { name: 'Changes', exact: true });
+type Locator = ReturnType<Page['locator']>;
+type BarTab = 'Diff' | 'Pull request';
 
-const PANEL = '[data-test-changes-panel]';
+// The right column of a workspace page: the 40 px rail or the 320 px bar, the one element with role
+// `complementary` named "Right bar" (a `div`: the left sidebar stays the page's only `<aside>`).
+const PANEL = '[role="complementary"][aria-label="Right bar"]';
+const rightBar = (page: Page) => page.getByRole('complementary', { name: 'Right bar', exact: true });
+const showRightBar = (page: Page) => page.getByRole('button', { name: 'Show right bar', exact: true });
+const hideRightBar = (page: Page) => page.getByRole('button', { name: 'Hide right bar', exact: true });
+// The rail's two buttons (the bar has tabs instead).
+const railButton = (page: Page, name: BarTab) => rightBar(page).getByRole('button', { name, exact: true });
+// A tab of the bar: its name may be followed by the number of files.
+const barTab = (page: Page, name: BarTab) => rightBar(page).getByRole('tab', { name: new RegExp(`^${name}`) });
 
-// The right sidebar has no test hook and no role the tests could rely on: it is the element 360 px
-// wide against the window's right edge that shows "Changes". Marks it (and only it) so locators can be
-// scoped to it, and says whether it was found.
+// Whether the right column is the open bar (320 px) and not the rail (40 px).
 const markChangesPanel = (page: Page) =>
-  page.evaluate((marker) => {
-    for (const marked of document.querySelectorAll(marker)) marked.removeAttribute(marker.slice(1, -1));
-    const panel = [...document.querySelectorAll<HTMLElement>('body *')].find((element) => {
-      const box = element.getBoundingClientRect();
-      return (
-        Math.abs(box.width - 360) <= 1 &&
-        Math.abs(box.right - window.innerWidth) <= 1 &&
-        box.height > 100 &&
-        (element.textContent ?? '').includes('Changes')
-      );
-    });
-    panel?.setAttribute(marker.slice(1, -1), '');
-    return panel !== undefined;
-  }, PANEL);
+  page.evaluate((selector) => (document.querySelector(selector)?.getBoundingClientRect().width ?? 0) > 100, PANEL);
 
-const panelBox = async (page: Page) => ((await markChangesPanel(page)) ? page.locator(PANEL).boundingBox() : null);
-
-// Runs `read` in the page on the sidebar, `null` when it is not open.
+// Runs `read` in the page on the bar, `null` when it is not there.
 async function panelEval<T, A>(page: Page, read: (panel: HTMLElement, arg: A) => T, arg: A): Promise<T | null> {
   if (!(await markChangesPanel(page))) return null;
   return page
@@ -5036,10 +5029,101 @@ async function panelEval<T, A>(page: Page, read: (panel: HTMLElement, arg: A) =>
     .catch(() => null);
 }
 
+// What is shown (a hidden tab panel's text is not part of `innerText`).
 const panelText = async (page: Page) => (await panelEval(page, (panel) => panel.innerText, null)) ?? '';
 
 const waitForPanelText = (page: Page, matches: (text: string) => boolean, timeout = UI_TIMEOUT) =>
   poll(() => panelText(page), matches, timeout);
+
+// Geometry and style of an element: the facts the right bar's criteria state.
+const readStyle = (element: Element) => {
+  const style = getComputedStyle(element);
+  const box = element.getBoundingClientRect();
+  return {
+    left: box.left,
+    right: box.right,
+    top: box.top,
+    bottom: box.bottom,
+    width: box.width,
+    height: box.height,
+    color: style.color,
+    background: style.backgroundColor,
+    fontSize: style.fontSize,
+    lineHeight: style.lineHeight,
+    fontWeight: style.fontWeight,
+    fontFamily: style.fontFamily,
+    radius: style.borderTopLeftRadius,
+    paddingLeft: style.paddingLeft,
+    paddingRight: style.paddingRight,
+    borderTop: style.borderTopWidth,
+    borderRight: style.borderRightWidth,
+    borderBottom: style.borderBottomWidth,
+    borderLeft: style.borderLeftWidth,
+    borderTopColor: style.borderTopColor,
+    borderLeftColor: style.borderLeftColor,
+    position: style.position,
+  };
+};
+const lookOf = (target: Locator) => target.evaluate(readStyle);
+
+// The smallest element that holds every one of `targets`.
+async function commonAncestor(page: Page, ...targets: Locator[]) {
+  const handles = await Promise.all(targets.map((target) => target.elementHandle({ timeout: UI_TIMEOUT })));
+  return page.evaluateHandle((elements) => {
+    let node: Element | null = elements[0]!;
+    while (node && !elements.every((element) => node!.contains(element))) node = node.parentElement;
+    return node!;
+  }, handles as ElementHandle<SVGElement | HTMLElement>[]);
+}
+const lookOfHandle = (handle: unknown) => (handle as Locator).evaluate(readStyle);
+
+// The Lucide icon inside `target`: its class, size, stroke width and color.
+const iconIn = (target: Locator) =>
+  target
+    .locator('svg')
+    .first()
+    .evaluate((svg) => ({
+      className: svg.getAttribute('class') ?? '',
+      width: svg.getBoundingClientRect().width,
+      height: svg.getBoundingClientRect().height,
+      stroke: parseFloat(getComputedStyle(svg).strokeWidth),
+      color: getComputedStyle(svg).color,
+    }));
+
+const near = (actual: number, expected: number, tolerance = 1) => Math.abs(actual - expected) <= tolerance;
+
+const TRANSPARENT = 'rgba(0, 0, 0, 0)';
+
+// Whether `target`'s fill is the token's color at 14 % opacity (the state pills): both are drawn over the
+// same gray in a canvas and the pixels compared, whatever color syntax the computed value uses.
+const fillIsTokenAt14 = (target: Locator, token: string) =>
+  target.evaluate((element, token) => {
+    const probe = document.createElement('span');
+    probe.style.color = `var(${token})`;
+    document.body.append(probe);
+    const solid = getComputedStyle(probe).color;
+    probe.remove();
+    const fill = getComputedStyle(element).backgroundColor;
+    const context = document.createElement('canvas').getContext('2d', { willReadFrequently: true })!;
+    const over = (draw: () => void) => {
+      context.clearRect(0, 0, 1, 1);
+      context.globalAlpha = 1;
+      context.fillStyle = '#808080';
+      context.fillRect(0, 0, 1, 1);
+      draw();
+      return [...context.getImageData(0, 0, 1, 1).data].slice(0, 3);
+    };
+    const actual = over(() => {
+      context.fillStyle = fill;
+      context.fillRect(0, 0, 1, 1);
+    });
+    const expected = over(() => {
+      context.globalAlpha = 0.14;
+      context.fillStyle = solid;
+      context.fillRect(0, 0, 1, 1);
+    });
+    return fill !== 'rgba(0, 0, 0, 0)' && actual.every((value, index) => Math.abs(value - expected[index]!) <= 3);
+  }, token);
 
 // The sidebar's hunk headers (`@@ … @@`).
 const hunkHeaders = async (page: Page) =>
@@ -5055,22 +5139,31 @@ const hunkHeaders = async (page: Page) =>
     null,
   )) ?? [];
 
+interface LeafLook {
+  color: string;
+  fontSize: string;
+  fontFamily: string;
+}
 interface FileRow {
   /** The row's text, one entry per word, with "−" read as "-". */
   tokens: string[];
-  /** The computed color of each piece of text of the row, by its text. */
-  colors: Record<string, string>;
+  /** The look of each piece of text of the row, by its text ("−" read as "-"). */
+  leaves: Record<string, LeafLook>;
+  /** The row: the height of its button, its largest radius, the first fill from the name up to the row. */
+  row: { height: number; radius: number; background: string };
 }
 
-// The row of the file list that shows the file name `name`: its text pieces and their colors. The first
+// The row of the file list that shows the file name `name`: its text pieces and their looks. The first
 // match in document order is the list's (the diff area comes after it). `others` are the names of the
 // other rows, which tell where the row ends.
 const fileRow = (page: Page, name: string, others: string[]) =>
   panelEval(
     page,
-    (panel, { name, others }): { tokens: string[]; colors: Record<string, string> } | null => {
+    (panel, { name, others }): FileRow | null => {
       const text = (element: Element) => (element.textContent ?? '').trim();
-      const leaves = [...panel.querySelectorAll<HTMLElement>('*')].filter((element) => element.children.length === 0 && text(element) !== '');
+      const leaves = [...panel.querySelectorAll<HTMLElement>('*')].filter(
+        (element) => element.children.length === 0 && text(element) !== '' && element.checkVisibility(),
+      );
       const shows = (leaf: Element, wanted: string) => text(leaf) === wanted || text(leaf).startsWith(`${wanted} `);
       const nameLeaf = leaves.find((leaf) => shows(leaf, name));
       if (!nameLeaf) return null;
@@ -5081,13 +5174,31 @@ const fileRow = (page: Page, name: string, others: string[]) =>
         row = parent;
       }
       const inRow = leaves.filter((leaf) => row.contains(leaf));
+      const normalise = (value: string) => value.replace(/−/g, '-');
+      const chain: HTMLElement[] = [];
+      for (let node: HTMLElement | null = nameLeaf; node; node = node.parentElement) {
+        chain.push(node);
+        if (node === row) break;
+      }
+      const control = nameLeaf.closest<HTMLElement>('button, [role="button"], [role="option"], a') ?? row;
+      const fill = chain.map((node) => getComputedStyle(node).backgroundColor).find((color) => color !== 'rgba(0, 0, 0, 0)');
       return {
-        tokens: inRow.flatMap((leaf) => text(leaf).split(/\s+/)).map((token) => token.replace(/−/g, '-')),
-        colors: Object.fromEntries(inRow.map((leaf) => [text(leaf), getComputedStyle(leaf).color])),
+        tokens: inRow.flatMap((leaf) => normalise(text(leaf)).split(/\s+/)),
+        leaves: Object.fromEntries(
+          inRow.map((leaf) => {
+            const style = getComputedStyle(leaf);
+            return [normalise(text(leaf)), { color: style.color, fontSize: style.fontSize, fontFamily: style.fontFamily }];
+          }),
+        ),
+        row: {
+          height: control.getBoundingClientRect().height,
+          radius: Math.max(...chain.map((node) => parseFloat(getComputedStyle(node).borderTopLeftRadius))),
+          background: fill ?? 'rgba(0, 0, 0, 0)',
+        },
       };
     },
     { name, others },
-  ) as Promise<FileRow | null>;
+  );
 
 // The names of the files the list shows, with their status letters and counts, for a workspace
 // whose files are `names`.
@@ -5139,17 +5250,125 @@ const diffLine = (page: Page, number: number, prefix: '+' | '-' | ' ', content: 
 const waitForDiffLine = (page: Page, number: number, prefix: '+' | '-' | ' ', content: string, timeout = UI_TIMEOUT) =>
   poll(() => diffLine(page, number, prefix, content), (facts) => facts !== null, timeout);
 
-// Opens (or closes) the sidebar through the toggle in the page header and waits for it.
-async function setChangesOpen(page: Page, open: boolean) {
-  const toggle = changesToggle(page);
-  await toggle.waitFor({ timeout: UI_TIMEOUT });
-  if ((await toggle.getAttribute('aria-pressed')) !== String(open)) await toggle.click({ timeout: UI_TIMEOUT });
-  await poll(() => toggle.getAttribute('aria-pressed'), (pressed) => pressed === String(open), UI_TIMEOUT);
-  const found = await poll(() => markChangesPanel(page), (shown) => shown === open, UI_TIMEOUT);
-  expect(found, open ? 'the Changes sidebar opens' : 'the Changes sidebar closes').toBe(open);
+// The layout of one diff line (AC9): its height, the gutter holding the number (width, alignment, color),
+// the gap between the gutter and the prefix, the line's fill (the first one from the line up to the bar)
+// and the color of its text.
+const diffLineLook = (page: Page, number: number, prefix: '+' | '-', content: string) =>
+  panelEval(
+    page,
+    (panel, { expected, content }) => {
+      const normalise = (text: string) => text.replace(/\s+/g, '').replace(/−/g, '-');
+      const matches = [...panel.querySelectorAll<HTMLElement>('*')].filter((element) => normalise(element.textContent ?? '') === expected);
+      const line = matches.find((element) => !matches.some((other) => other !== element && element.contains(other)));
+      if (!line) return null;
+      const texts: Text[] = [];
+      const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) if ((node.textContent ?? '').trim() !== '') texts.push(node as Text);
+      const rangeOf = (node: Text) => {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        return range.getBoundingClientRect();
+      };
+      const gutter = texts[0]!.parentElement!;
+      const gutterBox = gutter.getBoundingClientRect();
+      const contentNode = texts.find((node) => (node.textContent ?? '').includes(content)) ?? texts.at(-1)!;
+      let fill = 'rgba(0, 0, 0, 0)';
+      for (let node: HTMLElement | null = line; node && node !== panel; node = node.parentElement) {
+        const background = getComputedStyle(node).backgroundColor;
+        if (background !== 'rgba(0, 0, 0, 0)') {
+          fill = background;
+          break;
+        }
+      }
+      const lineStyle = getComputedStyle(line);
+      return {
+        height: line.getBoundingClientRect().height,
+        fontSize: lineStyle.fontSize,
+        fontFamily: lineStyle.fontFamily,
+        gutterWidth: gutterBox.width,
+        gutterAlign: getComputedStyle(gutter).textAlign,
+        gutterColor: getComputedStyle(gutter).color,
+        gap: rangeOf(texts[1]!).left - gutterBox.right,
+        fill,
+        textColor: getComputedStyle(contentNode.parentElement!).color,
+      };
+    },
+    { expected: `${number}${prefix}${content}`.replace(/\s+/g, ''), content },
+  );
+
+// The hunk header row whose text starts with `start` (AC9): its height, fill, text style and the offset of
+// its text from its left edge.
+const hunkRowLook = (page: Page, start: string) =>
+  panelEval(
+    page,
+    (panel, start) => {
+      const text = (element: Element) => (element.textContent ?? '').trim();
+      const leaf = [...panel.querySelectorAll<HTMLElement>('*')].find(
+        (element) => text(element).startsWith(start) && ![...element.children].some((child) => text(child).startsWith(start)),
+      );
+      if (!leaf) return null;
+      let row: HTMLElement = leaf;
+      while (row.parentElement && row.parentElement !== panel && text(row.parentElement) === text(leaf)) row = row.parentElement;
+      const style = getComputedStyle(leaf);
+      const range = document.createRange();
+      range.selectNodeContents(leaf.firstChild ?? leaf);
+      let background = 'rgba(0, 0, 0, 0)';
+      for (let node: HTMLElement | null = leaf; node; node = node.parentElement) {
+        const fill = getComputedStyle(node).backgroundColor;
+        if (fill !== 'rgba(0, 0, 0, 0)') {
+          background = fill;
+          break;
+        }
+        if (node === row) break;
+      }
+      return {
+        height: row.getBoundingClientRect().height,
+        background,
+        color: style.color,
+        fontSize: style.fontSize,
+        fontFamily: style.fontFamily,
+        textOffset: range.getBoundingClientRect().left - row.getBoundingClientRect().left,
+      };
+    },
+    start,
+  );
+
+// Selects a tab of the open bar.
+async function selectBarTab(page: Page, tab: BarTab) {
+  const element = barTab(page, tab);
+  await element.waitFor({ timeout: UI_TIMEOUT });
+  if ((await element.getAttribute('aria-selected')) !== 'true') await element.click({ timeout: UI_TIMEOUT });
+  await poll(() => element.getAttribute('aria-selected'), (selected) => selected === 'true', UI_TIMEOUT);
 }
 
-// Clicks the file `name` in the sidebar's list.
+// The tab that is selected, without the number of files.
+const selectedTabName = (page: Page) =>
+  rightBar(page)
+    .getByRole('tab', { selected: true })
+    .first()
+    .innerText({ timeout: 2_000 })
+    .then((name) => name.replace(/\s*\d+\s*$/, '').trim())
+    .catch(() => '');
+
+// Opens (or closes) the right bar through its buttons, on `tab`, and waits for it.
+async function setChangesOpen(page: Page, open: boolean, tab: BarTab = 'Diff') {
+  if (open) {
+    if (!(await markChangesPanel(page))) {
+      await showRightBar(page).waitFor({ timeout: UI_TIMEOUT });
+      await showRightBar(page).click({ timeout: UI_TIMEOUT });
+    }
+    const found = await poll(() => markChangesPanel(page), (shown) => shown, UI_TIMEOUT);
+    expect(found, 'the right bar opens').toBe(true);
+    await selectBarTab(page, tab);
+  } else {
+    if (await markChangesPanel(page)) await hideRightBar(page).click({ timeout: UI_TIMEOUT });
+    await showRightBar(page).waitFor({ timeout: UI_TIMEOUT });
+    const found = await poll(() => markChangesPanel(page), (shown) => !shown, UI_TIMEOUT);
+    expect(found, 'the right bar closes').toBe(false);
+  }
+}
+
+// Clicks the file `name` in the bar's list.
 async function selectChangedFile(page: Page, name: string) {
   expect(await markChangesPanel(page)).toBe(true);
   await page.locator(PANEL).getByText(name, { exact: true }).first().click({ timeout: UI_TIMEOUT });
@@ -5364,26 +5583,31 @@ const remoteRef = (origin: string, branch: string) => {
 };
 
 const shipButton = (page: Page, name: string) => page.locator(PANEL).getByRole('button', { name, exact: true });
+const prLink = (page: Page) => page.locator(PANEL).getByRole('link', { name: 'Open on GitHub', exact: true });
 const commitField = (page: Page) => page.locator(PANEL).getByRole('textbox', { name: 'Commit message', exact: true });
 const prDialog = (page: Page) => page.getByRole('dialog', { name: 'Create pull request' });
 
 // Waits until the sidebar's text satisfies `matches`, and fails when it does not within `timeout`.
 async function waitForShipText(page: Page, matches: (text: string) => boolean, timeout = 5_000) {
-  const text = await waitForPanelText(page, matches, timeout);
+  const text = await poll(async () => (await panelText(page)).replace(/\s+/g, ' '), matches, timeout);
   expect(matches(text), `the sidebar does not show the expected text, it shows:\n${text}`).toBe(true);
   return text;
 }
 
 // Waits until the sidebar lists exactly `names` among `names` (the files the test wrote or removed).
+// The list is on the Diff tab: the tab selected before is selected again.
 async function expectListed(page: Page, names: string[], expected: string[]) {
+  const tab = await selectedTabName(page);
+  await selectBarTab(page, 'Diff');
   const listed = await poll(() => listedNames(page, names), (found) => JSON.stringify(found) === JSON.stringify(expected), UI_TIMEOUT);
+  if (tab === 'Pull request') await selectBarTab(page, 'Pull request');
   expect(listed).toEqual(expected);
 }
 
-// Opens a session's page and its Changes sidebar.
+// Opens a session's page and its right bar on the "Pull request" tab.
 async function openShip(page: Page, sessionId: string) {
   await openSessionById(page, sessionId);
-  await setChangesOpen(page, true);
+  await setChangesOpen(page, true, 'Pull request');
 }
 
 // Types `message` in the commit field and presses "Commit".
@@ -5397,9 +5621,10 @@ async function commitThroughPanel(page: Page, message: string) {
 // answers shows in the sidebar, then a commit and a push reach `origin`.
 async function expectShipSmoke(page: Page, gh: GhFixture, worktree: string, origin: string, branch: string) {
   setGh(gh, { list: prJson({ checks: 'pending' }) });
+  await setChangesOpen(page, true, 'Pull request');
   await dispatchFocus(page);
-  await page.locator(PANEL).getByRole('link', { name: '#7 Fix the bug', exact: true }).waitFor({ timeout: UI_TIMEOUT });
-  await waitForShipText(page, (text) => text.includes('Checks pending'));
+  await prLink(page).waitFor({ timeout: UI_TIMEOUT });
+  await waitForShipText(page, (text) => text.includes('#7 · Checks pending'));
 
   await commitThroughPanel(page, 'Smoke commit');
   expect(await poll(() => gitIn(worktree, 'log', '-1', '--format=%B'), (subject) => subject === 'Smoke commit', UI_TIMEOUT)).toBe('Smoke commit');
@@ -5455,139 +5680,399 @@ describe('changes sidebar: built app', () => {
     if (repo) rmSync(repo.parent, { recursive: true, force: true });
   });
 
-  test('changes AC9 — the "Changes" toggle docks a 360 px sidebar next to the main area, the terminal refits to the narrower area, and closing it gives the width back', async () => {
+  const windowWidth = (page: Page) => page.evaluate(() => window.innerWidth);
+
+  // No right column: no "Right bar", no "Show right bar", and `<main>` reaches the window's right edge.
+  async function expectNoRightColumn(page: Page, where: string) {
+    expect(await rightBar(page).count(), `${where}: no right column`).toBe(0);
+    expect(await showRightBar(page).count(), `${where}: no "Show right bar" button`).toBe(0);
+    const main = await lookOf(page.locator('main'));
+    expect(near(main.right, await windowWidth(page)), `${where}: <main> reaches the right edge (${main.right})`).toBe(true);
+  }
+
+  test('right bar AC1 — on a workspace page, first shown after a launch, the right column is the 40 px rail: the fill of <main> in both schemes and no border, a "Show right bar" button 22 px from the top, the Diff and Pull request pill below, and no "Changes" button in the header', async () => {
     const { page } = session;
     await openSessionById(page, A.id);
-    const toggle = changesToggle(page);
-    await toggle.waitFor({ timeout: UI_TIMEOUT });
-    expect(await toggle.getAttribute('aria-pressed')).toBe('false');
-    expect(await markChangesPanel(page)).toBe(false);
+    const rail = rightBar(page);
+    await rail.waitFor({ timeout: UI_TIMEOUT });
+    const width = await windowWidth(page);
+    expect(await markChangesPanel(page), 'the rail, not the bar').toBe(false);
+
+    const box = await lookOf(rail);
+    expect(near(box.width, 40), `the rail is 40 px wide: ${box.width}`).toBe(true);
+    expect(near(box.right, width), 'against the right edge').toBe(true);
+    expect([box.borderTop, box.borderRight, box.borderBottom, box.borderLeft], 'no border').toEqual(['0px', '0px', '0px', '0px']);
+    expect(near((await lookOf(page.locator('main'))).right, box.left, 2), '<main> ends where the rail starts').toBe(true);
+    try {
+      for (const [scheme, fill] of [['dark', 'rgb(14, 14, 16)'], ['light', 'rgb(255, 255, 255)']] as const) {
+        await page.emulateMedia({ colorScheme: scheme });
+        expect((await lookOf(rail)).background, `the rail's fill, ${scheme}`).toBe(fill);
+        expect((await lookOf(page.locator('main'))).background, `<main>'s fill, ${scheme}`).toBe(fill);
+      }
+    } finally {
+      await page.emulateMedia({ colorScheme: null });
+    }
+
+    const show = showRightBar(page);
+    const showLook = await lookOf(show);
+    expect([near(showLook.width, 24), near(showLook.height, 24)], '24 px square').toEqual([true, true]);
+    expect(near((showLook.top + showLook.bottom) / 2, 22), `centred 22 px from the top: ${(showLook.top + showLook.bottom) / 2}`).toBe(true);
+    const showIcon = await iconIn(show);
+    expect(showIcon.className).toMatch(/lucide-panel-right(\s|$)/);
+    expect(showIcon.stroke).toBe(1.25);
+    expect(showIcon.color, 'muted').toBe(await mutedColor(page));
+
+    const diff = railButton(page, 'Diff');
+    const pullRequest = railButton(page, 'Pull request');
+    const pillLook = await lookOfHandle(await commonAncestor(page, diff, pullRequest));
+    expect(near(pillLook.top, 48), `the pill starts 4 px below the 44 px header slot: ${pillLook.top}`).toBe(true);
+    expect(pillLook.radius).toBe('10px');
+    expect([pillLook.paddingLeft, pillLook.paddingRight]).toEqual(['4px', '4px']);
+    expect(pillLook.background).toBe(await tokenColor(page, '--sidebar-accent'));
+    const [first, second] = await Promise.all([lookOf(diff), lookOf(pullRequest)]);
+    expect(Math.max(second.left - first.right, second.top - first.bottom), 'a 4 px gap between the buttons').toBeGreaterThanOrEqual(3);
+    expect(Math.max(second.left - first.right, second.top - first.bottom)).toBeLessThanOrEqual(5);
+    for (const [button, name, icon] of [[diff, 'Diff', /lucide-file-diff(\s|$)/], [pullRequest, 'Pull request', /lucide-git-pull-request(\s|$)/]] as const) {
+      const look = await lookOf(button);
+      expect([near(look.width, 24), near(look.height, 24)], `${name}: 24 px`).toEqual([true, true]);
+      const svg = await iconIn(button);
+      expect(svg.className, `${name}: icon`).toMatch(icon);
+      expect([svg.width, svg.height], `${name}: 14 px icon`).toEqual([14, 14]);
+      expect(svg.stroke).toBe(1.25);
+      expect(svg.color, `${name}: muted`).toBe(await mutedColor(page));
+      expect(await button.getAttribute('aria-label')).toBe(name);
+      expect((await button.getAttribute('title')) ?? '', `${name}: a title`).not.toBe('');
+      expect((await button.innerText()).trim(), `${name}: no text or number`).toBe('');
+    }
+    expect(await page.getByRole('button', { name: 'Changes', exact: true }).count(), 'the page header has no "Changes" button').toBe(0);
+  });
+
+  test('right bar AC2 — Home and the page of a session outside any project have no right column and no "Show right bar" button, and <main> reaches the window\'s right edge', async () => {
+    const { page } = session;
+    await openSessionById(page, A.id);
+    await showRightBar(page).waitFor({ timeout: UI_TIMEOUT });
+
+    await goHome(page);
+    await expectNoRightColumn(page, 'Home');
+    await startSession(page, 'Claude Code', 'Claude Code 1');
+    await expectNoRightColumn(page, 'a session outside any project');
+
+    await openSessionById(page, A.id);
+    await showRightBar(page).waitFor({ timeout: UI_TIMEOUT });
+  });
+
+  test('right bar AC3 — "Show right bar" turns the rail into the 320 px bar (the fill of <main>, a 1 px left border in --border, the tabs at the left and a "Hide right bar" button 8 px from the edge, 22 px from the top), the terminal narrows by at least 260 px, and "Hide right bar" brings the rail and the width back', async () => {
+    const { page } = session;
+    await openSessionById(page, A.id);
+    await showRightBar(page).waitFor({ timeout: UI_TIMEOUT });
     const screen = page.locator('.xterm-screen:visible').first();
     await screen.waitFor({ timeout: UI_TIMEOUT });
     const widthBefore = (await screen.boundingBox())!.width;
+    const width = await windowWidth(page);
 
-    await toggle.click({ timeout: UI_TIMEOUT });
-    expect(await toggle.getAttribute('aria-pressed')).toBe('true');
-    const panel = await poll(() => panelBox(page), Boolean, UI_TIMEOUT);
-    expect(panel, 'a Changes sidebar 360 px wide against the right edge of the window').toBeTruthy();
-    const main = (await page.locator('main').boundingBox())!;
-    expect(Math.abs(panel!.width - 360)).toBeLessThanOrEqual(1);
-    // Docked: the main area ends where the sidebar starts, and both are visible.
-    expect(main.width).toBeGreaterThan(0);
-    expect(main.x + main.width).toBeLessThanOrEqual(panel!.x + 1);
-    expect(Math.abs(main.x + main.width - panel!.x)).toBeLessThanOrEqual(2);
+    await showRightBar(page).click({ timeout: UI_TIMEOUT });
+    await poll(() => markChangesPanel(page), (shown) => shown, UI_TIMEOUT);
+    const bar = rightBar(page);
+    const look = await poll(() => lookOf(bar), (found) => near(found.width, 320), UI_TIMEOUT);
+    expect(near(look.width, 320), `the bar is 320 px wide: ${look.width}`).toBe(true);
+    expect(near(look.right, width), 'against the right edge').toBe(true);
+    expect(look.background, "the fill of <main>").toBe((await lookOf(page.locator('main'))).background);
+    expect(look.borderLeft).toBe('1px');
+    expect(look.borderLeftColor, '--border').toBe(await tokenColor(page, '--border'));
+
+    const diffTab = await lookOf(barTab(page, 'Diff'));
+    const pullRequestTab = await lookOf(barTab(page, 'Pull request'));
+    expect(diffTab.left - look.left, 'the tabs sit at the left of the strip').toBeLessThan(20);
+    expect(pullRequestTab.left).toBeGreaterThan(diffTab.right - 1);
+    expect(near((diffTab.top + diffTab.bottom) / 2, 22), 'the tabs are centred in the 44 px strip').toBe(true);
+    const hide = await lookOf(hideRightBar(page));
+    expect([near(hide.width, 24), near(hide.height, 24)], '"Hide right bar" is 24 px').toEqual([true, true]);
+    expect(near(hide.right, width - 8), `8 px from the window's edge: ${width - hide.right}`).toBe(true);
+    expect(near((hide.top + hide.bottom) / 2, 22), 'centred 22 px from the top').toBe(true);
+    expect(hide.background, 'the --sidebar-accent fill').toBe(await tokenColor(page, '--sidebar-accent'));
     const narrower = await poll(
       async () => (await screen.boundingBox())!.width,
-      (width) => width <= widthBefore - 300,
+      (value) => value <= widthBefore - 260,
       UI_TIMEOUT,
     );
-    expect(narrower).toBeLessThanOrEqual(widthBefore - 300);
+    expect(narrower, 'the terminal narrows by at least 260 px').toBeLessThanOrEqual(widthBefore - 260);
 
-    await toggle.click({ timeout: UI_TIMEOUT });
-    expect(await toggle.getAttribute('aria-pressed')).toBe('false');
-    await poll(() => markChangesPanel(page), (shown) => !shown, UI_TIMEOUT);
-    expect(await markChangesPanel(page)).toBe(false);
+    await hideRightBar(page).click({ timeout: UI_TIMEOUT });
+    await showRightBar(page).waitFor({ timeout: UI_TIMEOUT });
+    expect(await poll(() => markChangesPanel(page), (shown) => !shown, UI_TIMEOUT)).toBe(false);
+    expect(near((await lookOf(bar)).width, 40), 'the rail is back').toBe(true);
     const restored = await poll(
       async () => (await screen.boundingBox())!.width,
-      (width) => Math.abs(width - widthBefore) <= 10,
+      (value) => Math.abs(value - widthBefore) <= 10,
       UI_TIMEOUT,
     );
-    expect(Math.abs(restored - widthBefore)).toBeLessThanOrEqual(10);
+    expect(Math.abs(restored - widthBefore), 'the terminal gets its width back').toBeLessThanOrEqual(10);
   });
 
-  test('changes AC10 — no button and no sidebar on Home or a session outside any project; back on a workspace page the sidebar shows again, open', async () => {
+  test('right bar AC4 — "Show right bar" opens on the tab selected last ("Diff" when none was selected since the page loaded), the rail\'s "Pull request" and "Diff" buttons open on their own tab', async () => {
     const { page } = session;
-    await setChangesOpen(page, true);
+    await openSessionById(page, A.id);
+    await showRightBar(page).waitFor({ timeout: UI_TIMEOUT });
+    const tabAfter = (expected: string) => poll(() => selectedTabName(page), (name) => name === expected, UI_TIMEOUT);
+    const hide = async () => {
+      await hideRightBar(page).click({ timeout: UI_TIMEOUT });
+      await showRightBar(page).waitFor({ timeout: UI_TIMEOUT });
+    };
+
+    // No tab was selected since the page loaded (the tests before this one only open and close the bar).
+    await showRightBar(page).click({ timeout: UI_TIMEOUT });
+    expect(await tabAfter('Diff')).toBe('Diff');
+    await hide();
+
+    await railButton(page, 'Pull request').click({ timeout: UI_TIMEOUT });
+    expect(await tabAfter('Pull request')).toBe('Pull request');
+    await hide();
+
+    await railButton(page, 'Diff').click({ timeout: UI_TIMEOUT });
+    expect(await tabAfter('Diff')).toBe('Diff');
+    await barTab(page, 'Pull request').click({ timeout: UI_TIMEOUT });
+    expect(await tabAfter('Pull request')).toBe('Pull request');
+    await hide();
+
+    await showRightBar(page).click({ timeout: UI_TIMEOUT });
+    expect(await tabAfter('Pull request'), 'the tab selected last').toBe('Pull request');
+    await hide();
+  });
+
+  test('right bar AC5 — the bar open on "Pull request" stays open there after Home and on another workspace\'s page, which lists its own data; after a reload the rail shows and "Show right bar" opens on "Diff"', async () => {
+    const { page } = session;
+    await openSessionById(page, A.id);
+    await setChangesOpen(page, true, 'Pull request');
+    // A has changes: its "Diff" tab shows their number.
+    expect(await poll(() => barTab(page, 'Diff').innerText(), (text) => /\b7\b/.test(text), UI_TIMEOUT)).toMatch(/\b7\b/);
 
     await goHome(page);
-    expect(await changesToggle(page).count()).toBe(0);
-    expect(await markChangesPanel(page)).toBe(false);
+    await expectNoRightColumn(page, 'Home');
+    await openSessionById(page, B.id);
+    expect(await poll(() => markChangesPanel(page), (shown) => shown, UI_TIMEOUT), 'the bar is open on the other workspace').toBe(true);
+    expect(await selectedTabName(page)).toBe('Pull request');
+    // B has no change: no number after "Diff".
+    expect(await poll(() => barTab(page, 'Diff').innerText(), (text) => !/\d/.test(text), UI_TIMEOUT)).not.toMatch(/\d/);
 
-    await startSession(page, 'Claude Code', 'Claude Code 1');
-    expect(await changesToggle(page).count()).toBe(0);
-    expect(await markChangesPanel(page)).toBe(false);
-
-    await openSessionById(page, A.id);
-    await changesToggle(page).waitFor({ timeout: UI_TIMEOUT });
-    expect(await changesToggle(page).getAttribute('aria-pressed')).toBe('true');
-    expect(await poll(() => markChangesPanel(page), Boolean, UI_TIMEOUT)).toBe(true);
-    // A reload starts with it closed: see changes AC17 below, which reloads the page.
+    await page.reload();
+    await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
+    await showRightBar(page).waitFor({ timeout: UI_TIMEOUT });
+    expect(await markChangesPanel(page), 'the rail shows after a reload').toBe(false);
+    await showRightBar(page).click({ timeout: UI_TIMEOUT });
+    expect(await poll(() => selectedTabName(page), (name) => name === 'Diff', UI_TIMEOUT)).toBe('Diff');
+    await setChangesOpen(page, false);
   });
 
-  test('changes AC11 — the strip, the file list (letter, name, folder, counts), the first file selected with its diff by hunk, a click selecting another file, and "No changes against main." without changes', async () => {
+  test('right bar AC6 — each tab is 24 px tall with a radius of 8 px, 8 px side padding and 12 px text; the selected one is filled with --sidebar-accent in --foreground, the other has a 1 px --sidebar-accent border in --muted-foreground; "Diff" shows the number of files in 11 px --subtle', async () => {
     const { page } = session;
     await openSessionById(page, A.id);
-    await setChangesOpen(page, true);
+    await setChangesOpen(page, true, 'Diff');
+    const count = barTab(page, 'Diff').getByText(String(CHANGED_NAMES.length), { exact: true });
+    await count.waitFor({ timeout: UI_TIMEOUT });
+    const accent = await tokenColor(page, '--sidebar-accent');
+    const foreground = await tokenColor(page, '--foreground');
+    const muted = await mutedColor(page);
 
-    const text = (await waitForPanelText(page, (shown) => shown.includes('main.ts'))).replace(/\s+/g, ' ');
-    expect(text).toContain('Changes');
-    expect(text).toContain('against main');
+    for (const [selected, other] of [['Diff', 'Pull request'], ['Pull request', 'Diff']] as const) {
+      await selectBarTab(page, selected);
+      const on = await lookOf(barTab(page, selected));
+      const off = await lookOf(barTab(page, other));
+      for (const [name, look] of [[selected, on], [other, off]] as const) {
+        expect([near(look.height, 24), look.radius, look.paddingLeft, look.paddingRight, look.fontSize], `${name}: 24 px, radius 8, padding 8, 12 px text`).toEqual([true, '8px', '8px', '8px', '12px']);
+      }
+      expect(await barTab(page, selected).getAttribute('aria-selected')).toBe('true');
+      expect(await barTab(page, other).getAttribute('aria-selected')).toBe('false');
+      expect([on.background, on.color], `${selected} selected`).toEqual([accent, foreground]);
+      expect(off.background, `${other}: no fill`).toBe(TRANSPARENT);
+      expect([off.borderTop, off.borderTopColor, off.color], `${other}: a 1 px --sidebar-accent border, muted text`).toEqual(['1px', accent, muted]);
+    }
+    const number = await lookOf(count);
+    expect([number.fontSize, number.color]).toEqual(['11px', await tokenColor(page, '--subtle')]);
+  });
 
+  test('right bar AC7 — the Diff tab\'s 36 px row shows "Changes", "against main" and the sums "+15005" and "−6" of the files\' counts in their tokens; with no change it shows "No changes against main." and no sum', async () => {
+    const { page } = session;
+    await openSessionById(page, A.id);
+    await setChangesOpen(page, true, 'Diff');
+    await waitForPanelText(page, (text) => text.includes('main.ts'));
+    const title = rightBar(page).getByText('Changes', { exact: true }).first();
+    const against = rightBar(page).getByText('against main', { exact: true });
+    const plus = rightBar(page).getByText(/^\+15005$/);
+    const minus = rightBar(page).getByText(/^[−-]6$/);
+    await plus.waitFor({ timeout: UI_TIMEOUT });
+    await minus.waitFor({ timeout: UI_TIMEOUT });
+
+    const titleLook = await lookOf(title);
+    expect([titleLook.fontSize, titleLook.color]).toEqual(['12px', await tokenColor(page, '--foreground')]);
+    const againstLook = await lookOf(against);
+    expect([againstLook.fontSize, againstLook.color]).toEqual(['11px', await tokenColor(page, '--subtle')]);
+    expect((await lookOf(plus)).color, 'additions: --diff-added-foreground').toBe(await tokenColor(page, '--diff-added-foreground'));
+    expect((await lookOf(minus)).color, 'deletions: --diff-removed-foreground').toBe(await tokenColor(page, '--diff-removed-foreground'));
+    const row = await lookOfHandle(await commonAncestor(page, title, against, plus, minus));
+    expect(near(row.height, 36), `a 36 px row: ${row.height}`).toBe(true);
+
+    await openSessionById(page, B.id);
+    await waitForPanelText(page, (text) => text.includes('No changes against main.'));
+    expect(await rightBar(page).getByText(/^[+−-]\d+$/).count(), 'no sum without a change').toBe(0);
+  });
+
+  test('right bar AC8 — each file is a 26 px row (radius 8 px) with its status letter in 11 px monospace in its token, the name, the muted folder and the counts in their tokens; the first file is selected when the bar opens and a click selects another', async () => {
+    const { page } = session;
+    await openSessionById(page, A.id);
+    await setChangesOpen(page, false);
+    await setChangesOpen(page, true, 'Diff');
+    await waitForPanelText(page, (text) => text.includes('main.ts'));
+    const [added, removed, working, foreground, subtle, accent] = await Promise.all(
+      ['--diff-added-foreground', '--diff-removed-foreground', '--status-working', '--foreground', '--subtle', '--sidebar-accent'].map((token) => tokenColor(page, token)),
+    );
     const row = async (name: string) => {
       const found = await fileRow(page, name, CHANGED_NAMES.filter((other) => other !== name));
       expect(found, `a row for ${name}`).not.toBeNull();
       return found!;
     };
-    const counts = (found: FileRow) => found.tokens.filter((token) => /^[+-]\d+$/.test(token));
 
+    for (const [name, letter, color] of [['a.txt', 'M', working], ['new.txt', 'A', added], ['c.txt', 'D', removed], ['e.txt', 'R', working]] as const) {
+      const found = await row(name);
+      expect(found.tokens[0], `${name}: status letter`).toBe(letter);
+      expect(near(found.row.height, 26), `${name}: a 26 px row (${found.row.height})`).toBe(true);
+      expect(found.row.radius, `${name}: radius 8`).toBe(8);
+      expect([found.leaves[letter]!.fontSize, /mono/.test(found.leaves[letter]!.fontFamily), found.leaves[letter]!.color], `${name}: the letter`).toEqual(['11px', true, color]);
+      expect([found.leaves[name]!.fontSize, found.leaves[name]!.color], `${name}: the name`).toEqual(['12px', foreground]);
+    }
     const a = await row('a.txt');
-    expect(a.tokens[0]).toBe('M');
-    expect(counts(a)).toEqual(['+2', '-2']);
-    const big = await row('big.txt');
-    expect(big.tokens[0]).toBe('A');
-    expect(counts(big)).toEqual(['+15000']);
-    const bin = await row('bin.dat');
-    expect(bin.tokens[0]).toBe('A');
-    expect(counts(bin), 'nothing for a binary file').toEqual([]);
-    const c = await row('c.txt');
-    expect(c.tokens[0]).toBe('D');
-    expect(counts(c)).toEqual(['-3']);
-    const e = await row('e.txt');
-    expect(e.tokens[0]).toBe('R');
-    expect(e.tokens).toContain('d.txt');
-    const created = await row('new.txt');
-    expect(created.tokens[0]).toBe('A');
-    expect(counts(created)).toEqual(['+2']);
+    expect([a.leaves['+2']!.color, a.leaves['-2']!.color], 'counts in their tokens').toEqual([added, removed]);
+    expect(a.tokens.filter((token) => /^[+-]\d+$/.test(token))).toEqual(['+2', '-2']);
+    const renamed = await row('e.txt');
+    expect(renamed.tokens).toContain('d.txt');
+    expect(renamed.tokens.filter((token) => /^[+-]\d+$/.test(token)), 'a pure rename has no counts').toEqual([]);
+    const binary = await row('bin.dat');
+    expect(binary.tokens.filter((token) => /^[+-]\d+$/.test(token)), 'nothing for a binary file').toEqual([]);
     const main = await row('main.ts');
-    expect(main.tokens[0]).toBe('M');
-    expect(counts(main)).toEqual(['+1', '-1']);
-    const folder = main.tokens.find((token) => /^src\/?$/.test(token));
+    const folder = Object.keys(main.leaves).find((key) => /^src\/?$/.test(key));
     expect(folder, 'the folder of src/main.ts').toBeTruthy();
-    expect(main.colors[folder!]).toBe(await mutedColor(page));
-    // Listed by path.
-    const order = await page.evaluate((names) => {
-      const leaves = [...document.querySelectorAll<HTMLElement>('[data-test-changes-panel] *')].filter((element) => element.children.length === 0);
-      return names.map((name) => leaves.findIndex((leaf) => (leaf.textContent ?? '').trim().startsWith(name)));
-    }, CHANGED_NAMES);
-    expect(order, 'every file is listed, in path order').toEqual([...order].sort((x, y) => x - y));
-    expect(order.every((index) => index >= 0)).toBe(true);
+    expect([main.leaves[folder!]!.fontSize, main.leaves[folder!]!.color], 'the folder: 11 px --subtle').toEqual(['11px', subtle]);
 
-    // The first file is selected: its diff, one block per hunk, each line with one number and its prefix.
-    const headers = await poll(() => hunkHeaders(page), (found) => found.length === 2, UI_TIMEOUT);
-    expect(headers).toHaveLength(2);
-    expect(headers[0]).toContain('@@ -1,5 +1,5 @@');
-    expect(headers[1]).toContain('@@ -15,6 +15,6 @@');
-    expect(await diffLine(page, 1, ' ', 'line 1')).toEqual({ added: false, removed: false });
-    expect(await diffLine(page, 2, '-', 'line 2')).toEqual({ added: false, removed: true });
-    expect(await diffLine(page, 2, '+', 'line two')).toEqual({ added: true, removed: false });
-    expect(await diffLine(page, 3, ' ', 'line 3')).toEqual({ added: false, removed: false });
-    expect(await diffLine(page, 18, '-', 'line 18')).toEqual({ added: false, removed: true });
-    expect(await diffLine(page, 18, '+', 'line eighteen')).toEqual({ added: true, removed: false });
-
-    // Another file: its diff replaces it.
+    // The first file is selected when the bar opens; a click selects another.
+    expect(a.row.background, 'a.txt is selected').toBe(accent);
+    expect((await row('new.txt')).row.background, 'new.txt is not').not.toBe(accent);
     await selectChangedFile(page, 'new.txt');
-    const newHeaders = await poll(() => hunkHeaders(page), (found) => found.length === 1, UI_TIMEOUT);
-    expect(newHeaders[0]).toContain('@@ -0,0 +1,2 @@');
-    expect(await waitForDiffLine(page, 1, '+', 'alpha')).toEqual({ added: true, removed: false });
-    expect(await diffLine(page, 2, '+', 'beta')).toEqual({ added: true, removed: false });
-    expect(await diffLine(page, 2, '-', 'line 2')).toBeNull();
+    expect((await poll(() => row('new.txt'), (found) => found.row.background === accent, UI_TIMEOUT)).row.background).toBe(accent);
+    expect((await row('a.txt')).row.background).not.toBe(accent);
+    await selectChangedFile(page, 'a.txt');
+  });
 
-    // A workspace without changes.
-    await openSessionById(page, B.id);
-    await waitForPanelText(page, (shown) => shown.includes('No changes against main.'));
-    expect(await panelText(page)).toContain('No changes against main.');
-    expect(await hunkHeaders(page)).toEqual([]);
-    expect(await listedNames(page, CHANGED_NAMES)).toEqual([]);
+  test('right bar AC9 — the selected file\'s diff sits under the list: a sticky 28 px row with its path and a "Close diff" × button, a 22 px hunk row on --diff-hunk with its text 42 px in, and 18 px lines with a 36 px gutter, the prefix 6 px after it and the added and removed lines on their fills', async () => {
+    const { page } = session;
+    await openSessionById(page, A.id);
+    await setChangesOpen(page, true, 'Diff');
+    const headers = await poll(() => hunkHeaders(page), (found) => found.length === 2, UI_TIMEOUT);
+    expect(headers[0]).toContain('@@ -1,5 +1,5 @@');
+    await waitForDiffLine(page, 2, '+', 'line two');
+
+    const close = rightBar(page).getByRole('button', { name: 'Close diff', exact: true });
+    const closeLook = await lookOf(close);
+    expect([near(closeLook.width, 16), near(closeLook.height, 16)], '"Close diff" is 16 px').toEqual([true, true]);
+    const closeIcon = await iconIn(close);
+    expect(closeIcon.className).toMatch(/lucide-x(\s|$)/);
+    expect([closeIcon.stroke, closeIcon.color]).toEqual([1.25, await mutedColor(page)]);
+
+    const pathRow = await close.evaluateHandle((button) => {
+      for (let node = button.parentElement; node; node = node.parentElement) if ((node.textContent ?? '').includes('a.txt')) return node;
+      return button;
+    });
+    const rowLook = await lookOfHandle(pathRow);
+    expect([near(rowLook.height, 28), rowLook.position, rowLook.borderBottom], 'a sticky 28 px row with a bottom border').toEqual([true, 'sticky', '1px']);
+    const pathLook = await (pathRow as unknown as Locator).evaluate((row) => {
+      const leaf = [...row.querySelectorAll('*')].find((element) => element.children.length === 0 && (element.textContent ?? '').trim() === 'a.txt');
+      if (!leaf) return null;
+      const style = getComputedStyle(leaf);
+      return { fontSize: style.fontSize, color: style.color };
+    });
+    expect(pathLook, 'the path in the row').toEqual({ fontSize: '11px', color: await tokenColor(page, '--foreground') });
+    const borders = await (pathRow as unknown as Locator).evaluate((row) => {
+      const found: Array<[string, string]> = [];
+      for (let node = row.parentElement; node && node.getAttribute('role') !== 'complementary'; node = node.parentElement) {
+        found.push([getComputedStyle(node).borderTopWidth, getComputedStyle(node).borderTopColor]);
+      }
+      return found;
+    });
+    const borderColor = await tokenColor(page, '--border');
+    expect(borders.some(([width, color]) => width === '1px' && color === borderColor), 'a top border in --border above the diff').toBe(true);
+
+    const hunk = await hunkRowLook(page, '@@ -1,5 +1,5 @@');
+    expect(hunk, 'a hunk row').not.toBeNull();
+    expect([near(hunk!.height, 22), hunk!.fontSize, /mono/.test(hunk!.fontFamily), hunk!.color], 'the hunk row: 22 px, 11 px monospace, muted').toEqual([true, '11px', true, await mutedColor(page)]);
+    expect(hunk!.background, '--diff-hunk').toBe(await tokenColor(page, '--diff-hunk'));
+    expect(near(hunk!.textOffset, 42), `its text is 42 px from the left: ${hunk!.textOffset}`).toBe(true);
+
+    const foreground = await tokenColor(page, '--foreground');
+    const subtle = await tokenColor(page, '--subtle');
+    for (const [number, prefix, content, token] of [[2, '+', 'line two', '--diff-added'], [2, '-', 'line 2', '--diff-removed']] as const) {
+      const look = await diffLineLook(page, number, prefix, content);
+      expect(look, `the line ${prefix}${content}`).not.toBeNull();
+      expect([near(look!.height, 18), look!.fontSize, /mono/.test(look!.fontFamily)], `${prefix}${content}: 18 px, 11 px monospace`).toEqual([true, '11px', true]);
+      expect([near(look!.gutterWidth, 36), ['right', 'end'].includes(look!.gutterAlign), look!.gutterColor], `${prefix}${content}: a 36 px gutter, number right-aligned in --subtle`).toEqual([true, true, subtle]);
+      expect(near(look!.gap, 6), `${prefix}${content}: the prefix 6 px after the gutter: ${look!.gap}`).toBe(true);
+      expect(look!.textColor, `${prefix}${content}: --foreground text`).toBe(foreground);
+      expect(look!.fill, `${prefix}${content}: ${token}`).toBe(await tokenColor(page, token));
+    }
+  });
+
+  test('right bar AC10 — "Close diff" hides the diff, selects no row and lets the list take the height; a file written meanwhile updates the list and shows no diff; a click shows it again; closing and opening the bar selects the first file again', async () => {
+    const { page } = session;
+    await openSessionById(page, A.id);
+    await setChangesOpen(page, true, 'Diff');
+    await poll(() => hunkHeaders(page), (found) => found.length === 2, UI_TIMEOUT);
+    const accent = await tokenColor(page, '--sidebar-accent');
+    const close = rightBar(page).getByRole('button', { name: 'Close diff', exact: true });
+    const listArea = () =>
+      rightBar(page)
+        .getByText('a.txt', { exact: true })
+        .first()
+        .evaluate((leaf) => {
+          for (let node = leaf.parentElement; node; node = node.parentElement) {
+            const overflow = getComputedStyle(node).overflowY;
+            if (overflow === 'auto' || overflow === 'scroll') return { height: node.getBoundingClientRect().height, bottom: node.getBoundingClientRect().bottom };
+          }
+          return { height: 0, bottom: 0 };
+        });
+    const rows = (names: string[]) => Promise.all(names.map((name) => fileRow(page, name, names.filter((other) => other !== name))));
+    const before = await listArea();
+
+    await close.click({ timeout: UI_TIMEOUT });
+
+    await close.waitFor({ state: 'hidden', timeout: UI_TIMEOUT });
+    expect(await hunkHeaders(page), 'the diff area goes').toEqual([]);
+    await moveMouseAway(page);
+    const selectedRows = (await rows(CHANGED_NAMES)).filter((found) => found?.row.background === accent);
+    expect(selectedRows, 'no row is selected').toEqual([]);
+    const after = await poll(listArea, (found) => found.height > before.height + 50, UI_TIMEOUT);
+    expect(after.height, `the list takes the height: ${before.height} then ${after.height}`).toBeGreaterThan(before.height + 50);
+    expect(near(after.bottom, (await lookOf(rightBar(page))).bottom, 16), 'down to the bottom of the bar').toBe(true);
+
+    // A file written meanwhile: listed, no diff.
+    const late = join(A.path, 'late.txt');
+    writeFileSync(late, 'late\n');
+    try {
+      expect(await poll(() => listedNames(page, ['late.txt']), (names) => names.length === 1, UI_TIMEOUT)).toEqual(['late.txt']);
+      await sleep(300);
+      expect(await close.count(), 'still no diff').toBe(0);
+      expect(await hunkHeaders(page)).toEqual([]);
+
+      await selectChangedFile(page, 'late.txt');
+      expect(await waitForDiffLine(page, 1, '+', 'late')).not.toBeNull();
+      expect(await close.count()).toBe(1);
+
+      // Closing and opening the bar selects the first file again.
+      await setChangesOpen(page, false);
+      await setChangesOpen(page, true, 'Diff');
+      const first = await poll(() => fileRow(page, 'a.txt', CHANGED_NAMES.filter((name) => name !== 'a.txt')), (found) => found?.row.background === accent, UI_TIMEOUT);
+      expect(first?.row.background, 'a.txt is selected again').toBe(accent);
+      expect(await poll(() => hunkHeaders(page), (found) => found.length === 2, UI_TIMEOUT)).toHaveLength(2);
+    } finally {
+      rmSync(late, { force: true });
+    }
+    expect(await poll(() => listedNames(page, ['late.txt']), (names) => names.length === 0, UI_TIMEOUT)).toEqual([]);
   });
 
   test('changes AC14 — a binary file shows "Binary file" and a diff over 1 MiB "Diff too large to display", with no error logged', async () => {
@@ -5706,7 +6191,7 @@ describe('changes sidebar: built app', () => {
     await expectNoNewErrors(session, mark);
   });
 
-  test('changes AC17 (and AC10 for the reload) — closing the sidebar, leaving for a page without it or reloading stops the watcher: a file written afterwards starts no git command in the worktree; opening the sidebar again lists the changes again', async () => {
+  test('changes AC17, right bar AC15 — with the rail showing (the bar closed, left for a page without it, or reloaded) a file written starts no git command in the worktree; with the bar open, on either tab, it does and the changes are listed again', async () => {
     const { page } = session;
     await openSessionById(page, A.id);
     await setChangesOpen(page, true);
@@ -5734,6 +6219,18 @@ describe('changes sidebar: built app', () => {
     rmSync(join(A.path, 'probe.txt'));
     await poll(() => listedNames(page, ['probe.txt']), (names) => names.length === 0, UI_TIMEOUT);
 
+    // The same with the other tab selected: the changes and the git status are read whichever tab shows.
+    await selectBarTab(page, 'Pull request');
+    await settleGit();
+    const runsOnOtherTab = gitRunsIn(fx, A.path).length;
+    writeFileSync(join(A.path, 'probe-tab.txt'), 'probe\n');
+    await poll(() => gitRunsIn(fx, A.path).length, (runs) => runs > runsOnOtherTab, UI_TIMEOUT);
+    expect(gitRunsIn(fx, A.path).length, 'git runs with the bar open on "Pull request"').toBeGreaterThan(runsOnOtherTab);
+    await selectBarTab(page, 'Diff');
+    expect(await poll(() => listedNames(page, ['probe-tab.txt']), (names) => names.length === 1, UI_TIMEOUT)).toEqual(['probe-tab.txt']);
+    rmSync(join(A.path, 'probe-tab.txt'));
+    await poll(() => listedNames(page, ['probe-tab.txt']), (names) => names.length === 0, UI_TIMEOUT);
+
     // Writes `name`, waits 1 s (5 times the debounce) and returns the git runs in the worktree since `before`.
     const gitRunsAfterWrite = async (name: string) => {
       await settleGit();
@@ -5753,15 +6250,13 @@ describe('changes sidebar: built app', () => {
     await goHome(page);
     expect(await gitRunsAfterWrite('after-home.txt')).toEqual([]);
     await openSessionById(page, A.id);
-    await changesToggle(page).waitFor({ timeout: UI_TIMEOUT });
-    expect(await changesToggle(page).getAttribute('aria-pressed')).toBe('true');
+    expect(await poll(() => markChangesPanel(page), (shown) => shown, UI_TIMEOUT), 'the bar is still open').toBe(true);
     expect(await poll(() => listedNames(page, ['after-home.txt']), (names) => names.length === 1, UI_TIMEOUT)).toEqual(['after-home.txt']);
 
-    // (c) The page reloads, and starts with the sidebar closed.
+    // (c) The page reloads, and starts with the rail.
     await page.reload();
     await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
-    await changesToggle(page).waitFor({ timeout: UI_TIMEOUT });
-    expect(await changesToggle(page).getAttribute('aria-pressed')).toBe('false');
+    await showRightBar(page).waitFor({ timeout: UI_TIMEOUT });
     expect(await markChangesPanel(page)).toBe(false);
     expect(await gitRunsAfterWrite('after-reload.txt')).toEqual([]);
     await setChangesOpen(page, true);
@@ -5813,21 +6308,22 @@ describe('changes sidebar: built app', () => {
 
     const waitForText = (matches: (text: string) => boolean, timeout = 5_000) => waitForShipText(session.page, matches, timeout);
 
-    test('ship AC1 — a pull request opened outside Cockpit shows "#7 Fix the bug" as a link to its URL, its state and its CI summary, and no "Create pull request" button; each state and summary follows the answer', async () => {
+    test('ship AC1, right bar AC11 — a pull request opened outside Cockpit shows "#7 · Checks pending", its state and an "Open on GitHub" link to its URL, and no "Create pull request" button; each state and summary follows the answer', async () => {
       const { page } = session;
       setGh(gh, { list: prJson({ checks: 'pending' }) });
       await openShip(page, W1.id);
 
-      const link = page.locator(PANEL).getByRole('link', { name: '#7 Fix the bug', exact: true });
+      const link = prLink(page);
       await link.waitFor({ timeout: UI_TIMEOUT });
       expect(await link.getAttribute('href')).toBe(PR_URL);
-      const text = await waitForText((shown) => shown.includes('Checks pending'));
-      expect(text).toMatch(/\bOpen\b/);
+      const text = await waitForText((shown) => shown.includes('#7 · Checks pending'));
+      expect(await page.locator(PANEL).getByText('Open', { exact: true }).count(), 'the state pill').toBe(1);
+      expect(text).toContain('Fix the bug');
       expect(await shipButton(page, 'Create pull request').count()).toBe(0);
       // Nothing to commit and nothing to push in a fresh workspace.
       expect(await shipButton(page, 'Push').count()).toBe(0);
 
-      for (const [checks, label] of [['unknown', 'Checks unknown'], ['failing', 'Checks failing'], ['passing', 'Checks passing']] as const) {
+      for (const [checks, label] of [['unknown', '#7 · Checks unknown'], ['failing', '#7 · Checks failing'], ['passing', '#7 · Checks passing']] as const) {
         setGh(gh, { list: prJson({ checks }) });
         await dispatchFocus(page);
         await waitForText((shown) => shown.includes(label));
@@ -5836,17 +6332,70 @@ describe('changes sidebar: built app', () => {
       setGh(gh, { list: prJson({ checks: 'none' }) });
       await dispatchFocus(page);
       await waitForText((shown) => !shown.includes('Checks '));
-      expect(await panelText(page)).toMatch(/\bOpen\b/);
+      expect(await page.locator(PANEL).getByText('Open', { exact: true }).count()).toBe(1);
 
       setGh(gh, { list: prJson({ state: 'CLOSED' }) });
       await dispatchFocus(page);
       await waitForText((shown) => /\bClosed\b/.test(shown));
-      // AC10: a branch with only closed pull requests can have a new one.
+      // AC12: a branch with only closed pull requests can have a new one, its block above the button.
       await shipButton(page, 'Create pull request').waitFor({ timeout: UI_TIMEOUT });
       expect(await shipButton(page, 'Create pull request').count()).toBe(1);
+      const closedPill = await lookOf(page.locator(PANEL).getByText('Closed', { exact: true }));
+      expect(closedPill.top, 'the closed pull request shows above "Create pull request"').toBeLessThan((await lookOf(shipButton(page, 'Create pull request'))).top);
     });
 
-    test('ship AC2 — clicking the pull request link opens its URL in the system browser and the window stays on its page', async () => {
+    test('right bar AC11 — the meta row (24 px) holds the state pill (20 px, radius 10, 12 px icon, 11 px text, its token at 14 %), "#7" with its checks and the "Open on GitHub" link; the title (13 px on 18 px, not a link) and "<branch> → <base>" follow; only a merged pull request offers "Delete workspace…"', async () => {
+      const { page } = session;
+      const states = [
+        ['OPEN', 'Open', /lucide-git-pull-request(\s|$)/, '--status-ready'],
+        ['MERGED', 'Merged', /lucide-git-merge(\s|$)/, '--status-merged'],
+        ['CLOSED', 'Closed', /lucide-git-pull-request-closed(\s|$)/, '--status-exited'],
+      ] as const;
+      for (const [state, label, icon, token] of states) {
+        setGh(gh, { list: prJson({ state, checks: state === 'OPEN' ? 'passing' : 'none' }) });
+        await openShip(page, W1.id);
+        await dispatchFocus(page);
+        const bar = page.locator(PANEL);
+        const pillText = bar.getByText(label, { exact: true });
+        await pillText.waitFor({ timeout: UI_TIMEOUT });
+        // The pill is the smallest element around the label that also holds its icon.
+        const pillElement = await pillText.evaluateHandle((text) => {
+          for (let node: Element | null = text; node; node = node.parentElement) if (node.querySelector('svg')) return node;
+          return text;
+        });
+        const look = await lookOfHandle(pillElement);
+        expect([near(look.height, 20), look.radius], `${label}: a 20 px pill with radius 10`).toEqual([true, '10px']);
+        expect((await lookOf(pillText)).fontSize, `${label}: 11 px text`).toBe('11px');
+        const svg = await iconIn(pillText.locator('xpath=ancestor-or-self::*[.//*[name()="svg"]][1]'));
+        expect(svg.className, `${label}: icon`).toMatch(icon);
+        expect([svg.width, svg.height, svg.stroke]).toEqual([12, 12, 1.25]);
+        expect(svg.color, `${label}: the color of ${token}`).toBe(await tokenColor(page, token));
+        expect(await fillIsTokenAt14(pillElement as unknown as Locator, token), `${label}: ${token} at 14 %`).toBe(true);
+
+        const number = bar.getByText(/^#7\b/);
+        const numberLook = await lookOf(number);
+        expect([numberLook.fontSize, numberLook.color], '#7: 11 px muted').toEqual(['11px', await mutedColor(page)]);
+        const text = (await panelText(page)).replace(/\s+/g, ' ');
+        if (state === 'OPEN') expect(text).toContain('#7 · Checks passing');
+        else expect(text, 'no checks once merged or closed').not.toContain('Checks ');
+        const link = await lookOf(prLink(page));
+        expect([near(link.width, 24), near(link.height, 24)], '"Open on GitHub": 24 px').toEqual([true, true]);
+        expect((await iconIn(prLink(page))).className).toMatch(/lucide-external-link(\s|$)/);
+        const metaRow = await lookOfHandle(await commonAncestor(page, pillText, number, prLink(page)));
+        expect(near(metaRow.height, 24), `the meta row is 24 px: ${metaRow.height}`).toBe(true);
+
+        const title = bar.getByText('Fix the bug', { exact: true });
+        const titleLook = await lookOf(title);
+        expect([titleLook.fontSize, titleLook.lineHeight, titleLook.color], 'the title: 13 px on 18 px').toEqual(['13px', '18px', await tokenColor(page, '--foreground')]);
+        expect(await bar.getByRole('link', { name: /Fix the bug/ }).count(), 'the title is not a link').toBe(0);
+        const branch = await lookOf(bar.getByText('ship-pr → main', { exact: true }));
+        expect([branch.fontSize, /mono/.test(branch.fontFamily), branch.color], 'the branch line: 11 px monospace muted').toEqual(['11px', true, await mutedColor(page)]);
+        expect(await shipButton(page, 'Delete workspace…').count(), `${label}: "Delete workspace…"`).toBe(state === 'MERGED' ? 1 : 0);
+      }
+      setGh(gh);
+    });
+
+    test('ship AC2, right bar AC11 — clicking "Open on GitHub" opens its URL in the system browser and the window stays on its page', async () => {
       const { page } = session;
       await session.evaluateInMain(`(() => {
         const { shell } = require('electron');
@@ -5858,7 +6407,7 @@ describe('changes sidebar: built app', () => {
       setGh(gh, { list: prJson({ checks: 'passing' }) });
       await openShip(page, W1.id);
       await dispatchFocus(page);
-      const link = page.locator(PANEL).getByRole('link', { name: '#7 Fix the bug', exact: true });
+      const link = prLink(page);
       await link.waitFor({ timeout: UI_TIMEOUT });
       const url = page.url();
 
@@ -5870,7 +6419,7 @@ describe('changes sidebar: built app', () => {
       expect(await markChangesPanel(page)).toBe(true);
     });
 
-    test('ship AC3, AC4 — a change in the worktree reads no pull request, the window gaining focus does (within 5 s), and no gh runs while the sidebar is closed, left or reloaded', async () => {
+    test('ship AC3, AC4, right bar AC15 — a change in the worktree reads no pull request, the window gaining focus does (within 5 s, on either tab), and no gh runs while the rail shows (the bar closed or reloaded), on a write or on a window focus', async () => {
       const { page } = session;
       const leftovers = ['tick.txt', 'closed.txt', 'reloaded.txt'];
       try {
@@ -5888,29 +6437,42 @@ describe('changes sidebar: built app', () => {
         // The pull request merged meanwhile; a file written in the worktree must not read it.
         setGh(gh, { list: prJson({ state: 'MERGED', checks: 'passing' }) });
         const before = ghRuns(gh).length;
+        await selectBarTab(page, 'Diff');
         writeFileSync(join(W1.path, 'tick.txt'), 'x\n');
         await expectListed(page, ['tick.txt'], ['tick.txt']);
         await sleep(1_000);
         expect(ghRuns(gh)).toHaveLength(before);
-        expect(await panelText(page)).toMatch(/\bOpen\b/);
+        await selectBarTab(page, 'Pull request');
+        expect(await page.locator(PANEL).getByText('Open', { exact: true }).count(), 'still the open pull request').toBe(1);
 
+        // A window focus reads it, with the other tab showing: the Pull request panel stays mounted.
+        await selectBarTab(page, 'Diff');
         await dispatchFocus(page);
+        await poll(() => ghRuns(gh).length, (count) => count > before, 5_000);
+        expect(ghRuns(gh).length, 'a focus reads the pull request whichever tab shows').toBeGreaterThan(before);
+        await selectBarTab(page, 'Pull request');
         await waitForText((shown) => /\bMerged\b/.test(shown));
         rmSync(join(W1.path, 'tick.txt'));
 
-        // Closed, then reloaded: a write starts no gh run.
+        // The rail shows (the bar closed), then the page reloaded: a write or a focus starts no gh run.
         await setChangesOpen(page, false);
         const runs = ghRuns(gh).length;
         writeFileSync(join(W1.path, 'closed.txt'), 'x\n');
         await sleep(1_000);
         expect(ghRuns(gh)).toHaveLength(runs);
+        await dispatchFocus(page);
+        await sleep(500);
+        expect(ghRuns(gh), 'a focus with the rail shown runs no gh').toHaveLength(runs);
 
         await page.reload();
         await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
-        await changesToggle(page).waitFor({ timeout: UI_TIMEOUT });
+        await showRightBar(page).waitFor({ timeout: UI_TIMEOUT });
         expect(await markChangesPanel(page)).toBe(false);
         writeFileSync(join(W1.path, 'reloaded.txt'), 'x\n');
         await sleep(1_000);
+        expect(ghRuns(gh)).toHaveLength(runs);
+        await dispatchFocus(page);
+        await sleep(500);
         expect(ghRuns(gh)).toHaveLength(runs);
       } finally {
         // A failure must leave neither a file in the worktree nor an answer of this test to the next one.
@@ -5958,8 +6520,7 @@ describe('changes sidebar: built app', () => {
         // A pull request opens meanwhile: nothing reads it until the commit succeeds.
         setGh(gh, { list: prJson({ title: 'After the commit', checks: 'pending' }) });
         await commitThroughPanel(page, 'Commit then read');
-        await page.locator(PANEL).getByRole('link', { name: '#7 After the commit', exact: true }).waitFor({ timeout: 5_000 });
-        await waitForText((shown) => shown.includes('Checks pending'));
+        await waitForText((shown) => shown.includes('After the commit') && shown.includes('#7 · Checks pending'));
 
         // It merges meanwhile: nothing reads it until the push succeeds.
         setGh(gh, { list: prJson({ title: 'After the commit', state: 'MERGED', checks: 'passing' }) });
@@ -5997,6 +6558,8 @@ describe('changes sidebar: built app', () => {
       expect(gitIn(W2.path, 'show', '--name-status', '--format=', 'HEAD').split('\n').sort()).toEqual(['A\tnew.txt', 'D\tc.txt', 'M\ta.txt']);
       expect(gitIn(W2.path, 'ls-files', 'ignored.log')).toBe('');
       expect(await poll(() => commitField(page).inputValue(), (value) => value === '', UI_TIMEOUT)).toBe('');
+      // One commit to push.
+      await waitForText((shown) => /(^|\s)1 commit to push(\s|$)/.test(shown));
       // Nothing is uncommitted any more: a message does not enable the button.
       await commitField(page).fill('Nothing left');
       await poll(() => commit.isDisabled(), Boolean, UI_TIMEOUT);
@@ -6018,6 +6581,10 @@ describe('changes sidebar: built app', () => {
 
         const text = await waitForText((shown) => /Could not commit: [\s\S]*hook says no/.test(shown));
         expect(text).toMatch(/Could not commit: [\s\S]*hook says no/);
+        // The failure shows under the section, in --destructive.
+        const failure = page.locator(PANEL).getByText(/Could not commit: /).first();
+        expect((await lookOf(failure)).color, 'the failure is --destructive').toBe(await tokenColor(page, '--destructive'));
+        expect((await lookOf(failure)).top, 'under the Commit button').toBeGreaterThan((await lookOf(shipButton(page, 'Commit'))).bottom - 1);
         expect(gitIn(W2.path, 'rev-parse', 'HEAD')).toBe(head);
         expect(await commitField(page).inputValue()).toBe('Add the second file');
       } finally {
@@ -6027,6 +6594,7 @@ describe('changes sidebar: built app', () => {
       await shipButton(page, 'Commit').click({ timeout: UI_TIMEOUT });
       expect(await poll(() => gitIn(W2.path, 'log', '-1', '--format=%B'), (subject) => subject === 'Add the second file', UI_TIMEOUT)).toBe('Add the second file');
       expect(gitIn(W2.path, 'status', '--porcelain')).toBe('');
+      await waitForText((shown) => /(^|\s)2 commits to push(\s|$)/.test(shown));
     });
 
     test('ship AC10 — with gh ready and no pull request, "Create pull request" is disabled with "Push the branch first." while the branch is not pushed', async () => {
@@ -6038,6 +6606,40 @@ describe('changes sidebar: built app', () => {
       expect(await create.isDisabled()).toBe(true);
       expect(await panelText(page)).toContain('Push the branch first.');
       await shipButton(page, 'Push').waitFor({ timeout: UI_TIMEOUT });
+      // AC12: "Create pull request" and the hint show at the top of the tab, above "Commit & push".
+      const section = await lookOf(page.locator(PANEL).getByText('Commit & push', { exact: true }));
+      expect((await lookOf(create)).top, '"Create pull request" is above "Commit & push"').toBeLessThan(section.top);
+      expect((await lookOf(page.locator(PANEL).getByText('Push the branch first.'))).top).toBeLessThan(section.top);
+    });
+
+    test('right bar AC13 — "Commit & push" (11 px --subtle, a top border) holds the 32 px "Commit message" field (radius 8) and an outline "Commit"; "2 commits to push" (11 px muted) has an arrow-up "Push" button at its right, and the row goes once pushed', async () => {
+      const { page } = session;
+      const bar = page.locator(PANEL);
+      const heading = bar.getByText('Commit & push', { exact: true });
+      const headingLook = await lookOf(heading);
+      expect([headingLook.fontSize, headingLook.color]).toEqual(['11px', await tokenColor(page, '--subtle')]);
+      const borders = await heading.evaluate((element) => {
+        for (let node = element.parentElement; node && node.getAttribute('role') !== 'complementary'; node = node.parentElement) {
+          if (getComputedStyle(node).borderTopWidth === '1px') return getComputedStyle(node).borderTopColor;
+        }
+        return null;
+      });
+      expect(borders, 'the section has a top border in --border').toBe(await tokenColor(page, '--border'));
+
+      const field = await lookOf(commitField(page));
+      expect([near(field.height, 32), field.radius], 'the field: 32 px, radius 8').toEqual([true, '8px']);
+      const commit = await lookOf(shipButton(page, 'Commit'));
+      expect(commit.borderTop, 'an outline button has a border').toBe('1px');
+
+      const count = bar.getByText('2 commits to push', { exact: true });
+      await count.waitFor({ timeout: UI_TIMEOUT });
+      const countLook = await lookOf(count);
+      expect([countLook.fontSize, countLook.color]).toEqual(['11px', await mutedColor(page)]);
+      const push = shipButton(page, 'Push');
+      expect((await iconIn(push)).className).toMatch(/lucide-arrow-up(\s|$)/);
+      const pushLook = await lookOf(push);
+      expect(pushLook.left, '"Push" is at the right of the count').toBeGreaterThan(countLook.right);
+      expect(near((pushLook.top + pushLook.bottom) / 2, (countLook.top + countLook.bottom) / 2, 8), 'on the same row').toBe(true);
     });
 
     test('ship AC8 — Push runs git push --set-upstream origin <branch> (never forced), origin has the branch at HEAD, the upstream is origin/<branch> and the button goes', async () => {
@@ -6051,6 +6653,7 @@ describe('changes sidebar: built app', () => {
       expect(gitIn(W2.path, 'rev-parse', '--abbrev-ref', 'ship-flow@{upstream}')).toBe('origin/ship-flow');
       await poll(() => shipButton(page, 'Push').count(), (count) => count === 0, UI_TIMEOUT);
       expect(await shipButton(page, 'Push').count()).toBe(0);
+      expect(await panelText(page), 'the "commits to push" row goes').not.toMatch(/commits? to push/);
       const pushes = gitRunsIn(fx, W2.path).filter((line) => line.startsWith(`${W2.path} push`));
       expect(pushes).toEqual([`${W2.path} push --set-upstream origin ship-flow`]);
       // Whatever git ran in the whole launch: no push is forced.
@@ -6091,10 +6694,10 @@ describe('changes sidebar: built app', () => {
       await createButtonOfDialog.click({ timeout: UI_TIMEOUT });
       await dialog.waitFor({ state: 'hidden', timeout: UI_TIMEOUT });
 
-      const link = page.locator(PANEL).getByRole('link', { name: '#7 Ship the flow', exact: true });
+      const link = prLink(page);
       await link.waitFor({ timeout: 5_000 });
       expect(await link.getAttribute('href')).toBe(PR_URL);
-      await waitForText((shown) => shown.includes('Checks pending'));
+      await waitForText((shown) => shown.includes('Ship the flow') && shown.includes('#7 · Checks pending'));
       expect(await shipButton(page, 'Create pull request').count()).toBe(0);
       const creates = ghRuns(gh).filter((run) => run.args[0] === 'pr' && run.args[1] === 'create');
       const args = ['pr', 'create', '--base', 'main', '--head', 'ship-flow', '--title', 'Ship the flow', '--body', 'Line 1\nLine 2'];
@@ -6104,7 +6707,7 @@ describe('changes sidebar: built app', () => {
       ]);
     });
 
-    test('ship AC11 — once the pull request is merged, "Delete workspace…" opens the Delete dialog; confirming removes the worktree, the branch and the row, and the session page has no Changes button', async () => {
+    test('ship AC11 — once the pull request is merged, "Delete workspace…" opens the Delete dialog; confirming removes the worktree, the branch and the row, and the page of the deleted workspace has no right column', async () => {
       const { page } = session;
       setGh(gh, { list: prJson({ title: 'Ship the flow', state: 'MERGED', checks: 'passing' }) });
       await dispatchFocus(page);
@@ -6122,8 +6725,9 @@ describe('changes sidebar: built app', () => {
       expect(await poll(() => entryTitles(page), (titles) => !titles.includes(W2.path), UI_TIMEOUT)).not.toContain(W2.path);
       expect(await sidebarLines(page)).not.toContain('Branch ship-flow was kept: it is not merged.');
       expect(await allSessionLinkIds(page)).not.toContain(W2.id);
-      await poll(() => changesToggle(page).count(), (count) => count === 0, UI_TIMEOUT);
-      expect(await changesToggle(page).count()).toBe(0);
+      await poll(() => rightBar(page).count(), (count) => count === 0, UI_TIMEOUT);
+      expect(await rightBar(page).count(), 'no right column on the page of the deleted workspace').toBe(0);
+      expect(await showRightBar(page).count()).toBe(0);
       expect(await markChangesPanel(page)).toBe(false);
     });
 

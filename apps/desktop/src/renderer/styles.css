@@ -24,6 +24,7 @@
   --color-status-waiting: var(--status-waiting);
   --color-status-ready: var(--status-ready);
   --color-status-exited: var(--status-exited);
+  --color-status-merged: var(--status-merged);
   --color-subtle: var(--subtle);
   --color-hover: var(--hover);
   --color-project-1: var(--project-1);
@@ -35,6 +36,9 @@
   --color-project-foreground: var(--project-foreground);
   --color-diff-added: var(--diff-added);
   --color-diff-removed: var(--diff-removed);
+  --color-diff-added-foreground: var(--diff-added-foreground);
+  --color-diff-removed-foreground: var(--diff-removed-foreground);
+  --color-diff-hunk: var(--diff-hunk);
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -114,6 +118,7 @@
   --status-waiting: #2F6FE0;
   --status-ready: #2E9D68;
   --status-exited: #D64545;
+  --status-merged: #8250DF;
   /* Text under the muted one, and the fill of a row under the pointer. */
   --subtle: #A1A1A8;
   --hover: #0000000A;
@@ -125,9 +130,13 @@
   --project-5: #0284C7;
   --project-6: #7C3AED;
   --project-foreground: #FFFFFF;
-  /* Backgrounds of the added and removed lines of a diff, under the foreground text. */
-  --diff-added: oklch(0.93 0.07 145);
-  --diff-removed: oklch(0.93 0.06 25);
+  /* Backgrounds of the added and removed lines of a diff, under the foreground text, the colors of
+     their counts and letters, and the fill of a hunk header. */
+  --diff-added: #2E9D681F;
+  --diff-removed: #D645451F;
+  --diff-added-foreground: #2E9D68;
+  --diff-removed-foreground: #D64545;
+  --diff-hunk: #5E6AD214;
   /* The 16 ANSI colors of the terminal, readable on the page background. */
   --terminal-black: oklch(0.25 0 0);
   --terminal-red: oklch(0.55 0.2 27);
@@ -184,10 +193,13 @@
     --status-waiting: #4F8FF7;
     --status-ready: #4CB782;
     --status-exited: #EB5757;
+    --status-merged: #A371F7;
     --subtle: #5C5C63;
     --hover: #FFFFFF0A;
-    --diff-added: oklch(0.32 0.07 145);
-    --diff-removed: oklch(0.32 0.08 25);
+    --diff-added: #4CB7821F;
+    --diff-removed: #EB57571F;
+    --diff-added-foreground: #4CB782;
+    --diff-removed-foreground: #EB5757;
     --terminal-black: oklch(0.45 0 0);
     --terminal-red: oklch(0.7 0.19 25);
     --terminal-green: oklch(0.78 0.18 145);
