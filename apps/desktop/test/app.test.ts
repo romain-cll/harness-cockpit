@@ -5066,6 +5066,24 @@ const readStyle = (element: Element) => {
 };
 const lookOf = (target: Locator) => target.evaluate(readStyle);
 
+// The heaviest font weight of the element and of everything in it (hidden content included).
+const heaviestWeight = (target: Locator) =>
+  target.evaluate((root) => Math.max(...[root, ...root.querySelectorAll('*')].map((element) => parseInt(getComputedStyle(element).fontWeight, 10))));
+
+// The window-dragging region in force at a point of the page: `drag`, `no-drag` or `none`.
+const regionAt = (page: Page, x: number, y: number) =>
+  page.evaluate(
+    ([x, y]) => {
+      for (let element = document.elementFromPoint(x!, y!); element; element = element.parentElement) {
+        const region = getComputedStyle(element).getPropertyValue('-webkit-app-region');
+        if (region === 'drag' || region === 'no-drag') return region;
+      }
+      return 'none';
+    },
+    [x, y] as const,
+  );
+const centreOf = (look: { left: number; right: number; top: number; bottom: number }) => [(look.left + look.right) / 2, (look.top + look.bottom) / 2] as const;
+
 // The smallest element that holds every one of `targets`.
 async function commonAncestor(page: Page, ...targets: Locator[]) {
   const handles = await Promise.all(targets.map((target) => target.elementHandle({ timeout: UI_TIMEOUT })));
@@ -5745,6 +5763,11 @@ describe('changes sidebar: built app', () => {
       expect((await button.innerText()).trim(), `${name}: no text or number`).toBe('');
     }
     expect(await page.getByRole('button', { name: 'Changes', exact: true }).count(), 'the page header has no "Changes" button').toBe(0);
+
+    // Constraints: nothing heavier than 400; the top strip drags the window, its button does not.
+    expect(await heaviestWeight(rail), 'nothing in the rail is heavier than 400').toBeLessThanOrEqual(400);
+    expect(await regionAt(page, box.left + box.width / 2, 3), 'the strip drags').toBe('drag');
+    expect(await regionAt(page, ...centreOf(showLook)), 'the "Show right bar" button does not').toBe('no-drag');
   });
 
   test('right bar AC2 — Home and the page of a session outside any project have no right column and no "Show right bar" button, and <main> reaches the window\'s right edge', async () => {
@@ -5790,6 +5813,10 @@ describe('changes sidebar: built app', () => {
     expect(near(hide.right, width - 8), `8 px from the window's edge: ${width - hide.right}`).toBe(true);
     expect(near((hide.top + hide.bottom) / 2, 22), 'centred 22 px from the top').toBe(true);
     expect(hide.background, 'the --sidebar-accent fill').toBe(await tokenColor(page, '--sidebar-accent'));
+    expect(await heaviestWeight(bar), 'nothing in the bar is heavier than 400').toBeLessThanOrEqual(400);
+    expect(await regionAt(page, (pullRequestTab.right + hide.left) / 2, 22), 'the empty part of the strip drags').toBe('drag');
+    expect(await regionAt(page, ...centreOf(diffTab)), 'a tab does not').toBe('no-drag');
+    expect(await regionAt(page, ...centreOf(hide)), '"Hide right bar" does not').toBe('no-drag');
     const narrower = await poll(
       async () => (await screen.boundingBox())!.width,
       (value) => value <= widthBefore - 260,
@@ -5863,31 +5890,38 @@ describe('changes sidebar: built app', () => {
     await setChangesOpen(page, false);
   });
 
-  test('right bar AC6 — each tab is 24 px tall with a radius of 8 px, 8 px side padding and 12 px text; the selected one is filled with --sidebar-accent in --foreground, the other has a 1 px --sidebar-accent border in --muted-foreground; "Diff" shows the number of files in 11 px --subtle', async () => {
+  test('right bar AC6 — in both color schemes, each tab is 24 px tall with a radius of 8 px, 8 px side padding and 12 px text; the selected one is filled with --sidebar-accent in --foreground, the other has a 1 px --sidebar-accent border in --muted-foreground; "Diff" shows the number of files in 11 px --subtle', async () => {
     const { page } = session;
     await openSessionById(page, A.id);
     await setChangesOpen(page, true, 'Diff');
     const count = barTab(page, 'Diff').getByText(String(CHANGED_NAMES.length), { exact: true });
     await count.waitFor({ timeout: UI_TIMEOUT });
-    const accent = await tokenColor(page, '--sidebar-accent');
-    const foreground = await tokenColor(page, '--foreground');
-    const muted = await mutedColor(page);
+    try {
+      for (const scheme of ['dark', 'light'] as const) {
+        await page.emulateMedia({ colorScheme: scheme });
+        const accent = await tokenColor(page, '--sidebar-accent');
+        const foreground = await tokenColor(page, '--foreground');
+        const muted = await mutedColor(page);
 
-    for (const [selected, other] of [['Diff', 'Pull request'], ['Pull request', 'Diff']] as const) {
-      await selectBarTab(page, selected);
-      const on = await lookOf(barTab(page, selected));
-      const off = await lookOf(barTab(page, other));
-      for (const [name, look] of [[selected, on], [other, off]] as const) {
-        expect([near(look.height, 24), look.radius, look.paddingLeft, look.paddingRight, look.fontSize], `${name}: 24 px, radius 8, padding 8, 12 px text`).toEqual([true, '8px', '8px', '8px', '12px']);
+        for (const [selected, other] of [['Diff', 'Pull request'], ['Pull request', 'Diff']] as const) {
+          await selectBarTab(page, selected);
+          const on = await lookOf(barTab(page, selected));
+          const off = await lookOf(barTab(page, other));
+          for (const [name, look] of [[selected, on], [other, off]] as const) {
+            expect([near(look.height, 24), look.radius, look.paddingLeft, look.paddingRight, look.fontSize], `${scheme}, ${name}: 24 px, radius 8, padding 8, 12 px text`).toEqual([true, '8px', '8px', '8px', '12px']);
+          }
+          expect(await barTab(page, selected).getAttribute('aria-selected')).toBe('true');
+          expect(await barTab(page, other).getAttribute('aria-selected')).toBe('false');
+          expect([on.background, on.color], `${scheme}: ${selected} selected`).toEqual([accent, foreground]);
+          expect(off.background, `${scheme}: ${other}: no fill`).toBe(TRANSPARENT);
+          expect([off.borderTop, off.borderTopColor, off.color], `${scheme}: ${other}: a 1 px --sidebar-accent border, muted text`).toEqual(['1px', accent, muted]);
+        }
+        const number = await lookOf(count);
+        expect([number.fontSize, number.color], `${scheme}: the number of files`).toEqual(['11px', await tokenColor(page, '--subtle')]);
       }
-      expect(await barTab(page, selected).getAttribute('aria-selected')).toBe('true');
-      expect(await barTab(page, other).getAttribute('aria-selected')).toBe('false');
-      expect([on.background, on.color], `${selected} selected`).toEqual([accent, foreground]);
-      expect(off.background, `${other}: no fill`).toBe(TRANSPARENT);
-      expect([off.borderTop, off.borderTopColor, off.color], `${other}: a 1 px --sidebar-accent border, muted text`).toEqual(['1px', accent, muted]);
+    } finally {
+      await page.emulateMedia({ colorScheme: null });
     }
-    const number = await lookOf(count);
-    expect([number.fontSize, number.color]).toEqual(['11px', await tokenColor(page, '--subtle')]);
   });
 
   test('right bar AC7 — the Diff tab\'s 36 px row shows "Changes", "against main" and the sums "+15005" and "−6" of the files\' counts in their tokens; with no change it shows "No changes against main." and no sum', async () => {
@@ -6055,7 +6089,6 @@ describe('changes sidebar: built app', () => {
     writeFileSync(late, 'late\n');
     try {
       expect(await poll(() => listedNames(page, ['late.txt']), (names) => names.length === 1, UI_TIMEOUT)).toEqual(['late.txt']);
-      await sleep(300);
       expect(await close.count(), 'still no diff').toBe(0);
       expect(await hunkHeaders(page)).toEqual([]);
 
@@ -6143,6 +6176,34 @@ describe('changes sidebar: built app', () => {
         status: 'refused',
         message: 'No base branch to compare no-base with.',
       });
+      await removeThroughMenu(page, bare.root);
+      await poll(() => entryTitles(page), (titles) => !titles.includes(bare.root), UI_TIMEOUT);
+    } finally {
+      rmSync(bare.parent, { recursive: true, force: true });
+    }
+  });
+
+  test('right bar AC7 — the bar opened on a workspace with no base shows "No base branch to compare no-base with." in the Diff tab', async () => {
+    const { page } = session;
+    const bare = makeRepo('changes-no-base-ui');
+    try {
+      const path = join(bare.parent, 'wt-no-base-ui');
+      gitIn(bare.root, 'worktree', 'add', '--quiet', '-b', 'no-base', path, 'main');
+      // Detached in the main working tree and without origin: nothing to default to.
+      gitIn(bare.root, 'checkout', '--quiet', '--detach');
+      await addRepository(session, bare);
+      await dispatchFocus(page);
+      const row = page.getByTitle(path, { exact: true }).first();
+      await row.waitFor({ timeout: UI_TIMEOUT });
+      await row.click({ timeout: UI_TIMEOUT });
+      await page.waitForURL((url) => url.pathname === '/workspace' && url.searchParams.get('path') === path, { timeout: UI_TIMEOUT });
+
+      await setChangesOpen(page, true, 'Diff');
+      await waitForPanelText(page, (text) => text.includes('No base branch to compare no-base with.'));
+      expect(await panelText(page)).not.toContain('No changes against');
+
+      await setChangesOpen(page, false);
+      await goHome(page);
       await removeThroughMenu(page, bare.root);
       await poll(() => entryTitles(page), (titles) => !titles.includes(bare.root), UI_TIMEOUT);
     } finally {
@@ -6308,7 +6369,7 @@ describe('changes sidebar: built app', () => {
 
     const waitForText = (matches: (text: string) => boolean, timeout = 5_000) => waitForShipText(session.page, matches, timeout);
 
-    test('ship AC1, right bar AC11 — a pull request opened outside Cockpit shows "#7 · Checks pending", its state and an "Open on GitHub" link to its URL, and no "Create pull request" button; each state and summary follows the answer', async () => {
+    test('ship AC1, right bar AC11 — a pull request opened outside Cockpit shows "#7 · Checks pending", its state and an "Open on GitHub" link to its URL, and no "Create pull request" button; each summary follows the answer; the meta row (24 px) holds the state pill (20 px, radius 10, 12 px icon, 11 px text, its token at 14 %), "#7" and the link; the title (13 px on 18 px, not a link) and "<branch> → <base>" follow; only a merged pull request offers "Delete workspace…"', async () => {
       const { page } = session;
       setGh(gh, { list: prJson({ checks: 'pending' }) });
       await openShip(page, W1.id);
@@ -6319,7 +6380,6 @@ describe('changes sidebar: built app', () => {
       const text = await waitForText((shown) => shown.includes('#7 · Checks pending'));
       expect(await page.locator(PANEL).getByText('Open', { exact: true }).count(), 'the state pill').toBe(1);
       expect(text).toContain('Fix the bug');
-      expect(await shipButton(page, 'Create pull request').count()).toBe(0);
       // Nothing to commit and nothing to push in a fresh workspace.
       expect(await shipButton(page, 'Push').count()).toBe(0);
 
@@ -6334,18 +6394,6 @@ describe('changes sidebar: built app', () => {
       await waitForText((shown) => !shown.includes('Checks '));
       expect(await page.locator(PANEL).getByText('Open', { exact: true }).count()).toBe(1);
 
-      setGh(gh, { list: prJson({ state: 'CLOSED' }) });
-      await dispatchFocus(page);
-      await waitForText((shown) => /\bClosed\b/.test(shown));
-      // AC12: a branch with only closed pull requests can have a new one, its block above the button.
-      await shipButton(page, 'Create pull request').waitFor({ timeout: UI_TIMEOUT });
-      expect(await shipButton(page, 'Create pull request').count()).toBe(1);
-      const closedPill = await lookOf(page.locator(PANEL).getByText('Closed', { exact: true }));
-      expect(closedPill.top, 'the closed pull request shows above "Create pull request"').toBeLessThan((await lookOf(shipButton(page, 'Create pull request'))).top);
-    });
-
-    test('right bar AC11 — the meta row (24 px) holds the state pill (20 px, radius 10, 12 px icon, 11 px text, its token at 14 %), "#7" with its checks and the "Open on GitHub" link; the title (13 px on 18 px, not a link) and "<branch> → <base>" follow; only a merged pull request offers "Delete workspace…"', async () => {
-      const { page } = session;
       const states = [
         ['OPEN', 'Open', /lucide-git-pull-request(\s|$)/, '--status-ready'],
         ['MERGED', 'Merged', /lucide-git-merge(\s|$)/, '--status-merged'],
@@ -6353,11 +6401,12 @@ describe('changes sidebar: built app', () => {
       ] as const;
       for (const [state, label, icon, token] of states) {
         setGh(gh, { list: prJson({ state, checks: state === 'OPEN' ? 'passing' : 'none' }) });
-        await openShip(page, W1.id);
         await dispatchFocus(page);
         const bar = page.locator(PANEL);
         const pillText = bar.getByText(label, { exact: true });
         await pillText.waitFor({ timeout: UI_TIMEOUT });
+        // The previous answer was an open pull request with no check: wait for the one just set.
+        if (state === 'OPEN') await waitForText((shown) => shown.includes('#7 · Checks passing'));
         // The pill is the smallest element around the label that also holds its icon.
         const pillElement = await pillText.evaluateHandle((text) => {
           for (let node: Element | null = text; node; node = node.parentElement) if (node.querySelector('svg')) return node;
@@ -6375,11 +6424,11 @@ describe('changes sidebar: built app', () => {
         const number = bar.getByText(/^#7\b/);
         const numberLook = await lookOf(number);
         expect([numberLook.fontSize, numberLook.color], '#7: 11 px muted').toEqual(['11px', await mutedColor(page)]);
-        const text = (await panelText(page)).replace(/\s+/g, ' ');
-        if (state === 'OPEN') expect(text).toContain('#7 · Checks passing');
-        else expect(text, 'no checks once merged or closed').not.toContain('Checks ');
-        const link = await lookOf(prLink(page));
-        expect([near(link.width, 24), near(link.height, 24)], '"Open on GitHub": 24 px').toEqual([true, true]);
+        const shown = (await panelText(page)).replace(/\s+/g, ' ');
+        if (state === 'OPEN') expect(shown).toContain('#7 · Checks passing');
+        else expect(shown, 'no checks once merged or closed').not.toContain('Checks ');
+        const linkLook = await lookOf(prLink(page));
+        expect([near(linkLook.width, 24), near(linkLook.height, 24)], '"Open on GitHub": 24 px').toEqual([true, true]);
         expect((await iconIn(prLink(page))).className).toMatch(/lucide-external-link(\s|$)/);
         const metaRow = await lookOfHandle(await commonAncestor(page, pillText, number, prLink(page)));
         expect(near(metaRow.height, 24), `the meta row is 24 px: ${metaRow.height}`).toBe(true);
@@ -6391,6 +6440,11 @@ describe('changes sidebar: built app', () => {
         const branch = await lookOf(bar.getByText('ship-pr → main', { exact: true }));
         expect([branch.fontSize, /mono/.test(branch.fontFamily), branch.color], 'the branch line: 11 px monospace muted').toEqual(['11px', true, await mutedColor(page)]);
         expect(await shipButton(page, 'Delete workspace…').count(), `${label}: "Delete workspace…"`).toBe(state === 'MERGED' ? 1 : 0);
+        // AC12: a branch with only closed pull requests can have a new one, its block above the button.
+        expect(await shipButton(page, 'Create pull request').count(), `${label}: "Create pull request"`).toBe(state === 'CLOSED' ? 1 : 0);
+        if (state === 'CLOSED') {
+          expect(look.top, 'the closed pull request shows above "Create pull request"').toBeLessThan((await lookOf(shipButton(page, 'Create pull request'))).top);
+        }
       }
       setGh(gh);
     });
