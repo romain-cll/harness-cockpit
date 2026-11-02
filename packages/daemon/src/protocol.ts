@@ -91,7 +91,8 @@ export type Message =
   | { id: number; error: string }
   | { type: 'data'; terminal: number; seq: number; data: string }
   | ({ type: 'exit'; terminal: number } & TerminalExit)
-  | ({ type: 'status' } & SessionReport);
+  | ({ type: 'status' } & SessionReport)
+  | { type: 'title'; sessionId: string; title: string };
 
 /** Splits a stream into its JSON lines. A line that does not parse is dropped. */
 export function lineReader(onMessage: (message: unknown) => void): (chunk: Buffer | string) => void {

@@ -7,6 +7,8 @@ import { SCROLLBACK, type Attached, type SessionEventName, type SessionReport, t
 export interface Subscriber {
   data(terminal: number, seq: number, data: string): void;
   exit(terminal: number, exit: TerminalExit): void;
+  /** The title a `session` terminal's program set (OSC 0 or 2), once per change. */
+  title(sessionId: string, title: string): void;
 }
 
 interface Terminal {
@@ -86,6 +88,14 @@ export function createTerminals(onEnd: () => void) {
       };
       terminals.set(id, terminal);
 
+      if (kind === 'session' && sessionId !== undefined) {
+        let lastTitle: string | undefined;
+        headless.onTitleChange((title) => {
+          if (title === lastTitle) return;
+          lastTitle = title;
+          for (const each of terminal.subscribers) each.title(sessionId, title);
+        });
+      }
       pty.onData((data) => {
         const seq = ++terminal.seq;
         headless.write(data);
@@ -140,6 +150,17 @@ export function createTerminals(onEnd: () => void) {
         terminal.subscribers.delete(subscriber);
         if (terminal.owner === subscriber) withTerminal(id, hangUp);
       }
+    },
+
+    /**
+     * Resolves once everything the session's terminal has output so far is parsed, so the title events it
+     * holds are out: a report is announced after them, in the order the program produced them.
+     */
+    settled(sessionId: string): Promise<void> {
+      for (const { info, headless } of terminals.values()) {
+        if (info.sessionId === sessionId) return new Promise((resolve) => headless.write('', resolve));
+      }
+      return Promise.resolve();
     },
 
     /** Records what a session reported; `false` when no terminal runs that session. */

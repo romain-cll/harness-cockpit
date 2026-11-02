@@ -60,7 +60,10 @@ export interface AttachedTerminal {
 /** Whether the background service that runs the terminals is up; `log` says whether its log file exists. */
 export type DaemonStatus = { status: 'running' } | { status: 'down'; reason: string; log: boolean };
 
-/** A linked git worktree of a project; `name` is its branch, or its folder name when detached. */
+/**
+ * A linked git worktree of a project; `name` is the readable name the composer gave it
+ * (`branch.<branch>.cockpitName`), else its branch, or its folder name when detached.
+ */
 export interface Workspace {
   path: string;
   name: string;
@@ -205,6 +208,8 @@ export interface StartSessionOptions {
   prompt?: string;
   /** Run `cockpit setup` in the workspace first, then the agent, then the login shell. */
   setup?: boolean;
+  /** Name the workspace after the first title the agent derives from the prompt (with `workspace`). */
+  nameFromTitle?: boolean;
 }
 
 /** A detected agent CLI the user can start a session with. */
@@ -253,13 +258,18 @@ export interface Api {
     add(): Promise<AddProjectResult>;
     /** Forgets the project; its files stay on disk. */
     remove(path: string): Promise<void>;
+    /** Calls `listener` when the main process changed a project's workspaces (a workspace named from its agent's title). */
+    onChanged(listener: () => void): () => void;
   };
   /** Git worktrees of a project; every call refuses a project path that is not in the app state. */
   workspaces: {
     /** The local and `origin/*` branches, and the base to preselect. Runs no fetch. */
     branches(project: string): Promise<BranchesResult>;
-    /** Creates the branch `name` from `base` and its worktree under `$COCKPIT_HOME/worktrees`. */
-    create(project: string, name: string, base: string): Promise<CreateWorkspaceResult>;
+    /**
+     * Creates a branch named after the task (its slug, with `-2`, `-3`… when taken) from `base` and its
+     * worktree under `$COCKPIT_HOME/worktrees`.
+     */
+    create(project: string, task: string, base: string): Promise<CreateWorkspaceResult>;
     /** Removes the worktree, and its branch when merged; `force` removes it with its uncommitted changes. */
     remove(project: string, path: string, options?: { force?: boolean }): Promise<RemoveWorkspaceResult>;
     /** The detected editors and terminals, looked up at each call. */
@@ -312,6 +322,7 @@ export interface Api {
     list(): Promise<Session[]>;
     /**
      * Runs the harness in a new folder, or in `options.workspace`, in a pty owned by the calling window.
+     * The harness `terminal` runs the login shell (after `cockpit setup` in a workspace) instead of an agent CLI.
      * Refused when the project is not in the app state or the path is not one of its linked worktrees.
      */
     start(harness: string, size: { cols: number; rows: number }, options?: StartSessionOptions): Promise<StartSessionResult>;

@@ -132,7 +132,7 @@ interface CommandsResult {
 }
 
 /** Reads the commands of `kind` and runs them one by one; the first failure stops them. */
-async function runCommands(kind: Kind, io: SetupIo, env: NodeJS.ProcessEnv, onStart: () => void): Promise<CommandsResult> {
+async function runCommands(kind: Kind, io: SetupIo, env: NodeJS.ProcessEnv, onStart: () => Promise<void>): Promise<CommandsResult> {
   let config;
   try {
     config = await readWorkspaceConfig({ repo: io.cwd, path: io.cwd, env });
@@ -142,7 +142,9 @@ async function runCommands(kind: Kind, io: SetupIo, env: NodeJS.ProcessEnv, onSt
   const commands = config[kind];
   if (commands.length === 0) return { ran: false };
 
-  onStart();
+  // The daemon hears that the setup runs before the commands print anything: the output that follows
+  // (a title a command sets) is never taken for the agent's.
+  await onStart();
   io.stdout.write(`cockpit ${kind} · ${config.env.COCKPIT_WORKSPACE_NAME} · .cockpit/config.json\n`);
   const commandEnv = { ...env, ...config.env };
   for (const command of commands) {
@@ -158,7 +160,7 @@ async function runCommands(kind: Kind, io: SetupIo, env: NodeJS.ProcessEnv, onSt
 const harnessName = (binary: string) => harnesses.find((harness) => harness.binary === binary)?.name ?? binary;
 
 /** Runs the agent and reports how it ended; resolves to the code `cockpit` exits with. */
-async function runAgent(agent: string[], io: SetupIo, env: NodeJS.ProcessEnv, send: (report: SetupReport) => void): Promise<number> {
+async function runAgent(agent: string[], io: SetupIo, env: NodeJS.ProcessEnv, send: (report: SetupReport) => Promise<void>): Promise<number> {
   const outcome = await run(agent[0]!, agent.slice(1), io.cwd, env);
   io.stdout.write(`[${harnessName(basename(agent[0]!))} ${describe(outcome)}]\n`);
   send({ event: 'exited', exitCode: outcome.code });
@@ -178,9 +180,9 @@ async function runShell(io: SetupIo, env: NodeJS.ProcessEnv): Promise<number> {
  */
 export function runSetup({ shell, agent }: SetupArguments, io: SetupIo, env: NodeJS.ProcessEnv): Promise<number> {
   return inTerminal(async () => {
-    // Reports go out in order, without holding the run back.
+    // Reports go out in order; only `setup-running` holds the run back (each report gives up after 2 s).
     let sent = Promise.resolve();
-    const send = (report: SetupReport) => void (sent = sent.then(() => io.report(report)));
+    const send = (report: SetupReport) => (sent = sent.then(() => io.report(report)));
 
     let status = 0;
     const { ran, failure } = await runCommands('setup', io, env, () => send({ event: 'setup-running' }));
@@ -206,7 +208,7 @@ export function runSetup({ shell, agent }: SetupArguments, io: SetupIo, env: Nod
 /** `cockpit teardown`: the teardown commands in the current linked worktree. Resolves to the exit code: 0, or that of the command that failed. */
 export function runTeardown(io: SetupIo, env: NodeJS.ProcessEnv): Promise<number> {
   return inTerminal(async () => {
-    const { failure } = await runCommands('teardown', io, env, () => {});
+    const { failure } = await runCommands('teardown', io, env, async () => {});
     if (!failure) return 0;
     io.stdout.write(`✗ Teardown failed: ${failure.reason}\n`);
     return failure.code;

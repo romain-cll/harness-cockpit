@@ -1,11 +1,11 @@
-import { Link, useRouter } from '@tanstack/react-router';
-import { CircleCheckIcon, CircleDashedIcon, CircleDotIcon, CircleXIcon, ChevronDownIcon, ChevronRightIcon, ContrastIcon } from 'lucide-react';
-import { useState, useSyncExternalStore } from 'react';
+import { Link, useNavigate } from '@tanstack/react-router';
+import { CircleCheckIcon, CircleDashedIcon, CircleDotIcon, CircleXIcon, ChevronDownIcon, ChevronRightIcon, ContrastIcon, PlusIcon } from 'lucide-react';
+import { useSyncExternalStore } from 'react';
 import type { DaemonStatus, Session } from '../../shared/api';
 import { toggleSessions, useSessionsCollapsed } from '@/components/collapsed';
 import { useRetrying } from '@/components/daemon-down';
-import { getRunningIds, getSessionDots, startSession, subscribe } from '@/components/live-terminals';
-import { StartSessionMenu } from '@/components/start-session-menu';
+import { getRunningIds, getSessionDots, subscribe } from '@/components/live-terminals';
+import { Button } from '@/components/ui/button';
 import { useRestoring } from '@/components/workspace-panes';
 
 /** The classes of a 28 px sidebar row, with its icons at 14 px unless they set a size of their own. */
@@ -62,22 +62,9 @@ export function SessionLink({ session }: { session: Session }) {
 
 // The sessions outside any project; those of a workspace are listed under it.
 export function Sessions({ sessions, daemon }: { sessions: Session[]; daemon: DaemonStatus }) {
-  const router = useRouter();
+  const navigate = useNavigate();
   const retrying = useRetrying();
   const collapsed = useSessionsCollapsed();
-  // Why the last start was refused; cleared by the next one that succeeds.
-  const [message, setMessage] = useState<string>();
-
-  async function start(harness: string) {
-    const result = await startSession(harness);
-    if (result.status === 'refused') {
-      setMessage(result.message);
-      return;
-    }
-    setMessage(undefined);
-    await router.invalidate();
-    await router.navigate({ to: '/sessions/$sessionId', params: { sessionId: result.session.id } });
-  }
 
   return (
     <section className="flex max-h-[40%] shrink-0 flex-col gap-px">
@@ -88,15 +75,19 @@ export function Sessions({ sessions, daemon }: { sessions: Session[]; daemon: Da
             {collapsed ? <ChevronRightIcon className="size-2.5 text-subtle" /> : <ChevronDownIcon className="size-2.5 text-subtle" />}
           </button>
         </h2>
-        <StartSessionMenu label="Start session" className="text-subtle" onStart={(harness) => void start(harness)} />
+        {/* The composer, with no project: a session in a folder of its own. */}
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          aria-label="Start session"
+          className="text-subtle"
+          onClick={() => void navigate({ to: '/', search: { project: 'none' } })}
+        >
+          <PlusIcon className="size-3.5" />
+        </Button>
       </header>
       {daemon.status === 'down' && !retrying && (
         <p className="shrink-0 px-2 py-1 text-xs break-words text-muted-foreground">{`Cockpit's background service could not start: ${daemon.reason}`}</p>
-      )}
-      {message && (
-        <p role="status" className="shrink-0 px-2 py-1 text-xs break-words text-destructive">
-          {message}
-        </p>
       )}
       {!collapsed && (
         <ul className="flex min-h-0 flex-col gap-px overflow-y-auto">

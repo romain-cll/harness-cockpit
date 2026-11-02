@@ -3,7 +3,7 @@ import type { ReactNode } from 'react';
 import { toggleSidebar, useSidebarCollapsed } from '@/components/collapsed';
 import { Button } from '@/components/ui/button';
 
-export function PageHeader({ title, children }: { title: string; children?: ReactNode }) {
+export function PageHeader({ title, children }: { title?: string; children?: ReactNode }) {
   const sidebarHidden = useSidebarCollapsed();
   return (
     // With the sidebar hidden the row leaves room for the window controls, then holds the button that brings it back.
@@ -13,7 +13,7 @@ export function PageHeader({ title, children }: { title: string; children?: Reac
           <PanelLeftOpenIcon />
         </Button>
       )}
-      <h1 className="font-heading text-xs font-medium">{title}</h1>
+      {title !== undefined && <h1 className="font-heading text-xs font-medium">{title}</h1>}
       {children && <div className="app-no-drag ml-4 flex min-w-0 items-center gap-1">{children}</div>}
     </header>
   );

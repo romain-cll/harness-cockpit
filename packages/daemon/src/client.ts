@@ -38,6 +38,8 @@ export interface DaemonClient {
   onExit(listener: (event: { id: number } & TerminalExit) => void): void;
   /** Everything a session reported (a hook, `cockpit setup`), for any session of the daemon. */
   onStatus(listener: (report: SessionReport) => void): void;
+  /** The title a session's program set (OSC 0 or 2), once per change, for any session of the daemon. */
+  onTitle(listener: (event: { sessionId: string; title: string }) => void): void;
   /** The connection ended: the daemon went away, or `close` was called. */
   onClose(listener: () => void): void;
   close(): void;
@@ -125,6 +127,7 @@ function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutM
   const dataListeners: Array<Parameters<DaemonClient['onData']>[0]> = [];
   const exitListeners: Array<Parameters<DaemonClient['onExit']>[0]> = [];
   const statusListeners: Array<Parameters<DaemonClient['onStatus']>[0]> = [];
+  const titleListeners: Array<Parameters<DaemonClient['onTitle']>[0]> = [];
   const closeListeners: Array<() => void> = [];
 
   const send = (message: Request) => {
@@ -164,6 +167,9 @@ function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutM
         statusListeners.forEach((listener) => listener(report));
         break;
       }
+      case 'title':
+        titleListeners.forEach((listener) => listener({ sessionId: message.sessionId, title: message.title }));
+        break;
     }
   };
   const drain = async () => {
@@ -206,6 +212,7 @@ function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutM
     onData: (listener) => void dataListeners.push(listener),
     onExit: (listener) => void exitListeners.push(listener),
     onStatus: (listener) => void statusListeners.push(listener),
+    onTitle: (listener) => void titleListeners.push(listener),
     onClose: (listener) => void closeListeners.push(listener),
     close: () => void socket.destroy(),
   };

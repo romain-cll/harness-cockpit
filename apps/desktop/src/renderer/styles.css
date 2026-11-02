@@ -27,6 +27,7 @@
   --color-status-merged: var(--status-merged);
   --color-subtle: var(--subtle);
   --color-hover: var(--hover);
+  --color-brand: var(--brand);
   --color-project-1: var(--project-1);
   --color-project-2: var(--project-2);
   --color-project-3: var(--project-3);
@@ -122,6 +123,8 @@
   /* Text under the muted one, and the fill of a row under the pointer. */
   --subtle: #A1A1A8;
   --hover: #0000000A;
+  /* The accent of the composer's send button, the same in both themes. */
+  --brand: #5E6AD2;
   /* Badge backgrounds of the projects, picked by path, and the letter on them. */
   --project-1: #5E6AD2;
   --project-2: #D97706;
