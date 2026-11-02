@@ -1363,7 +1363,7 @@ describe('workspace panes: built app', () => {
 
   // --- Leaving and coming back ---
 
-  test('AC18, AC20 — Home, another workspace and back keep the panes, tabs, selections, outputs, processes and the keyboard; a window resized meanwhile is fitted on return, in the shown and in a hidden tab', async () => {
+  test('AC18, AC20, AC9 — Home, another workspace and back keep the panes, their sizes, tabs, selections, outputs, processes and the keyboard; a window resized meanwhile is fitted on return, in the shown and in a hidden tab', async () => {
     const { page } = session;
     await openWorkspace(page, 'alpha', ws.alpha);
     const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
@@ -1371,6 +1371,17 @@ describe('workspace panes: built app', () => {
     rmSync(done, { force: true });
     await expectLabels(page, 0, ['Claude Code 1', 'Codex 1', 'Terminal', 'Claude Code 2'], 'Claude Code 2');
     await expectLabels(page, 1, ['Terminal', 'Codex 2'], 'Codex 2');
+    // COCKPIT-45 AC9: the splits are left at 60% (right split) and 40% (down split), not equal halves.
+    const areaBefore = await areaRect(page);
+    await dragSeparator(page, await separatorOf(page, 'vertical'), { x: areaBefore.left + 0.6 * areaBefore.width });
+    await dragSeparator(page, await separatorOf(page, 'horizontal'), { y: areaBefore.top + 0.4 * areaBefore.height });
+    const ratios = async () => {
+      const area = await areaRect(page);
+      return { column: (await paneRect(page, 0)).width / area.width, row: (await paneRect(page, 1)).height / area.height };
+    };
+    const resized = await ratios();
+    expect(Math.abs(resized.column - 0.6), 'left column after the drag').toBeLessThanOrEqual(0.01);
+    expect(Math.abs(resized.row - 0.4), 'top right pane after the drag').toBeLessThanOrEqual(0.01);
     // Markers in the shells, a command that prints later in the bottom pane, the keyboard there.
     await selectTab(page, 1, 'Terminal');
     const second = await terminalOf(page, 1);
@@ -1396,6 +1407,10 @@ describe('workspace panes: built app', () => {
       await openWorkspace(page, 'alpha', ws.alpha);
 
       expect(await paneCount(page)).toBe(3);
+      // COCKPIT-45 AC9: the proportions survive Home and back, the window being smaller.
+      const returned = await ratios();
+      expect(Math.abs(returned.column - resized.column), 'left column share after Home and back').toBeLessThanOrEqual(0.01);
+      expect(Math.abs(returned.row - resized.row), 'top right pane share after Home and back').toBeLessThanOrEqual(0.01);
       await expectLabels(page, 0, ['Claude Code 1', 'Codex 1', 'Terminal', 'Claude Code 2'], 'Claude Code 2');
       await expectLabels(page, 1, ['Terminal', 'Codex 2'], 'Terminal');
       await expectLabels(page, 2, ['Terminal'], 'Terminal');
