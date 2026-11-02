@@ -2,7 +2,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { basename } from 'node:path';
 import { harnesses } from '@cockpit/harnesses';
 import { readWorkspaceConfig, shellInvocation } from '@cockpit/workspaces';
-import type { SetupEventName } from './protocol';
+import { agentMarker, type SetupEventName } from './protocol';
 
 /** What `cockpit setup` tells the daemon: a setup event, then the agent's exit (`null` for a signal). */
 export type SetupReport = { event: SetupEventName } | { event: 'exited'; exitCode: number | null };
@@ -132,7 +132,7 @@ interface CommandsResult {
 }
 
 /** Reads the commands of `kind` and runs them one by one; the first failure stops them. */
-async function runCommands(kind: Kind, io: SetupIo, env: NodeJS.ProcessEnv, onStart: () => Promise<void>): Promise<CommandsResult> {
+async function runCommands(kind: Kind, io: SetupIo, env: NodeJS.ProcessEnv, onStart: () => void): Promise<CommandsResult> {
   let config;
   try {
     config = await readWorkspaceConfig({ repo: io.cwd, path: io.cwd, env });
@@ -142,9 +142,7 @@ async function runCommands(kind: Kind, io: SetupIo, env: NodeJS.ProcessEnv, onSt
   const commands = config[kind];
   if (commands.length === 0) return { ran: false };
 
-  // The daemon hears that the setup runs before the commands print anything: the output that follows
-  // (a title a command sets) is never taken for the agent's.
-  await onStart();
+  onStart();
   io.stdout.write(`cockpit ${kind} · ${config.env.COCKPIT_WORKSPACE_NAME} · .cockpit/config.json\n`);
   const commandEnv = { ...env, ...config.env };
   for (const command of commands) {
@@ -160,8 +158,11 @@ async function runCommands(kind: Kind, io: SetupIo, env: NodeJS.ProcessEnv, onSt
 const harnessName = (binary: string) => harnesses.find((harness) => harness.binary === binary)?.name ?? binary;
 
 /** Runs the agent and reports how it ended; resolves to the code `cockpit` exits with. */
-async function runAgent(agent: string[], io: SetupIo, env: NodeJS.ProcessEnv, send: (report: SetupReport) => Promise<void>): Promise<number> {
+async function runAgent(agent: string[], io: SetupIo, env: NodeJS.ProcessEnv, send: (report: SetupReport) => void): Promise<number> {
+  // The markers tell the daemon, in the stream, which titles are the agent's.
+  io.stdout.write(agentMarker('started'));
   const outcome = await run(agent[0]!, agent.slice(1), io.cwd, env);
+  io.stdout.write(agentMarker('exited'));
   io.stdout.write(`[${harnessName(basename(agent[0]!))} ${describe(outcome)}]\n`);
   send({ event: 'exited', exitCode: outcome.code });
   return outcome.code ?? 1;
@@ -180,9 +181,9 @@ async function runShell(io: SetupIo, env: NodeJS.ProcessEnv): Promise<number> {
  */
 export function runSetup({ shell, agent }: SetupArguments, io: SetupIo, env: NodeJS.ProcessEnv): Promise<number> {
   return inTerminal(async () => {
-    // Reports go out in order; only `setup-running` holds the run back (each report gives up after 2 s).
+    // Reports go out in order and never hold the run back; the last one is awaited before exiting.
     let sent = Promise.resolve();
-    const send = (report: SetupReport) => (sent = sent.then(() => io.report(report)));
+    const send = (report: SetupReport) => void (sent = sent.then(() => io.report(report)));
 
     let status = 0;
     const { ran, failure } = await runCommands('setup', io, env, () => send({ event: 'setup-running' }));

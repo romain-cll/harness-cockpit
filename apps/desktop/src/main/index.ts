@@ -231,13 +231,13 @@ const sessionStatuses = new Map<string, SessionStatus>();
 // clears the entry.
 const pendingNames = new Map<string, { worktree: string; harness: Harness }>();
 
-// A session's program set a terminal title. The first one its harness derives from the prompt, after
-// the setup, names the workspace: the branch follows it (`nameWorkspace`) and the windows list again.
+// A session's program set a terminal title. The daemon forwards only those between the markers
+// `cockpit setup` writes around the agent, so the setup's and the login shell's never get here. The
+// first one its harness derives from the prompt names the workspace: the branch follows it (`nameWorkspace`) and the windows list again.
 async function nameFromTitle({ sessionId, title }: { sessionId: string; title: string }): Promise<void> {
   const pending = pendingNames.get(sessionId);
   if (!pending) return;
-  const setupRunning = [...terminals.values()].some((terminal) => terminal.sessionId === sessionId && terminal.setup === 'running');
-  const name = setupRunning ? null : pending.harness.promptTitle(title);
+  const name = pending.harness.promptTitle(title);
   if (name === null) return;
   pendingNames.delete(sessionId);
   try {
@@ -719,8 +719,7 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
     }),
   );
 
-  // The branch is named after the task. A branch taken between the choice of the name and the
-  // creation (`BRANCH_EXISTS`) is chosen again once.
+  // The branch is named after the task, with a free name: not a local branch, not an existing worktree folder.
   ipcMain.handle('workspaces:create', (event, project: string, task: string, base: string): Promise<CreateWorkspaceResult> => {
     let name = task;
     return forProject<CreateWorkspaceResult>(
@@ -729,14 +728,8 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
       project,
       async () => {
         const env = await shellEnv;
-        const make = async () => {
-          name = await availableBranch(project, task, { env, root: worktreesRoot });
-          return createWorktree({ repo: project, root: worktreesRoot, branch: name, base, env });
-        };
-        const { path, branch } = await make().catch((error: unknown) => {
-          if (error instanceof WorkspaceError && error.code === 'BRANCH_EXISTS') return make();
-          throw error;
-        });
+        name = await availableBranch(project, task, { env, root: worktreesRoot });
+        const { path, branch } = await createWorktree({ repo: project, root: worktreesRoot, branch: name, base, env });
         return { status: 'created', workspace: { path, name: branch ?? basename(path), branch } };
       },
       (error) => {
@@ -1074,18 +1067,19 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
             ? { command: cliPath, args: ['setup', '--shell', '--then', found.path, ...agentArgs] }
             : { command: found.path, args: agentArgs };
         } else {
-          // The login shell, after the setup in a workspace; the spawn defaults run `$SHELL -l` otherwise.
-          command = viaSetup ? { command: cliPath, args: ['setup', '--shell'] } : {};
+          // The login shell: the spawn defaults run `$SHELL -l`.
+          command = {};
+        }
+        // The composer names the workspace after the first title the agent derives from the prompt. The
+        // entry exists before the spawn, so no title can arrive ahead of it.
+        if (workspace && options?.nameFromTitle && catalogued) {
+          pendingNames.set(id, { worktree: workspace.path, harness: catalogued });
         }
         ptyId = await spawnFor(
           event.sender,
           { ...size, ...command, cwd: directory, env },
           { kind: 'session', sessionId: id, workspace: workspace?.path, before: endings },
         );
-        // The composer names the workspace after the first title the agent derives from the prompt.
-        if (workspace && options?.nameFromTitle && catalogued) {
-          pendingNames.set(id, { worktree: workspace.path, harness: catalogued });
-        }
         const session = {
           id,
           name: sessionName(state, harness, workspace?.path),

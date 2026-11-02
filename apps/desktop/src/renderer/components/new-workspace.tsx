@@ -28,9 +28,10 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { Textarea } from '@/components/ui/textarea';
+import { InputGroupTextarea } from '@/components/ui/input-group';
+import { addSessionTab, openShellTab } from '@/components/workspace-panes';
 
-// The pseudo-harness of "Terminal": the login shell, no agent CLI.
+// The pseudo-harness of "Terminal": no agent CLI. In a workspace it is the setup shell tab; with no project, a session running the login shell.
 const TERMINAL = 'terminal';
 
 const selectClass = 'h-6 gap-1 px-2 font-normal';
@@ -185,8 +186,9 @@ function ProjectSelect({ projects, project }: { projects: Project[]; project?: P
 
 /**
  * The home page: describe a task, pick the project, the agent and the base, send. A send makes the
- * workspace (a worktree on a branch named after the task), runs its setup and starts the agent on the
- * prompt in the terminal of a session, whose page opens.
+ * workspace (a worktree on a branch named after the task) and opens its page: the agent runs there on the
+ * prompt after the workspace's setup, or "Terminal" shows the setup, then the login shell. With no project
+ * the session's own page opens.
  */
 export function NewWorkspace() {
   const router = useRouter();
@@ -233,23 +235,37 @@ export function NewWorkspace() {
     setSending(true);
     try {
       const withAgent = agent !== TERMINAL;
-      let started;
       if (project && base !== null) {
         const created = await window.api.workspaces.create(project.path, task, base);
         if (created.status === 'refused') {
           setMessage(created.message);
           return;
         }
+        const workspace = created.workspace.path;
         // The sidebar lists the workspace, whether or not its session starts.
         await router.invalidate();
-        started = await startSession(agent, {
-          workspace: { project: project.path, path: created.workspace.path },
-          setup: true,
-          ...(withAgent && { prompt: task, nameFromTitle: true }),
-        });
-      } else {
-        started = await startSession(agent, withAgent ? { prompt: task } : undefined);
+        if (withAgent) {
+          const started = await startSession(agent, {
+            workspace: { project: project.path, path: workspace },
+            setup: true,
+            prompt: task,
+            nameFromTitle: true,
+          });
+          if (started.status === 'refused') {
+            setMessage(started.message);
+            return;
+          }
+          addSessionTab(started.session);
+        } else {
+          // "Terminal" is the workspace's setup shell tab, no session.
+          openShellTab(workspace, { setup: true });
+        }
+        setMessage(undefined);
+        await router.invalidate();
+        await navigate({ to: '/workspace', search: { path: workspace } });
+        return;
       }
+      const started = await startSession(agent, withAgent ? { prompt: task } : undefined);
       if (started.status === 'refused') {
         setMessage(started.message);
         return;
@@ -282,7 +298,7 @@ export function NewWorkspace() {
             void send();
           }}
         >
-          <Textarea
+          <InputGroupTextarea
             aria-label="Prompt"
             placeholder="Describe the task"
             rows={2}
@@ -290,7 +306,7 @@ export function NewWorkspace() {
             autoFocus
             onChange={(event) => setPrompt(event.target.value)}
             onKeyDown={onKeyDown}
-            className="min-h-10 rounded-none border-0 bg-transparent p-0 text-[13px] focus-visible:border-0 focus-visible:ring-0 md:text-[13px] dark:bg-transparent"
+            className="min-h-10 p-0 text-[13px] focus-visible:border-0 md:text-[13px]"
           />
           <div className="flex items-center gap-1.5">
             <ProjectSelect projects={projects} project={project} />
@@ -301,7 +317,7 @@ export function NewWorkspace() {
               size="icon"
               aria-label="Create workspace"
               disabled={!canSend}
-              className="ml-auto size-[26px] rounded-full bg-brand text-white hover:bg-brand/90"
+              className="ml-auto size-[26px] rounded-full bg-brand text-brand-foreground hover:bg-brand/90"
             >
               <ArrowUpIcon />
             </Button>

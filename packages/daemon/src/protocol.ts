@@ -3,6 +3,14 @@ export const PROTOCOL_VERSION = 1;
 
 export { SCROLLBACK } from './scrollback';
 
+/**
+ * The private OSC sequence `cockpit setup` writes around the agent: `agent-started` right before it
+ * spawns it, `agent-exited` right after it ends. In the terminal's own byte stream, so the daemon
+ * reads it in order with what the program prints, with no timing involved.
+ */
+export const AGENT_MARKER_OSC = 6973;
+export const agentMarker = (what: 'started' | 'exited') => `\u001b]${AGENT_MARKER_OSC};agent-${what}\u0007`;
+
 /** Upgrade token of the stream: `cockpit-<protocol>`. */
 export const UPGRADE = `cockpit-${PROTOCOL_VERSION}`;
 

@@ -63,9 +63,7 @@ export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon>
 
   const server = createServer((req, res) => handle(req, res, token, (report) => {
     if (!terminals.report(report)) return false;
-    // After the titles the terminal's output already holds (the headless terminal parses later), so a
-    // title printed before a `setup-done` reaches the clients before it.
-    void terminals.settled(report.sessionId).then(() => broadcast({ type: 'status', ...report }));
+    broadcast({ type: 'status', ...report });
     return true;
   }));
 

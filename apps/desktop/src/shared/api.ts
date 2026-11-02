@@ -322,7 +322,7 @@ export interface Api {
     list(): Promise<Session[]>;
     /**
      * Runs the harness in a new folder, or in `options.workspace`, in a pty owned by the calling window.
-     * The harness `terminal` runs the login shell (after `cockpit setup` in a workspace) instead of an agent CLI.
+     * The harness `terminal` runs the login shell instead of an agent CLI; it serves a session with no project.
      * Refused when the project is not in the app state or the path is not one of its linked worktrees.
      */
     start(harness: string, size: { cols: number; rows: number }, options?: StartSessionOptions): Promise<StartSessionResult>;
