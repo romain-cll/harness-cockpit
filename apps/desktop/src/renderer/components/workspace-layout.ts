@@ -1,6 +1,6 @@
 // The pure part of the workspace page: the tree of panes, the tab labels and the status of a
 // workspace's row. A pane holds tabs (terminal keys) and the selected one; a split divides its
-// area in two equal halves. Nothing here imports through `@/`, so a vitest test imports it.
+// area in two, `ratio` being the share of the first half. Nothing here imports through `@/`, so a vitest test imports it.
 
 export interface Pane {
   id: string;
@@ -11,6 +11,8 @@ export interface Pane {
 /** `first` is the left (`right`) or the top (`down`) half. */
 export interface Split {
   direction: 'right' | 'down';
+  /** The share of `first` along the split's axis: 0.5 from `split()`, moved by dragging its separator. */
+  ratio: number;
   first: Layout;
   second: Layout;
 }
@@ -50,7 +52,7 @@ export const selectTab = (layout: Layout, pane: string, tab: string): Layout =>
 
 /** The pane keeps its tabs; a new pane (after it) holds one selected tab. */
 export const split = (layout: Layout, pane: string, direction: 'right' | 'down', newPane: string, tab: string): Layout =>
-  mapPane(layout, pane, (found) => ({ direction, first: found, second: { id: newPane, tabs: [tab], selected: tab } }));
+  mapPane(layout, pane, (found) => ({ direction, ratio: 0.5, first: found, second: { id: newPane, tabs: [tab], selected: tab } }));
 
 /** The tab that takes the keyboard when a tab closes. */
 export interface Focus {
@@ -99,13 +101,80 @@ export function closeTab(layout: Layout, paneId: string, tab: string): { layout:
 /** The area of each pane, in percent. */
 export function boxes(layout: Layout, box: Omit<PaneBox, 'pane'> = { left: 0, top: 0, width: 100, height: 100 }): PaneBox[] {
   if (isPane(layout)) return [{ pane: layout.id, ...box }];
-  const { left, top, width, height } = box;
-  if (layout.direction === 'right') {
-    const half = width / 2;
-    return [...boxes(layout.first, { left, top, width: half, height }), ...boxes(layout.second, { left: left + half, top, width: half, height })];
+  const [first, second] = halves(layout, box);
+  return [...boxes(layout.first, first), ...boxes(layout.second, second)];
+}
+
+type Box = Omit<PaneBox, 'pane'>;
+
+/** The areas of a split's two halves inside the split's own box. */
+function halves({ direction, ratio }: Split, { left, top, width, height }: Box): [Box, Box] {
+  if (direction === 'right') {
+    const firstWidth = width * ratio;
+    return [
+      { left, top, width: firstWidth, height },
+      { left: left + firstWidth, top, width: width - firstWidth, height },
+    ];
   }
-  const half = height / 2;
-  return [...boxes(layout.first, { left, top, width, height: half }), ...boxes(layout.second, { left, top: top + half, width, height: half })];
+  const firstHeight = height * ratio;
+  return [
+    { left, top, width, height: firstHeight },
+    { left, top: top + firstHeight, width, height: height - firstHeight },
+  ];
+}
+
+/** Where a split sits in the tree: 0 for `first`, 1 for `second`, from the root. Opaque to callers. */
+export type SplitPath = readonly (0 | 1)[];
+
+/** A split's separator: the split's box and the separator's position (a `left` for a right split, a `top` for a down one), in percent. */
+export interface Separator {
+  path: SplitPath;
+  direction: Split['direction'];
+  box: Box;
+  position: number;
+}
+
+/** One separator per split: the root first, then the splits of `first`, then those of `second`. */
+export function separators(layout: Layout, box: Box = { left: 0, top: 0, width: 100, height: 100 }, path: SplitPath = []): Separator[] {
+  if (isPane(layout)) return [];
+  const [first, second] = halves(layout, box);
+  const position = layout.direction === 'right' ? box.left + box.width * layout.ratio : box.top + box.height * layout.ratio;
+  return [
+    { path, direction: layout.direction, box, position },
+    ...separators(layout.first, first, [...path, 0]),
+    ...separators(layout.second, second, [...path, 1]),
+  ];
+}
+
+function splitAt(layout: Layout, path: SplitPath): Split {
+  const found = path.reduce<Layout>((each, index) => (isPane(each) ? each : index === 0 ? each.first : each.second), layout);
+  if (isPane(found)) throw new Error('No split at this path');
+  return found;
+}
+
+/** The layout with the ratio of the split at `path` changed. */
+export function setRatio(layout: Layout, path: SplitPath, ratio: number): Layout {
+  if (isPane(layout)) return layout;
+  const [index, ...rest] = path;
+  if (index === undefined) return { ...layout, ratio };
+  return index === 0 ? { ...layout, first: setRatio(layout.first, rest, ratio) } : { ...layout, second: setRatio(layout.second, rest, ratio) };
+}
+
+/**
+ * `ratio` moved into the range where every pane on both sides of the split at `path` is at least
+ * `floor` px along its axis; the split's current ratio when no ratio gives that to both sides.
+ * `area` is the workspace's size in px.
+ */
+export function clampRatio(layout: Layout, path: SplitPath, ratio: number, area: { width: number; height: number }, floor: number): number {
+  const target = splitAt(layout, path);
+  const { box } = separators(layout).find((each) => each.path.join() === path.join())!;
+  const right = target.direction === 'right';
+  const size = (right ? area.width * box.width : area.height * box.height) / 100;
+  // The smallest share of its side a pane takes along the axis.
+  const smallest = (side: Layout) => Math.min(...boxes(side).map((each) => (right ? each.width : each.height) / 100));
+  const lowest = floor / (size * smallest(target.first));
+  const highest = 1 - floor / (size * smallest(target.second));
+  return lowest > highest ? target.ratio : Math.min(Math.max(ratio, lowest), highest);
 }
 
 /**
