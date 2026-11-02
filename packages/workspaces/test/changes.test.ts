@@ -306,14 +306,14 @@ async function commitFile(worktree: string, name: string, message: string): Prom
 }
 
 describe('branchStatus', () => {
-  test('AC8 — a fresh workspace has its branch, no upstream, nothing uncommitted and nothing to push', async () => {
+  test('AC14 — a fresh workspace has its branch, no upstream, nothing uncommitted and nothing to push', async () => {
     const { worktree } = await makeShippableWorkspace();
 
     expect(await branchStatus(worktree, { env: testEnv })).toEqual({
       branch: 'feat',
       upstream: null,
       uncommitted: false,
-      unpushed: false,
+      unpushed: 0,
     });
   });
 
@@ -330,22 +330,25 @@ describe('branchStatus', () => {
     expect((await branchStatus(worktree, { env: testEnv })).uncommitted).toBe(true);
   });
 
-  test('AC8 — without an upstream, commits beyond the merge-base with the base are unpushed', async () => {
+  test('AC14 — without an upstream, unpushed counts the commits beyond the merge-base with the base', async () => {
     const { worktree } = await makeShippableWorkspace();
     await commitFile(worktree, 'one.txt', 'one');
-
-    expect(await branchStatus(worktree, { env: testEnv })).toMatchObject({ branch: 'feat', upstream: null, unpushed: true });
-  });
-
-  test('AC8 — with an upstream, only the commits the upstream lacks are unpushed', async () => {
-    const { worktree } = await makeShippableWorkspace();
-    await commitFile(worktree, 'one.txt', 'one');
-    await pushBranch(worktree, { env: testEnv });
-    expect(await branchStatus(worktree, { env: testEnv })).toMatchObject({ upstream: 'origin/feat', unpushed: false });
+    expect(await branchStatus(worktree, { env: testEnv })).toMatchObject({ branch: 'feat', upstream: null, unpushed: 1 });
 
     await commitFile(worktree, 'two.txt', 'two');
 
-    expect(await branchStatus(worktree, { env: testEnv })).toMatchObject({ upstream: 'origin/feat', unpushed: true });
+    expect(await branchStatus(worktree, { env: testEnv })).toMatchObject({ branch: 'feat', upstream: null, unpushed: 2 });
+  });
+
+  test('AC14 — with an upstream, unpushed is 0 when HEAD matches it and the number of commits HEAD is ahead of it', async () => {
+    const { worktree } = await makeShippableWorkspace();
+    await commitFile(worktree, 'one.txt', 'one');
+    await pushBranch(worktree, { env: testEnv });
+    expect(await branchStatus(worktree, { env: testEnv })).toMatchObject({ upstream: 'origin/feat', unpushed: 0 });
+
+    await commitFile(worktree, 'two.txt', 'two');
+
+    expect(await branchStatus(worktree, { env: testEnv })).toMatchObject({ upstream: 'origin/feat', unpushed: 1 });
   });
 });
 

@@ -162,8 +162,8 @@ export interface BranchStatus {
   upstream: string | null;
   /** Whether the worktree has a change to commit: edits, deletions, untracked files not ignored. */
   uncommitted: boolean;
-  /** Whether HEAD has commits the upstream lacks, or, without an upstream, commits beyond the merge-base with the base. */
-  unpushed: boolean;
+  /** The commits to push: how far HEAD is ahead of the upstream, or, without an upstream, of the merge-base with the base. */
+  unpushed: number;
 }
 
 /** The state of a worktree's branch against its upstream; `NO_BASE` when it has no upstream and no base either. */
@@ -176,7 +176,7 @@ export async function branchStatus(worktree: string, { env }: GitEnv = {}): Prom
     git(['--no-optional-locks', 'status', '--porcelain'], { cwd: worktree, env }),
     git(['rev-list', '--count', `${since}..HEAD`], { cwd: worktree, env }),
   ]);
-  return { branch, upstream, uncommitted: status.trim() !== '', unpushed: Number(ahead) > 0 };
+  return { branch, upstream, uncommitted: status.trim() !== '', unpushed: Number(ahead) };
 }
 
 /** The subject (first line) of HEAD's commit. */

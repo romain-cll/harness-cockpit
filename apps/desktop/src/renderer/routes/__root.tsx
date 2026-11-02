@@ -2,7 +2,7 @@ import { createRootRoute, Outlet, useLocation, useNavigate, useRouter } from '@t
 import { useEffect } from 'react';
 import { AppSidebar } from '@/components/app-sidebar';
 import { useSidebarCollapsed } from '@/components/collapsed';
-import { ChangesPanel, useChangesOpen, workspaceOf } from '@/components/changes-panel';
+import { ChangesPanel, RightRail, useRightBar, workspaceOf } from '@/components/changes-panel';
 import { restoreFromDaemon, selectSessionTab } from '@/components/workspace-panes';
 
 export const Route = createRootRoute({
@@ -26,10 +26,10 @@ function RootLayout() {
   const { version, projects, sessions, daemon, git } = Route.useLoaderData();
   const router = useRouter();
   const navigate = useNavigate();
-  // The Changes sidebar belongs to the workspace page.
+  // The right column belongs to the workspace page.
   const { pathname, search } = useLocation();
   const workspace = workspaceOf(pathname === '/workspace' ? (search as { path?: string }).path : undefined, projects);
-  const changesOpen = useChangesOpen();
+  const { open: rightBarOpen } = useRightBar();
   const sidebarHidden = useSidebarCollapsed();
   // Worktrees may be added or removed outside the app: list them again when the window gains focus.
   useEffect(() => {
@@ -62,7 +62,12 @@ function RootLayout() {
       <main className="flex min-w-0 flex-1 flex-col bg-background p-2">
         <Outlet />
       </main>
-      {changesOpen && workspace && <ChangesPanel key={workspace.workspace.path} project={workspace.project} workspace={workspace.workspace} />}
+      {workspace &&
+        (rightBarOpen ? (
+          <ChangesPanel key={workspace.workspace.path} project={workspace.project} workspace={workspace.workspace} />
+        ) : (
+          <RightRail />
+        ))}
     </div>
   );
 }

@@ -1531,33 +1531,27 @@ describe('workspace panes: built app', () => {
     await waitForRow(page, 'ready', terminals[0]!);
   });
 
-  test('AC26 — the Changes toggle sits at the right of the top row of the workspace page and opens the Changes sidebar for that workspace; Home shows neither', async () => {
+  test('AC26 — on the workspace page the right column is the rail at the right edge of the window; "Show right bar" opens the bar for that workspace and "Hide right bar" brings the rail back; Home shows neither', async () => {
     const { page } = session;
     await openWorkspace(page, 'alpha', ws.alpha);
-    const toggle = page.getByRole('button', { name: 'Changes', exact: true });
-    await toggle.waitFor({ timeout: UI_TIMEOUT });
-    expect(await toggle.getAttribute('aria-pressed')).toBe('false');
-    const box = (await toggle.boundingBox())!;
-    const width = await page.evaluate(() => innerWidth);
-    expect(box.y).toBeLessThan(48);
-    expect(box.x + box.width).toBeGreaterThan(width - 60);
+    const column = page.getByRole('complementary', { name: 'Right bar', exact: true });
+    const show = page.getByRole('button', { name: 'Show right bar', exact: true });
+    await show.waitFor({ timeout: UI_TIMEOUT });
+    const rail = (await column.boundingBox())!;
+    expect(Math.abs(rail.x + rail.width - (await page.evaluate(() => innerWidth)))).toBeLessThanOrEqual(1);
+    expect(rail.width, 'the rail').toBeLessThan(100);
 
-    await toggle.click({ timeout: UI_TIMEOUT });
-    expect(await toggle.getAttribute('aria-pressed')).toBe('true');
+    await show.click({ timeout: UI_TIMEOUT });
     await page.getByText('against main', { exact: true }).waitFor({ timeout: UI_TIMEOUT });
-    const panel = await page.evaluate(() => {
-      const found = [...document.querySelectorAll<HTMLElement>('body *')].find((element) => {
-        const box = element.getBoundingClientRect();
-        return Math.abs(box.width - 360) <= 1 && Math.abs(box.right - innerWidth) <= 1 && box.height > 100 && (element.textContent ?? '').includes('Changes');
-      });
-      return !!found;
-    });
-    expect(panel, 'a 360 px sidebar docked to the right').toBe(true);
-    await toggle.click({ timeout: UI_TIMEOUT });
-    expect(await toggle.getAttribute('aria-pressed')).toBe('false');
+    expect((await column.boundingBox())!.width, 'the bar').toBeGreaterThan(300);
+
+    await page.getByRole('button', { name: 'Hide right bar', exact: true }).click({ timeout: UI_TIMEOUT });
+    await show.waitFor({ timeout: UI_TIMEOUT });
+    expect((await column.boundingBox())!.width, 'the rail is back').toBeLessThan(100);
 
     await goHome(page);
-    expect(await page.getByRole('button', { name: 'Changes', exact: true }).count()).toBe(0);
+    expect(await column.count(), 'no right column on Home').toBe(0);
+    expect(await show.count()).toBe(0);
   });
 
   // --- Deleting and removing ---

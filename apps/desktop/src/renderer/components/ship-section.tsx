@@ -1,3 +1,4 @@
+import { ArrowUpIcon, ExternalLinkIcon, GitMergeIcon, GitPullRequestClosedIcon, GitPullRequestIcon } from 'lucide-react';
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import type { BranchStatusResult, ChangesResult, Project, PullRequestResult, Workspace } from '../../shared/api';
 import { readPullRequests } from '@/components/pull-request-reads';
@@ -15,7 +16,11 @@ const CHECKS = {
   unknown: 'Checks unknown',
 } as const;
 
-const STATES = { open: 'Open', merged: 'Merged', closed: 'Closed' } as const;
+const STATES = {
+  open: { label: 'Open', Icon: GitPullRequestIcon, color: 'bg-status-ready/14 text-status-ready' },
+  merged: { label: 'Merged', Icon: GitMergeIcon, color: 'bg-status-merged/14 text-status-merged' },
+  closed: { label: 'Closed', Icon: GitPullRequestClosedIcon, color: 'bg-status-exited/14 text-status-exited' },
+} as const;
 
 /** Why a call to the main process could not be made, as a message. */
 const reason = (error: unknown) => (error instanceof Error ? error.message : String(error));
@@ -92,10 +97,10 @@ function CreatePullRequestDialog({
 }
 
 /**
- * The block of the Changes sidebar between its strip and the file list: the commit field, the Push
- * button and the workspace's pull request. It reads the pull request through `gh` (see
- * `readPullRequests`) while mounted; `status` is the git state the sidebar read, and `onShipped` asks
- * the sidebar to read it again after a commit or a push.
+ * The content of the right bar's "Pull request" tab: the workspace's pull request, the button that
+ * creates one, and the commit and push section. It reads the pull request through `gh` (see
+ * `readPullRequests`) while mounted; `status` is the git state the bar read, and `onShipped` asks
+ * the bar to read it again after a commit or a push.
  */
 export function ShipSection({
   project,
@@ -155,49 +160,88 @@ export function ShipSection({
   }
 
   const base = changes?.status === 'listed' ? changes.base.replace(/^origin\//, '') : undefined;
-  const pushed = git !== undefined && git.upstream !== null && !git.unpushed;
+  const unpushed = git?.unpushed ?? 0;
+  const pushed = git !== undefined && git.upstream !== null && unpushed === 0;
   // Pull requests are offered once `gh` answered, for a branch with no pull request or only a closed one.
   const canOffer = pullRequest?.status === 'read' && (found === null || found?.state === 'closed') && git?.branch != null;
+  const state = found && STATES[found.state];
 
   return (
-    <section className="flex shrink-0 flex-col gap-3 border-b p-3 text-xs">
-      <form className="flex gap-2" onSubmit={(event) => void commit(event)}>
-        <Input aria-label="Commit message" placeholder="Commit message" value={message} onChange={(event) => setMessage(event.target.value)} />
-        <Button type="submit" size="sm" disabled={!git?.uncommitted || message.trim() === '' || busy}>
-          Commit
-        </Button>
-      </form>
-      {git?.unpushed && (
-        <div>
-          <Button size="sm" disabled={busy} onClick={() => void ship(() => window.api.workspaces.push(project.path, workspace.path))}>
-            Push
-          </Button>
-        </div>
-      )}
-      {failure && <p role="status" className="break-words text-destructive">{failure}</p>}
-      {pullRequest?.status === 'refused' && <p className="break-words text-muted-foreground">{pullRequest.message}</p>}
-      {found && (
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-          <a href={found.url} target="_blank" rel="noreferrer" className="font-medium underline-offset-2 hover:underline">
-            #{found.number} {found.title}
-          </a>
-          <span className="text-muted-foreground">{STATES[found.state]}</span>
-          {found.state === 'open' && found.checks !== 'none' && <span className="text-muted-foreground">{CHECKS[found.checks]}</span>}
-          {found.state === 'merged' && (
-            <Button size="sm" onClick={() => requestDeleteWorkspace(project, workspace)}>
-              Delete workspace…
+    <div className="flex flex-col">
+      <div className="flex flex-col gap-3 p-3">
+        {pullRequest?.status === 'refused' && <p className="text-xs break-words text-muted-foreground">{pullRequest.message}</p>}
+        {found && state && (
+          <div className="flex flex-col gap-2">
+            <div className="flex h-6 items-center gap-2">
+              <span className={`inline-flex h-5 items-center gap-1 rounded-lg px-2 text-[11px] ${state.color}`}>
+                <state.Icon className="size-3" />
+                {state.label}
+              </span>
+              <span className="text-[11px] text-muted-foreground">
+                {found.state === 'open' && found.checks !== 'none' ? `#${found.number} · ${CHECKS[found.checks]}` : `#${found.number}`}
+              </span>
+              <a
+                href={found.url}
+                target="_blank"
+                rel="noreferrer"
+                aria-label="Open on GitHub"
+                title="Open on GitHub"
+                className="ml-auto inline-flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-hover"
+              >
+                <ExternalLinkIcon className="size-3.5" />
+              </a>
+            </div>
+            <p className="text-[13px] leading-[18px] break-words text-foreground">{found.title}</p>
+            {git?.branch && base !== undefined && (
+              <p className="font-mono text-[11px] break-all text-muted-foreground">{`${git.branch} → ${base}`}</p>
+            )}
+            {found.state === 'merged' && (
+              <div>
+                <Button size="sm" onClick={() => requestDeleteWorkspace(project, workspace)}>
+                  Delete workspace…
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+        {canOffer && (
+          <div className="flex items-center gap-2">
+            <Button size="sm" disabled={!pushed || base === undefined} onClick={() => setCreating(true)}>
+              Create pull request
             </Button>
-          )}
-        </div>
-      )}
-      {canOffer && (
-        <div className="flex items-center gap-2">
-          <Button size="sm" disabled={!pushed || base === undefined} onClick={() => setCreating(true)}>
-            Create pull request
+            {!pushed && <span className="text-[11px] text-muted-foreground">Push the branch first.</span>}
+          </div>
+        )}
+      </div>
+      <section className="flex flex-col gap-2 border-t p-3">
+        <h3 className="text-[11px] text-subtle">{'Commit & push'}</h3>
+        <form className="flex gap-2" onSubmit={(event) => void commit(event)}>
+          <Input
+            aria-label="Commit message"
+            placeholder="Commit message"
+            className="h-8"
+            value={message}
+            onChange={(event) => setMessage(event.target.value)}
+          />
+          <Button type="submit" variant="outline" size="lg" disabled={!git?.uncommitted || message.trim() === '' || busy}>
+            Commit
           </Button>
-          {!pushed && <span className="text-muted-foreground">Push the branch first.</span>}
-        </div>
-      )}
+        </form>
+        {unpushed > 0 && (
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[11px] text-muted-foreground">{unpushed === 1 ? '1 commit to push' : `${unpushed} commits to push`}</span>
+            <Button size="sm" disabled={busy} onClick={() => void ship(() => window.api.workspaces.push(project.path, workspace.path))}>
+              <ArrowUpIcon />
+              Push
+            </Button>
+          </div>
+        )}
+        {failure && (
+          <p role="status" className="text-xs break-words text-destructive">
+            {failure}
+          </p>
+        )}
+      </section>
       {creating && base !== undefined && git && (
         <CreatePullRequestDialog
           project={project}
@@ -211,6 +255,6 @@ export function ShipSection({
           }}
         />
       )}
-    </section>
+    </div>
   );
 }
