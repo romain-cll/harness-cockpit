@@ -475,13 +475,14 @@ const areaRect = async (page: Page): Promise<Rect> =>
 
 async function separatorOf(page: Page, orientation: 'vertical' | 'horizontal'): Promise<Locator> {
   const separator = page.locator(`[role="separator"][aria-orientation="${orientation}"]:visible`);
-  expect(await poll(() => separator.count(), (count) => count >= 1, UI_TIMEOUT), `one ${orientation} separator between the panes`).toBe(1);
+  await separator.first().waitFor();
+  expect(await separator.count(), `one ${orientation} separator between the panes`).toBe(1);
   return separator;
 }
 
 // A real pointer drag from the middle of the separator to `to` (the other coordinate stays).
 async function dragSeparator(page: Page, separator: Locator, to: { x?: number; y?: number }, release = true) {
-  const box = (await separator.boundingBox({ timeout: UI_TIMEOUT }))!;
+  const box = (await separator.boundingBox())!;
   const from = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
   await page.mouse.move(from.x, from.y);
   await page.mouse.down();
@@ -493,7 +494,7 @@ let sttyMarks = 0;
 
 // What `stty size` answers in the terminal: [rows, columns].
 async function sttySize(page: Page, terminal: Terminal): Promise<[number, number]> {
-  await terminal.click({ timeout: UI_TIMEOUT });
+  await terminal.click();
   await waitForPrompt(page, terminal);
   const mark = `ss${Date.now()}x${sttyMarks++}`;
   await typeLine(page, `printf '${mark} %s\\n' "$(stty size)"`);
@@ -1153,7 +1154,7 @@ describe('workspace panes: built app', () => {
   test('AC1, AC3 — dragging the separator of a split right to 70% of the area resizes both panes (± 1 px), refits both terminals, and the terminal that held the keyboard still holds it', async () => {
     const { page } = session;
     await openWorkspace(page, 'alpha', ws.alpha);
-    expect(await paneCount(page)).toBe(3);
+    await expectPaneCount(page, 3);
     const area = await areaRect(page);
     const [left, right] = [await terminalOf(page, 0), await terminalOf(page, 1)];
     const before = { left: (await sttySize(page, left))[1], right: (await sttySize(page, right))[1] };
@@ -1204,7 +1205,7 @@ describe('workspace panes: built app', () => {
       await page.mouse.move(away.x, away.y);
       expect(await separatorLine(separator, orientation), `${orientation} separator, pointer away`).toBe(border);
 
-      await separator.hover({ timeout: UI_TIMEOUT });
+      await separator.hover();
       expect(await separator.evaluate((element) => getComputedStyle(element).cursor)).toBe(cursor);
       expect(await separatorLine(separator, orientation), `${orientation} separator, hovered`).toBe(ring);
 
@@ -1236,14 +1237,14 @@ describe('workspace panes: built app', () => {
     const { page } = session;
     const area = await areaRect(page);
 
-    await (await separatorOf(page, 'vertical')).dblclick({ timeout: UI_TIMEOUT });
+    await (await separatorOf(page, 'vertical')).dblclick();
     const widths = [(await paneRect(page, 0)).width, (await paneRect(page, 1)).width];
     expect(Math.abs(widths[0]! - area.width / 2)).toBeLessThanOrEqual(1);
     expect(Math.abs(widths[1]! - area.width / 2)).toBeLessThanOrEqual(1);
     await expectSizeMatchesDisplay(page, await terminalOf(page, 0));
     await expectSizeMatchesDisplay(page, await terminalOf(page, 1));
 
-    await (await separatorOf(page, 'horizontal')).dblclick({ timeout: UI_TIMEOUT });
+    await (await separatorOf(page, 'horizontal')).dblclick();
     const heights = [(await paneRect(page, 1)).height, (await paneRect(page, 2)).height];
     expect(Math.abs(heights[0]! - area.height / 2)).toBeLessThanOrEqual(1);
     expect(Math.abs(heights[1]! - area.height / 2)).toBeLessThanOrEqual(1);
