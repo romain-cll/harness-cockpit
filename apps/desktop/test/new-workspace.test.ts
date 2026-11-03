@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { open, type FileHandle } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { type Locator, type Page } from 'playwright-core';
@@ -18,6 +19,7 @@ import {
   itemTexts,
   itemsOf,
   messageOf,
+  waitForMessage,
   norm,
   openComposer,
   openPopup as openMenu,
@@ -95,10 +97,10 @@ function makeClone(name: string): Repo {
 const sha8 = (root: string) => createHash('sha256').update(root).digest('hex').slice(0, 8);
 const localBranches = (repo: Repo) => git(repo.root, 'for-each-ref', '--format=%(refname:short)', 'refs/heads').split('\n').filter(Boolean).sort();
 
-// The stub agent: logs every `--version` run, waits while `<stub>.gate` exists, prints `9.9.9` (nothing
-// with `<stub>.noversion`), and as a session logs its working directory and arguments (what the status
+// The stub agent: logs every `--version` run, waits on the FIFO `<stub>.gate` while there is one, prints `9.9.9`
+// (nothing with `<stub>.noversion`), and as a session logs its working directory and arguments (what the status
 // feature adds before them is set aside), prints the idle title, then one title per line of
-// `<stub>.titles.<folder>` and creates `<stub>.titles.<folder>.done`, `<folder>` being the name of its working
+// `<stub>.titles.<folder>` and writes a line to the FIFO `<stub>.titles.<folder>.done`, `<folder>` being the name of its working
 // directory, and echoes what it reads until `exit`. It never pauses: `cockpit setup`'s markers order its titles
 // against anything printed before it started. The titles are per folder because a session's agent may start
 // after its test ended: it must not print the titles the next test meant for its own session.
@@ -106,7 +108,7 @@ function stubScript(runLog: string) {
   return `#!/bin/sh
 if [ "$1" = "--version" ]; then
   echo "$(basename "$0") --version" >> '${runLog}'
-  while [ -e "$0.gate" ]; do sleep 0.1; done
+  if [ -p "$0.gate" ]; then { read -r _ <&3; } 3<>"$0.gate" 2>/dev/null; fi
   [ -e "$0.noversion" ] || echo 9.9.9
   exit 0
 fi
@@ -121,7 +123,7 @@ echo ready
 titles="$0.titles.$(basename "$(pwd -P)")"
 if [ -e "$titles" ]; then
   while IFS= read -r title; do printf '\\033]0;%s\\007' "$title"; done < "$titles"
-  touch "$titles.done"
+  if [ -p "$titles.done" ]; then { echo >&3; } 3<>"$titles.done" 2>/dev/null; fi
 fi
 while IFS= read -r line; do
   [ "$line" = exit ] && exit 3
@@ -153,13 +155,14 @@ function makeFixture(): Fixture {
   );
   chmodSync(shell, 0o755);
   execFileSync(shell, ['--warmup']);
-  // A `git` first on the PATH that holds `worktree add` while `<root>/git-block` exists (and says so in
-  // `git-waiting`), logs each one in `git-adds.log`, and runs the real git.
+  // A `git` first on the PATH that, while the FIFO `<root>/git-block` exists, writes a line to the FIFO
+  // `<root>/git-waiting` and holds `worktree add` until a line comes through `git-block`; it logs each
+  // `worktree add` in `git-adds.log` and runs the real git.
   const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
   const wrapper = join(bin, 'git');
   writeFileSync(
     wrapper,
-    `#!/bin/sh\nif [ "$1" = worktree ] && [ "$2" = add ]; then\n  echo add >> '${root}/git-adds.log'\n  if [ -e '${root}/git-block' ]; then touch '${root}/git-waiting'; while [ -e '${root}/git-block' ]; do sleep 0.1; done; fi\nfi\nexec '${realGit}' "$@"\n`,
+    `#!/bin/sh\nif [ "$1" = worktree ] && [ "$2" = add ]; then\n  echo add >> '${root}/git-adds.log'\n  if [ -p '${root}/git-block' ]; then { echo >&3; } 3<>'${root}/git-waiting' 2>/dev/null; { read -r _ <&3; } 3<>'${root}/git-block' 2>/dev/null; fi\nfi\nexec '${realGit}' "$@"\n`,
   );
   chmodSync(wrapper, 0o755);
   // macOS scans a new executable the first time it runs.
@@ -183,10 +186,35 @@ function installStub(fx: Fixture, name: string, { noVersion = false }: { noVersi
 
 const removeStub = (fx: Fixture, name: string) => rmSync(join(fx.bin, name), { force: true });
 
-function setGate(fx: Fixture, names: string[], closed: boolean) {
+// A FIFO between the test and a stub. Both sides open it read-write, so neither open blocks, and the test holds
+// it open, so a line written before the other side reads it stays in the pipe. A stub waits on one with `read`
+// until the test writes a line, or writes a line the test waits for: no side polls a file.
+async function openFifo(path: string): Promise<FileHandle> {
+  rmSync(path, { force: true });
+  execFileSync('mkfifo', [path]);
+  return open(path, 'r+');
+}
+
+// Lets every stub waiting on the FIFO go on, then removes it so a stub that comes later does not wait.
+async function releaseFifo(fifo: FileHandle, path: string) {
+  await fifo.write('\n'.repeat(16));
+  rmSync(path, { force: true });
+  await fifo.close();
+}
+
+// Waits for a stub to write a line to the FIFO.
+const signalled = async (fifo: FileHandle) => {
+  await fifo.read(Buffer.alloc(1), 0, 1, null);
+};
+
+const gates = new Map<string, FileHandle>();
+async function setGate(fx: Fixture, names: string[], closed: boolean) {
   for (const name of names) {
-    if (closed) writeFileSync(join(fx.bin, `${name}.gate`), '');
-    else rmSync(join(fx.bin, `${name}.gate`), { force: true });
+    const path = join(fx.bin, `${name}.gate`);
+    const held = gates.get(path);
+    gates.delete(path);
+    if (held) await releaseFifo(held, path);
+    if (closed) gates.set(path, await openFifo(path));
   }
 }
 
@@ -294,7 +322,7 @@ describe('new workspace page: built app', () => {
     installStub(fx, 'claude');
     installStub(fx, 'codex');
     // The detection waits on these until a test opens the gate.
-    setGate(fx, ['claude', 'codex'], true);
+    await setGate(fx, ['claude', 'codex'], true);
     clone = makeClone('cmp-clone');
     mkdirSync(join(clone.root, '.cockpit'));
     writeFileSync(join(clone.root, '.cockpit', 'config.json'), JSON.stringify({ setup: ['echo setup-ran >> "$COCKPIT_ROOT_PATH/setup.log"'] }));
@@ -310,8 +338,7 @@ describe('new workspace page: built app', () => {
     rmSync(gone.parent, { recursive: true, force: true });
     session = await launchSpawned(createRequire(import.meta.url)('electron') as string, ['.'], true, dataDir, fx.env());
     home = join(realpathSync(dataDir), 'h');
-    session.page.setDefaultTimeout(UI_TIMEOUT);
-    await session.page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
+    await session.page.getByText(versionLabel).waitFor();
   });
 
   afterAll(async () => {
@@ -336,7 +363,7 @@ describe('new workspace page: built app', () => {
     expect(await isDisabledItem(itemsOf(menu).first())).toBe(true);
     await closePopups(page);
 
-    setGate(fx, ['claude', 'codex'], false);
+    await setGate(fx, ['claude', 'codex'], false);
     await waitForAgent(page, 'Claude Code');
     await waitForBase(page, 'origin/main');
     expect(await createButton(page).isEnabled()).toBe(true);
@@ -344,10 +371,10 @@ describe('new workspace page: built app', () => {
 
     // A reload, a visit to another page and a second visit to this one run no `--version` again.
     await page.reload();
-    await promptBox(page).waitFor({ timeout: UI_TIMEOUT });
+    await promptBox(page).waitFor();
     await page.getByRole('button', { name: 'Start session', exact: true }).click();
     await page.getByRole('link', { name: 'New workspace', exact: true }).click();
-    await promptBox(page).waitFor({ timeout: UI_TIMEOUT });
+    await promptBox(page).waitFor();
     await waitForAgent(page, 'Claude Code');
     await closePopups(page);
     await openMenu(page, agentSelect(page));
@@ -397,11 +424,11 @@ describe('new workspace page: built app', () => {
   test('AC3 — "New workspace…" in a project\'s menu goes to /?project=<path>, the project select shows that project and no dialog opens', async () => {
     const { page } = session;
     await openComposer(page);
-    await page.getByTitle(refuse.root, { exact: true }).first().hover({ timeout: UI_TIMEOUT });
-    await page.getByRole('button', { name: `Actions for ${refuse.name}`, exact: true }).click({ timeout: UI_TIMEOUT });
-    await page.getByRole('menuitem', { name: 'New workspace…' }).click({ timeout: UI_TIMEOUT });
+    await page.getByTitle(refuse.root, { exact: true }).first().hover();
+    await page.getByRole('button', { name: `Actions for ${refuse.name}`, exact: true }).click();
+    await page.getByRole('menuitem', { name: 'New workspace…' }).click();
 
-    await poll(() => new URL(page.url()).searchParams.get('project'), (value) => value === refuse.root, UI_TIMEOUT);
+    await page.waitForURL((url) => url.searchParams.get('project') === refuse.root);
     expect(new URL(page.url()).pathname).toBe('/');
     expect(await textOf(projectSelect(page))).toContain(refuse.name);
     expect(await page.locator('[role="dialog"], [role="alertdialog"]').count()).toBe(0);
@@ -410,9 +437,9 @@ describe('new workspace page: built app', () => {
   test('AC4 — the Sessions "+" goes to /?project=none, the project select shows "No project" and no menu opens', async () => {
     const { page } = session;
     await openComposer(page);
-    await page.getByRole('button', { name: 'Start session', exact: true }).click({ timeout: UI_TIMEOUT });
+    await page.getByRole('button', { name: 'Start session', exact: true }).click();
 
-    await poll(() => new URL(page.url()).searchParams.get('project'), (value) => value === 'none', UI_TIMEOUT);
+    await page.waitForURL((url) => url.searchParams.get('project') === 'none');
     expect(new URL(page.url()).pathname).toBe('/');
     expect(await textOf(projectSelect(page))).toBe('No project');
     expect(await page.locator('[role="menu"]').count()).toBe(0);
@@ -534,18 +561,18 @@ describe('new workspace page: built app', () => {
     await waitForBase(page, 'origin/main');
 
     let menu = await openMenu(page, projectSelect(page));
-    await itemsOf(menu).filter({ hasText: refuse.name }).click({ timeout: UI_TIMEOUT });
-    await poll(() => new URL(page.url()).searchParams.get('project'), (value) => value === refuse.root, UI_TIMEOUT);
+    await itemsOf(menu).filter({ hasText: refuse.name }).click();
+    await page.waitForURL((url) => url.searchParams.get('project') === refuse.root);
     expect(await textOf(projectSelect(page))).toContain(refuse.name);
     expect(await textOf(projectSelect(page))).not.toContain(clone.name);
     await waitForBase(page, 'main');
 
     menu = await openMenu(page, projectSelect(page));
-    await itemsOf(menu).filter({ hasText: /^\s*No project/ }).click({ timeout: UI_TIMEOUT });
-    await poll(() => new URL(page.url()).searchParams.get('project'), (value) => value === 'none', UI_TIMEOUT);
+    await itemsOf(menu).filter({ hasText: /^\s*No project/ }).click();
+    await page.waitForURL((url) => url.searchParams.get('project') === 'none');
     expect(new URL(page.url()).pathname).toBe('/');
     expect(await textOf(projectSelect(page))).toBe('No project');
-    await poll(() => baseSelect(page).count(), (count) => count === 0, UI_TIMEOUT);
+    await baseSelect(page).waitFor({ state: 'detached' });
   });
 
   test('AC8, AC9 — the base select shows the default base; opened, it has a focused "Search branches" field, the local branches under "Local" and the origin branches under "Remote" with the selected one checked; typing filters both groups case-insensitively (an empty group is hidden, no match says "No branch found") and picking a branch selects it and closes the popup; with "No project" there is no base select', async () => {
@@ -554,8 +581,8 @@ describe('new workspace page: built app', () => {
     await waitForBase(page, 'origin/main');
     expect(await baseSelect(page).locator('svg.lucide-git-branch').count()).toBe(1);
 
-    await baseSelect(page).click({ timeout: UI_TIMEOUT });
-    await searchBranches(page).waitFor({ timeout: UI_TIMEOUT });
+    await baseSelect(page).click();
+    await searchBranches(page).waitFor();
     const opened = (await basePopup(page))!;
     expect(opened.focused).toBe(true);
     expect(opened.lines.slice(0, 1)).toEqual(['Local']);
@@ -575,8 +602,8 @@ describe('new workspace page: built app', () => {
     expect((await basePopup(page))!.lines).toEqual(['No branch found']);
 
     await searchBranches(page).fill('nested');
-    await page.locator('[role="option"]').filter({ hasText: 'topic/nested' }).click({ timeout: UI_TIMEOUT });
-    await poll(() => searchBranches(page).count(), (count) => count === 0, UI_TIMEOUT);
+    await page.locator('[role="option"]').filter({ hasText: 'topic/nested' }).click();
+    await searchBranches(page).first().waitFor({ state: 'detached' });
     expect(await textOf(baseSelect(page))).toBe('topic/nested');
 
     await openComposer(page, 'none');
@@ -590,15 +617,15 @@ describe('new workspace page: built app', () => {
     await promptBox(page).fill('Some task');
     await waitForBase(page, 'Select a base');
     expect(await createButton(page).isDisabled()).toBe(true);
-    await baseSelect(page).click({ timeout: UI_TIMEOUT });
-    await searchBranches(page).waitFor({ timeout: UI_TIMEOUT });
-    await page.locator('[role="option"]').filter({ hasText: /^\s*main\s*$/ }).click({ timeout: UI_TIMEOUT });
+    await baseSelect(page).click();
+    await searchBranches(page).waitFor();
+    await page.locator('[role="option"]').filter({ hasText: /^\s*main\s*$/ }).click();
     await waitForBase(page, 'main');
     expect(await createButton(page).isEnabled()).toBe(true);
 
     await openComposer(page, gone.root);
     await promptBox(page).fill('Some task');
-    const message = await poll(() => messageOf(page), Boolean, UI_TIMEOUT);
+    const message = await waitForMessage(page);
     expect(message).not.toBe('');
     expect(await createButton(page).isDisabled()).toBe(true);
   });
@@ -637,11 +664,11 @@ describe('new workspace page: built app', () => {
 
     installStub(fx, 'opencode', { noVersion: true });
     removeStub(fx, 'codex');
-    setGate(fx, ['claude', 'opencode'], true);
+    await setGate(fx, ['claude', 'opencode'], true);
     await detectAgain(page);
     await waitForAgent(page, 'Detecting…');
     expect(await createButton(page).isDisabled()).toBe(true);
-    setGate(fx, ['claude', 'opencode'], false);
+    await setGate(fx, ['claude', 'opencode'], false);
     await waitForAgent(page, 'Claude Code');
 
     expect(versionRuns(fx)).toEqual({ claude: 2, codex: 1, opencode: 1 });
@@ -674,8 +701,8 @@ describe('new workspace page: built app', () => {
 
   test('AC15 — while a send is running the button is disabled and Enter sends nothing more; the send ends with one workspace and one session', async () => {
     const { page } = session;
-    const block = join(fx.root, 'git-block');
-    const waiting = join(fx.root, 'git-waiting');
+    const blockPath = join(fx.root, 'git-block');
+    const waitingPath = join(fx.root, 'git-waiting');
     const addsLog = join(fx.root, 'git-adds.log');
     const adds = () => (existsSync(addsLog) ? readFileSync(addsLog, 'utf8').split('\n').filter(Boolean).length : 0);
     const before = { adds: adds(), sessions: sessionsInState(dataDir).length };
@@ -683,17 +710,20 @@ describe('new workspace page: built app', () => {
     await waitForAgent(page, 'Claude Code');
     await waitForBase(page, 'origin/main');
     await promptBox(page).fill('Blocked send');
-    writeFileSync(block, '');
+    const waiting = await openFifo(waitingPath);
+    const block = await openFifo(blockPath);
     try {
-      await createButton(page).click({ timeout: UI_TIMEOUT });
-      await poll(() => existsSync(waiting), Boolean, UI_TIMEOUT);
+      await createButton(page).click();
+      await signalled(waiting);
       expect(await createButton(page).isDisabled(), 'the button is disabled while the worktree is being made').toBe(true);
       await promptBox(page).press('Enter');
-      await createButton(page).click({ force: true, timeout: 1_000 }).catch(() => {});
+      await createButton(page).click({ force: true }).catch(() => {});
       expect(new URL(page.url()).pathname, 'nothing was sent meanwhile').toBe('/');
       expect(adds(), 'a single worktree is being made').toBe(before.adds + 1);
     } finally {
-      rmSync(block, { force: true });
+      await releaseFifo(block, blockPath);
+      await waiting.close();
+      rmSync(waitingPath, { force: true });
     }
     await waitForWorkspacePage(page, worktreeOf(clone, 'blocked-send'));
     // The workspace's setup runs in this session's terminal: let it end so it does not write setup.log later.
@@ -728,7 +758,7 @@ describe('new workspace page: built app', () => {
     );
     const id = stored!.id;
     // The page is the workspace's, with the session as its one tab, selected.
-    await poll(async () => (await tabs(page)).selected.length, (count) => count === 1, UI_TIMEOUT);
+    await page.locator('[role="tab"][aria-selected="true"]').first().waitFor();
     const shown = await tabs(page);
     expect(shown.labels).toHaveLength(1);
     expect(shown.selected[0]).toMatch(/Claude Code/);
@@ -755,7 +785,7 @@ describe('new workspace page: built app', () => {
     expect(await entryOf(page, path).innerText()).toContain(branch);
 
     await page.getByRole('link', { name: 'New workspace', exact: true }).click();
-    await promptBox(page).waitFor({ timeout: UI_TIMEOUT });
+    await promptBox(page).waitFor();
     expect(await promptBox(page).inputValue()).toBe('');
   }, 60_000);
 
@@ -769,11 +799,11 @@ describe('new workspace page: built app', () => {
     await pickAgent(page, 'Terminal');
     await waitForBase(page, 'origin/main');
     await promptBox(page).fill('Run the tests');
-    await createButton(page).click({ timeout: UI_TIMEOUT });
+    await createButton(page).click();
 
     await waitForWorkspacePage(page, path);
     expect(existsSync(path)).toBe(true);
-    await poll(async () => (await tabs(page)).labels.length, (count) => count === 1, UI_TIMEOUT);
+    await page.getByRole('tab').first().waitFor();
     expect(await tabs(page)).toEqual({ labels: ['Terminal'], selected: ['Terminal'] });
     await waitForRow(page, `cockpit setup · ${branch} · .cockpit/config.json`);
     await waitForRow(page, '✓ Setup done');
@@ -791,9 +821,9 @@ describe('new workspace page: built app', () => {
     await waitForAgent(page, 'Claude Code');
     await pickAgent(page, 'Terminal');
     await promptBox(page).fill('Scratch pad');
-    await createButton(page).click({ timeout: UI_TIMEOUT });
+    await createButton(page).click();
     const terminalId = await waitForSessionPage(page);
-    await page.getByRole('heading', { name: 'Terminal 1', exact: true }).waitFor({ timeout: UI_TIMEOUT });
+    await page.getByRole('heading', { name: 'Terminal 1', exact: true }).waitFor();
     await waitForRow(page, 'login-shell>');
     expect((await terminalRows(page)).some((row) => row.startsWith('cockpit setup'))).toBe(false);
     expect(shellRuns(fx)).toBe(before.shells + 1);
@@ -824,7 +854,7 @@ describe('new workspace page: built app', () => {
     await waitForAgent(page, 'Claude Code');
     await waitForBase(page, 'origin/main');
     await promptBox(page).fill('Run the tests!');
-    await createButton(page).click({ timeout: UI_TIMEOUT });
+    await createButton(page).click();
     await waitForWorkspacePage(page, worktreeOf(clone, 'run-the-tests-2'));
     expect(localBranches(clone)).toContain('run-the-tests-2');
     expect(localBranches(clone)).toContain('run-the-tests');
@@ -842,9 +872,9 @@ describe('new workspace page: built app', () => {
     await waitForAgent(page, 'Claude Code');
     await waitForBase(page, 'main');
     await promptBox(page).fill('Cannot be created');
-    await createButton(page).click({ timeout: UI_TIMEOUT });
+    await createButton(page).click();
 
-    const message = await poll(() => messageOf(page), Boolean, UI_TIMEOUT);
+    const message = await waitForMessage(page);
     expect(message).not.toBe('');
     const colour = await page.locator('main').getByRole('status').filter({ hasText: /\S/ }).first().evaluate((element) => getComputedStyle(element).color);
     expect(colour).toBe(await tokenColour(page, '--destructive'));
@@ -856,11 +886,11 @@ describe('new workspace page: built app', () => {
     expect(sessionsInState(dataDir)).toHaveLength(before.sessions);
 
     rmSync(blocker);
-    await createButton(page).click({ timeout: UI_TIMEOUT });
+    await createButton(page).click();
     await waitForWorkspacePage(page, worktreeOf(refuse, 'cannot-be-created'));
     expect(existsSync(worktreeOf(refuse, 'cannot-be-created'))).toBe(true);
     await page.getByRole('link', { name: 'New workspace', exact: true }).click();
-    await promptBox(page).waitFor({ timeout: UI_TIMEOUT });
+    await promptBox(page).waitFor();
     expect(await messageOf(page)).toBe('');
   }, 60_000);
 
@@ -873,18 +903,18 @@ describe('new workspace page: built app', () => {
     // Removed after it was detected: the start finds it gone.
     removeStub(fx, 'claude');
     await promptBox(page).fill('Start fails');
-    await createButton(page).click({ timeout: UI_TIMEOUT });
+    await createButton(page).click();
 
-    const message = await poll(() => messageOf(page), Boolean, UI_TIMEOUT);
+    const message = await waitForMessage(page);
     expect(message).toMatch(/^Could not start Claude Code: /);
     expect(new URL(page.url()).pathname).toBe('/');
     expect(existsSync(path)).toBe(true);
     expect(localBranches(refuse)).toContain('start-fails');
-    await entryOf(page, path).waitFor({ timeout: UI_TIMEOUT });
+    await entryOf(page, path).waitFor();
     expect(await promptBox(page).inputValue()).toBe('Start fails');
 
     installStub(fx, 'claude');
-    await createButton(page).click({ timeout: UI_TIMEOUT });
+    await createButton(page).click();
     await waitForWorkspacePage(page, worktreeOf(refuse, 'start-fails-2'));
     expect(localBranches(refuse)).toContain('start-fails-2');
   }, 60_000);
@@ -904,6 +934,7 @@ describe('new workspace page: built app', () => {
     const first = 'please-fix-the-login-redirect-loop';
     const titles = titlesFor(first);
     writeFileSync(titles, '✳ Fix the login redirect loop\n✳ Something else entirely\n');
+    let done = await openFifo(`${titles}.done`);
     const renamed = 'fix-the-login-redirect-loop';
     const path = worktreeOf(clone, first);
 
@@ -923,12 +954,13 @@ describe('new workspace page: built app', () => {
     expect(existsSync(path), 'the folder does not move').toBe(true);
     expect(git(path, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe(renamed);
     // The sidebar row shows the name without a window focus; its title attribute stays the path.
-    await poll(() => entryOf(page, path).innerText(), (text) => text.includes('Fix the login redirect loop'), 5_000);
+    // AC21's bound: the name shows within 5 s.
+    await entryOf(page, path).filter({ hasText: 'Fix the login redirect loop' }).waitFor({ timeout: 5_000 });
     expect(await entryOf(page, path).innerText()).toContain('Fix the login redirect loop');
     expect(await entryOf(page, path).getAttribute('title')).toBe(path);
 
     // A second prompt-derived title changes nothing.
-    await poll(() => existsSync(`${titles}.done`), Boolean, 15_000);
+    await signalled(done);
     await settleMain(page);
     expect(localBranches(clone)).toContain(renamed);
     expect(localBranches(clone)).not.toContain('something-else-entirely');
@@ -937,7 +969,8 @@ describe('new workspace page: built app', () => {
 
     // A session started from the workspace row (no `nameFromTitle`) renames nothing, whatever its title.
     writeFileSync(titles, '✳ Started from the row\n');
-    rmSync(`${titles}.done`);
+    await done.close();
+    done = await openFifo(`${titles}.done`);
     const started = await page.evaluate(
       ([project, workspace]) =>
         (globalThis as unknown as { api: { sessions: { start(harness: string, size: object, options: object): Promise<{ status: string }> } } }).api.sessions.start(
@@ -948,9 +981,11 @@ describe('new workspace page: built app', () => {
       [clone.root, path] as const,
     );
     expect(started.status).toBe('started');
-    await poll(() => existsSync(`${titles}.done`), Boolean, 15_000);
+    await signalled(done);
     await settleMain(page);
     expect(localBranches(clone)).toContain(renamed);
+    await done.close();
+    rmSync(`${titles}.done`, { force: true });
     expect(localBranches(clone)).not.toContain('started-from-the-row');
     expect(gitOrNull(clone.root, 'config', '--get', `branch.${renamed}.cockpitName`)).toBe('Fix the login redirect loop');
 
@@ -963,8 +998,8 @@ describe('new workspace page: built app', () => {
 
   // Types a line on the keyboard of the visible terminal, as a user does.
   const typeLine = async (page: Page, text: string) => {
-    await page.locator('.xterm:visible').first().click({ timeout: UI_TIMEOUT });
-    await page.locator('.xterm:visible .xterm-helper-textarea').first().focus({ timeout: UI_TIMEOUT });
+    await page.locator('.xterm:visible').first().click();
+    await page.locator('.xterm:visible .xterm-helper-textarea').first().focus();
     await page.keyboard.type(text);
     await page.keyboard.press('Enter');
   };

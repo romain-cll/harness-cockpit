@@ -22,16 +22,23 @@ export const projectSelect = (page: Page) =>
 export const agentSelect = (page: Page) => controls(page).filter({ hasText: /^\s*(Detecting…|Claude Code|Codex|OpenCode|Terminal)\s*$/ }).first();
 export const baseSelect = (page: Page) => controls(page).filter({ has: page.locator('svg.lucide-git-branch') }).first();
 export const textOf = async (locator: Locator) => norm(await locator.innerText());
+const exactly = (text: string) => new RegExp(`^\\s*${text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`);
 
 // The message the composer shows (`role="status"`), empty when there is none.
-export const messageOf = async (page: Page) => {
-  const messages = page.locator('main').getByRole('status').filter({ hasText: /\S/ });
-  return (await messages.count()) === 0 ? '' : norm(await messages.first().innerText());
+const messages = (page: Page) => page.locator('main').getByRole('status').filter({ hasText: /\S/ });
+export const messageOf = async (page: Page) => ((await messages(page).count()) === 0 ? '' : norm(await messages(page).first().innerText()));
+// Waits for the composer to show a message, and gives it.
+export const waitForMessage = async (page: Page) => {
+  await messages(page).first().waitFor();
+  return messageOf(page);
 };
 
+// The menu `trigger` opens: Base UI labels a menu by its trigger, so a menu another trigger opened, still in the
+// DOM during its exit animation, is never this one.
 export const openPopup = async (page: Page, trigger: Locator) => {
+  const id = await trigger.getAttribute('id');
   await trigger.click({ timeout: UI_TIMEOUT });
-  const menu = page.getByRole('menu');
+  const menu = page.locator(`[role="menu"][aria-labelledby="${id}"]`);
   await menu.waitFor({ timeout: UI_TIMEOUT });
   return menu;
 };
@@ -39,10 +46,12 @@ export const itemsOf = (menu: Locator) => menu.locator('[role^="menuitem"]');
 export const itemTexts = async (menu: Locator) => (await itemsOf(menu).allInnerTexts()).map(norm);
 export const isDisabledItem = (item: Locator) =>
   item.evaluate((element) => element.getAttribute('aria-disabled') === 'true' || element.hasAttribute('data-disabled'));
+// Escape closes the innermost popup: one press per popup, each awaited until it has left the DOM.
 export const closePopups = async (page: Page) => {
-  for (let attempt = 0; attempt < 3 && (await page.locator('[role="menu"], [role="listbox"]').count()) > 0; attempt++) {
+  const popups = page.locator('[role="menu"], [role="listbox"]');
+  while ((await popups.count()) > 0) {
     await page.keyboard.press('Escape');
-    await poll(() => page.locator('[role="menu"], [role="listbox"]').count(), (count) => count === 0, 1_000);
+    await popups.last().waitFor({ state: 'detached' });
   }
 };
 
@@ -73,7 +82,7 @@ export async function openComposerFromSidebar(page: Page, project: string) {
 export async function pickAgent(page: Page, name: string) {
   const menu = await openPopup(page, agentSelect(page));
   await itemsOf(menu).filter({ hasText: new RegExp(`^\\s*${name}`) }).first().click({ timeout: UI_TIMEOUT });
-  await poll(() => textOf(agentSelect(page)), (text) => text === name, UI_TIMEOUT);
+  await waitForAgent(page, name);
 }
 
 export async function detectAgain(page: Page) {
@@ -81,8 +90,8 @@ export async function detectAgain(page: Page) {
   await itemsOf(menu).filter({ hasText: /^\s*Detect again\s*$/ }).click({ timeout: UI_TIMEOUT });
 }
 
-export const waitForAgent = (page: Page, text: string) => poll(() => textOf(agentSelect(page)), (value) => value === text, UI_TIMEOUT);
-export const waitForBase = (page: Page, text: string) => poll(() => textOf(baseSelect(page)), (value) => value === text, UI_TIMEOUT);
+export const waitForAgent = (page: Page, text: string) => agentSelect(page).filter({ hasText: exactly(text) }).waitFor();
+export const waitForBase = (page: Page, text: string) => baseSelect(page).filter({ hasText: exactly(text) }).waitFor();
 
 export const searchBranches = (page: Page) => page.locator('input[placeholder="Search branches"], input[aria-label="Search branches"]');
 
@@ -112,7 +121,11 @@ export const sessionIdIn = (page: Page) => /^\/sessions\/([^/]+)$/.exec(new URL(
 
 // The id of the session whose page opened, other than `previous`.
 export const waitForNewSession = async (page: Page, previous?: string) => {
-  const id = await poll(() => (sessionIdIn(page) === previous ? undefined : sessionIdIn(page)), Boolean, 15_000);
+  await page.waitForURL((url) => {
+    const id = /^\/sessions\/([^/]+)$/.exec(url.pathname)?.[1];
+    return id !== undefined && id !== previous;
+  });
+  const id = sessionIdIn(page);
   expect(id, `the page ${page.url()} is a new session's`).toBeTruthy();
   return id!;
 };
@@ -125,7 +138,8 @@ export const workspacePathIn = (page: Page) => {
 
 // Waits for the workspace page of `path` (any workspace without it).
 export const waitForWorkspacePage = async (page: Page, path?: string) => {
-  const found = await poll(() => workspacePathIn(page), (found) => found !== undefined && (path === undefined || found === path), 15_000);
+  await page.waitForURL((url) => url.pathname === '/workspace' && url.searchParams.has('path') && (path === undefined || url.searchParams.get('path') === path));
+  const found = workspacePathIn(page);
   expect(found, `the page ${page.url()} is the workspace page${path ? ` of ${path}` : ''}`).toBeTruthy();
   return found!;
 };
@@ -158,13 +172,13 @@ export async function waitForWorkspaceSession(page: Page, path: string, known: S
     15_000,
   );
   expect(stored, `a session stored for ${path}`).toBeTruthy();
-  await poll(async () => (await tabsOf(page)).selected.length, (count) => count > 0, UI_TIMEOUT);
+  await page.locator('[role="tab"][aria-selected="true"]').first().waitFor();
   return stored!;
 }
 
 // Waits for the detection to end and picks `agent` unless it is the one shown.
 export async function useAgent(page: Page, agent: string) {
-  await poll(() => textOf(agentSelect(page)), (text) => text !== 'Detecting…', 30_000);
+  await agentSelect(page).filter({ hasNotText: 'Detecting…' }).waitFor();
   if ((await textOf(agentSelect(page))) !== agent) await pickAgent(page, agent);
 }
 
@@ -189,7 +203,7 @@ export async function sendFromComposer(
   await openComposerFromSidebar(page, project === 'none' ? 'none' : project.root);
   await useAgent(page, agent);
   if (project !== 'none') {
-    await poll(() => textOf(baseSelect(page)).catch(() => ''), (text) => text !== '' && text !== 'Select a base', UI_TIMEOUT);
+    await baseSelect(page).filter({ hasText: /\S/ }).filter({ hasNotText: exactly('Select a base') }).waitFor();
     if (base) await chooseBase(page, base);
   }
   await promptBox(page).fill(prompt);
