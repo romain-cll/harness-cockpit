@@ -1,6 +1,7 @@
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { accessSync, appendFileSync, chmodSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { accessSync, appendFileSync, chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { request as httpRequest } from 'node:http';
 import { homedir, userInfo } from 'node:os';
@@ -3605,10 +3606,13 @@ const rememberedApps = (dataDir: string) => {
   return { editor, terminal };
 };
 
-// The text of the items of the menu that is open, trimmed. The first menu is the "…" menu; a
-// submenu opened from it is the last.
+// The text of the items of a menu, trimmed. Menus are found by their accessible name (their trigger's): a menu
+// that was just closed stays in the DOM until its exit animation ends, and an unnamed lookup would see it.
+// The "…" menu of a workspace is named "Actions for <workspace>", a submenu opened from it by its sub-trigger.
 const trimmed = (texts: string[]) => texts.map((text) => text.trim());
-const topLevelItems = async (page: Page) => trimmed(await page.getByRole('menu').first().getByRole('menuitem').allInnerTexts());
+const topLevelItems = async (menu: ReturnType<Page['locator']>) => trimmed(await menu.getByRole('menuitem').allInnerTexts());
+const workspaceMenu = (page: Page, path: string) => page.getByRole('menu', { name: `Actions for ${basename(path)}`, exact: true });
+const submenuNamed = (page: Page, trigger: 'Open in editor' | 'Open in terminal') => page.getByRole('menu', { name: trigger, exact: true });
 
 // Opens the "…" menu of the workspace at `path` and waits until the items above "Delete workspace…"
 // are exactly `expected` (in any order), "Delete workspace…" being last.
@@ -3616,7 +3620,7 @@ async function openWorkspaceMenu(page: Page, path: string, expected: string[]) {
   await openMenu(page, path);
   const wanted = [...expected].sort();
   const shown = (items: string[]) => items.at(-1) === 'Delete workspace…' && JSON.stringify(items.slice(0, -1).sort()) === JSON.stringify(wanted);
-  const items = await poll(() => topLevelItems(page), shown, UI_TIMEOUT);
+  const items = await poll(() => topLevelItems(workspaceMenu(page, path)), shown, UI_TIMEOUT);
   expect(items.at(-1), 'the app items sit above "Delete workspace…"').toBe('Delete workspace…');
   expect(items.slice(0, -1).sort()).toEqual(wanted);
 }
@@ -3626,18 +3630,19 @@ async function openWorkspaceMenu(page: Page, path: string, expected: string[]) {
 // opening, Base UI leaves the parent popup at `pointer-events: none` until the next real mouse move,
 // and a stale submenu would pass for the requested one.
 async function openSubmenu(page: Page, trigger: 'Open in editor' | 'Open in terminal') {
-  const menus = page.getByRole('menu');
-  if ((await menus.count()) > 1) {
+  const submenu = submenuNamed(page, trigger);
+  const open = page.getByRole('menu', { name: /^Open in (editor|terminal)$/ });
+  if ((await open.count()) > 0) {
     await page.keyboard.press('Escape');
-    await poll(() => menus.count(), (count) => count === 1, UI_TIMEOUT);
+    await open.first().waitFor({ state: 'detached' });
   }
   const item = page.getByRole('menuitem', { name: trigger, exact: true });
-  await item.hover({ timeout: UI_TIMEOUT });
-  if ((await poll(() => menus.count(), (count) => count >= 2, 2_000)) < 2) {
-    await item.click({ timeout: UI_TIMEOUT });
-    await poll(() => menus.count(), (count) => count >= 2, UI_TIMEOUT);
+  await item.hover();
+  if ((await poll(() => submenu.count(), (count) => count >= 1, 2_000)) < 1) {
+    await item.click();
+    await submenu.waitFor();
   }
-  return menus.last().getByRole('menuitem');
+  return submenu.getByRole('menuitem');
 }
 
 const submenuTexts = async (page: Page, trigger: 'Open in editor' | 'Open in terminal') =>
@@ -4422,7 +4427,7 @@ describe('sessions: built app', () => {
     await openWorkspaceMenu(page, launcher.path, FIRST_MENU);
     expect(await submenuTexts(page, 'Open in editor')).toEqual(['Visual Studio Code', 'Cursor']);
     expect(await submenuTexts(page, 'Open in terminal')).toEqual(['Terminal', 'Ghostty']);
-    for (const item of await page.getByRole('menu').last().getByRole('menuitem').all()) expect(await item.isDisabled()).toBe(false);
+    for (const item of await submenuNamed(page, 'Open in terminal').getByRole('menuitem').all()) expect(await item.isDisabled()).toBe(false);
 
     expect(openRuns(open)).toEqual([]);
     expect(stateSnapshot(session.dataDir)).toEqual(stateBefore);
@@ -6700,12 +6705,39 @@ describe('changes sidebar: built app', () => {
       const { page } = session;
       expect(remoteRef(origin, 'ship-flow')).toBe('');
 
-      await shipButton(page, 'Push').click({ timeout: UI_TIMEOUT });
+      // The origin's post-receive hook holds the push after the remote ref has moved, and before the pushing git
+      // writes the upstream: it tells the test through the FIFO `moved`, then waits for the FIFO `release`.
+      const gates = realpathSync(makeTestDir('g-'));
+      const [moved, release] = [join(gates, 'moved'), join(gates, 'release')];
+      execFileSync('mkfifo', [moved, release]);
+      const hook = join(origin, 'hooks', 'post-receive');
+      mkdirSync(dirname(hook), { recursive: true });
+      writeFileSync(hook, `#!/bin/sh\necho moved > '${moved}'\nread -r _ < '${release}'\n`);
+      chmodSync(hook, 0o755);
+      let released = false;
+      try {
+        await shipButton(page, 'Push').click();
+        await readFile(moved);
 
-      const head = gitIn(W2.path, 'rev-parse', 'HEAD');
-      expect(await poll(() => remoteRef(origin, 'ship-flow'), (ref) => ref === head, UI_TIMEOUT)).toBe(head);
+        const head = gitIn(W2.path, 'rev-parse', 'HEAD');
+        expect(remoteRef(origin, 'ship-flow'), 'origin has the branch at HEAD').toBe(head);
+        expect(gitIn(W2.path, 'rev-parse', '--abbrev-ref', 'ship-flow@{upstream}'), 'the upstream is not written yet').toBe('origin/main');
+        expect(await shipButton(page, 'Push').count(), 'the Push button is still shown').toBe(1);
+
+        released = true;
+        await writeFile(release, 'go\n');
+        await shipButton(page, 'Push').waitFor({ state: 'detached' });
+      } finally {
+        rmSync(hook, { force: true });
+        if (!released) {
+          // A failed test must not leave the push held: a read side that is already waiting gets the line.
+          const fd = openSync(release, constants.O_RDWR);
+          writeSync(fd, 'go\n');
+          closeSync(fd);
+        }
+        rmSync(gates, { recursive: true, force: true });
+      }
       expect(gitIn(W2.path, 'rev-parse', '--abbrev-ref', 'ship-flow@{upstream}')).toBe('origin/ship-flow');
-      await poll(() => shipButton(page, 'Push').count(), (count) => count === 0, UI_TIMEOUT);
       expect(await shipButton(page, 'Push').count()).toBe(0);
       expect(await panelText(page), 'the "commits to push" row goes').not.toMatch(/commits? to push/);
       const pushes = gitRunsIn(fx, W2.path).filter((line) => line.startsWith(`${W2.path} push`));
