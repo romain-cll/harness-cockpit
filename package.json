@@ -1,6 +1,7 @@
 {
   "name": "cockpit",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "packageManager": "bun@1.4.2",
   "engines": {
