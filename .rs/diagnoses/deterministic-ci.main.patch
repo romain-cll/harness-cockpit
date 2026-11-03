@@ -1,0 +1,522 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index f91bea0..c822a10 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -20,6 +20,11 @@ jobs:
+     # desktop session for the Electron tests.
+     runs-on: macos-latest
+     timeout-minutes: 20
++    # COCKPIT-80 diagnosis (throwaway): five identical runs in parallel.
++    strategy:
++      fail-fast: false
++      matrix:
++        copy: [1, 2, 3, 4, 5]
+     steps:
+       - uses: actions/checkout@v7
+ 
+@@ -43,4 +48,22 @@ jobs:
+ 
+       # `test` launches the desktop app four ways: the dev script, the built app,
+       # the packaged app and the packaged app with the environment of launchd.
+-      - run: bun turbo run build typecheck lint test
++      - run: bun turbo run build typecheck lint test --continue
++
++      - if: always()
++        run: |
++          which -a git; ls -l /usr/bin/git; xcode-select -p; git --version; /usr/bin/git --version
++          sw_vers; sysctl -n hw.ncpu hw.memsize; uptime
++
++  # COCKPIT-80 diagnosis (throwaway): the cost of the first /usr/bin/git calls on a fresh runner,
++  # with the environment the CLI tests give the binary (no HOME, no TMPDIR) and with the runner's.
++  probe:
++    runs-on: macos-latest
++    timeout-minutes: 10
++    steps:
++      - run: |
++          t() { local s=$(perl -MTime::HiRes=time -e 'printf "%.3f", time'); "$@" >/dev/null 2>&1; local e=$(perl -MTime::HiRes=time -e 'printf "%.3f", time'); echo "$(perl -e "printf '%5d', ($e-$s)*1000") ms  $*"; }
++          for i in 1 2 3; do t env -i PATH=/usr/bin:/bin /usr/bin/git --version; done
++          for i in 1 2 3; do t env -i PATH=/usr/bin:/bin HOME=$HOME TMPDIR=$TMPDIR /usr/bin/git --version; done
++          for i in 1 2 3; do t /usr/bin/git --version; done
++          which -a git; xcode-select -p; uptime
+diff --git a/apps/cli/test/binary.test.ts b/apps/cli/test/binary.test.ts
+index ebcf2bd..0070a52 100644
+--- a/apps/cli/test/binary.test.ts
++++ b/apps/cli/test/binary.test.ts
+@@ -55,7 +55,10 @@ function run(args: string[], env: Record<string, string>) {
+     child.stdout.on('data', (chunk) => (out += chunk));
+     child.stderr.on('data', (chunk) => (err += chunk));
+     child.on('error', fail);
+-    child.on('close', (code) => done({ code, out, err, ms: Date.now() - started }));
++    child.on('close', (code) => {
++      console.error(`[ck80] binary.test ${args.join(' ')}: ${started} → ${Date.now()} = ${Date.now() - started} ms, pid ${child.pid}`);
++      done({ code, out, err, ms: Date.now() - started });
++    });
+   });
+ }
+ 
+diff --git a/apps/cli/test/setup.test.ts b/apps/cli/test/setup.test.ts
+index 461a384..28c5a91 100644
+--- a/apps/cli/test/setup.test.ts
++++ b/apps/cli/test/setup.test.ts
+@@ -1,9 +1,9 @@
+ import { execFileSync, spawn } from 'node:child_process';
+ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+ import { createServer, type Server } from 'node:http';
+-import { tmpdir } from 'node:os';
++import { loadavg, tmpdir } from 'node:os';
+ import { join, resolve } from 'node:path';
+-import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
++import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest';
+ 
+ // COCKPIT-57: `cockpit setup` and `cockpit teardown`, the compiled binary itself: only Bun's runtime
+ // shows the stdio inheritance, the signal handling and the exit codes of the children as a pty gives
+@@ -42,9 +42,16 @@ let agent: string;
+ let server: Server;
+ let socket: string;
+ let reports: Array<Record<string, unknown>> = [];
++// COCKPIT-80 diagnosis (throwaway): when each report reached the fake daemon.
++const arrivals: string[] = [];
++let traceCount = 0;
+ 
+ const cleanups: Array<() => void> = [];
+-afterEach(() => {
++beforeEach(({ task }) => {
++  console.error(`[ck80] ${Date.now()} test start: ${task.name.slice(0, 50)} loadavg ${loadavg().map((n) => n.toFixed(2)).join(' ')} reports so far ${reports.length}`);
++});
++afterEach(({ task }) => {
++  console.error(`[ck80] ${Date.now()} test end (${task.result?.state}): ${task.name.slice(0, 50)} reports ${JSON.stringify(reports)}\n  arrivals:\n  ${arrivals.splice(0).join('\n  ')}`);
+   for (const cleanup of cleanups.splice(0).reverse()) cleanup();
+   reports = [];
+ });
+@@ -104,6 +111,7 @@ echo shell-prompt
+     req.on('end', () => {
+       if (req.headers.authorization === `Bearer ${TOKEN}` && req.method === 'POST' && req.url === '/session-events') {
+         reports.push(JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>);
++        arrivals.push(`${Date.now()} ${JSON.stringify(reports.at(-1))}`);
+         res.statusCode = 204;
+       } else {
+         res.statusCode = 401;
+@@ -143,17 +151,21 @@ async function cockpit(args: string[], { cwd = worktree, env = {} }: { cwd?: str
+   const dir = mkdtempSync(join(tmpdir(), 'ck-'));
+   cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+   const output = join(dir, 'output.txt');
++  const trace = join(root, `trace-${++traceCount}.txt`);
+   const fd = openSync(output, 'w');
++  const started = Date.now();
+   try {
+     const code = await new Promise<number | null>((done, fail) => {
+       const child = spawn(BINARY, args, {
+         cwd,
+         stdio: ['ignore', fd, fd],
+-        env: { PATH: `${bin}:/usr/bin:/bin`, SHELL: shell, STUB_DIR: dir, ...gitEnv, ...env },
++        env: { PATH: `${bin}:/usr/bin:/bin`, SHELL: shell, STUB_DIR: dir, CK80_TRACE: trace, ...gitEnv, ...env },
+       });
++      child.once('spawn', () => console.error(`[ck80] ${Date.now()} cockpit ${args.join(' ').slice(0, 40)} spawned pid ${child.pid} after ${Date.now() - started} ms`));
+       const failsafe = setTimeout(() => child.kill('SIGKILL'), 30_000);
+       child.on('error', fail);
+       child.on('close', (exit) => {
++        console.error(`[ck80] ${Date.now()} cockpit pid ${child.pid} closed ${exit} after ${Date.now() - started} ms\n  trace:\n  ${existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').join('\n  ') : '(none)'}`);
+         clearTimeout(failsafe);
+         done(exit);
+       });
+diff --git a/apps/desktop/src/renderer/components/workspace-panes.tsx b/apps/desktop/src/renderer/components/workspace-panes.tsx
+index 4e3967e..1a523e7 100644
+--- a/apps/desktop/src/renderer/components/workspace-panes.tsx
++++ b/apps/desktop/src/renderer/components/workspace-panes.tsx
+@@ -1,6 +1,6 @@
+ import { useRouter } from '@tanstack/react-router';
+ import { Columns2Icon, CopyIcon, PanelLeftOpenIcon, PlusIcon, Rows2Icon, SquareTerminalIcon, XIcon } from 'lucide-react';
+-import { useRef, useState, useSyncExternalStore } from 'react';
++import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+ import type { Project, Session, StartSessionResult, Workspace } from '../../shared/api';
+ import { toggleSidebar, useSidebarCollapsed } from '@/components/collapsed';
+ import { HarnessIcon } from '@/components/harness-icon';
+@@ -218,7 +218,9 @@ export function restoreFromDaemon(again = false): Promise<void> {
+   // Once per page load (the root loader runs again at every change).
+   if (restoredOnce && !again) return whenRestored();
+   restoredOnce = true;
++  console.debug(`[ck80] ${Date.now()} restoreFromDaemon start again=${again}`);
+   const run = restore(again).finally(() => {
++    console.debug(`[ck80] ${Date.now()} restoreFromDaemon end`);
+     if (restoring === run) restoring = undefined;
+     for (const listener of listeners) listener();
+   });
+@@ -286,8 +288,16 @@ async function startInPane(project: string, path: string, harness: string, pane:
+ 
+ // --- The view --------------------------------------------------------------------
+ 
++let ck80Instances = 0;
++
+ function NewTabMenu({ onHarness, onTerminal, onRefocus }: { onHarness: (harness: string) => void; onTerminal: () => void; onRefocus: () => void }) {
+   const harnesses = useDetectedHarnesses();
++  // COCKPIT-80 diagnosis (throwaway).
++  const [instance] = useState(() => ++ck80Instances);
++  useEffect(() => {
++    console.debug(`[ck80] ${Date.now()} NewTabMenu#${instance} mount`);
++    return () => console.debug(`[ck80] ${Date.now()} NewTabMenu#${instance} unmount`);
++  }, [instance]);
+   // Whether the menu started something: the new tab then keeps the keyboard, not the button.
+   const started = useRef(false);
+   const [open, setOpen] = useState(false);
+@@ -480,6 +490,11 @@ function PaneView({
+   onClose: (pane: string, tab: Tab) => void;
+ }) {
+   const router = useRouter();
++  // COCKPIT-80 diagnosis (throwaway).
++  useEffect(() => {
++    console.debug(`[ck80] ${Date.now()} PaneView ${pane.id} mount (${workspace.path})`);
++    return () => console.debug(`[ck80] ${Date.now()} PaneView ${pane.id} unmount`);
++  }, [pane.id, workspace.path]);
+   const path = workspace.path;
+   const top = box.top === 0;
+   return (
+@@ -530,6 +545,12 @@ function PaneView({
+ export function WorkspacePanes({ project, workspace }: { project: Project; workspace: Workspace }) {
+   const view = useSyncExternalStore(subscribeViews, () => viewOf(workspace.path));
+   const waiting = useRestoring();
++  // COCKPIT-80 diagnosis (throwaway).
++  useEffect(() => {
++    console.debug(`[ck80] ${Date.now()} WorkspacePanes mount ${workspace.path}`);
++    return () => console.debug(`[ck80] ${Date.now()} WorkspacePanes unmount ${workspace.path}`);
++  }, [workspace.path]);
++  useEffect(() => console.debug(`[ck80] ${Date.now()} WorkspacePanes waiting=${waiting} panes=${panesOf(view.layout).map(({ id }) => id).join(',')}`), [waiting, view.layout]);
+   const sidebarHidden = useSidebarCollapsed();
+   // A running agent asks first; anything else closes at once.
+   const [closing, setClosing] = useState<{ pane: string; tab: Tab }>();
+diff --git a/apps/desktop/src/renderer/routes/__root.tsx b/apps/desktop/src/renderer/routes/__root.tsx
+index dd3b668..59c651c 100644
+--- a/apps/desktop/src/renderer/routes/__root.tsx
++++ b/apps/desktop/src/renderer/routes/__root.tsx
+@@ -1,19 +1,31 @@
+-import { createRootRoute, Outlet, useLocation, useNavigate, useRouter } from '@tanstack/react-router';
++import { createRootRoute, Outlet, useLocation, useNavigate, useRouter, useRouterState } from '@tanstack/react-router';
+ import { useEffect } from 'react';
+ import { AppSidebar } from '@/components/app-sidebar';
+ import { useSidebarCollapsed } from '@/components/collapsed';
+ import { ChangesPanel, RightRail, useRightBar, workspaceOf } from '@/components/changes-panel';
+ import { restoreFromDaemon, selectSessionTab } from '@/components/workspace-panes';
+ 
++let loaderRuns = 0;
++
+ export const Route = createRootRoute({
+   loader: async () => {
++    // COCKPIT-80 diagnosis (throwaway).
++    const run = ++loaderRuns;
++    const t0 = performance.now();
++    const timed = <T,>(name: string, promise: Promise<T>) =>
++      promise.then((value) => {
++        console.debug(`[ck80] ${Date.now()} loader#${run} ${name} after ${Math.round(performance.now() - t0)} ms`);
++        return value;
++      });
++    console.debug(`[ck80] ${Date.now()} loader#${run} start ${location.href}`);
+     const [version, projects, sessions, daemon, git] = await Promise.all([
+-      window.api.getVersion(),
+-      window.api.projects.list(),
+-      window.api.sessions.list(),
+-      window.api.daemon.status(),
+-      window.api.projects.git(),
++      timed('getVersion', window.api.getVersion()),
++      timed('projects.list', window.api.projects.list()),
++      timed('sessions.list', window.api.sessions.list()),
++      timed('daemon.status', window.api.daemon.status()),
++      timed('projects.git', window.api.projects.git()),
+     ]);
++    console.debug(`[ck80] ${Date.now()} loader#${run} end after ${Math.round(performance.now() - t0)} ms, workspaces ${JSON.stringify(projects.map((p) => p.workspaces?.map((w) => w.name)))} daemon ${daemon.status}`);
+     // The shells and sessions the daemons run come back with their screens, once per page load. The page
+     // does not wait for them: a daemon that does not answer must not keep it from opening.
+     void restoreFromDaemon();
+@@ -31,15 +43,29 @@ function RootLayout() {
+   const workspace = workspaceOf(pathname === '/workspace' ? (search as { path?: string }).path : undefined, projects);
+   const { open: rightBarOpen } = useRightBar();
+   const sidebarHidden = useSidebarCollapsed();
++  // COCKPIT-80 diagnosis (throwaway): every change of the router's state.
++  const routerState = useRouterState({
++    select: (s) =>
++      `status=${s.status} isLoading=${s.isLoading} isTransitioning=${s.isTransitioning} loc=${s.location.href} resolved=${s.resolvedLocation?.href} matches=${s.matches.map((m) => `${m.routeId}:${m.status}${m.isFetching ? '(fetching)' : ''}`).join(',')} pending=${(s.pendingMatches ?? []).map((m) => `${m.routeId}:${m.status}`).join(',')}`,
++  });
++  useEffect(() => console.debug(`[ck80] ${Date.now()} router ${routerState}`), [routerState]);
+   // Worktrees may be added or removed outside the app: list them again when the window gains focus.
+   useEffect(() => {
+-    const refresh = () => void router.invalidate();
++    const refresh = () => {
++      console.debug(`[ck80] ${Date.now()} window focus → invalidate`);
++      void router.invalidate();
++    };
+     window.addEventListener('focus', refresh);
+     return () => window.removeEventListener('focus', refresh);
+   }, [router]);
+   // A session the sidebar does not list yet (started by another caller than its menus) reported: list again.
+   useEffect(
+-    () => window.api.sessions.onStatus((sessionId) => sessions.some(({ id }) => id === sessionId) || void router.invalidate()),
++    () =>
++      window.api.sessions.onStatus((sessionId) => {
++        const known = sessions.some(({ id }) => id === sessionId);
++        console.debug(`[ck80] ${Date.now()} sessions.onStatus ${sessionId} known=${known}${known ? '' : ' → invalidate'}`);
++        return known || void router.invalidate();
++      }),
+     [router, sessions],
+   );
+   // A clicked notification opens its session's page, or its workspace's with the session's tab selected.
+diff --git a/apps/desktop/src/renderer/routes/workspace.tsx b/apps/desktop/src/renderer/routes/workspace.tsx
+index e5fd65c..8a96aa2 100644
+--- a/apps/desktop/src/renderer/routes/workspace.tsx
++++ b/apps/desktop/src/renderer/routes/workspace.tsx
+@@ -1,4 +1,5 @@
+ import { createFileRoute, rootRouteId, useLoaderData } from '@tanstack/react-router';
++import { useEffect } from 'react';
+ import { workspaceOf } from '@/components/changes-panel';
+ import { DaemonDown } from '@/components/daemon-down';
+ import { PageHeader } from '@/components/page-header';
+@@ -13,6 +14,13 @@ function WorkspacePage() {
+   const { path } = Route.useSearch();
+   const { projects, daemon } = useLoaderData({ from: rootRouteId });
+   const found = workspaceOf(path, projects);
++  // COCKPIT-80 diagnosis (throwaway).
++  const branch = found && daemon.status === 'running' ? 'panes' : daemon.status === 'down' ? 'down' : 'not-found';
++  useEffect(() => console.debug(`[ck80] ${Date.now()} WorkspacePage renders ${branch} for ${path}`), [branch, path]);
++  useEffect(() => {
++    console.debug(`[ck80] ${Date.now()} WorkspacePage mount`);
++    return () => console.debug(`[ck80] ${Date.now()} WorkspacePage unmount`);
++  }, []);
+ 
+   // Panes are the page's top row; the other views have a header of their own.
+   if (found && daemon.status === 'running') return <WorkspacePanes key={path} project={found.project} workspace={found.workspace} />;
+diff --git a/apps/desktop/test/launch.ts b/apps/desktop/test/launch.ts
+index d736967..4526560 100644
+--- a/apps/desktop/test/launch.ts
++++ b/apps/desktop/test/launch.ts
+@@ -177,10 +177,16 @@ export function daemonSocketIn(home: string): string {
+ // Attaches to a running Electron over the Chrome DevTools Protocol and returns
+ // its first window. Reloads it so the page's console output is captured from the
+ // start.
++// COCKPIT-80 diagnosis (throwaway): the renderer's `[ck80]` console lines, in order.
++export const ck80Log: string[] = [];
++
+ export async function attach(endpoint: string): Promise<{ browser: Browser; page: Page }> {
+   const browser = await chromium.connectOverCDP(endpoint);
+   const context = browser.contexts()[0]!;
+   const page = context.pages()[0] ?? (await context.waitForEvent('page'));
++  page.on('console', (message) => {
++    if (message.text().startsWith('[ck80]')) ck80Log.push(message.text());
++  });
+   // The window's target starts as `about:blank` while its first navigation to the
+   // app is pending: a reload racing that navigation waits for a load that never
+   // comes. Wait until the page is on the app's URL and loaded.
+diff --git a/apps/desktop/test/workspace-panes.test.ts b/apps/desktop/test/workspace-panes.test.ts
+index 914623e..eaf7258 100644
+--- a/apps/desktop/test/workspace-panes.test.ts
++++ b/apps/desktop/test/workspace-panes.test.ts
+@@ -7,7 +7,7 @@ import { homedir, userInfo } from 'node:os';
+ import { join } from 'node:path';
+ import { setTimeout as sleep } from 'node:timers/promises';
+ import { type ElementHandle, type Locator, type Page } from 'playwright-core';
+-import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
++import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest';
+ import {
+   MAIN_PROCESS_ERROR,
+   UI_TIMEOUT,
+@@ -22,6 +22,16 @@ import {
+   type Session,
+ } from './launch';
+ import { makeTestDir } from './run-root';
++import { ck80Log } from './launch';
++import { loadavg } from 'node:os';
++
++// COCKPIT-80 diagnosis (throwaway): every test's renderer trace, passed or failed.
++beforeEach(({ task }) => {
++  ck80Log.push(`[ck80] ${Date.now()} TEST START ${task.name.slice(0, 60)} loadavg ${loadavg().map((n) => n.toFixed(2)).join(' ')}`);
++});
++afterEach(({ task }) => {
++  console.error(`[ck80] ${Date.now()} TEST END (${task.result?.state}) ${task.name.slice(0, 60)}\n  ${ck80Log.splice(0).join('\n  ')}`);
++});
+ 
+ // COCKPIT-70: the workspace page, panes with tabs of agents and shells. The built app runs the full
+ // block (a launch of its own, the tests below share it and run in order); the dev server and the
+@@ -228,8 +238,10 @@ const onWorkspacePage = (page: Page, path: string) =>
+   page.waitForURL((url) => url.pathname === '/workspace' && url.searchParams.get('path') === path, { timeout: UI_TIMEOUT });
+ 
+ async function openWorkspace(page: Page, name: string, path: string) {
++  ck80Log.push(`[ck80] ${Date.now()} test openWorkspace ${name} click`);
+   await workspaceRow(page, name).click({ timeout: UI_TIMEOUT });
+   await onWorkspacePage(page, path);
++  ck80Log.push(`[ck80] ${Date.now()} test openWorkspace ${name} URL reached`);
+ }
+ 
+ async function goHome(page: Page) {
+@@ -259,6 +271,19 @@ async function markPanes(page: Page): Promise<number> {
+       .filter((button) => (button.getAttribute('aria-label') ?? button.textContent ?? '').trim() === 'New tab' && visible(button))
+       .sort(order);
+     buttons.forEach((button, index) => button.setAttribute('data-test-new', String(index)));
++    // COCKPIT-80 diagnosis (throwaway): which marked button leaves the DOM, and when.
++    const w = window as unknown as { __ck80mo?: MutationObserver };
++    if (!w.__ck80mo) {
++      const label = (node: Node) => (node instanceof Element ? `${node.tagName}#${node.id}.${String(node.className).slice(0, 50)}` : node.nodeName);
++      w.__ck80mo = new MutationObserver((records) => {
++        for (const record of records)
++          for (const node of record.removedNodes)
++            if (node instanceof Element && (node.matches('[data-test-new]') || node.querySelector('[data-test-new]')))
++              console.debug(`[ck80] ${Date.now()} DOM removed ${label(node)} holding a marked New tab button, from ${label(record.target)}; New tab buttons now ${[...document.querySelectorAll('button[aria-label="New tab"]')].map((b) => b.id).join(',')}`);
++      });
++      w.__ck80mo.observe(document.body, { childList: true, subtree: true });
++    }
++    console.debug(`[ck80] ${Date.now()} markPanes: ${lists.length} tablists, marked New tab ${buttons.map((b) => b.id).join(',')}; menus open ${document.querySelectorAll('[role="menu"]').length}; url ${location.href}`);
+     return lists.length;
+   });
+ }
+@@ -474,7 +499,9 @@ const menuItems = (page: Page) => page.getByRole('menu').first().getByRole('menu
+ 
+ async function openNewTabMenu(page: Page, index = 0) {
+   await markPanes(page);
++  ck80Log.push(`[ck80] ${Date.now()} test clicks [data-test-new="${index}"]`);
+   await page.locator(`[data-test-new="${index}"]`).click({ timeout: UI_TIMEOUT });
++  ck80Log.push(`[ck80] ${Date.now()} test click done`);
+   await page.getByRole('menu').first().waitFor({ timeout: UI_TIMEOUT });
+ }
+ 
+diff --git a/packages/daemon/src/cli.ts b/packages/daemon/src/cli.ts
+index 4625490..f9b437a 100644
+--- a/packages/daemon/src/cli.ts
++++ b/packages/daemon/src/cli.ts
+@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
+ import { request } from 'node:http';
+ import { tokenPathOf } from './paths';
+ import type { SessionEventName, SessionReport } from './protocol';
+-import { parseSetupArguments, runSetup, runTeardown } from './setup';
++import { ck80, parseSetupArguments, runSetup, runTeardown } from './setup';
+ import { SESSION_EVENTS } from './status';
+ 
+ export interface CliIo {
+@@ -30,6 +30,7 @@ const TIMEOUT_MS = 2_000;
+  */
+ export async function runCli(argv: readonly string[], env: NodeJS.ProcessEnv, { stdout, stderr, exit }: CliIo): Promise<void> {
+   const [command, ...rest] = argv;
++  ck80(`runCli ${command}, process uptime ${Math.round(process.uptime() * 1000)} ms`);
+   const socketPath = env.COCKPIT_SOCKET;
+   const sessionId = env.COCKPIT_SESSION_ID;
+   const send = (body: Omit<SessionReport, 'sessionId'>) =>
+@@ -72,10 +73,16 @@ function report(socketPath: string, body: SessionReport): Promise<void> {
+       (res) => {
+         res.resume();
+         res.on('error', () => {});
++        ck80(`report ${body.event} response ${res.statusCode}`);
+         res.on('end', resolve);
+       },
+     );
+-    const timer = setTimeout(() => req.destroy(), TIMEOUT_MS);
++    const timer = setTimeout(() => {
++      ck80(`report ${body.event} TIMEOUT_MS fired, destroying`);
++      req.destroy();
++    }, TIMEOUT_MS);
++    req.on('socket', () => ck80(`report ${body.event} socket`));
++    req.on('error', (error) => ck80(`report ${body.event} error ${error.message}`));
+     req.on('close', () => {
+       clearTimeout(timer);
+       resolve();
+diff --git a/packages/daemon/src/setup.ts b/packages/daemon/src/setup.ts
+index 07f8643..6a939d1 100644
+--- a/packages/daemon/src/setup.ts
++++ b/packages/daemon/src/setup.ts
+@@ -1,9 +1,13 @@
+ import { spawn, spawnSync } from 'node:child_process';
++import { appendFileSync } from 'node:fs';
+ import { basename } from 'node:path';
+ import { harnesses } from '@cockpit/harnesses';
+ import { readWorkspaceConfig, shellInvocation } from '@cockpit/workspaces';
+ import type { SetupEventName } from './protocol';
+ 
++// COCKPIT-80 diagnosis (throwaway): timestamped trace when CK80_TRACE names a file.
++export const ck80 = (line: string) => { const file = process.env.CK80_TRACE; if (file) try { appendFileSync(file, `${Date.now()} [${process.pid}] ${line}\n`); } catch {} };
++
+ /** What `cockpit setup` tells the daemon: a setup event, then the agent's exit (`null` for a signal). */
+ export type SetupReport = { event: SetupEventName } | { event: 'exited'; exitCode: number | null };
+ 
+@@ -43,10 +47,16 @@ interface Outcome {
+ 
+ /** Runs a process attached to this terminal and waits for it. Never rejects. */
+ function run(command: string, args: string[], cwd: string, env: NodeJS.ProcessEnv): Promise<Outcome> {
++  const started = Date.now();
++  ck80(`run ${command} ${args.join(' ').slice(0, 60)} start`);
+   return new Promise((resolve) => {
+     const child = spawn(command, args, { cwd, env, stdio: 'inherit' });
++    child.once('spawn', () => ck80(`run ${basename(command)} spawned pid ${child.pid} after ${Date.now() - started} ms`));
+     child.once('error', (error) => resolve({ code: null, signal: null, error: error.message }));
+-    child.once('close', (code, signal) => resolve({ code, signal }));
++    child.once('close', (code, signal) => {
++      ck80(`run ${basename(command)} closed ${code}/${signal} after ${Date.now() - started} ms`);
++      resolve({ code, signal });
++    });
+   });
+ }
+ 
+@@ -134,8 +144,11 @@ interface CommandsResult {
+ /** Reads the commands of `kind` and runs them one by one; the first failure stops them. */
+ async function runCommands(kind: Kind, io: SetupIo, env: NodeJS.ProcessEnv, onStart: () => void): Promise<CommandsResult> {
+   let config;
++  const configStart = Date.now();
++  ck80('readWorkspaceConfig start');
+   try {
+     config = await readWorkspaceConfig({ repo: io.cwd, path: io.cwd, env });
++    ck80(`readWorkspaceConfig done in ${Date.now() - configStart} ms`);
+   } catch (error) {
+     return { ran: true, failure: { reason: error instanceof Error ? error.message : String(error), code: 1 } };
+   }
+@@ -177,10 +190,18 @@ async function runShell(io: SetupIo, env: NodeJS.ProcessEnv): Promise<number> {
+  * the agent's end) leaves a usable prompt. Resolves to the exit code.
+  */
+ export function runSetup({ shell, agent }: SetupArguments, io: SetupIo, env: NodeJS.ProcessEnv): Promise<number> {
++  ck80(`runSetup start, process uptime ${Math.round(process.uptime() * 1000)} ms`);
+   return inTerminal(async () => {
+     // Reports go out in order, without holding the run back.
+     let sent = Promise.resolve();
+-    const send = (report: SetupReport) => void (sent = sent.then(() => io.report(report)));
++    const send = (report: SetupReport) => {
++      ck80(`report ${report.event} queued`);
++      void (sent = sent.then(() => {
++        const at = Date.now();
++        ck80(`report ${report.event} sending`);
++        return io.report(report).then(() => ck80(`report ${report.event} settled after ${Date.now() - at} ms`));
++      }));
++    };
+ 
+     let status = 0;
+     const { ran, failure } = await runCommands('setup', io, env, () => send({ event: 'setup-running' }));
+@@ -198,7 +219,9 @@ export function runSetup({ shell, agent }: SetupArguments, io: SetupIo, env: Nod
+     }
+ 
+     if (shell) status = await runShell(io, env);
++    ck80('awaiting reports');
+     await sent;
++    ck80(`runSetup end, status ${status}`);
+     return status;
+   });
+ }
+diff --git a/packages/workspaces/src/git.ts b/packages/workspaces/src/git.ts
+index 18e4541..f8251fa 100644
+--- a/packages/workspaces/src/git.ts
++++ b/packages/workspaces/src/git.ts
+@@ -1,6 +1,10 @@
+ import { execFile } from 'node:child_process';
++import { appendFileSync } from 'node:fs';
+ import { promisify } from 'node:util';
+ 
++// COCKPIT-80 diagnosis (throwaway): timestamped trace when CK80_TRACE names a file.
++const ck80 = (line: string) => { const file = process.env.CK80_TRACE; if (file) try { appendFileSync(file, `${Date.now()} [${process.pid}] ${line}\n`); } catch {} };
++
+ const execFileAsync = promisify(execFile);
+ 
+ /** `git worktree list --porcelain -z` needs git 2.36. */
+@@ -41,10 +45,14 @@ export interface GitOptions {
+  * executable included: with a `cwd`, ENOENT also means the folder is missing.
+  */
+ export async function git(args: string[], { cwd, env, maxBuffer }: GitOptions = {}): Promise<string> {
++  const started = Date.now();
++  ck80(`git ${args.join(' ')} start (PATH=${env?.PATH ?? process.env.PATH} HOME=${env?.HOME ?? '-'} TMPDIR=${env?.TMPDIR ?? '-'})`);
+   try {
+     const { stdout } = await execFileAsync('git', args, { cwd, env, ...(maxBuffer === undefined ? {} : { maxBuffer }) });
++    ck80(`git ${args[0]} done in ${Date.now() - started} ms`);
+     return stdout;
+   } catch (error) {
++    ck80(`git ${args[0]} failed in ${Date.now() - started} ms`);
+     const failure = error as NodeJS.ErrnoException & { stderr?: string };
+     throw new WorkspaceError(
+       'GIT_FAILED',

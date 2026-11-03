@@ -1,0 +1,151 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index f91bea0..877c97d 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -20,6 +20,11 @@ jobs:
+     # desktop session for the Electron tests.
+     runs-on: macos-latest
+     timeout-minutes: 20
++    # COCKPIT-80 diagnosis (throwaway): five identical runs in parallel.
++    strategy:
++      fail-fast: false
++      matrix:
++        copy: [1, 2, 3, 4, 5]
+     steps:
+       - uses: actions/checkout@v7
+ 
+@@ -43,4 +48,26 @@ jobs:
+ 
+       # `test` launches the desktop app four ways: the dev script, the built app,
+       # the packaged app and the packaged app with the environment of launchd.
+-      - run: bun turbo run build typecheck lint test
++      - run: bun turbo run build typecheck lint test --continue
++
++  # COCKPIT-80 diagnosis (throwaway): what the first /usr/bin/git costs on a fresh runner: the xcrun
++  # shim's lookup, or the first run of Xcode's git binary. Two orders, so neither warms the other.
++  probe:
++    runs-on: macos-latest
++    timeout-minutes: 10
++    strategy:
++      fail-fast: false
++      matrix:
++        order: [shim-first, binary-first]
++    steps:
++      - run: |
++          t() { local s=$(perl -MTime::HiRes=time -e 'printf "%.3f", time'); "$@" >/dev/null 2>&1; local e=$(perl -MTime::HiRes=time -e 'printf "%.3f", time'); echo "$(perl -e "printf '%5d', ($e-$s)*1000") ms  $*"; }
++          XGIT="$(xcode-select -p)/usr/bin/git"
++          uptime
++          ls -la "$(getconf DARWIN_USER_TEMP_DIR)" | grep -i xcrun || echo "no xcrun cache in DARWIN_USER_TEMP_DIR yet"
++          if [ "${{ matrix.order }}" = shim-first ]; then
++            t xcrun --find git; t xcrun --find git; t env -i PATH=/usr/bin:/bin /usr/bin/git --version; t "$XGIT" --version
++          else
++            t "$XGIT" --version; t "$XGIT" --version; t xcrun --find git; t env -i PATH=/usr/bin:/bin /usr/bin/git --version
++          fi
++          ls -la "$(getconf DARWIN_USER_TEMP_DIR)" | grep -i xcrun || echo "no xcrun cache in DARWIN_USER_TEMP_DIR"
+diff --git a/apps/desktop/test/composer.ts b/apps/desktop/test/composer.ts
+index d58cada..df2d750 100644
+--- a/apps/desktop/test/composer.ts
++++ b/apps/desktop/test/composer.ts
+@@ -1,7 +1,7 @@
+ import { basename } from 'node:path';
+ import { expect } from 'vitest';
+ import { type Locator, type Page } from 'playwright-core';
+-import { UI_TIMEOUT, poll } from './launch';
++import { UI_TIMEOUT, ck80Log, poll } from './launch';
+ 
+ // COCKPIT-66: the New workspace page (the composer at `/`) as the tests drive it, shared by the test
+ // files that create workspaces and sessions. The project, agent and base selects have no accessible
+@@ -30,7 +30,9 @@ export const messageOf = async (page: Page) => {
+ };
+ 
+ export const openPopup = async (page: Page, trigger: Locator) => {
++  ck80Log.push(`[ck80] ${Date.now()} test openPopup click; menus in DOM ${await page.locator('[role="menu"]').count()}`);
+   await trigger.click({ timeout: UI_TIMEOUT });
++  ck80Log.push(`[ck80] ${Date.now()} test openPopup clicked`);
+   const menu = page.getByRole('menu');
+   await menu.waitFor({ timeout: UI_TIMEOUT });
+   return menu;
+@@ -62,8 +64,10 @@ export async function openComposerFromSidebar(page: Page, project: string) {
+       await page.getByTitle(project, { exact: true }).first().hover({ timeout: 3_000 });
+       await page.getByRole('button', { name: `Actions for ${basename(project)}`, exact: true }).click({ timeout: 3_000 });
+       await page.getByRole('menuitem', { name: 'New workspace…' }).click({ timeout: 3_000 });
++      ck80Log.push(`[ck80] ${Date.now()} test clicked New workspace…`);
+     }
+     await promptBox(page).waitFor({ timeout: UI_TIMEOUT });
++    ck80Log.push(`[ck80] ${Date.now()} test prompt box visible`);
+   } catch {
+     await closePopups(page);
+     await openComposer(page, project);
+diff --git a/apps/desktop/test/launch.ts b/apps/desktop/test/launch.ts
+index d736967..0e662e9 100644
+--- a/apps/desktop/test/launch.ts
++++ b/apps/desktop/test/launch.ts
+@@ -1,3 +1,4 @@
++import { afterEach, beforeEach } from 'vitest';
+ import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
+ import { readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+ import { createRequire } from 'node:module';
+@@ -177,10 +178,63 @@ export function daemonSocketIn(home: string): string {
+ // Attaches to a running Electron over the Chrome DevTools Protocol and returns
+ // its first window. Reloads it so the page's console output is captured from the
+ // start.
++// COCKPIT-80 diagnosis (throwaway): the page's `[ck80]` console lines; each menu's lifecycle (open, closing,
++// exit transition, removal) logged by an observer installed in every document; dumped after a failing test,
++// the menu removals after every test.
++export const ck80Log: string[] = [];
++const CK80_MENUS = `(() => {
++  const seen = new Map();
++  const log = (text) => console.debug('[ck80] ' + Date.now() + ' ' + text);
++  const label = (menu) => menu.id + '(' + (menu.getAttribute('data-align') || '-') + ',' + (menu.getAttribute('data-slot') || '-') + ')';
++  const start = () => new MutationObserver((records) => {
++    for (const record of records) {
++      if (record.type === 'attributes' && record.target.getAttribute && record.target.getAttribute('role') === 'menu') {
++        const menu = record.target;
++        const has = menu.hasAttribute(record.attributeName);
++        const entry = seen.get(menu) || {};
++        if (record.attributeName === 'data-closed' && has) entry.closed = Date.now();
++        seen.set(menu, entry);
++        log('menu ' + label(menu) + ' ' + record.attributeName + (has ? ' set' : ' removed') + '; menus in DOM ' + document.querySelectorAll('[role=menu]').length);
++      }
++      for (const node of record.removedNodes || []) {
++        if (!(node instanceof Element)) continue;
++        const menus = node.matches('[role=menu]') ? [node] : [...node.querySelectorAll('[role=menu]')];
++        for (const menu of menus) {
++          const entry = seen.get(menu) || {};
++          log('MENU REMOVED ' + label(menu) + (entry.closed ? ' ' + (Date.now() - entry.closed) + ' ms after data-closed' : ' (no data-closed seen)'));
++        }
++      }
++      for (const node of record.addedNodes || []) {
++        if (!(node instanceof Element)) continue;
++        const menus = node.matches('[role=menu]') ? [node] : [...node.querySelectorAll('[role=menu]')];
++        for (const menu of menus) { seen.set(menu, {}); log('menu added ' + label(menu) + '; menus in DOM ' + document.querySelectorAll('[role=menu]').length); }
++      }
++    }
++  }).observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ['data-closed', 'data-open', 'data-ending-style', 'data-starting-style'] });
++  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else start();
++})();`;
++
++beforeEach(({ task }) => {
++  ck80Log.splice(0);
++  ck80Log.push(`[ck80] ${Date.now()} TEST START ${task.name.slice(0, 60)}`);
++});
++afterEach(({ task }) => {
++  const lines = ck80Log.splice(0);
++  if (task.result?.state === 'fail') console.error(`[ck80] FAILED ${task.name.slice(0, 80)}\n  ${lines.join('\n  ')}`);
++  else {
++    const removals = lines.filter((line) => line.includes('MENU REMOVED')).map((line) => line.replace(/^\[ck80\] \d+ /, ''));
++    if (removals.length > 0) console.error(`[ck80] passed ${task.name.slice(0, 50)}: ${removals.join(' | ')}`);
++  }
++});
++
+ export async function attach(endpoint: string): Promise<{ browser: Browser; page: Page }> {
+   const browser = await chromium.connectOverCDP(endpoint);
+   const context = browser.contexts()[0]!;
+   const page = context.pages()[0] ?? (await context.waitForEvent('page'));
++  page.on('console', (message) => {
++    if (message.text().startsWith('[ck80]')) ck80Log.push(message.text());
++  });
++  await page.addInitScript(CK80_MENUS);
+   // The window's target starts as `about:blank` while its first navigation to the
+   // app is pending: a reload racing that navigation waits for a load that never
+   // comes. Wait until the page is on the app's URL and loaded.
