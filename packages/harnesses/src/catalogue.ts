@@ -21,6 +21,11 @@ export interface Harness {
   resume(sessionId: string): string[];
   /** Where the harness keeps its sessions, given the environment it runs with. */
   sessions(env: NodeJS.ProcessEnv): SessionStore;
+  /**
+   * The name to give a workspace from a terminal title the harness set (OSC 0 or 2), or `null` when
+   * the title is not derived from the user's prompt (the idle title, an unrelated title, `""`).
+   */
+  promptTitle(title: string): string | null;
 }
 
 // Every fact below was checked on 2026-10-20 against the source named next to it. The flags and
@@ -53,6 +58,14 @@ const catalogue: Harness[] = [
       path: join(env.CLAUDE_CONFIG_DIR || join(home(env), '.claude'), 'projects'),
       format: 'jsonl',
     }),
+    // Claude Code 2.1.316 sets OSC 0 by default; `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` turns it off
+    // (shipped binary). The idle title is `✳ Claude Code`. The prompt-derived title is `<glyph> <title>`,
+    // the glyph `◐`/`◑` (alternating every 960 ms while busy) or `✳` when idle, a 2 to 5 word phrase from
+    // a separate small-model call at the first turn (a prompt of at least 10 characters).
+    promptTitle: (title) => {
+      const name = /^[◐◑✳] (.+)$/.exec(title)?.[1];
+      return name === undefined || name === 'Claude Code' ? null : name;
+    },
   },
   // Codex 0.163.0 (2026-10-15), sources in openai/codex `codex-rs` at `rust-v0.163.0`
   {
@@ -76,6 +89,19 @@ const catalogue: Harness[] = [
       path: join(env.CODEX_HOME || join(home(env), '.codex'), 'sessions'),
       format: 'jsonl',
     }),
+    // Codex 0.163.0 sets OSC 0 by default (`tui/src/terminal_title.rs`). The default items are
+    // `activity`, `thread-name` and `project-name`, separated by `" "` after the spinner and by
+    // `" | "` between the others. The idle title is the project alone; while the name is generated the
+    // name slot shows a spinner. A title asking for action starts with `[ ! ] Action Required | ` or
+    // `[ . ] …`, and there may be a `● ` prefix. The thread name is cut at 48 characters and comes from
+    // a hidden thread after the first user message.
+    promptTitle: (title) => {
+      const rest = title.replace(/^(● )?(\[ [!.] \] Action Required \| )?([⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] )*/, '');
+      const segments = rest.split(' | ');
+      if (segments.length < 2) return null;
+      const name = segments.slice(0, -1).join(' | ');
+      return /^[\s⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]*$/.test(name) ? null : name;
+    },
   },
   // OpenCode 2.0.31
   {
@@ -102,6 +128,14 @@ const catalogue: Harness[] = [
       ),
       format: 'sqlite',
     }),
+    // OpenCode 2.0.31 sets OSC 0 by default (`packages/tui/src/app.tsx:578`, through OpenTUI). The idle
+    // and untitled title is `OpenCode`, and it clears the title to `""` on exit. The prompt-derived title
+    // is `OC | <title>`, cut to 37 characters plus `…` above 40, from a separate LLM call at the first
+    // user message; a `--prompt` start goes through the normal submit path.
+    promptTitle: (title) => {
+      const name = /^OC \| (.+)$/.exec(title)?.[1]?.replace(/…$/, '');
+      return name === undefined || name === '' ? null : name;
+    },
   },
 ];
 

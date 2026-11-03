@@ -83,6 +83,7 @@ export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon>
       socket,
       data: (terminal, seq, data) => send({ type: 'data', terminal, seq, data }),
       exit: (terminal, exit) => send({ type: 'exit', terminal, ...exit }),
+      title: (sessionId, title) => send({ type: 'title', sessionId, title }),
     };
     connections.add(connection);
     socket.on('error', () => {});

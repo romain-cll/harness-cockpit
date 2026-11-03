@@ -1,10 +1,8 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { PageHeader } from '@/components/page-header';
+import { NewWorkspace } from '@/components/new-workspace';
 
 export const Route = createFileRoute('/')({
-  component: Home,
+  // `project` is a project's path, or `none` for no project.
+  validateSearch: (search): { project?: string } => (typeof search.project === 'string' ? { project: search.project } : {}),
+  component: NewWorkspace,
 });
-
-function Home() {
-  return <PageHeader title="Home" />;
-}
