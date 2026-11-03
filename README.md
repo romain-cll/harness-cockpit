@@ -30,7 +30,7 @@ Left out: Cursor CLI (its session storage is undocumented and the CLI is closed 
 - One package per concern:
   - `packages/daemon`: the pty-owning daemon and the CLI's logic.
   - `packages/workspaces`: git worktrees, changes, diffs and `.cockpit/config.json`.
-  - `packages/harnesses`: the agent CLIs (detection, how to start and resume them, status hooks).
+  - `packages/harnesses`: the agent CLIs (detection, launch arguments, status hooks).
   - `packages/launchers`: editors and terminal apps.
   - `packages/github`: pull requests and their checks through `gh`.
   - `packages/state`: the app state, one JSON file.
