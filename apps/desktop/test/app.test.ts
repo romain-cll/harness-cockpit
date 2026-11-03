@@ -1753,12 +1753,19 @@ describe.each([
     });
 
     // COCKPIT-42: the New workspace dialog words a worktrees folder that cannot be created.
+    // `git worktree list --porcelain` marks the worktrees under a folder that is moved aside as `prunable`:
+    // those lines only reflect that folder, every other line of the git state is compared.
+    const gitStateWithoutPrunable = (repo: TempRepo) => {
+      const state = gitState(repo);
+      return { ...state, worktrees: state.worktrees.split('\n').filter((line) => !line.startsWith('prunable ')).join('\n') };
+    };
+
     test('workspaces COCKPIT-42 AC3 — a worktrees folder that is a regular file keeps the dialog open with "Cockpit could not create its worktrees folder <root>: EEXIST.", lists no workspace, leaves state.json as it was and logs no error', async () => {
       const { page } = session;
       const root = join(session.cockpitHome, 'worktrees');
       const aside = `${root}.aside`;
       const titlesBefore = await entryTitles(page);
-      const git = gitState(clone);
+      const git = gitStateWithoutPrunable(clone);
       const state = stateSnapshot(session.dataDir);
       const mark = await errorMark(session);
       expect(existsSync(root), 'earlier tests created workspaces under the root').toBe(true);
@@ -1767,16 +1774,17 @@ describe.each([
       writeFileSync(root, 'not a folder');
       try {
         const dialog = await openNewWorkspaceDialog(page, clone);
-        await poll(() => selectedBase(dialog), (value) => value === 'origin/main', UI_TIMEOUT);
+        await baseSelect(dialog).filter({ hasText: 'origin/main' }).waitFor();
         await nameField(dialog).fill('no-root');
-        await createButton(dialog).click({ timeout: UI_TIMEOUT });
+        await createButton(dialog).click();
         const [message] = await waitForDialogLine(dialog, (line) => line.startsWith('Cockpit could not create its worktrees folder'));
-        await sleep(300);
+        // The request is settled once "Create" is enabled again.
+        await dialog.locator('button:enabled', { hasText: /^Create$/ }).waitFor();
 
         expect(message).toBe(`Cockpit could not create its worktrees folder ${root}: EEXIST.`);
         expect(await dialog.isVisible()).toBe(true);
         expect(await entryTitles(page)).toEqual(titlesBefore);
-        expect(gitState(clone)).toEqual(git);
+        expect(gitStateWithoutPrunable(clone)).toEqual(git);
         expect(localBranches(clone)).not.toContain('no-root');
         expect(stateSnapshot(session.dataDir)).toEqual(state);
         await expectNoNewErrors(session, mark);
@@ -1867,17 +1875,32 @@ describe.each([
         );
         expect(await fsEventWatchers(), 'the watch holds FSEvents watchers').toBeGreaterThan(before);
 
+        // The main process tells when the main frame failed to load: the app's own listener, added when the
+        // window was created, has run by then. The promise settles on a later turn of the event loop, so the
+        // closed handles are gone when the count is read.
+        await session.evaluateInMain(`(() => {
+          const contents = require('electron').webContents.getAllWebContents().find((candidate) => candidate.getURL().startsWith('app://'));
+          globalThis.__mainFrameFailed = new Promise((resolve) => {
+            const onFail = (_event, errorCode, _description, _url, isMainFrame) => {
+              if (!isMainFrame || errorCode === -3) return;
+              contents.removeListener('did-fail-load', onFail);
+              setImmediate(resolve);
+            };
+            contents.on('did-fail-load', onFail);
+          });
+        })()`);
         await page
           .evaluate(() => {
             location.href = new URL('/%', location.href).href;
           })
           .catch(() => {});
+        await session.evaluateInMain('globalThis.__mainFrameFailed');
 
-        expect(await poll(fsEventWatchers, (count) => count <= before, UI_TIMEOUT)).toBe(before);
+        expect(await fsEventWatchers()).toBe(before);
       } finally {
         // Load the app page again, so the pending navigation is gone and the next test can click.
         await page.goto(appUrl);
-        await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
+        await page.getByText(versionLabel).waitFor();
       }
     });
 
