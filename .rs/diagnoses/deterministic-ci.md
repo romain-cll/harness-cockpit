@@ -23,6 +23,7 @@ CI fails at random on tests the change under test does not touch: `apps/cli/test
 - **B "2 menus"**: the project "Actions" menu stays in the DOM for its ~110 ms exit animation; the test opens the agent menu ~30 ms later and asks for the only `menu` on the page.
 - **ship AC8**: `git push --set-upstream` updates the remote ref before it writes the upstream; the test reads the upstream as soon as the ref moves.
 - **survive m2-22**: the failing assertion no longer exists.
+- **daemon AC7/AC8** (local, found 2026-11-03): AC7 takes the first `sleep 300` of the whole machine as its setup; a foreign one (another workspace's suite) never ends with the page, AC7 fails before killing its app, and AC8's launch loses the single-instance lock. Predates COCKPIT-80 (COCKPIT-55).
 
 ## Findings
 
@@ -89,14 +90,34 @@ CI fails at random on tests the change under test does not touch: `apps/cli/test
 - Evidence: the assertion is gone since `daea1b0` (COCKPIT-70); `m2-22` is now awaited (`workspace-panes.test.ts:1199`, `:1225`, `waitForRow`).
 - Confidence: **proven** that the assertion is gone; **likely** for its cause (read before redraw) — missing: nothing worth running, the code is gone.
 
+### F7 — daemon AC7: the test picks another process's `sleep 300` as its setup, then AC8 loses the single-instance lock
+- What happens: in local full runs on `cockpit-80-deterministic-ci` (2026-11-03, three runs, two of them, plus the reviewer's), `daemon.test.ts` › "daemon: built app" › AC7 fails with `the setup ends with its page: expected true to be false` (`apps/desktop/test/daemon.test.ts:526`), then AC8 with `the app exited with code 0` (`launch.ts:326`).
+- Cause: `startSetup` (`apps/desktop/test/daemon.test.ts:304`) finds "the setup" as the first line of the whole machine's `ps -axo pid=,command=` whose command ends with `sleep 300` (`:324–330`), not a process of its own terminal. The order of events:
+  1. Any other process whose command ends with `sleep 300` and has a lower pid is running: another workspace's suite (its own daemon AC7 setup, or `packages/harnesses/test/detect.test.ts:142`'s `/bin/sleep 300 &`, alive ~2 s), or anything else on the machine.
+  2. `startSetup` returns that process's pid as `first`.
+  3. The page reloads; the real setup ends (the daemon ends `commands` terminals with their page), the foreign process does not.
+  4. `poll(() => isAlive(first), …, 5_000)` (`:525`) runs out, the assertion at `:526` fails, and the test stops before `killApp(session)` (`:532`).
+  5. AC8 launches an app on the same `dataDir` (`:542`); the AC7 app still holds the single-instance lock (`app.requestSingleInstanceLock()` is tied to `userData`), so the new app exits 0 as the losing instance.
+- Evidence:
+  - Isolated runs of the describe (`bunx vitest run test/daemon.test.ts -t "daemon: built app > "`, one run each, load average ~2): clean `origin/main` (67d0999) 9/9 passed; this branch 9/9 passed.
+  - Forcing run on clean `origin/main`: `/bin/sleep 300 &` started first, then the same command: AC7 `the setup ends with its page: expected true to be false`, AC8 `Error: the app exited with code 0` — the same two failures as the branch's full runs.
+  - The selector predates COCKPIT-80: `endsWith('sleep 300')` came with `75a519e` (COCKPIT-55, 2026-10-28); `-t AC7` alone cannot run it (`TypeError … reading 'output'` at `:264`: the describe's tests share one session).
+- Why it shows where it does: only when a foreign `sleep 300` with a lower pid lives during AC7. This machine runs other workspaces' suites in parallel (COCKPIT-66, COCKPIT-70 test apps were alive during these runs), which carry the same `daemon.test.ts` AC7 and `detect.test.ts` AC11. Load is not the trigger: the forcing run failed at the same load (~2) as the passing ones. Not in CI: one job per runner, and `detect.test.ts`'s sleep is killed within ~2 s, minutes before the desktop suite reaches AC7.
+- Confidence: **proven** for the mechanism (forcing run on main); **likely** for which foreign process it was in the failing runs — missing: the `ps` line seen at the time, not recorded.
+- Also: the 5 s deadlines at `:525` and `:535` are fixed waits on a non-child pid; the terminal's own exit (the daemon's `exit` event for that terminal id) is the event to wait on.
+
 ## Ruled out
 - H1 — the compiled 68 MB Bun binary's first launch (macOS scan) makes AC1 slow — ruled out: the CLI reached `runCli` 34 ms after its start in every trace (run 41478364783), the time is inside `git --version`.
 - H2 — the reports' HTTP requests to the fake daemon hit the CLI's 2 s timeout — ruled out: every report settled in 0–49 ms, no `TIMEOUT_MS fired` line (run 41478364783).
 - H3 — a missing `HOME` / `TMPDIR` in the CLI's environment makes `xcrun` slow on every call — ruled out: once warmed, `env -i PATH=/usr/bin:/bin /usr/bin/git --version` takes 20–32 ms (probe, run 41478364783).
 - H4 — the workspace page remounts by itself after opening (router pending state, right bar, daemon status, `restoreFromDaemon`) — ruled out on main: no `WorkspacePage renders not-found` nor `WorkspacePanes unmount` without a test navigation after a sidebar open, in 4 jobs (run 41478364783); the five `not-found` renders per job follow a workspace the test had just created through the New workspace dialog (dagent, dnone, dplain) or just deleted or removed (gamma, omega), and those tests pass.
+- H6 — machine load makes daemon AC7's setup outlive its page (F7) — ruled out as the trigger: at the same load (~2) the describe passed on main and on this branch, and failed only with a foreign `sleep 300` running.
+- H7 — COCKPIT-80 caused daemon AC7/AC8 (F7) — ruled out: the same failure on clean `origin/main` (67d0999) with a foreign `sleep 300`; the branch passes without one.
 - H5 — COCKPIT-67 (right bar) brought family B — ruled out as a cause: the mechanism (F2) is in the test and the router; no right-bar code is on the path.
 
 ## Unknowns
+- Which foreign `sleep 300` was running in the failing local runs of 2026-11-03 (F7) — to resolve: record `ps` at AC7's start in a failing run.
+- The first local full run of 2026-11-03 also failed 13 other desktop tests (navigation, single instance, daemon AC18, dev smoke; "Target page … closed", click timeouts) at load 7.3, not reproduced in the next two runs — to resolve: a run that fails them again, with its trace.
 - Why AC5's own CLI run was slow in the two failing runs (F1, likely) — to resolve: a CLI trace of a failing run.
 - F3 on COCKPIT-66's branch — to resolve: `markPanes` and loader timings on that branch (one CI wave, ~12 min); not run, by decision.
 - Whether F4 can fail locally — to resolve: the agent menu's opening time relative to the Actions menu's removal on a local run.
