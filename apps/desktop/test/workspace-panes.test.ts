@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSy
 import { createRequire } from 'node:module';
 import { request as httpRequest } from 'node:http';
 import { homedir, userInfo } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { type ElementHandle, type Locator, type Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
@@ -224,12 +224,28 @@ async function createWorkspace(session: Session, repo: TempRepo, name: string): 
   return worktreePath(session, repo, name);
 }
 
-const onWorkspacePage = (page: Page, path: string) =>
-  page.waitForURL((url) => url.pathname === '/workspace' && url.searchParams.get('path') === path, { timeout: UI_TIMEOUT });
+// The workspace page a test is on, by name: its area is a region named after the workspace (the workspace's name
+// is its branch, the basename of its path). The router pushes the URL before it loads and renders the page, so
+// the URL says nothing about what the page shows: a test waits for the page's own region, never for the URL.
+const currentWorkspace = new WeakMap<Page, string>();
+
+const workspaceRegion = (page: Page) => {
+  const name = currentWorkspace.get(page);
+  if (name === undefined) throw new Error('no workspace page was opened on this page');
+  return page.getByRole('region', { name, exact: true });
+};
+
+/** Waits for the page of the workspace at `path` to be rendered, then checks the URL is its own. */
+async function onWorkspacePage(page: Page, path: string, name = basename(path)) {
+  currentWorkspace.set(page, name);
+  await workspaceRegion(page).waitFor();
+  const url = new URL(page.url());
+  expect([url.pathname, url.searchParams.get('path')]).toEqual(['/workspace', path]);
+}
 
 async function openWorkspace(page: Page, name: string, path: string) {
-  await workspaceRow(page, name).click({ timeout: UI_TIMEOUT });
-  await onWorkspacePage(page, path);
+  await workspaceRow(page, name).click();
+  await onWorkspacePage(page, path, name);
 }
 
 async function goHome(page: Page) {
@@ -237,38 +253,32 @@ async function goHome(page: Page) {
   await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
 }
 
-// Panes, in the order a reader sees them (left to right, then top to bottom): marks each tab bar and each
-// "New tab" button with its index, so locators can be scoped to one pane. Only visible ones count.
-async function markPanes(page: Page): Promise<number> {
-  return page.evaluate(() => {
-    const visible = (element: Element) => {
-      const { width, height } = element.getBoundingClientRect();
-      return width > 0 && height > 0 && getComputedStyle(element).visibility === 'visible';
-    };
-    const order = (a: Element, b: Element) => {
-      const [x, y] = [a.getBoundingClientRect(), b.getBoundingClientRect()];
-      return Math.round(x.left) - Math.round(y.left) || Math.round(x.top) - Math.round(y.top);
-    };
-    const lists = [...document.querySelectorAll('[role="tablist"]')].filter(visible).sort(order);
-    for (const stale of document.querySelectorAll('[data-test-pane], [data-test-new]')) {
-      stale.removeAttribute('data-test-pane');
-      stale.removeAttribute('data-test-new');
-    }
-    lists.forEach((list, index) => list.setAttribute('data-test-pane', String(index)));
-    const buttons = [...document.querySelectorAll('button')]
-      .filter((button) => (button.getAttribute('aria-label') ?? button.textContent ?? '').trim() === 'New tab' && visible(button))
-      .sort(order);
-    buttons.forEach((button, index) => button.setAttribute('data-test-new', String(index)));
-    return lists.length;
-  });
+// A pane is the tab bar (`tablist`) of the workspace region, found by role and auto-waited. The panes are rendered
+// flat and placed by boxes, so the DOM order is not always the order a reader sees them in (left to right, then top
+// to bottom): the index is read from the tab bars' positions once the pane exists.
+const tabLists = (page: Page) => workspaceRegion(page).getByRole('tablist');
+
+/** Waits until the workspace page holds exactly `count` panes. */
+async function expectPaneCount(page: Page, count: number) {
+  const lists = tabLists(page);
+  if (count > 0) await lists.nth(count - 1).waitFor();
+  await lists.nth(count).waitFor({ state: 'detached' });
 }
 
 async function pane(page: Page, index: number): Promise<Locator> {
-  await markPanes(page);
-  return page.locator(`[data-test-pane="${index}"]`);
+  const lists = tabLists(page);
+  await lists.nth(index).waitFor();
+  const corners = await lists.evaluateAll((bars) =>
+    bars.map((bar, domIndex) => {
+      const { left, top } = bar.getBoundingClientRect();
+      return { domIndex, left: Math.round(left), top: Math.round(top) };
+    }),
+  );
+  corners.sort((a, b) => a.left - b.left || a.top - b.top);
+  return lists.nth(corners[index]!.domIndex);
 }
 
-const paneCount = (page: Page) => markPanes(page);
+const newTabButton = async (page: Page, index = 0) => (await pane(page, index)).getByRole('button', { name: 'New tab', exact: true });
 
 const labelsOf = (list: Locator) =>
   list.getByRole('tab').evaluateAll((tabs) =>
@@ -319,35 +329,25 @@ async function visibleTerminals(page: Page): Promise<Terminal[]> {
 
 // The visible terminal of pane `index`: the one under its tab bar.
 async function terminalOf(page: Page, index: number): Promise<Terminal> {
-  await markPanes(page);
-  const handle = await poll(
-    async () => {
-      const found = await page.evaluateHandle((index) => {
-        const list = document.querySelector(`[data-test-pane="${index}"]`);
-        if (!list) return null;
-        const bar = list.getBoundingClientRect();
+  const bar = (await (await pane(page, index)).elementHandle())!;
+  const found = await page.waitForFunction((bar) => {
+    const area = bar.getBoundingClientRect();
+    return (
+      [...document.querySelectorAll('.xterm')].find((element) => {
+        const box = element.getBoundingClientRect();
+        const centre = box.left + box.width / 2;
         return (
-          [...document.querySelectorAll('.xterm')].find((element) => {
-            const box = element.getBoundingClientRect();
-            const centre = box.left + box.width / 2;
-            return (
-              box.width > 0 &&
-              box.height > 0 &&
-              getComputedStyle(element).visibility === 'visible' &&
-              centre >= bar.left &&
-              centre <= bar.right &&
-              box.top >= bar.bottom - 1
-            );
-          }) ?? null
+          box.width > 0 &&
+          box.height > 0 &&
+          getComputedStyle(element).visibility === 'visible' &&
+          centre >= area.left &&
+          centre <= area.right &&
+          box.top >= area.bottom - 1
         );
-      }, index);
-      return found.asElement() as Terminal | null;
-    },
-    Boolean,
-    UI_TIMEOUT,
-  );
-  if (!handle) throw new Error(`pane ${index} shows no terminal`);
-  return handle;
+      }) ?? null
+    );
+  }, bar);
+  return found.asElement() as Terminal;
 }
 
 // The terminal that holds the keyboard focus, if it is a visible one.
@@ -375,7 +375,7 @@ async function expectKeyboardIn(page: Page, terminal: Terminal, what: string) {
 
 // The index of the pane whose terminal holds the keyboard.
 async function paneWithKeyboard(page: Page): Promise<number> {
-  const count = await markPanes(page);
+  const count = await tabLists(page).count();
   for (let index = 0; index < count; index++) {
     const active = await keyboardTerminal(page);
     if (active && (await isSame(active, await terminalOf(page, index)))) return index;
@@ -470,50 +470,68 @@ async function expectSizeMatchesDisplay(page: Page, terminal: Terminal) {
 
 // --- Menus -------------------------------------------------------------------
 
-const menuItems = (page: Page) => page.getByRole('menu').first().getByRole('menuitem');
+// Menus are found by their accessible name (the name of the trigger that opened them): a menu that was just closed
+// stays in the DOM until its exit animation ends, and an unnamed lookup would see it, or pick it.
+const newTabMenu = (page: Page) => page.getByRole('menu', { name: 'New tab', exact: true });
+const sessionsMenu = (page: Page) => page.getByRole('menu', { name: 'Start session', exact: true });
+const rowMenu = (page: Page, workspace: string) => page.getByRole('menu', { name: `Start session in ${workspace}`, exact: true });
+const harnessSubmenu = (page: Page) => page.getByRole('menu', { name: /^Open harness/ });
+// A tab's context menu has no accessible name (its trigger is the tab's wrapper, which has no role): it is the one
+// menu that holds "Split right".
+const tabMenu = (page: Page) => page.getByRole('menu').filter({ has: page.getByRole('menuitem', { name: 'Split right', exact: true }) });
 
-async function openNewTabMenu(page: Page, index = 0) {
-  await markPanes(page);
-  await page.locator(`[data-test-new="${index}"]`).click({ timeout: UI_TIMEOUT });
-  await page.getByRole('menu').first().waitFor({ timeout: UI_TIMEOUT });
+const menuItems = (menu: Locator) => menu.getByRole('menuitem');
+
+async function openNewTabMenu(page: Page, index = 0): Promise<Locator> {
+  // The menu of a previous pick may still be leaving.
+  await newTabMenu(page).waitFor({ state: 'detached' });
+  await (await newTabButton(page, index)).click();
+  const menu = newTabMenu(page);
+  await menu.waitFor();
+  return menu;
 }
 
 const detectionDone = (page: Page) => poll(() => page.getByRole('menuitem').filter({ hasText: LOADING_ITEM }).count(), (count) => count === 0, 15_000);
 
-const topLevelItems = async (page: Page) => (await menuItems(page).allInnerTexts()).map(normalized);
+const topLevelItems = async (menu: Locator) => (await menuItems(menu).allInnerTexts()).map(normalized);
 
-const menuItemNamed = (page: Page, text: string) =>
-  page.getByRole('menu').first().getByRole('menuitem').filter({ hasText: new RegExp(`^\\s*${escapeRegExp(text)}\\s*$`) });
+const menuItemNamed = (menu: Locator, text: string) =>
+  menu.getByRole('menuitem').filter({ hasText: new RegExp(`^\\s*${escapeRegExp(text)}\\s*$`) });
 
 async function openHarnessSubmenu(page: Page): Promise<Locator> {
-  await menuItemNamed(page, 'Open harness').click({ timeout: UI_TIMEOUT });
-  const submenu = page.getByRole('menu').last();
-  await submenu.getByRole('menuitem').first().waitFor({ timeout: UI_TIMEOUT });
+  await menuItemNamed(newTabMenu(page), 'Open harness').click();
+  const submenu = harnessSubmenu(page);
+  await submenu.getByRole('menuitem').first().waitFor();
   return submenu;
 }
 
 /** Picks an entry of the pane's "New tab" menu and waits for the tab it adds. */
 async function newTab(page: Page, choice: string, { pane: index = 0, submenu = false }: { pane?: number; submenu?: boolean } = {}) {
   const before = (await labelsOf(await pane(page, index))).length;
-  await openNewTabMenu(page, index);
+  const menu = await openNewTabMenu(page, index);
   await detectionDone(page);
   if (submenu) {
     const list = await openHarnessSubmenu(page);
-    await list.getByRole('menuitem').filter({ hasText: new RegExp(`^\\s*${escapeRegExp(choice)}(\\s|$)`) }).first().click({ timeout: UI_TIMEOUT });
+    await list.getByRole('menuitem').filter({ hasText: new RegExp(`^\\s*${escapeRegExp(choice)}(\\s|$)`) }).first().click();
   } else {
-    await menuItemNamed(page, choice).click({ timeout: UI_TIMEOUT });
+    await menuItemNamed(menu, choice).click();
   }
-  await poll(async () => (await labelsOf(await pane(page, index))).length, (count) => count === before + 1, UI_TIMEOUT);
+  await menu.waitFor({ state: 'detached' });
+  const tabs = (await pane(page, index)).getByRole('tab');
+  await tabs.nth(before).waitFor();
+  await tabs.nth(before + 1).waitFor({ state: 'detached' });
 }
 
-async function contextMenu(page: Page, index: number, label: string, nth = 0) {
-  await tabLabeled(await pane(page, index), label, nth).click({ button: 'right', timeout: UI_TIMEOUT });
-  await page.getByRole('menu').first().waitFor({ timeout: UI_TIMEOUT });
+async function contextMenu(page: Page, index: number, label: string, nth = 0): Promise<Locator> {
+  await tabLabeled(await pane(page, index), label, nth).click({ button: 'right' });
+  const menu = tabMenu(page);
+  await menu.waitFor();
+  return menu;
 }
 
-async function pickContextItem(page: Page, item: string) {
-  await menuItemNamed(page, item).click({ timeout: UI_TIMEOUT });
-  await page.getByRole('menu').first().waitFor({ state: 'hidden', timeout: UI_TIMEOUT });
+async function pickContextItem(menu: Locator, item: string) {
+  await menuItemNamed(menu, item).click();
+  await menu.waitFor({ state: 'detached' });
 }
 
 const projectsMessage = (page: Page) => page.locator('aside [role="status"]');
@@ -736,7 +754,7 @@ describe('workspace panes: built app', () => {
 
   test('AC9 — the menu shows one disabled "Detecting agent CLIs…" item while detection runs, then the harnesses with logos, the "Open harness" submenu (versions on the right, a separator, "Detect again") and "Terminal"', async () => {
     const { page } = session;
-    await openNewTabMenu(page);
+    const menu = await openNewTabMenu(page);
     const loading = page.getByRole('menuitem').filter({ hasText: LOADING_ITEM });
     expect(await loading.count()).toBe(1);
     expect(await loading.first().isDisabled()).toBe(true);
@@ -744,11 +762,11 @@ describe('workspace panes: built app', () => {
     // From now on a detection takes no time.
     for (const name of ['claude', 'codex']) unlinkSync(join(fx.bin, `${name}.slow`));
 
-    expect(await topLevelItems(page)).toEqual(['Claude Code', 'Codex', 'Open harness', 'Terminal']);
-    const text = normalized(await page.getByRole('menu').first().innerText());
+    expect(await topLevelItems(menu)).toEqual(['Claude Code', 'Codex', 'Open harness', 'Terminal']);
+    const text = normalized(await menu.innerText());
     expect(text).not.toMatch(/Browser|File|[⌘⇧⌥⌃]/);
     for (const name of ['Claude Code', 'Codex']) {
-      expect(await menuItemNamed(page, name).locator('svg').count(), `the logo of ${name}`).toBeGreaterThan(0);
+      expect(await menuItemNamed(menu, name).locator('svg').count(), `the logo of ${name}`).toBeGreaterThan(0);
     }
 
     const submenu = await openHarnessSubmenu(page);
@@ -814,8 +832,8 @@ describe('workspace panes: built app', () => {
     const before = sessionsInState(session.dataDir).length;
     renameSync(binary, `${binary}.off`);
     try {
-      await openNewTabMenu(page);
-      await menuItemNamed(page, 'Claude Code').click({ timeout: UI_TIMEOUT });
+      const menu = await openNewTabMenu(page);
+      await menuItemNamed(menu, 'Claude Code').click();
       await poll(() => projectsMessage(page).first().innerText().catch(() => ''), (text) => text.startsWith('Could not start Claude Code:'), UI_TIMEOUT);
       expect(await projectsMessage(page).first().innerText()).toContain('not found');
       expect(await labelsOf(await pane(page, 0))).toEqual(['Claude Code 1', 'Codex 1']);
@@ -973,10 +991,10 @@ describe('workspace panes: built app', () => {
 
   test('AC13, AC15 — right-clicking a tab opens a menu with "Split right", "Split down", "Copy path" and, after a separator, "Close tab", no shortcut; "Copy path" puts the worktree path on the clipboard', async () => {
     const { page } = session;
-    await contextMenu(page, 0, 'Codex 1');
-    expect(await topLevelItems(page)).toEqual(['Split right', 'Split down', 'Copy path', 'Close tab']);
-    expect(normalized(await page.getByRole('menu').first().innerText())).not.toMatch(/[⌘⇧⌥⌃]/);
-    const order = await page.getByRole('menu').first().evaluate((menu) => {
+    const menu = await contextMenu(page, 0, 'Codex 1');
+    expect(await topLevelItems(menu)).toEqual(['Split right', 'Split down', 'Copy path', 'Close tab']);
+    expect(normalized(await menu.innerText())).not.toMatch(/[⌘⇧⌥⌃]/);
+    const order = await menu.evaluate((menu) => {
       const y = (element: Element | null | undefined) => element?.getBoundingClientRect().top ?? NaN;
       const items = [...menu.querySelectorAll('[role="menuitem"]')];
       return { copy: y(items[2]), separator: y(menu.querySelector('[role="separator"]')), close: y(items[3]) };
@@ -985,16 +1003,15 @@ describe('workspace panes: built app', () => {
     expect(order.close).toBeGreaterThan(order.separator);
 
     await session.evaluateInMain(`require('electron').clipboard.writeText('before')`);
-    await pickContextItem(page, 'Copy path');
+    await pickContextItem(menu, 'Copy path');
     expect(await poll(() => session.evaluateInMain<string>(`require('electron').clipboard.readText()`), (text) => text === ws.alpha, UI_TIMEOUT)).toBe(ws.alpha);
   });
 
   test('AC14 — "Split right" and "Split down" divide a pane into equal halves with a new selected shell tab holding the keyboard; splits nest, panes are 8 px padded and 1 px apart in --border, and every terminal\'s stty size matches its display', async () => {
     const { page } = session;
     await selectTab(page, 0, 'Terminal');
-    await contextMenu(page, 0, 'Terminal');
-    await pickContextItem(page, 'Split right');
-    await poll(() => paneCount(page), (count) => count === 2, UI_TIMEOUT);
+    await pickContextItem(await contextMenu(page, 0, 'Terminal'), 'Split right');
+    await expectPaneCount(page, 2);
 
     // The pane keeps its tabs on the left; the new pane on the right holds one shell tab, selected, with the keyboard.
     await expectLabels(page, 0, ['Claude Code 1', 'Codex 1', 'Terminal'], 'Terminal');
@@ -1041,9 +1058,8 @@ describe('workspace panes: built app', () => {
     expect(dividerColor).toBe(border);
 
     // Split down on the right pane: three panes, the two on the right of equal height.
-    await contextMenu(page, 1, 'Terminal');
-    await pickContextItem(page, 'Split down');
-    await poll(() => paneCount(page), (count) => count === 3, UI_TIMEOUT);
+    await pickContextItem(await contextMenu(page, 1, 'Terminal'), 'Split down');
+    await expectPaneCount(page, 3);
     await expectLabels(page, 2, ['Terminal'], 'Terminal');
     const bottom = await terminalOf(page, 2);
     await expectKeyboardIn(page, bottom, 'the pane split down');
@@ -1066,7 +1082,7 @@ describe('workspace panes: built app', () => {
       const first = (await tabLabeled(await pane(page, 0), 'Claude Code 1').boundingBox({ timeout: UI_TIMEOUT }))!;
       expect(first.x).toBeGreaterThanOrEqual(showBox.x + showBox.width - 1);
 
-      const regions = await page.evaluate(() => {
+      const regions = await (await pane(page, 0)).evaluate((bar) => {
         const effective = (point: [number, number]) => {
           for (let element = document.elementFromPoint(...point); element; element = element.parentElement) {
             const region = getComputedStyle(element).getPropertyValue('-webkit-app-region');
@@ -1074,7 +1090,6 @@ describe('workspace panes: built app', () => {
           }
           return 'none';
         };
-        const bar = document.querySelector('[data-test-pane="0"]') as HTMLElement;
         const box = bar.getBoundingClientRect();
         const centre = (element: Element): [number, number] => {
           const rect = element.getBoundingClientRect();
@@ -1108,9 +1123,9 @@ describe('workspace panes: built app', () => {
     await selectTab(page, 0, 'Claude Code 1');
     await (await terminalOf(page, 0)).click();
     await workspaceRow(page, 'alpha').hover({ timeout: UI_TIMEOUT });
-    await page.getByRole('button', { name: 'Start session in alpha', exact: true }).click({ timeout: UI_TIMEOUT });
+    await page.getByRole('button', { name: 'Start session in alpha', exact: true }).click();
     await detectionDone(page);
-    await menuItemNamed(page, 'Claude Code').click({ timeout: UI_TIMEOUT });
+    await menuItemNamed(rowMenu(page, 'alpha'), 'Claude Code').click();
     await expectLabels(page, 0, ['Claude Code 1', 'Codex 1', 'Terminal', 'Claude Code 2'], 'Claude Code 2');
     const claudeTwo = await terminalOf(page, 0);
     await expectKeyboardIn(page, claudeTwo, 'the new tab');
@@ -1119,9 +1134,9 @@ describe('workspace panes: built app', () => {
     // Then the second pane.
     await (await terminalOf(page, 1)).click();
     await workspaceRow(page, 'alpha').hover({ timeout: UI_TIMEOUT });
-    await page.getByRole('button', { name: 'Start session in alpha', exact: true }).click({ timeout: UI_TIMEOUT });
+    await page.getByRole('button', { name: 'Start session in alpha', exact: true }).click();
     await detectionDone(page);
-    await menuItemNamed(page, 'Codex').click({ timeout: UI_TIMEOUT });
+    await menuItemNamed(rowMenu(page, 'alpha'), 'Codex').click();
     await expectLabels(page, 1, ['Terminal', 'Codex 2'], 'Codex 2');
     await expectLabels(page, 0, ['Claude Code 1', 'Codex 1', 'Terminal', 'Claude Code 2']);
     pids.codexTwo = await agentPid(page, await terminalOf(page, 1));
@@ -1140,7 +1155,7 @@ describe('workspace panes: built app', () => {
     for (let n = 1; n <= 3; n++) {
       await page.getByRole('button', { name: 'Start session in beta', exact: true }).click({ timeout: UI_TIMEOUT });
       await detectionDone(page);
-      await menuItemNamed(page, 'Claude Code').click({ timeout: UI_TIMEOUT });
+      await menuItemNamed(rowMenu(page, 'beta'), 'Claude Code').click();
       await onWorkspacePage(page, ws.beta);
       await expectLabels(page, 0, Array.from({ length: n }, (_, index) => `Claude Code ${index + 1}`), `Claude Code ${n}`);
       await workspaceRow(page, 'beta').hover({ timeout: UI_TIMEOUT });
@@ -1215,7 +1230,7 @@ describe('workspace panes: built app', () => {
       for (const pid of Object.values(pids)) if (pid) expect(isAlive(pid), `process ${pid} on another workspace`).toBe(true);
       await openWorkspace(page, 'alpha', ws.alpha);
 
-      expect(await paneCount(page)).toBe(3);
+      await expectPaneCount(page, 3);
       await expectLabels(page, 0, ['Claude Code 1', 'Codex 1', 'Terminal', 'Claude Code 2'], 'Claude Code 2');
       await expectLabels(page, 1, ['Terminal', 'Codex 2'], 'Terminal');
       await expectLabels(page, 2, ['Terminal'], 'Terminal');
@@ -1243,9 +1258,8 @@ describe('workspace panes: built app', () => {
   test('AC16, AC17 — closing a shell tab ends its process and selects the tab on its left; the last tab of a pane removes the pane and its sibling takes the keyboard; a running agent asks first (Cancel and Escape change nothing); an agent that ended closes at once', async () => {
     const { page } = session;
     // The bottom pane's only tab: the pane goes, the pane above fills the area and takes the keyboard.
-    await contextMenu(page, 2, 'Terminal');
-    await pickContextItem(page, 'Close tab');
-    await poll(() => paneCount(page), (count) => count === 2, UI_TIMEOUT);
+    await pickContextItem(await contextMenu(page, 2, 'Terminal'), 'Close tab');
+    await expectPaneCount(page, 2);
     expect(await endsWithin(pids.third), 'the closed shell is gone within 5 s').toBe(true);
     await expectLabels(page, 1, ['Terminal', 'Codex 2']);
     await expectKeyboardIn(page, await terminalOf(page, 1), 'the sibling pane');
@@ -1276,7 +1290,7 @@ describe('workspace panes: built app', () => {
 
     // The last tab of the pane: it goes, the first pane fills the window and takes the keyboard.
     await clickClose(page, 1, 'Terminal');
-    await poll(() => paneCount(page), (count) => count === 1, UI_TIMEOUT);
+    await expectPaneCount(page, 1);
     expect(await endsWithin(pids.second)).toBe(true);
     await expectLabels(page, 0, ['Claude Code 1', 'Codex 1', 'Terminal', 'Claude Code 2']);
     await expectKeyboardIn(page, await terminalOf(page, 0), 'the remaining pane');
@@ -1323,17 +1337,16 @@ describe('workspace panes: built app', () => {
         await page.keyboard.press('Escape');
         await poll(() => page.getByRole('menu').count(), (count) => count === 0, 2_000);
       }
-      await page.getByRole('menu').first().waitFor({ state: 'detached', timeout: UI_TIMEOUT });
+      await page.getByRole('menu').first().waitFor({ state: 'detached' });
     };
     // The popup mounts a moment after the click: read the items once the first one is there.
-    const readMenuItems = async () => {
-      await menuItems(page).first().waitFor({ timeout: UI_TIMEOUT });
+    const readMenuItems = async (menu: Locator) => {
+      await menuItems(menu).first().waitFor();
       await detectionDone(page);
-      return (await menuItems(page).allInnerTexts()).map(normalized);
+      return (await menuItems(menu).allInnerTexts()).map(normalized);
     };
     const readMenu = async () => {
-      await openNewTabMenu(page);
-      const items = await readMenuItems();
+      const items = await readMenuItems(await openNewTabMenu(page));
       await closeMenus();
       return items;
     };
@@ -1369,26 +1382,24 @@ describe('workspace panes: built app', () => {
       await closeMenus();
 
       // The Sessions header's menu and the workspace row's menu show the same result.
-      await page.getByRole('button', { name: 'Start session', exact: true }).click({ timeout: UI_TIMEOUT });
-      await page.getByRole('menu').first().waitFor({ timeout: UI_TIMEOUT });
-      expect(await readMenuItems()).toEqual(['Claude Code', 'Codex', 'OpenCode']);
+      await page.getByRole('button', { name: 'Start session', exact: true }).click();
+      expect(await readMenuItems(sessionsMenu(page))).toEqual(['Claude Code', 'Codex', 'OpenCode']);
       await closeMenus();
       await workspaceRow(page, 'alpha').hover({ timeout: UI_TIMEOUT });
       await page.getByRole('button', { name: 'Start session in alpha', exact: true }).click({ timeout: UI_TIMEOUT });
-      await page.getByRole('menu').first().waitFor({ timeout: UI_TIMEOUT });
-      expect(await readMenuItems()).toEqual(['Claude Code', 'Codex', 'OpenCode']);
+      expect(await readMenuItems(rowMenu(page, 'alpha'))).toEqual(['Claude Code', 'Codex', 'OpenCode']);
       await closeMenus();
 
       // Removing the stubs: they disappear, and with none left, nothing but "Terminal" starts.
       for (const name of ['claude', 'codex', 'opencode']) renameSync(join(fx.bin, name), join(fx.bin, `${name}.off`));
       await detectAgain();
       await poll(async () => (await readMenu()).includes('No agent CLI found'), Boolean, UI_TIMEOUT);
-      await openNewTabMenu(page);
+      const menu = await openNewTabMenu(page);
       await detectionDone(page);
       const none = page.getByRole('menuitem').filter({ hasText: 'No agent CLI found' });
       expect(await none.count()).toBe(1);
       expect(await none.first().isDisabled()).toBe(true);
-      expect(await menuItemNamed(page, 'Terminal').isDisabled()).toBe(false);
+      expect(await menuItemNamed(menu, 'Terminal').isDisabled()).toBe(false);
       await closeMenus();
     } finally {
       await closeMenus().catch(() => undefined);
@@ -1414,15 +1425,14 @@ describe('workspace panes: built app', () => {
     await (await terminalOf(page, 0)).click();
     await typeLine(page, 'title-spinner');
     await expectLabels(page, 0, ['Fix the tests', 'Codex 1', 'Terminal']);
-    await contextMenu(page, 0, 'Terminal');
-    await pickContextItem(page, 'Split right');
-    await poll(() => paneCount(page), (count) => count === 2, UI_TIMEOUT);
+    await pickContextItem(await contextMenu(page, 0, 'Terminal'), 'Split right');
+    await expectPaneCount(page, 2);
 
     await page.reload();
     await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
     await page.waitForURL((url) => url.pathname === '/workspace', { timeout: UI_TIMEOUT });
     await expectLabels(page, 0, ['Claude Code 1', 'Codex 1', 'Terminal', 'Terminal'], 'Claude Code 1');
-    expect(await paneCount(page), 'the split is not saved').toBe(1);
+    await expectPaneCount(page, 1);
     expect(await visibleTerminals(page)).toHaveLength(1);
     for (const pid of [pids.claude, pids.codex, shellId]) expect(isAlive(pid), `process ${pid}`).toBe(true);
     // The screens come back.
@@ -1504,9 +1514,9 @@ describe('workspace panes: built app', () => {
     await expectLabels(page, 0, ['Claude Code 1', 'Codex 1', 'Terminal', 'Terminal'], 'Claude Code 1');
 
     // A session outside any project: its page, as before.
-    await page.getByRole('button', { name: 'Start session', exact: true }).click({ timeout: UI_TIMEOUT });
+    await page.getByRole('button', { name: 'Start session', exact: true }).click();
     await detectionDone(page);
-    await menuItemNamed(page, 'Claude Code').click({ timeout: UI_TIMEOUT });
+    await menuItemNamed(sessionsMenu(page), 'Claude Code').click();
     await page.waitForURL((url) => /^\/sessions\/[^/]+$/.test(url.pathname), { timeout: UI_TIMEOUT });
     const outside = /^\/sessions\/([^/]+)$/.exec(new URL(page.url()).pathname)![1]!;
     await goHome(page);
@@ -1520,15 +1530,72 @@ describe('workspace panes: built app', () => {
   test('AC5 — a session outside any project keeps its page: one terminal, no tabs', async () => {
     const { page } = session;
     await goHome(page);
-    await page.getByRole('button', { name: 'Start session', exact: true }).click({ timeout: UI_TIMEOUT });
+    await page.getByRole('button', { name: 'Start session', exact: true }).click();
     await detectionDone(page);
-    await menuItemNamed(page, 'Codex').click({ timeout: UI_TIMEOUT });
+    await menuItemNamed(sessionsMenu(page), 'Codex').click();
     await page.getByRole('heading', { name: 'Codex 1', exact: true }).waitFor({ timeout: UI_TIMEOUT });
     expect(new URL(page.url()).pathname).toMatch(/^\/sessions\/[^/]+$/);
     expect(await page.locator('[role="tablist"]').count()).toBe(0);
     const terminals = await poll(() => visibleTerminals(page), (found) => found.length === 1, UI_TIMEOUT);
     expect(terminals).toHaveLength(1);
     await waitForRow(page, 'ready', terminals[0]!);
+  });
+
+  // --- COCKPIT-80: deterministic page and menu lookups ---
+
+  test('COCKPIT-80 AC4 — with beta\'s page shown, alpha\'s page and its "New tab" button do not exist; after openWorkspace(alpha) the button that is clicked is inside alpha\'s region and the new tab is listed in alpha\'s pane', async () => {
+    const { page } = session;
+    const regionOf = (name: string) => page.getByRole('region', { name, exact: true });
+    const newTabOf = (name: string) => regionOf(name).getByRole('button', { name: 'New tab', exact: true });
+
+    await openWorkspace(page, 'beta', ws.beta);
+    await newTabOf('beta').first().waitFor();
+    expect(await regionOf('alpha').count(), "alpha's page").toBe(0);
+    expect(await newTabOf('alpha').count(), "alpha's New tab button").toBe(0);
+
+    await openWorkspace(page, 'alpha', ws.alpha);
+    const before = await labelsOf(await pane(page, 0));
+    const button = await newTabButton(page);
+    expect(await button.evaluate((element) => element.closest('[role="region"]')?.getAttribute('aria-label'))).toBe('alpha');
+    expect(await newTabOf('beta').count(), "beta's page is gone").toBe(0);
+    await newTab(page, 'Terminal');
+    expect(await labelsOf(await pane(page, 0))).toEqual([...before, 'Terminal']);
+
+    // Leaves alpha as it was for the tests that follow.
+    await clickClose(page, 0, 'Terminal', before.filter((label) => label === 'Terminal').length);
+    await expectLabels(page, 0, before);
+  });
+
+  test('COCKPIT-80 AC5 — a project "Actions" menu closing with its animations frozen stays in the DOM; the pane\'s "New tab" menu is found by its name and reads its own items; once animations run again, the closing menu leaves the DOM', async () => {
+    const { page } = session;
+    await openWorkspace(page, 'alpha', ws.alpha);
+    const actions = page.getByRole('menu', { name: `Actions for ${repo.name}`, exact: true });
+    const frozen = await page.context().newCDPSession(page);
+    try {
+      await page.getByRole('button', { name: `Actions for ${repo.name}`, exact: true }).click();
+      await actions.waitFor();
+      await frozen.send('Animation.enable');
+      await frozen.send('Animation.setPlaybackRate', { playbackRate: 0 });
+      await page.keyboard.press('Escape');
+      await page.locator('[role="menu"][data-closed]').waitFor({ state: 'attached' });
+
+      const menu = await openNewTabMenu(page);
+      await detectionDone(page);
+      expect(await actions.count(), 'the closing menu is still in the DOM').toBe(1);
+      expect(await page.getByRole('menu').count(), 'two menus, told apart by their names').toBe(2);
+      expect(await topLevelItems(menu)).toEqual(['Claude Code', 'Codex', 'Open harness', 'Terminal']);
+
+      await frozen.send('Animation.setPlaybackRate', { playbackRate: 1 });
+      await actions.waitFor({ state: 'detached' });
+      expect(await page.getByRole('menu').count()).toBe(1);
+
+      // The test closes the menu it opened, so no later test starts with it open.
+      await page.keyboard.press('Escape');
+      await menu.waitFor({ state: 'detached' });
+    } finally {
+      await frozen.send('Animation.setPlaybackRate', { playbackRate: 1 }).catch(() => undefined);
+      await frozen.detach().catch(() => undefined);
+    }
   });
 
   test('AC26 — on the workspace page the right column is the rail at the right edge of the window; "Show right bar" opens the bar for that workspace and "Hide right bar" brings the rail back; Home shows neither', async () => {
@@ -1748,9 +1815,8 @@ async function smokePath(session: Session, fx: Fixture) {
     await typeLine(page, 'echo smoke-$((6*7))');
     await waitForRow(page, 'smoke-42', shell);
 
-    await contextMenu(page, 0, 'Terminal');
-    await pickContextItem(page, 'Split right');
-    await poll(() => paneCount(page), (count) => count === 2, UI_TIMEOUT);
+    await pickContextItem(await contextMenu(page, 0, 'Terminal'), 'Split right');
+    await expectPaneCount(page, 2);
     const right = await terminalOf(page, 1);
     await expectKeyboardIn(page, right, 'the new pane');
     await waitForPrompt(page, right);
@@ -1784,6 +1850,49 @@ describe('workspace panes: dev server smoke path', () => {
   test('smoke — a workspace page, a Terminal tab, Split right and an agent tab', async () => {
     await smokePath(session, fx);
   }, 120_000);
+
+  test('COCKPIT-80 AC3 — with the /workspace route module held, the URL is the workspace\'s while openWorkspace has not returned and no workspace region exists; once released, openWorkspace returns and a Terminal tab appears in that workspace\'s page', async () => {
+    const { page } = session;
+    const repo = makeRepo('held-route');
+    // The route module's request: the router pushes the URL, then fetches it (first visit) and renders.
+    const routeModule = /\/routes\/workspace\.tsx\?tsr-split=component/;
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    let held!: () => void;
+    const requested = new Promise<void>((resolve) => (held = resolve));
+    try {
+      await addRepository(session, repo);
+      const path = await createWorkspace(session, repo, 'held');
+      // A reload on Home: the route module has not been fetched by this page.
+      await goHome(page);
+      await page.reload();
+      await page.getByRole('heading', { name: 'Home' }).waitFor();
+      await page.route(routeModule, async (route) => {
+        held();
+        await released;
+        await route.continue();
+      });
+
+      let returned = false;
+      const opening = openWorkspace(page, 'held', path).then(() => {
+        returned = true;
+      });
+      await requested;
+      await page.waitForURL((url) => url.pathname === '/workspace' && url.searchParams.get('path') === path);
+      expect(returned, 'openWorkspace has not returned').toBe(false);
+      expect(await page.getByRole('region', { name: 'held', exact: true }).count(), 'no workspace region').toBe(0);
+
+      release();
+      await opening;
+      expect(await page.getByRole('region', { name: 'held', exact: true }).count()).toBe(1);
+      await newTab(page, 'Terminal');
+      expect(await labelsOf(await pane(page, 0))).toEqual(['Terminal']);
+    } finally {
+      release();
+      await page.unroute(routeModule).catch(() => undefined);
+      rmSync(repo.parent, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('workspace panes: packaged app smoke path and restart', () => {
