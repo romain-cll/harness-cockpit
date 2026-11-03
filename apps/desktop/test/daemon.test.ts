@@ -1,10 +1,12 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { once } from 'node:events';
 import { createRequire } from 'node:module';
 import { request as httpRequest } from 'node:http';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { connectDaemon, type DaemonClient } from '@cockpit/daemon';
 import { chromium, type Page } from 'playwright-core';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import {
@@ -272,7 +274,7 @@ const windowUrls = (session: Session) =>
 // A git repository with a teardown command that stays running, for the `commands` terminals (COCKPIT-57:
 // only the teardown runs as one; the setup is `cockpit setup`, in the session's own terminal), or with
 // the given `.cockpit/config.json`.
-function makeRepoWithSetup(config: unknown = { teardown: ['echo setup-running; exec sleep 300'] }): { parent: string; root: string } {
+function makeRepoWithSetup(config: unknown = { teardown: ['echo setup-pid-$$; exec sleep 300'] }): { parent: string; root: string } {
   const parent = realpathSync(makeTestDir('r-'));
   const root = join(parent, 'proj');
   mkdirSync(join(root, '.cockpit'), { recursive: true });
@@ -299,35 +301,68 @@ const stubPicker = (session: Session, pick: string) =>
 
 type ApiWindow = { api: Record<string, Record<string, (...args: unknown[]) => Promise<any>>> };
 
-// Adds the repository, creates a workspace and starts its setup (a `commands` terminal) through
-// `window.api`; resolves with the pid of the setup's `sleep`.
-async function startSetup(session: Session, repo: { root: string }, name: string): Promise<number> {
+// What a test's own connection to the daemon sees of one terminal: its output (the screen at the
+// attach, then the chunks after it) and its exit. Listeners come before the attach, so nothing the
+// daemon sends in between is lost.
+async function watchTerminal(daemon: DaemonClient, id: number) {
+  const chunks = new Map<number, string>();
+  const changed = new Set<() => void>();
+  daemon.onData((event) => {
+    if (event.id !== id) return;
+    chunks.set(event.seq, event.data);
+    changed.forEach((check) => check());
+  });
+  const exited = new Promise<void>((resolve) => daemon.onExit((event) => event.id === id && resolve()));
+  const { screen, seq } = await daemon.attach(id);
+  const text = () =>
+    screen +
+    [...chunks]
+      .filter(([each]) => each > seq)
+      .sort(([a], [b]) => a - b)
+      .map(([, data]) => data)
+      .join('');
+  const find = (pattern: RegExp) =>
+    new Promise<RegExpExecArray>((resolve) => {
+      const check = () => {
+        const found = pattern.exec(text());
+        if (!found) return;
+        changed.delete(check);
+        resolve(found);
+      };
+      changed.add(check);
+      check();
+    });
+  return { exited, find };
+}
+
+// The process is gone, or a zombie: a killed process stays one until its parent (or init, once the parent is gone) waits for it.
+const hasEnded = (pid: number) => {
+  try {
+    return execFileSync('ps', ['-p', String(pid), '-o', 'stat='], { encoding: 'utf8' }).trim().startsWith('Z');
+  } catch {
+    return true;
+  }
+};
+
+// Adds the repository, creates a workspace and starts its teardown (a `commands` terminal, like a
+// setup) through `window.api`. The terminal is found through the test's own connection to the daemon:
+// the main process numbers its terminals itself (`ptyId`), the daemon numbers its own and the two are
+// not mapped, so it is the daemon's `commands` terminal that runs in this workspace's folder. Its
+// command prints its pid (`exec` keeps it for the `sleep`); `exited` resolves when the daemon says the
+// terminal ended.
+async function startSetup(session: Session, daemon: DaemonClient, repo: { root: string }, name: string): Promise<{ pid: number; exited: Promise<void> }> {
   const { page } = session;
   await stubPicker(session, repo.root);
   await page.evaluate(() => (window as unknown as ApiWindow).api.projects!.add!());
   const created = await page.evaluate(([root, name]) => (window as unknown as ApiWindow).api.workspaces!.create!(root, name, 'main'), [repo.root, name] as const);
   expect(created.status).toBe('created');
-  const path = await poll(
-    () =>
-      page.evaluate(
-        async ([root, name]) =>
-          ((await (window as unknown as ApiWindow).api.projects!.list!()) as Array<{ path: string; workspaces: Array<{ path: string; name: string }> }>)
-            .find((project) => project.path === root)
-            ?.workspaces.find((workspace) => workspace.name === name)?.path,
-        [repo.root, name] as const,
-      ),
-    Boolean,
-    UI_TIMEOUT,
-  );
-  const started = await page.evaluate(([root, path]) => (window as unknown as ApiWindow).api.workspaces!.teardown!(root, path, { cols: 80, rows: 24 }), [repo.root, path!] as const);
+  const { path } = (created as { workspace: { path: string } }).workspace;
+  const started = await page.evaluate(([root, path]) => (window as unknown as ApiWindow).api.workspaces!.teardown!(root, path, { cols: 80, rows: 24 }), [repo.root, path] as const);
   expect(started.status).toBe('started');
-  const sleeper = await poll(
-    () => execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' }).split('\n').find((line) => line.trim().endsWith('sleep 300')),
-    Boolean,
-    UI_TIMEOUT,
-  );
-  expect(sleeper, 'the setup is running').toBeTruthy();
-  return Number(sleeper!.trim().split(/\s+/)[0]);
+  const info = (await daemon.list()).find((terminal) => terminal.kind === 'commands' && terminal.cwd === path);
+  const terminal = await watchTerminal(daemon, must(info, 'the setup terminal in the daemon').id);
+  const [, pid] = await terminal.find(/setup-pid-(\d+)\r?\n/);
+  return { pid: Number(pid), exited: terminal.exited };
 }
 
 // --- Built app: terminals and sessions survive --------------------------------
@@ -341,8 +376,15 @@ describe('daemon: built app', () => {
   let session: Session | undefined;
   let repo: { parent: string; root: string } | undefined;
   const known = { daemon: 0, session: '', sessionPid: 0, shells: [] as number[], workspace: '' };
+  // COCKPIT-80 AC10: a process that is none of the test's, whose command ends with `sleep 300` and
+  // whose pid is lower than any setup's, runs for the whole describe: a setup picked out by a
+  // machine-wide `ps` pattern would be this one, every run.
+  let foreign: ChildProcess;
 
-  beforeAll(() => {
+  beforeAll(async () => {
+    foreign = spawn('/bin/sleep', ['300'], { stdio: 'ignore' });
+    foreign.unref();
+    await once(foreign, 'spawn');
     fx = makeFixture();
     dataDir = makeDataDir();
     home = join(dataDir, 'h');
@@ -351,6 +393,7 @@ describe('daemon: built app', () => {
   });
 
   afterAll(async () => {
+    foreign.kill('SIGKILL');
     await session?.close().catch(() => {});
     await killDaemonsIn(home);
     rmSync(dataDir, { recursive: true, force: true });
@@ -514,27 +557,33 @@ describe('daemon: built app', () => {
     await expectDot(reopened!, known.session, 'Working');
   });
 
-  test('AC7 — a setup (commands terminal) ends when its page reloads, and is not shown again; when the app is killed with SIGKILL the daemon, the shells and the session still run 5 s later and the setup is gone', async () => {
+  test('AC7, AC10 — a setup (commands terminal) ends when its page reloads, and is not shown again; when the app is killed with SIGKILL the daemon, the shells and the session still run 5 s later and the setup is gone', async () => {
     repo = makeRepoWithSetup();
     const livePage = (await pagesOf(session!)).at(-1)!;
     const live = { ...session!, page: livePage } as Session;
+    const daemon = await connectDaemon(must(daemonFile(home, 'sock', build), 'the daemon sock'));
 
-    const first = await startSetup(live, repo, 'setup-reload');
-    await livePage.reload();
-    await livePage.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
-    await poll(() => isAlive(first), (alive) => !alive, 5_000);
-    expect(isAlive(first), 'the setup ends with its page').toBe(false);
-    await goToWorkspacePage(livePage, known.workspace);
-    await poll(() => tabNames(livePage), (names) => names.length === 2, UI_TIMEOUT);
-    expect(await tabNames(livePage)).toEqual(['Terminal', 'Terminal']);
+    try {
+      const first = await startSetup(live, daemon, repo, 'setup-reload');
+      await livePage.reload();
+      await livePage.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
+      await first.exited;
+      expect(hasEnded(first.pid), 'the setup ends with its page').toBe(true);
+      await goToWorkspacePage(livePage, known.workspace);
+      await poll(() => tabNames(livePage), (names) => names.length === 2, UI_TIMEOUT);
+      expect(await tabNames(livePage)).toEqual(['Terminal', 'Terminal']);
 
-    const second = await startSetup(live, repo, 'setup-kill');
-    await killApp(session!);
+      const second = await startSetup(live, daemon, repo, 'setup-kill');
+      await killApp(session!);
 
-    expect(isAlive(known.daemon)).toBe(true);
-    await poll(() => isAlive(second), (alive) => !alive, 5_000);
-    expect(isAlive(second), 'the daemon ends the commands terminal of the killed app').toBe(false);
-    expect(await stillAlive([known.daemon, known.sessionPid, ...known.shells])).toEqual([true, true, true, true]);
+      expect(isAlive(known.daemon)).toBe(true);
+      await second.exited;
+      expect(hasEnded(second.pid), 'the daemon ends the commands terminal of the killed app').toBe(true);
+      expect(await stillAlive([known.daemon, known.sessionPid, ...known.shells])).toEqual([true, true, true, true]);
+      expect(isAlive(foreign.pid!), 'the foreign sleep is no setup: still running').toBe(true);
+    } finally {
+      daemon.close();
+    }
   });
 
   test('AC8 — an app of another build shows the session and the shell of the older daemon and takes their input; new terminals run in a daemon of its own; the older daemon exits and removes .sock, .token and .pid, not .log, once its last terminal ends', async () => {

@@ -3615,17 +3615,25 @@ const workspaceMenu = (page: Page, path: string) => page.getByRole('menu', { nam
 const submenuNamed = (page: Page, trigger: 'Open in editor' | 'Open in terminal') => page.getByRole('menu', { name: trigger, exact: true });
 
 // Opens the "…" menu of the workspace at `path` and waits until the items above "Delete workspace…"
-// are exactly `expected` (in any order), "Delete workspace…" being last.
+// are exactly `expected` (in any order), "Delete workspace…" being last. The apps arrive after the menu
+// opens, and a menu opened again shows the earlier ones until they do: each item `expected` is awaited,
+// then the absence of any other.
 async function openWorkspaceMenu(page: Page, path: string, expected: string[]) {
   await openMenu(page, path);
   const wanted = [...expected].sort();
-  const shown = (items: string[]) => items.at(-1) === 'Delete workspace…' && JSON.stringify(items.slice(0, -1).sort()) === JSON.stringify(wanted);
-  const items = await poll(() => topLevelItems(workspaceMenu(page, path)), shown, UI_TIMEOUT);
+  const menu = workspaceMenu(page, path);
+  const exactly = (names: string[]) => new RegExp(`^\\s*(?:${names.map(escapeRegExp).join('|')})\\s*$`);
+  for (const name of [...expected, 'Delete workspace…']) await menu.getByRole('menuitem').filter({ hasText: exactly([name]) }).waitFor();
+  await menu.getByRole('menuitem').filter({ hasNotText: exactly([...expected, 'Delete workspace…']) }).first().waitFor({ state: 'detached' });
+  const items = await topLevelItems(menu);
   expect(items.at(-1), 'the app items sit above "Delete workspace…"').toBe('Delete workspace…');
   expect(items.slice(0, -1).sort()).toEqual(wanted);
 }
 
-// Opens a submenu of the "…" menu (hover, then a click when hover did not open it) and returns its items.
+// Opens a submenu of the "…" menu with one hover and returns its items. Base UI opens a submenu on hover
+// once the pointer has rested on its trigger for 100 ms (`delay`, a rest timer started by the mouse move)
+// and the parent popup has seen a mouse move (`allowMouseEnter`, which the hover's own move sets): the
+// submenu is not there when `hover()` returns, so the state to wait on is the named submenu itself.
 // A submenu still open from before is closed first (one Escape closes only the submenu): with hover
 // opening, Base UI leaves the parent popup at `pointer-events: none` until the next real mouse move,
 // and a stale submenu would pass for the requested one.
@@ -3636,12 +3644,8 @@ async function openSubmenu(page: Page, trigger: 'Open in editor' | 'Open in term
     await page.keyboard.press('Escape');
     await open.first().waitFor({ state: 'detached' });
   }
-  const item = page.getByRole('menuitem', { name: trigger, exact: true });
-  await item.hover();
-  if ((await poll(() => submenu.count(), (count) => count >= 1, 2_000)) < 1) {
-    await item.click();
-    await submenu.waitFor();
-  }
+  await page.getByRole('menuitem', { name: trigger, exact: true }).hover();
+  await submenu.waitFor();
   return submenu.getByRole('menuitem');
 }
 

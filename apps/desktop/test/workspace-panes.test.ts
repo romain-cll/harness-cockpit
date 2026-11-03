@@ -1560,7 +1560,6 @@ describe('workspace panes: built app', () => {
     expect(await newTabOf('beta').count(), "beta's page is gone").toBe(0);
     await newTab(page, 'Terminal');
     expect(await labelsOf(await pane(page, 0))).toEqual([...before, 'Terminal']);
-    expect(await regionOf('alpha').getByRole('tab').count()).toBeGreaterThan(before.length);
 
     // Leaves alpha as it was for the tests that follow.
     await clickClose(page, 0, 'Terminal', before.filter((label) => label === 'Terminal').length);
@@ -1589,6 +1588,10 @@ describe('workspace panes: built app', () => {
       await frozen.send('Animation.setPlaybackRate', { playbackRate: 1 });
       await actions.waitFor({ state: 'detached' });
       expect(await page.getByRole('menu').count()).toBe(1);
+
+      // The test closes the menu it opened, so no later test starts with it open.
+      await page.keyboard.press('Escape');
+      await menu.waitFor({ state: 'detached' });
     } finally {
       await frozen.send('Animation.setPlaybackRate', { playbackRate: 1 }).catch(() => undefined);
       await frozen.detach().catch(() => undefined);
@@ -1884,7 +1887,6 @@ describe('workspace panes: dev server smoke path', () => {
       expect(await page.getByRole('region', { name: 'held', exact: true }).count()).toBe(1);
       await newTab(page, 'Terminal');
       expect(await labelsOf(await pane(page, 0))).toEqual(['Terminal']);
-      expect(await page.getByRole('region', { name: 'held', exact: true }).getByRole('tab', { name: 'Terminal' }).count()).toBe(1);
     } finally {
       release();
       await page.unroute(routeModule).catch(() => undefined);

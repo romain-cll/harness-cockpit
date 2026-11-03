@@ -467,15 +467,14 @@ describe('cockpit usage', () => {
 
 // COCKPIT-80: the CLI's runs are deterministic. Its git is the test's own git, and a run's reports are its own.
 describe('deterministic runs (COCKPIT-80)', () => {
-  test('AC1 — the git the CLI runs is the one the test runs: `command -v git` prints the wrapper on the stubs\' PATH, and it answers with the test\'s own git', async () => {
-    writeConfig({ setup: ['command -v git', 'git --version'] });
+  test('AC1 — the git the CLI runs is the one the test runs: `command -v git` prints the wrapper on the stubs\' PATH, and the git behind it answers its version and exec path as the test\'s own git does', async () => {
+    writeConfig({ setup: ['command -v git', 'git --version', 'git --exec-path'] });
 
     const run = await cockpit(['setup']);
 
-    const ownVersion = execFileSync(testGit, ['--version'], { encoding: 'utf8' }).trim();
-    expect(run.lines.slice(1, 5)).toEqual(['$ command -v git', join(bin, 'git'), '$ git --version', ownVersion]);
+    const own = (option: string) => execFileSync(testGit, [option], { encoding: 'utf8' }).trim();
+    expect(run.lines.slice(1, 7)).toEqual(['$ command -v git', join(bin, 'git'), '$ git --version', own('--version'), '$ git --exec-path', own('--exec-path')]);
     expect(run.lines).not.toContain('/usr/bin/git');
-    expect(readFileSync(join(bin, 'git'), 'utf8')).toContain(`exec '${testGit}'`);
   });
 
   test('AC2 — a run whose first git call is held does not take the reports of a run that starts and ends meanwhile: each run holds exactly its own three, and the held one has not ended', async () => {

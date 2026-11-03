@@ -12,7 +12,7 @@ import { CATEGORIES, countCategories, type Category } from '../src/sleeps-count'
 // Like agents-md.test.ts it lives here because no package owns a repo-wide check, and it only reads files.
 
 /** The counts the test files hold at the end of COCKPIT-80. Lower a number here when a test below it. */
-const BASELINE: Record<Category, number> = { pauses: 79, timeouts: 372, polls: 241, deadlines: 8 };
+const BASELINE: Record<Category, number> = { pauses: 78, timeouts: 372, polls: 235, deadlines: 8 };
 
 const repoRoot = join(import.meta.dirname, '..', '..', '..', '..');
 const SELF = join(import.meta.dirname, 'sleeps-ratchet.test.ts');
