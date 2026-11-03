@@ -18,6 +18,11 @@ jobs:
   check:
     # macOS: the desktop app is packaged for macOS, and the runner has a
     # desktop session for the Electron tests.
+    # Throwaway (COCKPIT-80): five identical copies of the job, one wave.
+    strategy:
+      fail-fast: false
+      matrix:
+        copy: [1, 2, 3, 4, 5]
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
