@@ -21,6 +21,7 @@ import {
   waitForGroupGone,
   type Session,
 } from './launch';
+import { sendFromComposer } from './composer';
 import { makeTestDir } from './run-root';
 
 // COCKPIT-70: the workspace page, panes with tabs of agents and shells. The built app runs the full
@@ -249,8 +250,8 @@ async function openWorkspace(page: Page, name: string, path: string) {
 }
 
 async function goHome(page: Page) {
-  await page.getByRole('link', { name: 'Home', exact: true }).click({ timeout: UI_TIMEOUT });
-  await page.getByRole('heading', { name: 'Home' }).waitFor({ timeout: UI_TIMEOUT });
+  await page.getByRole('link', { name: 'New workspace', exact: true }).click({ timeout: UI_TIMEOUT });
+  await page.getByRole('heading', { name: 'New workspace', exact: true }).waitFor({ timeout: UI_TIMEOUT });
 }
 
 // A pane is the tab bar (`tablist`) of the workspace region, found by role and auto-waited. The panes are rendered
@@ -473,7 +474,6 @@ async function expectSizeMatchesDisplay(page: Page, terminal: Terminal) {
 // Menus are found by their accessible name (the name of the trigger that opened them): a menu that was just closed
 // stays in the DOM until its exit animation ends, and an unnamed lookup would see it, or pick it.
 const newTabMenu = (page: Page) => page.getByRole('menu', { name: 'New tab', exact: true });
-const sessionsMenu = (page: Page) => page.getByRole('menu', { name: 'Start session', exact: true });
 const rowMenu = (page: Page, workspace: string) => page.getByRole('menu', { name: `Start session in ${workspace}`, exact: true });
 const harnessSubmenu = (page: Page) => page.getByRole('menu', { name: /^Open harness/ });
 // A tab's context menu has no accessible name (its trigger is the tab's wrapper, which has no role): it is the one
@@ -641,22 +641,11 @@ const stubNotifications = (session: Session) =>
     BrowserWindow.getFocusedWindow = () => null;
   })()`);
 
-// --- New workspace dialog ----------------------------------------------------
+// --- New workspace composer ----------------------------------------------------
 
-async function createThroughDialog(page: Page, repo: TempRepo, name: string, agent?: string) {
-  await page.getByRole('button', { name: `Actions for ${repo.name}`, exact: true }).hover({ timeout: UI_TIMEOUT }).catch(() => undefined);
-  await page.getByRole('button', { name: `Actions for ${repo.name}`, exact: true }).click({ timeout: UI_TIMEOUT });
-  await page.getByRole('menuitem', { name: 'New workspace…' }).click({ timeout: UI_TIMEOUT });
-  const dialog = page.getByRole('dialog', { name: `New workspace in ${repo.name}` });
-  await dialog.waitFor({ timeout: UI_TIMEOUT });
-  await poll(async () => (await dialog.getByRole('combobox', { name: 'Base', exact: true }).innerText()).trim(), (value) => value === 'main', UI_TIMEOUT);
-  await dialog.getByRole('textbox', { name: 'Name', exact: true }).fill(name);
-  if (agent) {
-    await dialog.getByRole('combobox', { name: 'Agent', exact: true }).click({ timeout: UI_TIMEOUT });
-    await page.getByRole('option', { name: agent, exact: true }).click({ timeout: UI_TIMEOUT });
-  }
-  await dialog.getByRole('button', { name: 'Create', exact: true }).click({ timeout: UI_TIMEOUT });
-  await dialog.waitFor({ state: 'hidden', timeout: 15_000 });
+// COCKPIT-66: the prompt is `name`, so the workspace's branch is `name` (a lower-case word); the workspace page opens.
+async function createThroughComposer(page: Page, repo: TempRepo, name: string, agent?: string) {
+  await sendFromComposer(page, repo, { prompt: name, agent });
 }
 
 // =============================================================================
@@ -707,11 +696,12 @@ describe('workspace panes: built app', () => {
 
   // --- Sidebar ---
 
-  test('AC4 — the sidebar has no Terminal link, Home stays, and the route tree has no /terminal', async () => {
+  test('AC4 — the sidebar has no Terminal link, "New workspace" is its one link, and the route tree has no /terminal', async () => {
     const { page } = session;
     expect(await page.getByRole('link', { name: 'Terminal', exact: true }).count()).toBe(0);
     expect(await page.locator('aside a[href="/terminal"]').count()).toBe(0);
-    expect(await page.getByRole('link', { name: 'Home', exact: true }).count()).toBe(1);
+    expect(await page.getByRole('link', { name: 'New workspace', exact: true }).count()).toBe(1);
+    expect(await page.getByRole('link', { name: 'Home', exact: true }).count()).toBe(0);
     expect(readFileSync(join(import.meta.dirname, '..', 'src', 'renderer', 'routeTree.gen.ts'), 'utf8')).not.toContain("'/terminal'");
   });
 
@@ -752,12 +742,11 @@ describe('workspace panes: built app', () => {
 
   // --- The New tab menu ---
 
-  test('AC9 — the menu shows one disabled "Detecting agent CLIs…" item while detection runs, then the harnesses with logos, the "Open harness" submenu (versions on the right, a separator, "Detect again") and "Terminal"', async () => {
+  test('AC9 — the menu shows the harnesses with logos, the "Open harness" submenu (versions on the right, a separator, "Detect again") and "Terminal"', async () => {
     const { page } = session;
+    // The first render of the New workspace page (COCKPIT-66) started the detection at launch, long before this menu
+    // opens: its "Detecting agent CLIs…" item is the composer's test now (the same state of the shared store).
     const menu = await openNewTabMenu(page);
-    const loading = page.getByRole('menuitem').filter({ hasText: LOADING_ITEM });
-    expect(await loading.count()).toBe(1);
-    expect(await loading.first().isDisabled()).toBe(true);
     await detectionDone(page);
     // From now on a detection takes no time.
     for (const name of ['claude', 'codex']) unlinkSync(join(fx.bin, `${name}.slow`));
@@ -1328,7 +1317,7 @@ describe('workspace panes: built app', () => {
 
   // --- Detecting again ---
 
-  test('AC12 — "Detect again" runs every found harness\'s --version once more: a stub added to a PATH folder appears (without a version when it prints none), one removed disappears, and the other Start session menus show the same; with none left the menu says "No agent CLI found" and "Terminal" still works', async () => {
+  test('AC12 — "Detect again" runs every found harness\'s --version once more: a stub added to a PATH folder appears (without a version when it prints none), one removed disappears, and the workspace row\'s Start session menu shows the same; with none left the menu says "No agent CLI found" and "Terminal" still works', async () => {
     const { page } = session;
     await openWorkspace(page, 'alpha', ws.alpha);
     // Waits for every menu to be gone, so the next click never meets an open popup.
@@ -1381,10 +1370,7 @@ describe('workspace panes: built app', () => {
       expect((await submenu.getByRole('menuitem').allInnerTexts()).map(normalized)).toEqual(['Claude Code 9.9.9', 'Codex 9.9.9', 'OpenCode', 'Detect again']);
       await closeMenus();
 
-      // The Sessions header's menu and the workspace row's menu show the same result.
-      await page.getByRole('button', { name: 'Start session', exact: true }).click();
-      expect(await readMenuItems(sessionsMenu(page))).toEqual(['Claude Code', 'Codex', 'OpenCode']);
-      await closeMenus();
+      // The workspace row's menu shows the same result (the composer's agent select is COCKPIT-66's).
       await workspaceRow(page, 'alpha').hover({ timeout: UI_TIMEOUT });
       await page.getByRole('button', { name: 'Start session in alpha', exact: true }).click({ timeout: UI_TIMEOUT });
       expect(await readMenuItems(rowMenu(page, 'alpha'))).toEqual(['Claude Code', 'Codex', 'OpenCode']);
@@ -1447,10 +1433,10 @@ describe('workspace panes: built app', () => {
 
   // --- Entry points ---
 
-  test('AC21 — the New workspace dialog with an agent opens the workspace page with one selected agent tab that runs the setup through the CLI, then the agent; the row says Setting up meanwhile', async () => {
+  test('AC21 — the composer with an agent opens the workspace page with one selected agent tab that runs the setup through the CLI, then the agent; the row says Setting up meanwhile', async () => {
     const { page } = session;
     rmSync(join(repo.root, 'go'), { force: true });
-    await createThroughDialog(page, repo, 'dagent', 'Claude Code');
+    await createThroughComposer(page, repo, 'dagent', 'Claude Code');
     const path = worktreePath(session, repo, 'dagent');
     await onWorkspacePage(page, path);
     await expectLabels(page, 0, ['Claude Code 1'], 'Claude Code 1');
@@ -1469,9 +1455,9 @@ describe('workspace panes: built app', () => {
     expect(sessionNamed(session.dataDir, 'Claude Code 1', path)).toMatchObject({ project: repo.root });
   });
 
-  test('AC22 — the dialog with Agent "None" opens the workspace page with one shell tab running `cockpit setup --shell`: header, $ lines, output, ✓ Setup done, then the login shell prompt; no session, no label; with no setup command, the login shell at once', async () => {
+  test('AC22 — the composer with "Terminal" and a project opens the workspace page with one shell tab running `cockpit setup --shell`: header, $ lines, output, ✓ Setup done, then the login shell prompt; no session, no label; with no setup command, the login shell at once', async () => {
     const { page } = session;
-    await createThroughDialog(page, repo, 'dnone');
+    await createThroughComposer(page, repo, 'dnone');
     const path = worktreePath(session, repo, 'dnone');
     await onWorkspacePage(page, path);
     await expectLabels(page, 0, ['Terminal'], 'Terminal');
@@ -1485,7 +1471,7 @@ describe('workspace panes: built app', () => {
     expect(await workspaceRow(page, 'dnone').locator('xpath=ancestor::li[1]').innerText()).not.toMatch(/Setting up|Setup failed/);
 
     writeConfig(repo, { setup: [] });
-    await createThroughDialog(page, repo, 'dplain');
+    await createThroughComposer(page, repo, 'dplain');
     await onWorkspacePage(page, worktreePath(session, repo, 'dplain'));
     await expectLabels(page, 0, ['Terminal'], 'Terminal');
     const plain = await terminalOf(page, 0);
@@ -1514,11 +1500,7 @@ describe('workspace panes: built app', () => {
     await expectLabels(page, 0, ['Claude Code 1', 'Codex 1', 'Terminal', 'Terminal'], 'Claude Code 1');
 
     // A session outside any project: its page, as before.
-    await page.getByRole('button', { name: 'Start session', exact: true }).click();
-    await detectionDone(page);
-    await menuItemNamed(sessionsMenu(page), 'Claude Code').click();
-    await page.waitForURL((url) => /^\/sessions\/[^/]+$/.test(url.pathname), { timeout: UI_TIMEOUT });
-    const outside = /^\/sessions\/([^/]+)$/.exec(new URL(page.url()).pathname)![1]!;
+    const outside = (await sendFromComposer(page, 'none', { prompt: 'outside', agent: 'Claude Code' })).id!;
     await goHome(page);
     await session.evaluateInMain('globalThis.__notified.length = 0');
     await reportStatus(session, outside, 'waiting');
@@ -1530,9 +1512,7 @@ describe('workspace panes: built app', () => {
   test('AC5 — a session outside any project keeps its page: one terminal, no tabs', async () => {
     const { page } = session;
     await goHome(page);
-    await page.getByRole('button', { name: 'Start session', exact: true }).click();
-    await detectionDone(page);
-    await menuItemNamed(sessionsMenu(page), 'Codex').click();
+    await sendFromComposer(page, 'none', { prompt: 'outside', agent: 'Codex' });
     await page.getByRole('heading', { name: 'Codex 1', exact: true }).waitFor({ timeout: UI_TIMEOUT });
     expect(new URL(page.url()).pathname).toMatch(/^\/sessions\/[^/]+$/);
     expect(await page.locator('[role="tablist"]').count()).toBe(0);
@@ -1863,10 +1843,10 @@ describe('workspace panes: dev server smoke path', () => {
     try {
       await addRepository(session, repo);
       const path = await createWorkspace(session, repo, 'held');
-      // A reload on Home: the route module has not been fetched by this page.
+      // A reload on the New workspace page (`/`): the route module has not been fetched by this page.
       await goHome(page);
       await page.reload();
-      await page.getByRole('heading', { name: 'Home' }).waitFor();
+      await page.getByRole('heading', { name: 'New workspace', exact: true }).waitFor();
       await page.route(routeModule, async (route) => {
         held();
         await released;

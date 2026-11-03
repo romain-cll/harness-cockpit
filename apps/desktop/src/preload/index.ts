@@ -28,10 +28,11 @@ const api: Api = {
     git: () => ipcRenderer.invoke('projects:git'),
     add: () => ipcRenderer.invoke('projects:add'),
     remove: (path) => ipcRenderer.invoke('projects:remove', path),
+    onChanged: (listener) => subscribe('projects:changed', listener),
   },
   workspaces: {
     branches: (project) => ipcRenderer.invoke('workspaces:branches', project),
-    create: (project, name, base) => ipcRenderer.invoke('workspaces:create', project, name, base),
+    create: (project, task, base) => ipcRenderer.invoke('workspaces:create', project, task, base),
     remove: (project, path, options) => ipcRenderer.invoke('workspaces:remove', project, path, options),
     apps: () => ipcRenderer.invoke('workspaces:apps'),
     reveal: (project, path) => ipcRenderer.invoke('workspaces:reveal', project, path),
