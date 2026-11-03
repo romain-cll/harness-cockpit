@@ -625,7 +625,7 @@ export function WorkspacePanes({ project, workspace }: { project: Project; works
   const panes = panesOf(view.layout);
   return (
     // The tab bars are the page's top row: the area cancels the padding of `<main>`.
-    <div className="relative -m-2 min-h-0 flex-1">
+    <div role="region" aria-label={workspace.name} className="relative -m-2 min-h-0 flex-1">
       {sidebarHidden && (
         <Button variant="ghost" size="icon" aria-label="Show sidebar" className="app-no-drag absolute top-2 left-[72px] z-10 font-normal" onClick={toggleSidebar}>
           <PanelLeftOpenIcon />
