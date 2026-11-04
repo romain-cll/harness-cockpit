@@ -1,7 +1,8 @@
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
-import { readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { close, constants, open, openSync, read, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { createServer, type AddressInfo } from 'node:net';
+import { Socket, createConnection, createServer, type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -128,14 +129,30 @@ export function daemonPidFilesIn(home: string): string[] {
   }
 }
 
+// Connects to a daemon's socket; the kernel closes the connection when the daemon process ends,
+// whoever its parent is, so the returned promise resolves once the daemon is gone. A daemon with no
+// socket to connect to is taken as gone.
+function connectToDaemon(socketPath: string): Promise<{ gone: Promise<void> }> {
+  return new Promise((resolve) => {
+    const socket = createConnection(socketPath);
+    const gone = new Promise<void>((done) => socket.once('close', () => done()));
+    socket.on('error', () => {});
+    socket.once('connect', () => {
+      socket.resume();
+      resolve({ gone });
+    });
+    socket.once('error', () => resolve({ gone: Promise.resolve() }));
+  });
+}
+
 export async function killDaemonsIn(...homes: Array<string | undefined>): Promise<void> {
-  const pids: number[] = [];
+  const gone: Promise<void>[] = [];
   for (const home of homes) {
     if (!home) continue;
     for (const file of daemonPidFilesIn(home)) {
       const pid = Number(readFileSync(file, 'utf8').trim());
       if (!Number.isInteger(pid) || pid <= 1) continue;
-      pids.push(pid);
+      gone.push((await connectToDaemon(file.replace(/\.pid$/, '.sock'))).gone);
       for (const signal of ['SIGCONT', 'SIGKILL'] as const) {
         try {
           process.kill(pid, signal);
@@ -145,7 +162,7 @@ export async function killDaemonsIn(...homes: Array<string | undefined>): Promis
       }
     }
   }
-  for (const pid of pids) await poll(() => isAlive(pid), (alive) => !alive, 5_000);
+  await Promise.all(gone);
 }
 
 // The folders a launch's daemons live in: its COCKPIT_HOME, or, when that is unset or empty, the
@@ -184,8 +201,10 @@ export async function attach(endpoint: string): Promise<{ browser: Browser; page
   // The window's target starts as `about:blank` while its first navigation to the
   // app is pending: a reload racing that navigation waits for a load that never
   // comes. Wait until the page is on the app's URL and loaded.
-  await page.waitForURL((url) => url.protocol !== 'about:', { timeout: 30_000 });
+  await page.waitForURL((url) => url.protocol !== 'about:');
   await page.reload();
+  // The one action timeout of the tests: no call passes its own.
+  context.setDefaultTimeout(UI_TIMEOUT);
   return { browser, page };
 }
 
@@ -208,32 +227,162 @@ export function groupAlive(pid: number): boolean {
   }
 }
 
-// Waits until no process of the group `pid` is alive: the helpers of a child can
-// outlive it and still write in the data folder. The group gets SIGKILL 10 s after
-// `started` if anything is left, and an error names it after 20 s.
-export async function waitForGroupGone(pid: number, started = Date.now()): Promise<void> {
-  const killer = setTimeout(() => signalGroup(pid, 'SIGKILL'), Math.max(0, 10_000 - (Date.now() - started)));
-  try {
-    while (groupAlive(pid)) {
-      if (Date.now() - started > 20_000) throw new Error(`the process group ${pid} is still alive after 20 s`);
-      await sleep(100);
-    }
-  } finally {
-    clearTimeout(killer);
-  }
+// The `close` of each child a launch started, by pid: it fires once the child has ended and every
+// process holding its stdio has too, which for the app and the dev server is its whole process group
+// (the helpers inherit the pipes). `waitForGroupGone` has no event for a pid launched elsewhere.
+const closedByPid = new Map<number, Promise<void>>();
+
+function closedPromise(child: ChildProcess): Promise<void> {
+  const ended = child.exitCode !== null || child.signalCode !== null;
+  if (ended && [child.stdin, child.stdout, child.stderr].every((stream) => !stream || stream.destroyed)) return Promise.resolve();
+  return new Promise((resolve) => child.once('close', () => resolve()));
 }
 
-// Stops a process started with `detached: true` and everything in its process
-// group, and waits until no process of the group is alive.
+function track(child: ChildProcess): void {
+  closedByPid.set(child.pid!, closedPromise(child));
+}
+
+// Waits until the group of a child that a launch started is gone: the helpers of a child can outlive
+// it and still write in the data folder. Returns at once for a pid no launch started.
+export async function waitForGroupGone(pid: number): Promise<void> {
+  await closedByPid.get(pid);
+}
+
+// Stops a process started with `detached: true` and everything in its process group, and waits
+// until the group is gone: SIGKILL to the group, then the child's `close` (every process holding its
+// stdio has ended). Not SIGTERM first: an app with no window does not quit on it, and without a timer
+// there is no moment to give up on it and escalate.
 export async function stopGroup(child: ChildProcess): Promise<void> {
   const pid = child.pid!;
-  const started = Date.now();
-  const exited =
-    child.exitCode !== null || child.signalCode !== null
-      ? Promise.resolve()
-      : new Promise((resolve) => child.once('exit', resolve));
-  signalGroup(pid, 'SIGTERM');
-  await Promise.all([exited, waitForGroupGone(pid, started)]);
+  const closed = closedByPid.get(pid) ?? closedPromise(child);
+  signalGroup(pid, 'SIGKILL');
+  await closed;
+}
+
+// A FIFO in a folder of the run: a line written to it is an event the test awaits. Opened for
+// reading and writing at once, so a writer never blocks on a missing reader and no line is lost.
+function makeFifo(): string {
+  const path = join(makeTestDir('f-'), 'p');
+  execFileSync('mkfifo', [path]);
+  return path;
+}
+
+/** A FIFO at `path`; `line()` resolves with the first line a process writes to it. */
+export function fifo(): { path: string; line(): Promise<string> } {
+  const path = makeFifo();
+  const reader = new Socket({ fd: openSync(path, constants.O_RDWR), readable: true, writable: false });
+  reader.unref();
+  const first = new Promise<string>((resolve, reject) => {
+    let text = '';
+    reader.on('error', reject);
+    reader.on('data', (chunk) => {
+      text += chunk;
+      const end = text.indexOf('\n');
+      if (end < 0) return;
+      reader.destroy();
+      resolve(text.slice(0, end));
+    });
+  });
+  return { path, line: () => first };
+}
+
+/**
+ * A process the test holds: `snippet` is shell text that blocks until `release()` writes to its FIFO,
+ * then ends with status 0. For a stub or a `sh -c`, instead of a `sleep` or a wait on a file.
+ */
+export function heldProcess(): { snippet: string; release(): Promise<void> } {
+  const path = makeFifo();
+  return { snippet: `read _ < '${path}'`, release: () => writeFile(path, 'go\n') };
+}
+
+/**
+ * Tells when a process, and every process it passed the descriptor to, is gone: `snippet` is shell
+ * text that makes the running shell hold the write end of a FIFO on descriptor 9, which its children
+ * inherit; `gone` resolves once no process holds it any more (the read end's end of file).
+ */
+export function gonePipe(): { snippet: string; gone: Promise<void> } {
+  const path = makeFifo();
+  const gone = new Promise<void>((resolve, reject) => {
+    // The open returns once the first writer has opened the FIFO, so no end of file comes before it.
+    // The read blocks a thread of libuv's pool until a byte or the end of file: kqueue does not report
+    // a FIFO's end of file on macOS, so a stream over the descriptor would never end.
+    open(path, constants.O_RDONLY, (error, fd) => {
+      if (error) return reject(error);
+      const next = () =>
+        read(fd, Buffer.alloc(1), 0, 1, null, (failure, bytes) => {
+          if (failure) reject(failure);
+          else if (bytes > 0) next();
+          else close(fd, () => resolve());
+        });
+      next();
+    });
+  });
+  return { snippet: `exec 9> '${path}'`, gone };
+}
+
+/**
+ * Resolves once `predicate(arg)` holds in the page, checked at once and after each DOM mutation
+ * (a `MutationObserver`), for a condition no locator state expresses. `predicate` must be
+ * self-contained: it runs in the page, from its source text.
+ */
+export async function untilDom<A>(page: Page, predicate: (arg: A) => boolean, arg?: A): Promise<void> {
+  await page.evaluate(`new Promise((resolve, reject) => {
+    const predicate = ${predicate.toString()};
+    const arg = ${JSON.stringify(arg)};
+    const check = () => {
+      try {
+        if (!predicate(arg)) return;
+      } catch (error) {
+        observer.disconnect();
+        reject(error);
+        return;
+      }
+      observer.disconnect();
+      resolve();
+    };
+    const observer = new MutationObserver(check);
+    observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+    check();
+  })`);
+}
+
+// What a spawned app (or dev server) writes to stdout and stderr, and the lines tests wait for in it.
+interface OutputWatch {
+  output(): string;
+  /** Resolves with the match once the output holds `pattern`; rejects if the process exits first. */
+  match(pattern: RegExp): Promise<RegExpExecArray>;
+}
+
+function watchOutput(child: ChildProcess, label: string): OutputWatch {
+  let output = '';
+  let exit: Error | undefined;
+  const waiting = new Set<{ pattern: RegExp; resolve(match: RegExpExecArray): void; reject(error: Error): void }>();
+  const feed = (chunk: Buffer | string) => {
+    output += chunk;
+    for (const each of waiting) {
+      const found = each.pattern.exec(output);
+      if (!found) continue;
+      waiting.delete(each);
+      each.resolve(found);
+    }
+  };
+  child.stdout!.on('data', feed);
+  child.stderr!.on('data', feed);
+  child.once('exit', (code, signal) => {
+    exit = new Error(`${label} exited with code ${code ?? signal}:\n${output}`);
+    for (const each of waiting) each.reject(exit);
+    waiting.clear();
+  });
+  return {
+    output: () => output,
+    match: (pattern) =>
+      new Promise((resolve, reject) => {
+        const found = pattern.exec(output);
+        if (found) resolve(found);
+        else if (exit) reject(exit);
+        else waiting.add({ pattern, resolve, reject });
+      }),
+  };
 }
 
 // Connects to the main process's Node inspector (`--inspect=0` prints
@@ -241,15 +390,14 @@ export async function stopGroup(child: ChildProcess): Promise<void> {
 // evaluates expressions in it. The connection opens on the first evaluation.
 // `Runtime.evaluate` with `includeCommandLineAPI` exposes `require`, which is
 // what `electronApp.evaluate` of Playwright's Electron launcher does too.
-export function mainInspector(output: () => string) {
+export function mainInspector(watch: OutputWatch) {
   let socket: Promise<WebSocket> | undefined;
   let lastId = 0;
   const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();
 
   const connect = async () => {
-    const url = await poll(() => /Debugger listening on (ws:\/\/\S+)/.exec(output())?.[1], Boolean, 15_000);
-    if (!url) throw new Error(`the app did not open an inspector:\n${output()}`);
-    const ws = new WebSocket(url);
+    const [, url] = await watch.match(/Debugger listening on (ws:\/\/\S+)/);
+    const ws = new WebSocket(url!);
     await new Promise<void>((resolve, reject) => {
       ws.addEventListener('open', () => resolve(), { once: true });
       ws.addEventListener('error', () => reject(new Error(`cannot connect to the inspector at ${url}`)), { once: true });
@@ -312,29 +460,22 @@ export async function launchSpawned(
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  let output = '';
-  child.stdout.on('data', (chunk) => (output += chunk));
-  child.stderr.on('data', (chunk) => (output += chunk));
+  track(child);
+  const watch = watchOutput(child, 'the app');
   const removeDataDir = () => {
     if (!givenDataDir) rmSync(dataDir, { recursive: true, force: true });
   };
 
   try {
-    const deadline = Date.now() + 30_000;
-    let port: string | undefined;
-    while (!(port = /DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)/.exec(output)?.[1])) {
-      if (child.exitCode !== null) throw new Error(`the app exited with code ${child.exitCode}:\n${output}`);
-      if (Date.now() > deadline) throw new Error(`the app did not open a debugging port:\n${output}`);
-      await sleep(50);
-    }
+    const [, port] = await watch.match(/DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)/);
     const { browser, page } = await attach(`http://127.0.0.1:${port}`);
-    const inspector = mainInspector(() => output);
+    const inspector = mainInspector(watch);
     return {
       page,
       pid: child.pid!,
       dataDir,
       cockpitHome,
-      output: () => output,
+      output: watch.output,
       evaluateInMain: inspector.evaluate,
       disconnectInspector: inspector.close,
       isRunning: () => child.exitCode === null,
@@ -406,31 +547,25 @@ export async function launchDev(
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  let output = '';
-  dev.stdout.on('data', (chunk) => (output += chunk));
-  dev.stderr.on('data', (chunk) => (output += chunk));
+  track(dev);
+  const watch = watchOutput(dev, 'dev');
   const stop = () => stopGroup(dev);
   const removeDataDir = () => rmSync(dataDir, { recursive: true, force: true });
 
   try {
-    const endpoint = `http://127.0.0.1:${port}`;
-    const deadline = Date.now() + 90_000;
-    while (!(await fetch(`${endpoint}/json/version`).then((r) => r.ok, () => false))) {
-      if (dev.exitCode !== null) throw new Error(`dev exited with code ${dev.exitCode}:\n${output}`);
-      if (Date.now() > deadline) throw new Error(`dev did not open a window:\n${output}`);
-      await sleep(250);
-    }
-    const { browser, page } = await attach(endpoint);
+    await watch.match(new RegExp(`DevTools listening on ws://127\\.0\\.0\\.1:${port}`));
+    const { browser, page } = await attach(`http://127.0.0.1:${port}`);
     // The dev script runs Electron in the process group of `dev`; the helpers
     // are named `Electron Helper ...`, so `-x` matches the main process only.
     const pid = Number(execFileSync('pgrep', ['-g', String(dev.pid), '-x', 'Electron'], { encoding: 'utf8' }).split('\n')[0]);
-    const inspector = mainInspector(() => output);
+    closedByPid.set(pid, closedByPid.get(dev.pid!)!);
+    const inspector = mainInspector(watch);
     return {
       page,
       pid,
       dataDir,
       cockpitHome,
-      output: () => output,
+      output: watch.output,
       evaluateInMain: inspector.evaluate,
       disconnectInspector: inspector.close,
       isRunning: () => dev.exitCode === null,
