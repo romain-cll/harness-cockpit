@@ -50,18 +50,7 @@ const BASELINE: Baseline = {
 };
 
 /** The `// legitimate poll: <reason>` lines the test files may hold: a re-check loop whose source cannot notify. */
-const ALLOWED: AllowedLine[] = [
-  {
-    file: 'apps/desktop/test/app.test.ts',
-    line: 'await sleep(100); // legitimate poll: Launch Services registers a launched app at no event we can listen to',
-    reason: 'Launch Services registers a launched app at no event we can listen to',
-  },
-  {
-    file: 'apps/desktop/test/app.test.ts',
-    line: 'await sleep(100); // legitimate poll: the frontmost app is sampled, no notification is proven for it',
-    reason: 'the frontmost app is sampled, no notification is proven for it',
-  },
-];
+const ALLOWED: AllowedLine[] = [];
 
 const repoRoot = join(import.meta.dirname, '..', '..', '..', '..');
 const SELF = join(import.meta.dirname, 'sleeps-ratchet.test.ts');

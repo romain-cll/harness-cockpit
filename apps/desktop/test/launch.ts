@@ -270,8 +270,8 @@ function makeFifo(): string {
   return path;
 }
 
-/** A FIFO at `path`; `line()` resolves with the first line a process writes to it. */
-export function fifo(): { path: string; line(): Promise<string> } {
+/** A FIFO at `path`; `line()` resolves with the first line a process writes to it, `close()` closes its reader (a line that never came). */
+export function fifo(): { path: string; line(): Promise<string>; close(): void } {
   const path = makeFifo();
   const reader = new Socket({ fd: openSync(path, constants.O_RDWR), readable: true, writable: false });
   reader.unref();
@@ -286,7 +286,7 @@ export function fifo(): { path: string; line(): Promise<string> } {
       resolve(text.slice(0, end));
     });
   });
-  return { path, line: () => first };
+  return { path, line: () => first, close: () => reader.destroy() };
 }
 
 /**

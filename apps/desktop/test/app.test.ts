@@ -8,11 +8,10 @@ import { request as httpRequest } from 'node:http';
 import { Socket } from 'node:net';
 import { homedir, userInfo } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
-import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { statusLaunch } from '@cockpit/harnesses';
-import { type ElementHandle, type Page } from 'playwright-core';
+import { type ElementHandle, type Frame, type Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 import {
   MAIN_PROCESS_ERROR,
@@ -97,39 +96,105 @@ async function lsappinfo(...args: string[]): Promise<string> {
   return run('lsappinfo', args).then(({ stdout }) => stdout.trim(), () => '');
 }
 
-// Reports `ApplicationType` `UIElement` for an app without a Dock icon and
-// `Foreground` for a regular one. A launched app is not registered with Launch Services right away, and
-// `lsappinfo` has no notification for a registration that is not an activation.
+// Resolves once `path` exists.
+function untilExists(path: string): Promise<void> {
+  return new Promise((resolve) => {
+    const check = () => {
+      if (!existsSync(path)) return;
+      watcher.close();
+      resolve();
+    };
+    const watcher = watch(dirname(path), check);
+    check();
+  });
+}
+
+// `lsappinfo listen +<code>…` prints one `Notification:` line per Launch Services event while its `wait` runs. The
+// commands run in order, so the file `createFile` makes says the listener is registered (an event after it is
+// printed), and `wait -gone` ends it when `stop()` removes the file it waits on. Checked on a CI runner
+// (COCKPIT-81): `appCreation` carries `"ApplicationType"` and `"pid"` of an app spawned directly, `becameFrontmost`
+// the `LSASN` of the app.
+function listenLaunchServices(codes: string[], onLine: (line: string) => void = () => {}) {
+  const folder = makeTestDir('l-');
+  const registered = join(folder, 'registered');
+  const alive = join(folder, 'alive');
+  writeFileSync(alive, '');
+  const child = spawn('lsappinfo', ['listen', ...codes.map((code) => `+${code}`), 'createFile', registered, 'wait', '-gone', alive], { stdio: ['ignore', 'pipe', 'ignore'] });
+  const closed = once(child, 'close');
+  const lines: string[] = [];
+  const waiting: Array<() => void> = [];
+  let partial = '';
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk: string) => {
+    const parts = (partial + chunk).split('\n');
+    partial = parts.pop()!;
+    for (const line of parts.filter((each) => each.startsWith('Notification:'))) {
+      lines.push(line);
+      onLine(line);
+    }
+    for (const wake of waiting.splice(0)) wake();
+  });
+  return {
+    registered: Promise.race([untilExists(registered), closed.then(() => Promise.reject(new Error('lsappinfo listen ended before it listened')))]),
+    // The first notification, already printed or to come, that `matches`.
+    async next(matches: (line: string) => boolean): Promise<string> {
+      for (let seen = 0; ; ) {
+        const found = lines.slice(seen).find(matches);
+        if (found) return found;
+        seen = lines.length;
+        await new Promise<void>((resolve) => waiting.push(resolve));
+      }
+    },
+    async stop() {
+      rmSync(alive, { force: true });
+      await closed;
+    },
+  };
+}
+
+// Reports `ApplicationType` `UIElement` for an app without a Dock icon and `Foreground` for a regular one. A
+// launched app is not registered with Launch Services right away: the listener is up first, then one query, then
+// the `appCreation` of the app (its payload holds the type) when the query had nothing yet.
 async function applicationType(pid: number): Promise<string> {
-  // The re-check loop has no deadline: a registration that never comes is the test's own guard.
-  for (;;) {
+  const listener = listenLaunchServices(['appCreation']);
+  try {
+    await listener.registered;
     const answer = await lsappinfo('info', '-only', 'ApplicationType', String(pid));
     if (/ApplicationType"="/.test(answer)) return answer;
-    await sleep(100); // legitimate poll: Launch Services registers a launched app at no event we can listen to
+    const created = await listener.next((line) => new RegExp(`"pid"=${pid}\\b`).test(line));
+    return /"ApplicationType"="[^"]*"/.exec(created)![0];
+  } finally {
+    await listener.stop();
   }
 }
 
-// Samples the frontmost app every 100 ms and collects its pid. Started before
-// the launch, so an activation at startup is seen too. `lsappinfo listen +becameFrontmost` is the event
-// source; its output format is not proven on a machine whose screen the test must not take (COCKPIT-81
-// part 1, task 8), so the sampling stays.
-function watchFrontmost() {
+// Collects the pids of the apps that became the frontmost one. Started (and `await`ed) before the launch, so an
+// activation at startup is seen too. The notification names the app by its ASN: its pid is asked once per
+// notification, and `activated` waits for those answers.
+async function watchFrontmost() {
   const pids = new Set<number>();
-  let stopped = false;
-  const sampling = (async () => {
-    while (!stopped) {
-      const front = await lsappinfo('front');
-      const pid = /"pid"=(\d+)/.exec(front && (await lsappinfo('info', '-only', 'pid', front)))?.[1];
-      if (pid) pids.add(Number(pid));
-      await sleep(100); // legitimate poll: the frontmost app is sampled, no notification is proven for it
-    }
-  })();
+  const asked: Array<Promise<void>> = [];
+  const listener = listenLaunchServices(['becameFrontmost'], (line) => {
+    const asn = /"LSASN"=(ASN:[0-9a-fx-]+:)/.exec(line)?.[1];
+    if (!asn) return;
+    asked.push(
+      lsappinfo('info', '-only', 'pid', asn).then((answer) => {
+        const pid = /"pid"=(\d+)/.exec(answer)?.[1];
+        if (pid) pids.add(Number(pid));
+      }),
+    );
+  });
+  await listener.registered;
   return {
-    pids,
-    stop: async () => {
-      stopped = true;
-      await sampling;
+    // Whether the app of `pid` became the frontmost one since the watch began.
+    activated: async (pid: number) => {
+      for (let seen = 0; seen < asked.length; ) {
+        seen = asked.length;
+        await Promise.all(asked);
+      }
+      return pids.has(pid);
     },
+    stop: () => listener.stop(),
   };
 }
 
@@ -273,32 +338,86 @@ const allPageErrorsOf = (page: Page) => page.pageErrors({ filter: 'all' });
 // `read` and `done` must be self-contained, and `read` synchronous.
 const truthy = (value: unknown) => Boolean(value);
 
-// The script both run: `call` reads the value, `root` is what the observer watches.
-const untilScript = (read: object, done: object, arg: unknown, call: string, root: string, uses: Record<string, object> = {}) => `new Promise((resolve, reject) => {
+// A criterion's time bound ("within 5 s") stays a check, as a measure: the test waits for the event with no
+// timeout of its own, and `within` then fails when more than `boundMs` passed since `startClock()` ran, which is
+// at the action the criterion starts its clock from.
+const startClock = () => {
+  const start = performance.now();
+  return (what: string, boundMs: number) => expect(performance.now() - start, `${what} took longer than ${boundMs} ms`).toBeLessThan(boundMs);
+};
+
+// The script both run: `call` reads the value, `root` is what the observer watches. It reads again on DOM
+// mutations and on what changes geometry or style with none: a transition or animation ending, a resize of the
+// window or of the root. `id` names its last read in the page (`__waitLast`) for `pendingWaits`.
+const untilScript = (read: object, done: object, arg: unknown, call: string, root: string, id: string, uses: Record<string, object> = {}) => `new Promise((resolve, reject) => {
     ${Object.entries(uses).map(([name, each]) => `const ${name} = ${each.toString()};`).join('\n    ')}
     const read = ${read.toString()};
     const done = ${done.toString()};
     const arg = ${JSON.stringify(arg)};
+    const events = ['transitionend', 'transitioncancel', 'animationend'];
+    const stop = () => {
+      observer.disconnect();
+      resize.disconnect();
+      for (const name of events) document.removeEventListener(name, check, true);
+      window.removeEventListener('resize', check);
+      delete window.__waitLast?.[${JSON.stringify(id)}];
+    };
     const check = () => {
       let value;
       try {
         value = ${call};
+        (window.__waitLast ??= {})[${JSON.stringify(id)}] = String(JSON.stringify(value)).slice(0, 2000);
         if (!done(value, arg)) return;
       } catch (error) {
-        observer.disconnect();
+        stop();
         reject(error);
         return;
       }
-      observer.disconnect();
+      stop();
       resolve(value);
     };
     const observer = new MutationObserver(check);
+    const resize = new ResizeObserver(check);
     observer.observe(${root}, { subtree: true, childList: true, attributes: true, characterData: true });
+    resize.observe(${root} === document ? document.documentElement : ${root});
+    for (const name of events) document.addEventListener(name, check, true);
+    window.addEventListener('resize', check);
     check();
   })`;
 
+// The waits running in a page, for the diagnostic below: a wait that never ends is ended by the test's own guard
+// and says nothing, so the page keeps the last value each one read.
+type PendingWait = { frame: Frame; id: string; label: string };
+const pendingWaits = new Set<PendingWait>();
+
+async function evaluateUntil<R>(frame: Frame, read: object, arg: unknown, script: (id: string) => string): Promise<R> {
+  const label = `${read.toString().replace(/\s+/g, ' ').slice(0, 100)} waiting for ${JSON.stringify(arg)?.slice(0, 200)}`;
+  const pending: PendingWait = { frame, id: randomUUID(), label };
+  pendingWaits.add(pending);
+  try {
+    return (await frame.evaluate(script(pending.id))) as R;
+  } finally {
+    pendingWaits.delete(pending);
+  }
+}
+
+// A test the guard ended while a wait ran names what that wait last read, in the test's error.
+afterEach(async ({ task }) => {
+  const waiting = [...pendingWaits];
+  pendingWaits.clear();
+  const error = task.result?.errors?.[0];
+  if (task.result?.state !== 'fail' || !error || waiting.length === 0) return;
+  const lines = await Promise.all(
+    waiting.map(async ({ frame, id, label }) => {
+      const last = await frame.evaluate((id) => (window as unknown as { __waitLast?: Record<string, string> }).__waitLast?.[id], id).catch(() => '(the page is gone)');
+      return `  ${label}\n    last read: ${last}`;
+    }),
+  );
+  error.message += `\nWaits still running when the test ended:\n${lines.join('\n')}`;
+});
+
 async function untilRead<A, R>(page: Page, read: (arg: A) => R, done: (value: R, arg: A) => boolean, arg?: A): Promise<R> {
-  return (await page.evaluate(untilScript(read, done, arg, 'read(arg)', 'document'))) as R;
+  return evaluateUntil<R>(page.mainFrame(), read, arg, (id) => untilScript(read, done, arg, 'read(arg)', 'document', id));
 }
 
 // The script finds the element by a mark it carries meanwhile: a string handed to a handle's `evaluate` is an
@@ -308,9 +427,12 @@ async function untilIn<A, R>(element: ElementHandle<HTMLElement>, read: (element
   const frame = (await element.ownerFrame())!;
   await element.evaluate((target, mark) => target.setAttribute('data-waiting', mark), mark);
   try {
-    return (await frame.evaluate(
-      `(() => { const element = document.querySelector('[data-waiting="${mark}"]'); return ${untilScript(read, done, arg, 'read(element, arg)', 'element')}; })()`,
-    )) as R;
+    return await evaluateUntil<R>(
+      frame,
+      read,
+      arg,
+      (id) => `(() => { const element = document.querySelector('[data-waiting="${mark}"]'); return ${untilScript(read, done, arg, 'read(element, arg)', 'element', id)}; })()`,
+    );
   } finally {
     await element.evaluate((target) => target.removeAttribute('data-waiting')).catch(() => {});
   }
@@ -930,6 +1052,12 @@ const afterIpcAnswers = (page: Page) =>
     await (window as unknown as PtyWindow).api.pty.list();
   });
 
+// The invoke handlers of the main process, by channel, for a script run there. `_invokeHandlers` is a private API
+// of Electron's `ipcMain` (a `Map`), the only way to call a handler as another sender or to wrap one: the same
+// one `daemon.test.ts` and `workspace-panes.test.ts` use, so an Electron update that renames it breaks all three,
+// and this constant is the place of this file to change.
+const INVOKE_HANDLERS = "require('electron').ipcMain._invokeHandlers";
+
 // Counts, in the main process, the calls of the invoke handlers of `channels` (from the first call of this on):
 // the lowest level that tells whether an action reached the main process, for a "nothing happened" check.
 // The renderer's IPC messages reach the main process in order, so a later answer (`afterIpcAnswers`, or
@@ -937,7 +1065,7 @@ const afterIpcAnswers = (page: Page) =>
 // and `ipcAnswered` is the answer of the handler itself.
 const countIpcCalls = (session: Session, channels: string[]) =>
   session.evaluateInMain(`(() => {
-    const handlers = require('electron').ipcMain._invokeHandlers;
+    const handlers = ${INVOKE_HANDLERS};
     const calls = (globalThis.__ipcCalls ??= {});
     const watchers = (globalThis.__ipcWatchers ??= []);
     for (const channel of ${JSON.stringify(channels)}) {
@@ -1219,7 +1347,7 @@ function holdWaiter(repo: TempRepo, marker: string, { watchGone = false } = {}) 
   const held = heldProcess();
   const ended = watchGone ? gonePipe() : undefined;
   writeFileSync(join(repo.root, `${marker}.sh`), `${ended?.snippet ?? ''}\necho $$ > '${up.path}'\n${held.snippet}\n`);
-  return { pid: async () => Number(await up.line()), gone: ended?.gone, release: held.release };
+  return { pid: async () => Number(await up.line()), gone: ended?.gone, release: held.release, close: up.close };
 }
 
 // COCKPIT-57: the label a workspace's own row shows while its setup runs (`Setting up`, muted) or
@@ -1307,7 +1435,7 @@ describe.each([
   ['packaged app with the launchd environment', launchLaunchd],
 ])('%s', (mode, launch) => {
   let session: Session;
-  let front: ReturnType<typeof watchFrontmost>;
+  let front: Awaited<ReturnType<typeof watchFrontmost>>;
   // The terminal tests run the shell the tests chose (`SHELL=/bin/sh`). The
   // launchd-environment mode runs the developer's real shell and its
   // configuration, so it only gets the PATH check (terminal AC12).
@@ -1318,7 +1446,7 @@ describe.each([
   const full = mode === 'built app';
 
   beforeAll(async () => {
-    front = watchFrontmost();
+    front = await watchFrontmost();
     session = await launch();
   });
 
@@ -1381,7 +1509,7 @@ describe.each([
     // No Dock icon (`UIElement`) and never the frontmost app, whichever app the
     // user brings to the front meanwhile.
     expect(await applicationType(session.pid)).toContain('"UIElement"');
-    expect(front.pids.has(session.pid)).toBe(false);
+    expect(await front.activated(session.pid)).toBe(false);
   });
 
   test('runs while hidden', async () => {
@@ -1940,7 +2068,7 @@ describe.each([
       const path = worktreePath(session, clone, loginBranch);
       const file = { path: 'README.md', status: 'modified', additions: 0, deletions: 0 };
       const origins = await session.evaluateInMain<Record<string, string>>(`(async () => {
-        const handlers = require('electron').ipcMain._invokeHandlers;
+        const handlers = ${INVOKE_HANDLERS};
         const calls = {
           'workspaces:branches': [${JSON.stringify(clone.root)}],
           'workspaces:create': [${JSON.stringify(clone.root)}, 'from-elsewhere', 'main'],
@@ -2653,7 +2781,7 @@ describe.each([
       const { page } = session;
       writeConfig(repo, { setup: ['sh "$COCKPIT_ROOT_PATH/waitfor.sh" never-18'], teardown: ['sh "$COCKPIT_ROOT_PATH/waitfor.sh" never-18'] });
       // If a run did start the script, it would block and show.
-      holdWaiter(repo, 'never-18');
+      const waiter = holdWaiter(repo, 'never-18');
       const elsewhere = join(repo.parent, 'not-a-worktree');
       mkdirSync(elsewhere);
 
@@ -2674,6 +2802,8 @@ describe.each([
       // The daemon answers in order: once it ran a probe shell it has handled any spawn the calls would have sent.
       await ptyHostPid(page);
       expect(waiters(repo, 'never-18')).toEqual([]);
+      // No run reported its pid: the reader of that FIFO is closed here, not at the end of the worker.
+      waiter.close();
     });
   });
 
@@ -2705,7 +2835,7 @@ describe.each([
         expect([...new Set(await frontCalls(session))].sort()).toEqual(FRONT_CALLS);
         expect(stateSnapshot(session.dataDir)).toEqual(before);
         expect(session.isRunning()).toBe(true);
-        expect(front.pids.has(session.pid)).toBe(false);
+        expect(await front.activated(session.pid)).toBe(false);
       },
       120_000,
     );
@@ -2784,7 +2914,7 @@ describe.each([
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
     expect(session.isRunning()).toBe(true);
     // Still never the frontmost app, after every check above.
-    expect(front.pids.has(session.pid)).toBe(false);
+    expect(await front.activated(session.pid)).toBe(false);
   });
 
   // A navigation away from the app, scripted from the page (a real Finder drop
@@ -3384,8 +3514,14 @@ interface SessionsFixture {
   bin: string;
   /** The fake login shell. */
   shell: string;
-  /** Lets the `--version` runs the fixture's `slowVersion` holds go on: one line to the FIFO of each stub. */
-  releaseVersions(): Promise<void>;
+  /**
+   * Lets the `--version` runs the fixture's `slowVersion` holds go on: one line to the FIFO of each stub. The
+   * fixture holds each FIFO open for reading and writing, so the line is written at once whether a stub is
+   * reading, has not opened it yet or was killed by the detection's own guard: no write waits for a reader.
+   */
+  releaseVersions(): void;
+  /** Closes the FIFOs `releaseVersions` writes to. */
+  endVersionHolds(): void;
   /** The file the fake login shell appends its arguments to on every run (but its warm-up). */
   shellLog: string;
   /** The environment to launch the app with. */
@@ -3451,15 +3587,25 @@ function makeSessionsFixture(
   const printed = execFileSync(shell, ['-ilc', 'printf %s "$PATH"'], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
   expect(printed).toBe(`${bin}:/usr/bin:/bin`);
   if (log) writeFileSync(runLog, '');
-  if (slowVersion) for (const name of binaries) execFileSync('mkfifo', [join(bin, `${name}.slow`)]);
+  const holds: number[] = [];
+  if (slowVersion) {
+    for (const name of binaries) {
+      const slow = join(bin, `${name}.slow`);
+      execFileSync('mkfifo', [slow]);
+      holds.push(openSync(slow, constants.O_RDWR));
+    }
+  }
   // Its own checks above ran the shell: only what the app makes it run is counted.
   writeFileSync(shellLog, '');
 
-  const releaseVersions = async () => {
-    await Promise.all(binaries.map((name) => writeFile(join(bin, `${name}.slow`), 'go\n')));
+  const releaseVersions = () => {
+    for (const fd of holds) writeSync(fd, 'go\n');
+  };
+  const endVersionHolds = () => {
+    for (const fd of holds.splice(0)) closeSync(fd);
   };
 
-  return { root, bin, shell, shellLog, env: () => ({ ...process.env, SHELL: shell }), runLog, gitLog: gitLogFile, releaseVersions };
+  return { root, bin, shell, shellLog, env: () => ({ ...process.env, SHELL: shell }), runLog, gitLog: gitLogFile, releaseVersions, endVersionHolds };
 }
 
 const launchBuiltWith = (env: NodeJS.ProcessEnv, dataDir?: string | null, cockpitHome?: string | null) =>
@@ -3678,12 +3824,17 @@ const dotTarget = async (page: Page, id: string) => {
 };
 
 // Waits until the row of session `id` shows the dot `label`, `null` being no dot at all, and checks that the
-// dot's `title` says the same. With `wait` false it reads the row once (a session that must show no dot).
-async function expectDot(page: Page, id: string, label: string | null, wait = true) {
+// dot's `title` says the same. The dot shows within `bound` ms of the call, 2 s as "within 2 s of each report"
+// says (`null`: no bound, for a page that loads first). With `'now'` it reads the row once (a session that must
+// show no dot).
+async function expectDot(page: Page, id: string, label: string | null, bound: number | null | 'now' = 2_000) {
+  const within = startClock();
   const target = { ...(await dotTarget(page, id)), label };
-  const dot = wait
-    ? await untilRead(page, readDot, (found, arg: typeof target) => (found?.label ?? null) === arg.label, target)
-    : await page.evaluate(readDot, target);
+  const dot =
+    bound === 'now'
+      ? await page.evaluate(readDot, target)
+      : await untilRead(page, readDot, (found, arg: typeof target) => (found?.label ?? null) === arg.label, target);
+  if (typeof bound === 'number') within(`the dot of session ${id}`, bound);
   expect(dot?.label ?? null, `the dot of session ${id}`).toBe(label);
   if (label !== null) expect(dot?.title).toBe(label);
 }
@@ -4097,7 +4248,10 @@ describe('sessions: built app', () => {
   afterAll(async () => {
     await session?.close();
     await foreign?.stop();
-    if (fx) rmSync(fx.root, { recursive: true, force: true });
+    if (fx) {
+      fx.endVersionHolds();
+      rmSync(fx.root, { recursive: true, force: true });
+    }
     if (repo) rmSync(repo.parent, { recursive: true, force: true });
   });
 
@@ -4122,7 +4276,7 @@ describe('sessions: built app', () => {
     const { page } = session;
     await addRepository(session, repo);
     await openComposer(page, repo.root);
-    await fx.releaseVersions();
+    fx.releaseVersions();
     await waitForAgent(page, 'Claude Code');
 
     expect(versionRuns(fx)).toEqual(['claude --version', 'codex --version']);
@@ -4155,7 +4309,7 @@ describe('sessions: built app', () => {
 
     // The end of AC13: the agent menu lists the harnesses once detection has ended.
     await promptBox(page).waitFor();
-    await fx.releaseVersions();
+    fx.releaseVersions();
     await waitForAgent(page, 'Claude Code');
     const menu = await openPopup(page, agentSelect(page));
     expect(await itemTexts(menu)).toEqual(['Claude Code 9.9.9', 'Codex 9.9.9', 'Terminal', 'Detect again']);
@@ -4967,7 +5121,7 @@ describe('sessions: built app', () => {
 
     // From another origin the handlers reject.
     const origins = await session.evaluateInMain<Record<string, string>>(`(async () => {
-      const handlers = require('electron').ipcMain._invokeHandlers;
+      const handlers = ${INVOKE_HANDLERS};
       const calls = {
         'workspaces:apps': [],
         'workspaces:reveal': [${JSON.stringify(repo.root)}, ${JSON.stringify(launcher.path)}],
@@ -5239,7 +5393,7 @@ describe('sessions: built app', () => {
       // AC6: a reload shows the same dot.
       await page.reload();
       await page.getByText(versionLabel).waitFor();
-      await expectDot(page, id, 'Exited 3');
+      await expectDot(page, id, 'Exited 3', null);
       await waitForRow(page, '[Claude Code exited with code 3]');
 
       // The shell the agent left exits: the dot stays.
@@ -5340,8 +5494,11 @@ describe('sessions: built app', () => {
         await dialog.waitFor({ state: 'hidden' });
         await waitForEntries(page, [repo.root]);
 
-        // The CLI's exit is the terminal's; the agent and what it started are gone when the pipe has no holder left.
+        // The CLI's exit is the terminal's; the agent and what it started are gone when the pipe has no holder left,
+        // within 5 s of the workspace leaving the sidebar.
+        const within = startClock();
         await Promise.all([waitForExit(page, terminal), pipe.gone]);
+        within('the CLI and the agent were gone', 5_000);
         expect(stillRunning(tree).join(' | '), `the CLI ${cli} and everything under it`).toBe('');
       } finally {
         rmSync(join(fx.bin, 'claude.early'), { force: true });
@@ -5385,7 +5542,9 @@ describe('sessions: built app', () => {
           await removeThroughMenu(page, repo.root);
           await waitForEntries(page, []);
 
+          const within = startClock();
           await Promise.all([waitForExit(page, terminal), pipe.gone]);
+          within('the CLI and the login shell were gone', 5_000);
           expect(stillRunning(tree).join(' | '), `the CLI ${cli} and the login shell ${shellPid}`).toBe('');
         } finally {
           await addRepository(session, repo);
@@ -5466,16 +5625,17 @@ const untilPanel = <A, R>(
   arg: A,
   { closed = null, uses = {} }: { closed?: unknown; uses?: Record<string, object> } = {},
 ): Promise<R> =>
-  page.evaluate(
+  evaluateUntil<R>(page.mainFrame(), read, arg, (id) =>
     untilScript(
       read,
       done,
       arg,
       `((panel) => (panel && panel.getBoundingClientRect().width > 100 ? read(panel, arg) : ${JSON.stringify(closed)}))(document.querySelector(${JSON.stringify(PANEL)}))`,
       'document',
+      id,
       uses,
     ),
-  ) as Promise<R>;
+  );
 
 // Runs `read` in the page on the bar, `null` when it is not there.
 async function panelEval<T, A>(page: Page, read: (panel: HTMLElement, arg: A) => T, arg: A): Promise<T | null> {
@@ -6115,9 +6275,13 @@ const prLink = (page: Page) => page.locator(PANEL).getByRole('link', { name: 'Op
 const commitField = (page: Page) => page.locator(PANEL).getByRole('textbox', { name: 'Commit message', exact: true });
 const prDialog = (page: Page) => page.getByRole('dialog', { name: 'Create pull request' });
 
-// Waits until the sidebar's text (its whitespace folded) satisfies `matches(text, arg)`, which runs in the page.
-function waitForShipText<A = undefined>(page: Page, matches: (text: string, arg: A) => boolean, arg?: A) {
-  return untilPanel(page, (panel) => panel.innerText.replace(/\s+/g, ' '), matches, arg as A, { closed: '' });
+// Waits until the sidebar's text (its whitespace folded) satisfies `matches(text, arg)`, which runs in the page,
+// and checks it took less than 5 s from the call ("within 5 s").
+async function waitForShipText<A = undefined>(page: Page, matches: (text: string, arg: A) => boolean, arg?: A) {
+  const within = startClock();
+  const text = await untilPanel(page, (panel) => panel.innerText.replace(/\s+/g, ' '), matches, arg as A, { closed: '' });
+  within('the sidebar showed the expected text', 5_000);
+  return text;
 }
 
 // Waits until the sidebar lists exactly `names` among `names` (the files the test wrote or removed).
@@ -6634,16 +6798,25 @@ describe('changes sidebar: built app', () => {
     await waitForPanelText(page, (shown) => shown.includes('No changes against main.'));
     const file = join(B.path, 'live.txt');
 
+    // Each step has 5 s from the write.
+    let within = startClock();
     writeFileSync(file, 'first\n');
     expect(await waitForListed(page, ['live.txt'], ['live.txt'])).toEqual(['live.txt']);
+    within('the file was listed', 5_000);
+    within = startClock();
     expect(await waitForDiffLine(page, 1, '+', 'first')).not.toBeNull();
+    within('the diff showed the first line', 5_000);
 
+    within = startClock();
     appendFileSync(file, 'second\n');
     expect(await waitForDiffLine(page, 2, '+', 'second')).toEqual({ added: true, removed: false });
+    within('the diff showed the appended line', 5_000);
 
+    within = startClock();
     rmSync(file);
     expect(await waitForListed(page, ['live.txt'], [])).toEqual([]);
     await waitForPanelText(page, (shown) => shown.includes('No changes against main.'));
+    within('the file left the list', 5_000);
   });
 
   test('changes AC13 — opening the page of a session in workspace B lists B\'s changes, not A\'s', async () => {
@@ -6781,19 +6954,13 @@ describe('changes sidebar: built app', () => {
     const filesBefore = await diffCount();
     writeFileSync(join(A.path, 'probe-tab.txt'), 'probe\n');
     await barTab(page, 'Diff').filter({ hasText: new RegExp(`Diff\\s*${filesBefore + 1}$`) }).waitFor();
-    expect(gitRunsIn(fx, A.path).length, 'git runs with the bar open on "Pull request"').toBeGreaterThan(runsBefore);
     await selectBarTab(page, 'Diff');
     expect(await waitForListed(page, ['probe-tab.txt'], ['probe-tab.txt'])).toEqual(['probe-tab.txt']);
     rmSync(join(A.path, 'probe-tab.txt'));
     await waitForListed(page, ['probe-tab.txt'], []);
 
-    // Writes `name` and returns the git runs in the worktree since: none can have started if no watcher holds the
-    // worktree, which `expectNoWatcher` has read before.
-    const gitRunsAfterWrite = (name: string) => {
-      const before = gitRunsIn(fx, A.path).length;
-      writeFileSync(join(A.path, name), 'x\n');
-      return gitRunsIn(fx, A.path).slice(before);
-    };
+    // Nothing but a watcher on the worktree starts git commands on a write, and `expectNoWatcher` reads that there is
+    // none; a read of the git runs right after the write could not tell a run that has not started yet.
     const expectNoWatcher = async (where: string) => {
       const watchers = await fsEventWatchersOf(session);
       expect(watchers, `${where}: no watcher on the worktree`).toBeLessThan(watchersOpen);
@@ -6805,7 +6972,7 @@ describe('changes sidebar: built app', () => {
     await setChangesOpen(page, false);
     await untilUnwatches(session, unwatches + 1);
     const watchersClosed = await expectNoWatcher('the bar closed');
-    expect(gitRunsAfterWrite('after-close.txt')).toEqual([]);
+    writeFileSync(join(A.path, 'after-close.txt'), 'x\n');
     await setChangesOpen(page, true);
     expect(await waitForListed(page, ['after-close.txt'], ['after-close.txt'])).toEqual(['after-close.txt']);
 
@@ -6814,7 +6981,7 @@ describe('changes sidebar: built app', () => {
     await goHome(page);
     await untilUnwatches(session, unwatchesOpen + 1);
     expect(await expectNoWatcher('Home')).toBe(watchersClosed);
-    expect(gitRunsAfterWrite('after-home.txt')).toEqual([]);
+    writeFileSync(join(A.path, 'after-home.txt'), 'x\n');
     await openSessionById(page, A.id);
     expect(await waitForBar(page, true), 'the bar is still open').toBe(true);
     expect(await waitForListed(page, ['after-home.txt'], ['after-home.txt'])).toEqual(['after-home.txt']);
@@ -6825,7 +6992,7 @@ describe('changes sidebar: built app', () => {
     await showRightBar(page).waitFor();
     expect(await markChangesPanel(page)).toBe(false);
     expect(await expectNoWatcher('after a reload')).toBe(watchersClosed);
-    expect(gitRunsAfterWrite('after-reload.txt')).toEqual([]);
+    writeFileSync(join(A.path, 'after-reload.txt'), 'x\n');
     await setChangesOpen(page, true);
     expect(await waitForListed(page, ['after-reload.txt'], ['after-reload.txt'])).toEqual(['after-reload.txt']);
   });
@@ -7026,7 +7193,9 @@ describe('changes sidebar: built app', () => {
 
         // A window focus reads it, with the other tab showing: the Pull request panel stays mounted.
         await selectBarTab(page, 'Diff');
+        const within = startClock();
         await untilAnswered(session, 'workspaces:pull-request', () => dispatchFocus(page));
+        within('the focus read the pull request', 5_000);
         expect(ghRuns(gh).length, 'a focus reads the pull request whichever tab shows').toBeGreaterThan(before);
         await selectBarTab(page, 'Pull request');
         await waitForText((shown) => /\bMerged\b/.test(shown));
@@ -7305,7 +7474,9 @@ describe('changes sidebar: built app', () => {
       await dialog.waitFor({ state: 'hidden' });
 
       const link = prLink(page);
+      const within = startClock();
       await link.waitFor();
+      within('the pull request link showed', 5_000);
       expect(await link.getAttribute('href')).toBe(PR_URL);
       await waitForText((shown) => shown.includes('Ship the flow') && shown.includes('#7 · Checks pending'));
       expect(await shipButton(page, 'Create pull request').count()).toBe(0);
@@ -7384,21 +7555,31 @@ describe('changes sidebar: built app', () => {
       await commit.and(page.locator('button:enabled')).waitFor();
       expect(await shipButton(page, 'Push').count()).toBe(0);
 
-      // The commit: "Push" shows and "Commit" is disabled (nothing is uncommitted any more).
+      // The commit: "Push" shows and "Commit" is disabled (nothing is uncommitted any more), each within 5 s.
       gitIn(W4.path, 'commit', '-q', '-am', 'Committed in the terminal');
+      let within = startClock();
       await shipButton(page, 'Push').waitFor();
+      within('"Push" showed', 5_000);
+      within = startClock();
       await commit.and(page.locator('button:disabled')).waitFor();
+      within('"Commit" was disabled', 5_000);
       expect(await create.isDisabled()).toBe(true);
 
-      // The push: "Push" goes and "Create pull request" is enabled.
+      // The push: "Push" goes and "Create pull request" is enabled, each within 5 s.
       gitIn(W4.path, 'push', '-q', '-u', 'origin', 'ship-outside');
+      within = startClock();
       await shipButton(page, 'Push').waitFor({ state: 'detached' });
+      within('"Push" went', 5_000);
+      within = startClock();
       await create.and(page.locator('button:enabled')).waitFor();
+      within('"Create pull request" was enabled', 5_000);
       expect(await panelText(page)).not.toContain('Push the branch first.');
 
       // Reading the state writes nothing under the gitdir, so it does not start itself again. The cause of a loop
-      // would be a read that writes there: the gitdir of the worktree and the repository's own are the same after
-      // the reads the app makes (its status and its changes, called here) as they were before.
+      // would be a read that writes there (or a watcher that does): the files of the worktree's gitdir and of the
+      // repository's own are the same after everything the app does on its own as they were before. That is its
+      // status, its changes and the selected file's diff (called here), and the start of a watcher (the bar closed and
+      // opened again, answered), which touches the folders it watches, not their files.
       const gitdirs = [gitIn(W4.path, 'rev-parse', '--absolute-git-dir'), gitIn(W4.path, 'rev-parse', '--path-format=absolute', '--git-common-dir')];
       const gitdirState = () =>
         gitdirs.map((dir) =>
@@ -7407,16 +7588,24 @@ describe('changes sidebar: built app', () => {
             .map((entry) => `${join(entry.parentPath, entry.name)} ${statSync(join(entry.parentPath, entry.name)).mtimeMs}`)
             .sort(),
         );
+      await countIpcCalls(session, ['workspaces:watch']);
+      const watches = await ipcCalls(session, 'workspaces:watch');
       const settled = gitdirState();
       await page.evaluate(
-        ([project, path]) =>
-          Promise.all([
-            (window as unknown as ChangesWindow & { api: { workspaces: { status(project: string, path: string): Promise<unknown> } } }).api.workspaces.status(project!, path!),
-            (window as unknown as ChangesWindow).api.workspaces.changes(project!, path!),
-          ]),
+        ([project, path]) => {
+          const { workspaces } = (window as unknown as ChangesWindow & { api: { workspaces: { status(project: string, path: string): Promise<unknown> } } }).api;
+          return Promise.all([
+            workspaces.status(project!, path!),
+            workspaces.changes(project!, path!),
+            workspaces.diff(project!, path!, { path: 'a.txt', status: 'modified', additions: 1, deletions: 1 }),
+          ]);
+        },
         [ship.root, W4.path] as const,
       );
-      expect(gitdirState(), 'reading the state writes nothing under the gitdir').toEqual(settled);
+      await setChangesOpen(page, false);
+      await setChangesOpen(page, true, 'Pull request');
+      await ipcAnswered(session, 'workspaces:watch', watches + 1);
+      expect(gitdirState(), 'reading the state and starting a watcher write nothing under the gitdir').toEqual(settled);
     });
 
     test('ship AC12 — the new window.api.workspaces calls refuse an unknown project, a path that is not a linked worktree, a blank message or title, and a detached HEAD with the messages of the spec, run nothing, and reject from another origin', async () => {
@@ -7473,7 +7662,7 @@ describe('changes sidebar: built app', () => {
 
       // From another origin the handlers reject.
       const origins = await session.evaluateInMain<Record<string, string>>(`(async () => {
-        const handlers = require('electron').ipcMain._invokeHandlers;
+        const handlers = ${INVOKE_HANDLERS};
         const calls = {
           'workspaces:status': [${JSON.stringify(ship.root)}, ${JSON.stringify(clean)}],
           'workspaces:commit': [${JSON.stringify(ship.root)}, ${JSON.stringify(branch)}, 'A message'],
@@ -7673,13 +7862,13 @@ describe('session status: built app', () => {
       await typeLine(page, `hook ${hook}`);
       await waitForRow(page, `hooked:${hook}`);
       await expectDot(page, known.claude.id, dot);
-      for (const id of silent) await expectDot(page, id, null, false);
+      for (const id of silent) await expectDot(page, id, null, 'now');
     }
 
     await typeLine(page, 'exit');
     await waitForRow(page, '[Process exited with code 3]');
     await expectDot(page, known.claude.id, 'Exited 3');
-    for (const id of silent) await expectDot(page, id, null, false);
+    for (const id of silent) await expectDot(page, id, null, 'now');
   });
 
   test('AC7 — the same under a workspace: the icon shows on the workspace row', async () => {
@@ -7820,7 +8009,7 @@ describe('session status: built app', () => {
 
     await killPtyHost(page);
 
-    for (const id of [known.codex.id, known.opencode.id, known.workspace.id, known.notified.id]) await expectDot(page, id, 'Ended');
+    for (const id of [known.codex.id, known.opencode.id, known.workspace.id, known.notified.id]) await expectDot(page, id, 'Ended', null);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
   });
 });
@@ -8646,7 +8835,7 @@ const FRONT_CALLS = ['app.focus {"steal":true}', 'focus', 'show'];
 describe('single instance: built app', () => {
   let session: Session;
   let dataDir: string;
-  let front: ReturnType<typeof watchFrontmost>;
+  let front: Awaited<ReturnType<typeof watchFrontmost>>;
   const electron: string = createRequire(import.meta.url)('electron');
   const secondLaunch = () =>
     runSecondLaunch(
@@ -8656,7 +8845,7 @@ describe('single instance: built app', () => {
     );
 
   beforeAll(async () => {
-    front = watchFrontmost();
+    front = await watchFrontmost();
     dataDir = makeTestDir('d-');
     session = await launchBuiltWith({ ...process.env, SHELL: '/bin/sh' }, dataDir);
     await session.page.getByText(versionLabel).waitFor();
@@ -8696,7 +8885,7 @@ describe('single instance: built app', () => {
     expect([...new Set(calls)].sort()).toEqual(['app.focus {"steal":true}', 'focus', 'restore', 'show']);
     await setMinimized(session, false);
     // The stubbed calls never took the user's focus: the app was not frontmost at any time.
-    expect(front.pids.has(session.pid)).toBe(false);
+    expect(await front.activated(session.pid)).toBe(false);
   });
 
   test('AC4 — two launches with their own userData folders and COCKPIT_HOME, started together, both render the home page and neither prints that the background service could not start', async () => {
@@ -8749,11 +8938,11 @@ describe('single instance: packaged app', () => {
   let session: Session;
   let dataDir: string;
   let userHome: string;
-  let front: ReturnType<typeof watchFrontmost>;
+  let front: Awaited<ReturnType<typeof watchFrontmost>>;
   let env: NodeJS.ProcessEnv;
 
   beforeAll(async () => {
-    front = watchFrontmost();
+    front = await watchFrontmost();
     dataDir = makeTestDir('d-');
     // A short folder: the socket path is limited to 103 bytes on macOS.
     userHome = makeTestDir('u');
@@ -8799,7 +8988,7 @@ describe('single instance: packaged app', () => {
     expect([...new Set(await frontCalls(session))].sort()).toEqual(FRONT_CALLS);
     expect(await windowCount(session)).toBe(1);
     expect(session.isRunning()).toBe(true);
-    expect(front.pids.has(session.pid)).toBe(false);
+    expect(await front.activated(session.pid)).toBe(false);
   });
 });
 
