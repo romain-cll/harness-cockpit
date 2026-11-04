@@ -243,9 +243,12 @@ function track(child: ChildProcess): void {
 }
 
 // Waits until the group of a child that a launch started is gone: the helpers of a child can outlive
-// it and still write in the data folder. Returns at once for a pid no launch started.
+// it and still write in the data folder. Rejects for a pid no launch started: nothing tells when its group is
+// gone, and returning at once would claim it was.
 export async function waitForGroupGone(pid: number): Promise<void> {
-  await closedByPid.get(pid);
+  const closed = closedByPid.get(pid);
+  if (!closed) throw new Error(`no launch started ${pid}: nothing tells when its group is gone`);
+  await closed;
 }
 
 // Stops a process started with `detached: true` and everything in its process group, and waits
