@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, realpath } from 'node:fs/promises';
+import { access, mkdir, readFile, realpath } from 'node:fs/promises';
 import { basename, isAbsolute, join } from 'node:path';
 import { checkGit, git, list, succeeds, WorkspaceError, type GitEnv, type Worktree } from './git';
 
@@ -36,9 +36,90 @@ export async function findRepositoryRoot(path: string, { env }: GitEnv = {}): Pr
   return repositoryRoot(path, env);
 }
 
+/** The readable names kept in git config, by branch: one `git config` call for the repository. */
+async function cockpitNames(repo: string, env?: NodeJS.ProcessEnv): Promise<Map<string, string>> {
+  const names = new Map<string, string>();
+  let output: string;
+  try {
+    output = await git(['config', '--get-regexp', '^branch\\..*\\.cockpitname$'], { cwd: repo, env });
+  } catch (error) {
+    // Exit 1 means no such key.
+    if (error instanceof WorkspaceError && error.code === 'GIT_FAILED') return names;
+    throw error;
+  }
+  for (const line of output.split('\n')) {
+    const space = line.indexOf(' ');
+    if (space === -1) continue;
+    const key = line.slice(0, space);
+    names.set(key.slice('branch.'.length, -'.cockpitname'.length), line.slice(space + 1));
+  }
+  return names;
+}
+
 export async function listWorktrees(repo: string, { env }: GitEnv = {}): Promise<Worktree[]> {
   await checkGit(env);
-  return list(repo, env);
+  const worktrees = await list(repo, env);
+  const names = await cockpitNames(worktrees[0]!.path, env);
+  for (const worktree of worktrees) {
+    const name = worktree.branch === null ? undefined : names.get(worktree.branch);
+    if (name !== undefined) worktree.name = name;
+  }
+  return worktrees;
+}
+
+/** The folder of a project's worktrees under the root: its name and a hash of its path. */
+const projectFolder = (main: string) => `${basename(main)}-${createHash('sha256').update(main).digest('hex').slice(0, 8)}`;
+
+const exists = (path: string) => access(path).then(() => true, () => false);
+
+const MAX_SLUG = 40;
+
+/**
+ * The branch name for a task or a title: lower-cased, accents removed, every run of characters
+ * outside `[a-z0-9]` one `-`, cut to 40 characters at the last `-` (hard-cut without one);
+ * `workspace` when nothing is left.
+ */
+export function branchSlug(text: string): string {
+  const slug = text
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+  if (slug === '') return 'workspace';
+  if (slug.length <= MAX_SLUG) return slug;
+  const cut = slug.slice(0, MAX_SLUG + 1).lastIndexOf('-');
+  return cut > 0 ? slug.slice(0, cut) : slug.slice(0, MAX_SLUG);
+}
+
+async function localBranches(main: string, env?: NodeJS.ProcessEnv): Promise<Set<string>> {
+  const output = await git(['for-each-ref', '--format=%(refname:short)', 'refs/heads'], { cwd: main, env });
+  return new Set(output.split('\n').filter((name) => name !== ''));
+}
+
+/** The slug of `text`, with `-2`, `-3`… appended until no name in `taken` has it. */
+function freeName(text: string, taken: Set<string>): string {
+  const slug = branchSlug(text);
+  let name = slug;
+  for (let n = 2; taken.has(name); n++) name = `${slug}-${n}`;
+  return name;
+}
+
+/**
+ * The branch name for `text` in `repo`: its slug, with `-2`, `-3`… appended while a local branch has that
+ * name. With `root` (the worktrees root) a name whose worktree folder exists there is taken too: a renamed
+ * workspace keeps its folder, so the name its branch left would be refused by the next creation.
+ */
+export async function availableBranch(repo: string, text: string, { env, root }: GitEnv & { root?: string } = {}): Promise<string> {
+  await checkGit(env);
+  const main = await repositoryRoot(repo, env);
+  const taken = await localBranches(main, env);
+  if (root === undefined) return freeName(text, taken);
+  const folder = join(root, projectFolder(main));
+  const slug = branchSlug(text);
+  let name = slug;
+  for (let n = 2; taken.has(name) || (await exists(join(folder, name))); n++) name = `${slug}-${n}`;
+  return name;
 }
 
 const queues = new Map<string, Promise<void>>();
@@ -81,7 +162,7 @@ export async function createWorktree({
   if (!isAbsolute(requestedRoot)) throw new TypeError(`root must be an absolute path: ${requestedRoot}`);
   await checkGit(env);
   const main = await repositoryRoot(repo, env);
-  const project = `${basename(main)}-${createHash('sha256').update(main).digest('hex').slice(0, 8)}`;
+  const project = projectFolder(main);
 
   return serialised(main, async () => {
     // `--branch` expands shorthands such as `@{-1}`: a name it rewrites is not a branch name.
@@ -125,6 +206,43 @@ export async function createWorktree({
       throw error;
     }
     return linkedWorktree(await list(main, env), path);
+  });
+}
+
+/**
+ * Gives the linked worktree a readable name: stores `name` in `branch.<branch>.cockpitName` and, unless
+ * the branch was pushed (it tracks a branch of its own name) or already has the name's slug, renames the branch to it (a taken slug
+ * gets a suffix). `git branch -m` carries the branch's other settings, `cockpitBase` included, and the
+ * folder stays where it is. Calls for one repository run one at a time.
+ */
+export async function nameWorkspace({
+  worktree,
+  name,
+  env,
+}: {
+  worktree: string;
+  name: string;
+} & GitEnv): Promise<{ branch: string }> {
+  await checkGit(env);
+  const worktrees = await list(worktree, env);
+  const main = worktrees[0]!.path;
+  const linked = await linkedWorktree(worktrees, worktree);
+  const current = linked.branch;
+  if (current === null) throw new WorkspaceError('GIT_FAILED', `no branch to name: ${worktree}`);
+
+  return serialised(main, async () => {
+    let branch = current;
+    // Pushed: its upstream is a branch of its own name. A branch made from a remote base tracks that
+    // base (`git worktree add -b` sets the upstream), which is not a publication.
+    const merge = await git(['config', '--get', `branch.${current}.merge`], { cwd: main, env }).catch(() => '');
+    if (merge.trim() !== `refs/heads/${current}`) {
+      const taken = await localBranches(main, env);
+      taken.delete(current);
+      branch = freeName(name, taken);
+      if (branch !== current) await git(['branch', '-m', '--', current, branch], { cwd: main, env });
+    }
+    await git(['config', `branch.${branch}.cockpitName`, name], { cwd: main, env });
+    return { branch };
   });
 }
 

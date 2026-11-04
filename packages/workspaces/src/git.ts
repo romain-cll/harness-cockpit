@@ -99,6 +99,8 @@ export interface Worktree {
   branch: string | null;
   /** Whether this is the main working tree. */
   main: boolean;
+  /** The readable name `nameWorkspace` stored in `branch.<branch>.cockpitName`; absent when there is none. */
+  name?: string;
 }
 
 /** The main working tree comes first. */

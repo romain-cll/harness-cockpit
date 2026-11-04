@@ -37,6 +37,8 @@ function RootLayout() {
     window.addEventListener('focus', refresh);
     return () => window.removeEventListener('focus', refresh);
   }, [router]);
+  // The main process changed a workspace (named after its agent's title): list the projects again.
+  useEffect(() => window.api.projects.onChanged(() => void router.invalidate()), [router]);
   // A session the sidebar does not list yet (started by another caller than its menus) reported: list again.
   useEffect(
     () => window.api.sessions.onStatus((sessionId) => sessions.some(({ id }) => id === sessionId) || void router.invalidate()),

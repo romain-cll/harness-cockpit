@@ -21,7 +21,7 @@ import {
   type TerminalKind,
 } from '@cockpit/daemon';
 import { createPullRequest, findPullRequest, GitHubError } from '@cockpit/github';
-import { detectHarnesses, harnesses, statusLaunch, type DetectedHarness } from '@cockpit/harnesses';
+import { detectHarnesses, harnesses, statusLaunch, type DetectedHarness, type Harness } from '@cockpit/harnesses';
 import { apps, defaultApplicationDirs, detectApps, LaunchError, openIn, reveal, type App } from '@cockpit/launchers';
 import {
   addProject,
@@ -36,6 +36,7 @@ import {
   type State,
 } from '@cockpit/state';
 import {
+  availableBranch,
   branchStatus,
   checkGit,
   commitAll,
@@ -46,6 +47,7 @@ import {
   listBranches,
   listChanges,
   listWorktrees,
+  nameWorkspace,
   pushBranch,
   readWorkspaceConfig,
   removeWorktree,
@@ -223,6 +225,30 @@ let state: State;
 // The last status each session reported, as the sidebar shows it.
 const sessionStatuses = new Map<string, SessionStatus>();
 
+// The sessions the composer started in a new workspace, waiting for the title their agent derives from
+// the prompt (session id to worktree and harness). In memory only: a title that arrives while the app
+// is not running names nothing. The first accepted title, the agent's exit or the end of the terminal
+// clears the entry.
+const pendingNames = new Map<string, { worktree: string; harness: Harness }>();
+
+// A session's program set a terminal title. The daemon forwards only those between the markers
+// `cockpit setup` writes around the agent, so the setup's and the login shell's never get here. The
+// first one its harness derives from the prompt names the workspace: the branch follows it (`nameWorkspace`) and the windows list again.
+async function nameFromTitle({ sessionId, title }: { sessionId: string; title: string }): Promise<void> {
+  const pending = pendingNames.get(sessionId);
+  if (!pending) return;
+  const name = pending.harness.promptTitle(title);
+  if (name === null) return;
+  pendingNames.delete(sessionId);
+  try {
+    await nameWorkspace({ worktree: pending.worktree, name, env: await shellEnv });
+  } catch {
+    // The workspace keeps the name it has.
+    return;
+  }
+  for (const window of BrowserWindow.getAllWindows()) window.webContents.send('projects:changed');
+}
+
 // A session reported to a daemon: a harness hook (a status), or `cockpit setup` (a setup state, the
 // agent's exit). The window that holds the session's terminal is told of a change; a macOS
 // notification is raised for `waiting` and `finished` when no Cockpit window is focused, and
@@ -235,6 +261,7 @@ function reportSessionStatus(report: SessionReport): void {
   const owner = terminal?.owner && !terminal.owner.isDestroyed() ? terminal.owner : undefined;
 
   if (report.event === 'exited') {
+    pendingNames.delete(sessionId);
     if (terminal) terminal.exitCode = report.exitCode;
     owner?.send('sessions:status', sessionId, event, report.exitCode);
     return;
@@ -352,6 +379,7 @@ function end(daemon: Daemon, remote: number, exit: TerminalExit): void {
   if (!terminal) return;
   daemon.terminals.delete(remote);
   terminals.delete(terminal.appId);
+  if (terminal.sessionId !== undefined) pendingNames.delete(terminal.sessionId);
   if (terminal.owner && !terminal.owner.isDestroyed()) terminal.owner.send('pty:exit', terminal.appId, exit);
 }
 
@@ -366,6 +394,7 @@ async function adopt(client: DaemonClient): Promise<Daemon> {
   });
   client.onExit(({ id, exitCode, signal }) => end(daemon, id, { exitCode, signal }));
   client.onStatus(reportSessionStatus);
+  client.onTitle((event) => void nameFromTitle(event));
   client.onClose(() => {
     daemon.alive = false;
     for (const remote of daemon.terminals.keys()) end(daemon, remote, { exitCode: null, signal: null });
@@ -594,7 +623,7 @@ async function toProject({ path }: { path: string }): Promise<Project> {
     const worktrees = await listWorktrees(path, { env: await shellEnv });
     const workspaces = worktrees
       .filter((worktree) => !worktree.main)
-      .map(({ path, branch }) => ({ path, name: branch ?? basename(path), branch }));
+      .map(({ path, branch, name }) => ({ path, name: name ?? branch ?? basename(path), branch }));
     return { ...project, workspaces };
   } catch (error) {
     if (!(error instanceof WorkspaceError)) throw error;
@@ -690,19 +719,17 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
     }),
   );
 
-  ipcMain.handle('workspaces:create', (event, project: string, name: string, base: string): Promise<CreateWorkspaceResult> =>
-    forProject<CreateWorkspaceResult>(
+  // The branch is named after the task, with a free name: not a local branch, not an existing worktree folder.
+  ipcMain.handle('workspaces:create', (event, project: string, task: string, base: string): Promise<CreateWorkspaceResult> => {
+    let name = task;
+    return forProject<CreateWorkspaceResult>(
       event,
       'workspaces:create',
       project,
       async () => {
-        const { path, branch } = await createWorktree({
-          repo: project,
-          root: worktreesRoot,
-          branch: name,
-          base,
-          env: await shellEnv,
-        });
+        const env = await shellEnv;
+        name = await availableBranch(project, task, { env, root: worktreesRoot });
+        const { path, branch } = await createWorktree({ repo: project, root: worktreesRoot, branch: name, base, env });
         return { status: 'created', workspace: { path, name: branch ?? basename(path), branch } };
       },
       (error) => {
@@ -714,8 +741,8 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
         }
         return undefined;
       },
-    ),
-  );
+    );
+  });
 
   ipcMain.handle(
     'workspaces:remove',
@@ -999,11 +1026,14 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
       if (!isFromApp(event)) throw new Error('sessions:start refused: unexpected origin');
       // A page that ends while detection or the worktree check runs starts nothing.
       const endings = endingsOf(event.sender);
-      const harness = harnesses.find(({ id }) => id === harnessId);
-      const found = (await detected()).find(({ id }) => id === harnessId);
-      if (!harness || !found) return { status: 'refused', message: `${harness?.name ?? harnessId} is not installed.` };
+      // `terminal` is no agent CLI: the login shell, always available, never detected.
+      const login = harnessId === 'terminal';
+      const catalogued = harnesses.find(({ id }) => id === harnessId);
+      const found = login ? undefined : (await detected()).find(({ id }) => id === harnessId);
+      const harness = login ? { id: 'terminal', name: 'Terminal' } : catalogued;
+      if (!harness || (!login && !found)) return { status: 'refused', message: `${harness?.name ?? harnessId} is not installed.` };
       // Detected at launch, removed since: nothing is created or spawned.
-      if (!isFile(found.path)) return { status: 'refused', message: `Could not start ${harness.name}: ${found.path} not found.` };
+      if (found && !isFile(found.path)) return { status: 'refused', message: `Could not start ${harness.name}: ${found.path} not found.` };
       // The agent runs in the daemon: without it nothing is created, spawned or stored.
       try {
         await ensureOwnDaemon();
@@ -1031,23 +1061,31 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
           COCKPIT_SESSION_ID: id,
           ...(workspace && { COCKPIT_WORKSPACE_PATH: workspace.path }),
         });
-        // The harness is told, through its arguments and environment, to report its status to the daemon.
-        const status = await statusLaunch(harness.id, { cli: cliPath, pluginsDir: join(cockpitHome, 'plugins'), env });
-        env = status.env as Record<string, string>;
-        // From the New workspace dialog the terminal runs `cockpit setup`, which runs the repository's
-        // setup, then the agent, then the login shell. The agent follows `--then` by the path detection
-        // found, so that binary is the one that runs.
         const viaSetup = workspace && options?.setup;
-        const agentArgs = [...status.args, ...harness.start(prompt)];
+        let command: { command?: string; args?: string[] };
+        if (catalogued && found) {
+          // The harness is told, through its arguments and environment, to report its status to the daemon.
+          const status = await statusLaunch(catalogued.id, { cli: cliPath, pluginsDir: join(cockpitHome, 'plugins'), env });
+          env = status.env as Record<string, string>;
+          // From the composer the terminal runs `cockpit setup`, which runs the repository's setup, then
+          // the agent, then the login shell. The agent follows `--then` by the path detection found, so
+          // that binary is the one that runs.
+          const agentArgs = [...status.args, ...catalogued.start(prompt)];
+          command = viaSetup
+            ? { command: cliPath, args: ['setup', '--shell', '--then', found.path, ...agentArgs] }
+            : { command: found.path, args: agentArgs };
+        } else {
+          // The login shell: the spawn defaults run `$SHELL -l`.
+          command = {};
+        }
+        // The composer names the workspace after the first title the agent derives from the prompt. The
+        // entry exists before the spawn, so no title can arrive ahead of it.
+        if (workspace && options?.nameFromTitle && catalogued) {
+          pendingNames.set(id, { worktree: workspace.path, harness: catalogued });
+        }
         ptyId = await spawnFor(
           event.sender,
-          {
-            ...size,
-            command: viaSetup ? cliPath : found.path,
-            args: viaSetup ? ['setup', '--shell', '--then', found.path, ...agentArgs] : agentArgs,
-            cwd: directory,
-            env,
-          },
+          { ...size, ...command, cwd: directory, env },
           { kind: 'session', sessionId: id, workspace: workspace?.path, before: endings },
         );
         const session = {
@@ -1063,6 +1101,7 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
         state = next;
         return { status: 'started', session, ptyId };
       } catch (error) {
+        pendingNames.delete(id);
         if (ptyId !== undefined) kill(ptyId);
         if (!workspace) rmSync(directory, { recursive: true, force: true });
         return {

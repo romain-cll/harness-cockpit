@@ -1,12 +1,14 @@
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { Terminal as Headless } from '@xterm/headless';
 import { spawn, type IPty } from 'node-pty';
-import { SCROLLBACK, type Attached, type SessionEventName, type SessionReport, type SetupState, type SpawnOptions, type TerminalExit, type TerminalInfo } from './protocol';
+import { AGENT_MARKER_OSC, SCROLLBACK, type Attached, type SessionEventName, type SessionReport, type SetupState, type SpawnOptions, type TerminalExit, type TerminalInfo } from './protocol';
 
 /** Who receives what a terminal produces: one connection. */
 export interface Subscriber {
   data(terminal: number, seq: number, data: string): void;
   exit(terminal: number, exit: TerminalExit): void;
+  /** The title a `session` terminal's program set (OSC 0 or 2), once per change. */
+  title(sessionId: string, title: string): void;
 }
 
 interface Terminal {
@@ -86,6 +88,23 @@ export function createTerminals(onEnd: () => void) {
       };
       terminals.set(id, terminal);
 
+      if (kind === 'session' && sessionId !== undefined) {
+        // Titles count only between the markers `cockpit setup` writes around the agent (in the stream, so
+        // the parser meets them in the order the program wrote them): the setup's and the login shell's
+        // never name a workspace.
+        let forwarding = false;
+        let lastTitle: string | undefined;
+        headless.parser.registerOscHandler(AGENT_MARKER_OSC, (data) => {
+          forwarding = data === 'agent-started';
+          lastTitle = undefined;
+          return true;
+        });
+        headless.onTitleChange((title) => {
+          if (!forwarding || title === lastTitle) return;
+          lastTitle = title;
+          for (const each of terminal.subscribers) each.title(sessionId, title);
+        });
+      }
       pty.onData((data) => {
         const seq = ++terminal.seq;
         headless.write(data);

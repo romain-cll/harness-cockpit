@@ -31,7 +31,25 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { addTab, boxes, closeTab, panesOf, selectTab, singlePane, split, tabLabel, workspaceStatus, type Layout, type Pane, type PaneBox } from '@/components/workspace-layout';
+import {
+  addTab,
+  boxes,
+  clampRatio,
+  closeTab,
+  panesOf,
+  selectTab,
+  separators,
+  setRatio,
+  singlePane,
+  split,
+  tabLabel,
+  workspaceStatus,
+  type Layout,
+  type Pane,
+  type PaneBox,
+  type Separator as SeparatorSpec,
+  type SplitPath,
+} from '@/components/workspace-layout';
 import { cn } from 'cn';
 
 // --- The store -------------------------------------------------------------------
@@ -150,6 +168,12 @@ function splitPane(path: string, pane: string, direction: 'right' | 'down') {
     request: view.request + 1,
     tabs: new Map(view.tabs).set(tab.key, tab),
   });
+}
+
+// Moves a split's separator: only the layout changes, the keyboard stays where it was.
+function resizeSplit(path: string, splitPath: SplitPath, ratio: number) {
+  const view = viewOf(path);
+  commit(path, { ...view, layout: setRatio(view.layout, splitPath, ratio) });
 }
 
 function select(path: string, pane: string, key: string) {
@@ -526,6 +550,65 @@ function PaneView({
   );
 }
 
+// The least a pane keeps while a separator is dragged, in px.
+const MIN_PANE_WIDTH = 160;
+const MIN_PANE_HEIGHT = 100;
+
+// The line between two panes. Its hit area is wider than the line and centred on the border of the
+// pane after it, which draws the line in `--border`; a 1 px line inside takes `--ring` while hovered
+// or dragged. A drag holds the pointer, so it follows it past the edges; the area is read once at its start.
+function Separator({ path, spec }: { path: string; spec: SeparatorSpec }) {
+  const vertical = spec.direction === 'right';
+  const [hovered, setHovered] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const area = useRef<DOMRect>(null);
+
+  const stop = () => {
+    area.current = null;
+    setDragging(false);
+  };
+  const areaOf = (element: HTMLElement) => element.parentElement!.getBoundingClientRect();
+  const clamp = (ratio: number, { width, height }: DOMRect) =>
+    clampRatio(viewOf(path).layout, spec.path, ratio, { width, height }, vertical ? MIN_PANE_WIDTH : MIN_PANE_HEIGHT);
+
+  return (
+    <div
+      role="separator"
+      aria-orientation={vertical ? 'vertical' : 'horizontal'}
+      className={cn('absolute z-10 touch-none', vertical ? 'w-2 cursor-col-resize' : 'h-2 cursor-row-resize')}
+      style={
+        vertical
+          ? { left: `calc(${spec.position}% - 4px)`, top: `${spec.box.top}%`, height: `${spec.box.height}%` }
+          : { top: `calc(${spec.position}% - 4px)`, left: `${spec.box.left}%`, width: `${spec.box.width}%` }
+      }
+      // A press must not take the keyboard from the terminal that holds it.
+      onMouseDown={(event) => event.preventDefault()}
+      onPointerDown={(event) => {
+        if (event.button !== 0) return;
+        event.currentTarget.setPointerCapture(event.pointerId);
+        area.current = areaOf(event.currentTarget);
+        setDragging(true);
+      }}
+      onPointerMove={(event) => {
+        if (!area.current) return;
+        const { left, top, width, height } = area.current;
+        const { box } = spec;
+        // The pointer in percent of the area, then as a share of the split's box.
+        const ratio = vertical ? ((event.clientX - left) / width) * 100 - box.left : ((event.clientY - top) / height) * 100 - box.top;
+        resizeSplit(path, spec.path, clamp(ratio / (vertical ? box.width : box.height), area.current));
+      }}
+      onPointerEnter={() => setHovered(true)}
+      onPointerLeave={() => setHovered(false)}
+      onPointerUp={stop}
+      onPointerCancel={stop}
+      onDoubleClick={(event) => resizeSplit(path, spec.path, clamp(0.5, areaOf(event.currentTarget)))}
+    >
+      {/* Only while hovered or dragged: otherwise the pane's own border is the line. */}
+      {(hovered || dragging) && <div className={cn('absolute bg-ring', vertical ? 'inset-y-0 left-1 w-px' : 'inset-x-0 top-1 h-px')} />}
+    </div>
+  );
+}
+
 /** The panes of a workspace: tab bars in the top row of the window, the terminals under them. */
 export function WorkspacePanes({ project, workspace }: { project: Project; workspace: Workspace }) {
   const view = useSyncExternalStore(subscribeViews, () => viewOf(workspace.path));
@@ -560,6 +643,10 @@ export function WorkspacePanes({ project, workspace }: { project: Project; works
           waiting={waiting}
           onClose={requestClose}
         />
+      ))}
+      {/* Last in the DOM is on top: a nested separator ends at the outer one, which wins where they meet. */}
+      {separators(view.layout).reverse().map((spec) => (
+        <Separator key={`s${spec.path.join('')}`} path={workspace.path} spec={spec} />
       ))}
       <AlertDialog open={closing !== undefined} onOpenChange={(open) => !open && setClosing(undefined)}>
         <AlertDialogContent>

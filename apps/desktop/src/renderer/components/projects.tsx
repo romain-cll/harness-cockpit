@@ -1,12 +1,11 @@
-import { Link, useRouter } from '@tanstack/react-router';
+import { Link, useNavigate, useRouter } from '@tanstack/react-router';
 import { ChevronDownIcon, ChevronRightIcon, MoreHorizontalIcon, PlusIcon, TriangleAlertIcon } from 'lucide-react';
 import { useState, useSyncExternalStore, type ReactNode } from 'react';
 import type { AppsResult, AvailableApp, OpenWorkspaceResult, Project, Session, StartSessionResult, Workspace } from '../../shared/api';
 import { toggleProject, toggleProjects, useCollapsedProjects, useProjectsCollapsed } from '@/components/collapsed';
 import { DeleteWorkspaceDialog } from '@/components/delete-workspace-dialog';
-import { NewWorkspaceDialog } from '@/components/new-workspace-dialog';
 import { endSessions, getWorkspaceSetups, startSession, subscribe } from '@/components/live-terminals';
-import { projectColour } from '@/components/project-colour';
+import { ProjectBadge } from '@/components/project-badge';
 import { linkRowClass, rowClass, StatusIcon } from '@/components/sessions';
 import { StartSessionMenu } from '@/components/start-session-menu';
 import { Button } from '@/components/ui/button';
@@ -20,7 +19,7 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { addSessionTab, closeWorkspace, openShellTab, setProjectsMessage, useProjectsMessage, useWorkspaceStatus } from '@/components/workspace-panes';
+import { addSessionTab, closeWorkspace, setProjectsMessage, useProjectsMessage, useWorkspaceStatus } from '@/components/workspace-panes';
 import { cn } from 'cn';
 
 // The workspace whose Delete dialog is open. Module-level so that the Changes sidebar can open it
@@ -159,10 +158,10 @@ function WorkspaceName({ workspace }: { workspace: Workspace }) {
 
 export function Projects({ projects, sessions }: { projects: Project[]; sessions: Session[] }) {
   const router = useRouter();
+  const navigate = useNavigate();
   // Why the last add or start was refused, or that a deletion kept its branch; cleared by the next add, start or deletion that succeeds.
   const message = useProjectsMessage();
   const setMessage = setProjectsMessage;
-  const [creatingIn, setCreatingIn] = useState<Project>();
   const deleting = useSyncExternalStore(subscribeDeleting, () => deletion);
   const setups = useSyncExternalStore(subscribe, getWorkspaceSetups);
   const collapsed = useProjectsCollapsed();
@@ -231,13 +230,7 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
               <li key={project.path}>
                 <Entry
                   title={project.path}
-                  icon={
-                    <span
-                      className={`flex size-4 shrink-0 items-center justify-center rounded-[4px] text-[9px] leading-none text-project-foreground ${projectColour(project.path)}`}
-                    >
-                      {project.name.charAt(0).toUpperCase()}
-                    </span>
-                  }
+                  icon={<ProjectBadge path={project.path} name={project.name} />}
                   name={<span className="truncate">{project.name}</span>}
                   after={
                     project.missing ? (
@@ -256,7 +249,7 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
                   }
                   label={`Actions for ${project.name}`}
                 >
-                  <DropdownMenuItem onClick={() => setCreatingIn(project)}>New workspace…</DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => void navigate({ to: '/', search: { project: project.path } })}>New workspace…</DropdownMenuItem>
                   <DropdownMenuItem className="flex-col items-start gap-0" onClick={() => void remove(project)}>
                     <span>Remove from Cockpit</span>
                     <span className="text-muted-foreground!">Files stay on disk</span>
@@ -318,23 +311,6 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
             );
           })}
         </ul>
-      )}
-      {creatingIn && (
-        <NewWorkspaceDialog
-          project={creatingIn}
-          onClose={() => setCreatingIn(undefined)}
-          onCreated={async (workspace, start) => {
-            await router.invalidate();
-            setCreatingIn(undefined);
-            if (start) {
-              await started(start);
-            } else {
-              // No agent: a shell tab runs the setup, then the login shell.
-              openShellTab(workspace.path, { setup: true });
-              await router.navigate({ to: '/workspace', search: { path: workspace.path } });
-            }
-          }}
-        />
       )}
       {deleting && (
         <DeleteWorkspaceDialog
