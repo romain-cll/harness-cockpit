@@ -1,5 +1,6 @@
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { once } from 'node:events';
 import { accessSync, appendFileSync, chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
@@ -17,7 +18,9 @@ import {
   UI_TIMEOUT,
   appDir,
   daemonSocketIn,
+  fifo,
   freePort,
+  heldProcess,
   isAlive,
   launchBuilt,
   launchDev,
@@ -1793,12 +1796,17 @@ describe.each([
             contents.on('did-fail-load', onFail);
           });
         })()`);
+        // `did-fail-load` fires before Chromium commits its error page (`chrome-error://chromewebdata/`), and
+        // a `goto` started in between is interrupted by that commit: the page's own navigation event tells
+        // when the error page is there.
+        const errorPage = page.waitForEvent('framenavigated', (frame) => frame === page.mainFrame() && frame.url() === 'chrome-error://chromewebdata/');
         await page
           .evaluate(() => {
             location.href = new URL('/%', location.href).href;
           })
           .catch(() => {});
         await session.evaluateInMain('globalThis.__mainFrameFailed');
+        await errorPage;
 
         expect(await fsEventWatchers()).toBe(before);
       } finally {
@@ -3442,6 +3450,27 @@ async function expectSetupThenAgent(page: Page, name: string, command: string, o
   expect(rows.slice(header + 1, header + 4)).toEqual([`$ ${command}`, output, '✓ Setup done']);
 }
 
+// COCKPIT-81 AC2: a process that is not this session's, with a command line like the app's own
+// `cockpit setup`: it starts with `<cli> setup ` and passes `--then <another folder>/claude`. It runs for
+// the whole describe that checks the detected path, and the checks must neither count it nor stop it.
+async function startForeignSetup(cli: string): Promise<{ pid: number; stop(): Promise<void> }> {
+  const up = fifo();
+  const held = heldProcess();
+  const child = spawn('/bin/sh', ['-c', `echo up > '${up.path}'; ${held.snippet}`], {
+    argv0: `${cli} setup --then /foreign-session/bin/claude`,
+    stdio: 'ignore',
+  });
+  const exited = once(child, 'exit');
+  await up.line();
+  return {
+    pid: child.pid!,
+    stop: async () => {
+      await held.release();
+      await exited;
+    },
+  };
+}
+
 // COCKPIT-57: the app's own `cockpit setup` (the CLI parent of the agent, alive while it runs) was
 // given the absolute path harness detection found after `--then`, so the binary detection found is
 // the one that runs, not the first `claude` of a `PATH` the CLI would search itself.
@@ -3714,6 +3743,8 @@ describe('sessions: built app', () => {
     claude3: { id: '', pid: 0 },
   };
 
+  // A `cockpit setup` of someone else, running for the whole describe (COCKPIT-81 AC2).
+  let foreign: Awaited<ReturnType<typeof startForeignSetup>>;
   // The repository the workspace tests (COCKPIT-28) work in.
   let repo: TempRepo;
   // The stub `open` and the applications folder of the open workspace tests (COCKPIT-33).
@@ -3731,6 +3762,7 @@ describe('sessions: built app', () => {
     // A stub `open` and fake editor and terminal bundles (open workspace, COCKPIT-33).
     open = addOpenFixture(fx);
     repo = makeRepo('agent-ws');
+    foreign = await startForeignSetup(REPOSITORY_CLI);
     // The app itself is launched with the three control variables set, as when it runs from a session's terminal.
     session = await launchBuiltWith({ ...open.env(), ...INHERITED_CONTROL_ENV });
     await session.page.getByText(versionLabel).waitFor();
@@ -3738,6 +3770,7 @@ describe('sessions: built app', () => {
 
   afterAll(async () => {
     await session?.close();
+    await foreign?.stop();
     if (fx) rmSync(fx.root, { recursive: true, force: true });
     if (repo) rmSync(repo.parent, { recursive: true, force: true });
   });
@@ -4725,6 +4758,7 @@ describe('sessions: built app', () => {
       expect(stub.args).toBe(prompt);
       expect(startRuns(fx).slice(before.runs.length)).toEqual(['setup-done', `claude ${prompt}`]);
       expectSetupSpawnedWithDetectedPath(fx, REPOSITORY_CLI);
+      expect(isAlive(foreign.pid), 'the foreign `cockpit setup` is still running').toBe(true);
       const done = await terminalRows(page);
       expect(done.indexOf('✓ Setup done')).toBeLessThan(done.indexOf('ready'));
       // The agent runs with its status hooks, which name the CLI.
@@ -7742,8 +7776,11 @@ describe('sessions smoke path: dev server', () => {
   let open: OpenFixture;
   let gh: GhFixture;
   let session: Session;
+  // A `cockpit setup` of someone else, running for the whole describe (COCKPIT-81 AC2).
+  let foreign: Awaited<ReturnType<typeof startForeignSetup>>;
 
   beforeAll(async () => {
+    foreign = await startForeignSetup(REPOSITORY_CLI);
     fx = makeSessionsFixture(['claude']);
     open = addOpenFixture(fx);
     // A stub `gh` for the ship section (COCKPIT-38).
@@ -7754,6 +7791,7 @@ describe('sessions smoke path: dev server', () => {
 
   afterAll(async () => {
     await session?.close();
+    await foreign?.stop();
     if (fx) rmSync(fx.root, { recursive: true, force: true });
   });
 
@@ -7791,6 +7829,7 @@ describe('sessions smoke path: dev server', () => {
       expect(stub.argCount).toBe(1);
       expect(stub.args).toBe('fix the tests');
       expectSetupSpawnedWithDetectedPath(fx, REPOSITORY_CLI);
+      expect(isAlive(foreign.pid), 'the foreign `cockpit setup` is still running').toBe(true);
       expect(await waitForWorkspaceTabs(page, ['Claude Code 1'])).toEqual(['Claude Code 1']);
       const stored = await poll(() => sessionsInState(session.dataDir), (list) => list.some((entry) => entry.id === id), UI_TIMEOUT);
       expect(stored.find((entry) => entry.id === id)).toMatchObject({ name: 'Claude Code 1', directory: path, project: repo.root });
@@ -8252,8 +8291,11 @@ describe('packaged app sessions after a restart', () => {
   let origin: string;
   let open: OpenFixture;
   let gh: GhFixture;
+  // A `cockpit setup` of someone else, running for the whole test (COCKPIT-81 AC2).
+  let foreign: Awaited<ReturnType<typeof startForeignSetup>>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    foreign = await startForeignSetup(PACKAGED_CLI());
     fx = makeSessionsFixture(['claude', 'codex']);
     open = addOpenFixture(fx);
     // A stub `gh` for the ship section (COCKPIT-38).
@@ -8263,7 +8305,8 @@ describe('packaged app sessions after a restart', () => {
     origin = addOrigin(repo);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await foreign?.stop();
     rmSync(fx.root, { recursive: true, force: true });
     rmSync(dataDir, { recursive: true, force: true });
     rmSync(repo.parent, { recursive: true, force: true });
@@ -8301,6 +8344,7 @@ describe('packaged app sessions after a restart', () => {
       expect(wsStub.argCount).toBe(1);
       expect(wsStub.args).toBe('fix the tests');
       expectSetupSpawnedWithDetectedPath(fx, PACKAGED_CLI());
+      expect(isAlive(foreign.pid), 'the foreign `cockpit setup` is still running').toBe(true);
       expect(await waitForWorkspaceTabs(first.page, ['Claude Code 1'])).toEqual(['Claude Code 1']);
       const storedWs = await poll(() => sessionsInState(dataDir), (list) => list.some((entry) => entry.id === wsId), UI_TIMEOUT);
       expect(storedWs.find((entry) => entry.id === wsId)).toMatchObject({ name: 'Claude Code 1', directory: wsPath, project: repo.root });

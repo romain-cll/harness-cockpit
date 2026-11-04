@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
-import { UI_TIMEOUT, fifo, gonePipe, groupAlive, heldProcess, isAlive, launchBuilt, stopGroup, untilDom, type Session } from './launch';
+import { UI_TIMEOUT, fifo, gonePipe, groupAlive, heldProcess, isAlive, launchBuilt, stopGroup, untilDom, waitForGroupGone, type Session } from './launch';
 
 // COCKPIT-81 (part 0): the helpers of `launch.ts` that wait on events instead of polling. AC6 to AC8
 // run real `/bin/sh` processes and FIFOs, no app; AC9 and AC10 share one built-app launch.
@@ -72,6 +72,22 @@ describe('stopGroup', () => {
     expect(signals).toContain('SIGKILL');
     expect(timers.map((timer) => timer.mock.calls.length)).toEqual([0, 0]);
     expect(timerPromiseCalls).toEqual([]);
+  });
+});
+
+describe('waitForGroupGone', () => {
+  test('part 1 review note — rejects for a pid no launch started, instead of returning at once as if the group were gone', async () => {
+    const held = heldProcess();
+    // A child of the test that no launch started: nothing tells when its group is gone.
+    const child = sh(held.snippet, true);
+    try {
+      await expect(waitForGroupGone(child.pid!)).rejects.toThrow();
+      // It was still running: returning at once would have been a lie.
+      expect(groupAlive(child.pid!)).toBe(true);
+    } finally {
+      await held.release();
+      await once(child, 'exit');
+    }
   });
 });
 

@@ -30,7 +30,6 @@ interface AllowedLine {
  */
 const BASELINE: Baseline = {
   '.github/scripts/plane-sync/test/lint.test.ts': { timeouts: 1 },
-  'apps/desktop/test/app.test.ts': { pauses: 42, timeouts: 204, polls: 176, deadlines: 1 },
   'apps/desktop/test/composer.ts': { timeouts: 14, polls: 1 },
   'apps/desktop/test/daemon.test.ts': { pauses: 3, timeouts: 47, polls: 32 },
   'apps/desktop/test/global-teardown.test.ts': { pauses: 2, polls: 1 },
@@ -265,6 +264,11 @@ describe('the test files', () => {
   test('AC5 — launch.ts holds only the three lines of the definition of poll: one pause, one timeout option, one deadline, no poll( call', () => {
     const { found } = countRepo();
     expect(found['apps/desktop/test/launch.ts']).toEqual({ pauses: 1, timeouts: 1, polls: 0, deadlines: 1 });
+  });
+
+  test('COCKPIT-81 part 1 AC1 — app.test.ts holds no pause, no timeout option, no poll and no deadline, and has no baseline entry', () => {
+    expect(countRepo().found['apps/desktop/test/app.test.ts']).toBeUndefined();
+    expect(BASELINE['apps/desktop/test/app.test.ts']).toBeUndefined();
   });
 
   test('AC5 — every file holds exactly its baseline entry', () => {
