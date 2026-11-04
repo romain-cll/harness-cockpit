@@ -19,6 +19,10 @@ jobs:
     # macOS: the desktop app is packaged for macOS, and the runner has a
     # desktop session for the Electron tests.
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        copy: [1, 2, 3, 4, 5]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
