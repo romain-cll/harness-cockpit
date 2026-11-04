@@ -735,6 +735,10 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
       (error) => {
         if (error.code === 'BRANCH_EXISTS') return { status: 'refused', message: `A branch named ${name} already exists.` };
         if (error.code === 'INVALID_BRANCH_NAME') return { status: 'refused', message: `${name} is not a valid branch name.` };
+        if (error.code === 'FS_FAILED') {
+          const errno = (error.cause as NodeJS.ErrnoException | undefined)?.code ?? error.message;
+          return { status: 'refused', message: `Cockpit could not create its worktrees folder ${worktreesRoot}: ${errno}.` };
+        }
         return undefined;
       },
     );
@@ -929,6 +933,10 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
   };
   app.on('web-contents-created', (_event, contents) => {
     contents.on('did-navigate', () => unwatch(contents));
+    // An error page commits no `did-navigate`; an aborted navigation changes nothing (see `endRunsOf`).
+    contents.on('did-fail-load', (_event, errorCode, _description, _url, isMainFrame) => {
+      if (isMainFrame && errorCode !== ERR_ABORTED) unwatch(contents);
+    });
     contents.on('destroyed', () => unwatch(contents));
   });
 

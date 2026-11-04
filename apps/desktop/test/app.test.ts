@@ -49,6 +49,7 @@ import {
   textOf,
   useAgent,
   waitForBase,
+  waitForMessage,
 } from './composer';
 import { makeTestDir } from './run-root';
 
@@ -1652,6 +1653,159 @@ describe.each([
         gitIn(clone.root, 'update-ref', 'refs/remotes/origin/develop', develop);
       }
       expect(gitState(clone)).toEqual(before.git);
+    });
+
+    // COCKPIT-42: the composer words a worktrees folder that cannot be created.
+    // `git worktree list --porcelain` marks the worktrees under a folder that is moved aside as `prunable`:
+    // those lines only reflect that folder, every other line of the git state is compared.
+    const gitStateWithoutPrunable = (repo: TempRepo) => {
+      const state = gitState(repo);
+      return { ...state, worktrees: state.worktrees.split('\n').filter((line) => !line.startsWith('prunable ')).join('\n') };
+    };
+
+    test('workspaces COCKPIT-42 AC3 — a worktrees folder that is a regular file keeps the composer open with "Cockpit could not create its worktrees folder <root>: EEXIST.", lists no workspace, leaves state.json as it was and logs no error', async () => {
+      const { page } = session;
+      const root = join(session.cockpitHome, 'worktrees');
+      const aside = `${root}.aside`;
+      const titlesBefore = await entryTitles(page);
+      const git = gitStateWithoutPrunable(clone);
+      const state = stateSnapshot(session.dataDir);
+      const mark = await errorMark(session);
+      expect(existsSync(root), 'earlier tests created workspaces under the root').toBe(true);
+
+      renameSync(root, aside);
+      writeFileSync(root, 'not a folder');
+      try {
+        await openComposer(page, clone.root);
+        await useAgent(page, 'Terminal');
+        await waitForBase(page, 'origin/main');
+        await promptBox(page).fill('no root');
+        await createButton(page).click();
+        // The fresh composer shows no message before this one.
+        const message = await waitForMessage(page);
+        // The request is settled once "Create workspace" is enabled again.
+        await createButton(page).and(page.locator('button:enabled')).waitFor();
+
+        expect(message).toBe(`Cockpit could not create its worktrees folder ${root}: EEXIST.`);
+        expect(new URL(page.url()).pathname).toBe('/');
+        expect(await entryTitles(page)).toEqual(titlesBefore);
+        expect(gitStateWithoutPrunable(clone)).toEqual(git);
+        expect(localBranches(clone)).not.toContain('no-root');
+        expect(stateSnapshot(session.dataDir)).toEqual(state);
+        await expectNoNewErrors(session, mark);
+      } finally {
+        rmSync(root, { force: true });
+        renameSync(aside, root);
+      }
+    });
+
+    test('workspaces COCKPIT-42 AC7 — branches, create and remove refuse a project that is not in Cockpit with "<path> is not a project in Cockpit.", creating and changing nothing', async () => {
+      const { page } = session;
+      const root = join(session.cockpitHome, 'worktrees');
+      const listing = () => (existsSync(root) ? readdirSync(root, { recursive: true }).map(String).sort() : []);
+      const before = { listing: listing(), git: gitState(clone), state: stateSnapshot(session.dataDir), titles: await entryTitles(page) };
+      const project = '/no/such/project';
+      const refusal = { status: 'refused', message: `${project} is not a project in Cockpit.` };
+
+      expect(await workspacesApi(page, 'branches', [project])).toEqual(refusal);
+      expect(await workspacesApi(page, 'create', [project, 'orphan', 'main'])).toEqual(refusal);
+      expect(await workspacesApi(page, 'remove', [project, join(project, 'ws')])).toEqual(refusal);
+
+      expect(listing()).toEqual(before.listing);
+      expect(existsSync(join(root, basename(project)))).toBe(false);
+      expect(gitState(clone)).toEqual(before.git);
+      expect(stateSnapshot(session.dataDir)).toEqual(before.state);
+      expect(await entryTitles(page)).toEqual(before.titles);
+    });
+
+    test('workspaces COCKPIT-42 AC8 — the handlers of branches, create, remove, changes, diff, watch and teardown reject a sender frame from another origin', async () => {
+      const path = worktreePath(session, clone, loginBranch);
+      const file = { path: 'README.md', status: 'modified', additions: 0, deletions: 0 };
+      const origins = await session.evaluateInMain<Record<string, string>>(`(async () => {
+        const handlers = require('electron').ipcMain._invokeHandlers;
+        const calls = {
+          'workspaces:branches': [${JSON.stringify(clone.root)}],
+          'workspaces:create': [${JSON.stringify(clone.root)}, 'from-elsewhere', 'main'],
+          'workspaces:remove': [${JSON.stringify(clone.root)}, ${JSON.stringify(path)}],
+          'workspaces:changes': [${JSON.stringify(clone.root)}, ${JSON.stringify(path)}],
+          'workspaces:diff': [${JSON.stringify(clone.root)}, ${JSON.stringify(path)}, ${JSON.stringify(file)}],
+          'workspaces:watch': [${JSON.stringify(clone.root)}, ${JSON.stringify(path)}],
+          'workspaces:teardown': [${JSON.stringify(clone.root)}, ${JSON.stringify(path)}, { cols: 80, rows: 24 }],
+        };
+        const results = {};
+        for (const [channel, args] of Object.entries(calls)) {
+          const handler = handlers.get(channel);
+          if (!handler) { results[channel] = 'no handler'; continue; }
+          try {
+            await handler({ senderFrame: { url: 'https://example.com/' }, sender: null }, ...args);
+            results[channel] = 'resolved';
+          } catch {
+            results[channel] = 'rejected';
+          }
+        }
+        return results;
+      })()`);
+
+      expect(origins).toEqual({
+        'workspaces:branches': 'rejected',
+        'workspaces:create': 'rejected',
+        'workspaces:remove': 'rejected',
+        'workspaces:changes': 'rejected',
+        'workspaces:diff': 'rejected',
+        'workspaces:watch': 'rejected',
+        'workspaces:teardown': 'rejected',
+      });
+      expect(localBranches(clone)).not.toContain('from-elsewhere');
+      expect(existsSync(path)).toBe(true);
+    });
+
+    // The FSEvents watchers the main process holds.
+    const fsEventWatchers = () =>
+      session.evaluateInMain<number>("process.getActiveResourcesInfo().filter((name) => name === 'FSEventWrap').length");
+
+    test('workspaces COCKPIT-42 AC14 — a same-origin navigation that fails to load (an error page) closes the watchers of the workspace the window was watching', async () => {
+      const { page } = session;
+      const path = worktreePath(session, clone, loginBranch);
+      const appUrl = await page.evaluate(() => location.href);
+      const before = await fsEventWatchers();
+
+      try {
+        await page.evaluate(
+          ([project, workspace]) =>
+            (window as unknown as { api: { workspaces: { watch(project: string, path: string, listener: () => void): Promise<() => void> } } }).api.workspaces
+              .watch(project!, workspace!, () => {})
+              .then(() => undefined),
+          [clone.root, path] as const,
+        );
+        expect(await fsEventWatchers(), 'the watch holds FSEvents watchers').toBeGreaterThan(before);
+
+        // The main process tells when the main frame failed to load: the app's own listener, added when the
+        // window was created, has run by then. The promise settles on a later turn of the event loop, so the
+        // closed handles are gone when the count is read.
+        await session.evaluateInMain(`(() => {
+          const contents = require('electron').webContents.getAllWebContents().find((candidate) => candidate.getURL().startsWith('app://'));
+          globalThis.__mainFrameFailed = new Promise((resolve) => {
+            const onFail = (_event, errorCode, _description, _url, isMainFrame) => {
+              if (!isMainFrame || errorCode === -3) return;
+              contents.removeListener('did-fail-load', onFail);
+              setImmediate(resolve);
+            };
+            contents.on('did-fail-load', onFail);
+          });
+        })()`);
+        await page
+          .evaluate(() => {
+            location.href = new URL('/%', location.href).href;
+          })
+          .catch(() => {});
+        await session.evaluateInMain('globalThis.__mainFrameFailed');
+
+        expect(await fsEventWatchers()).toBe(before);
+      } finally {
+        // Load the app page again, so the pending navigation is gone and the next test can click.
+        await page.goto(appUrl);
+        await page.getByText(versionLabel).waitFor();
+      }
     });
 
     // A workspace added with git itself (on a new branch from origin/main), listed after a reload.
@@ -3529,7 +3683,7 @@ const pickTopItem = (page: Page, name: string) => page.getByRole('menuitem', { n
 // The whole menu of a workspace when every fake bundle is there and nothing is remembered.
 const FIRST_MENU = ['Open in Visual Studio Code', 'Open in Terminal', 'Reveal in Finder', 'Open in editor', 'Open in terminal'];
 
-const workspacesApi = (page: Page, call: 'reveal' | 'open', args: unknown[]) =>
+const workspacesApi = (page: Page, call: 'branches' | 'create' | 'remove' | 'reveal' | 'open', args: unknown[]) =>
   page.evaluate(
     ([call, args]) =>
       (window as unknown as { api: { workspaces: Record<string, (...args: unknown[]) => Promise<unknown>> } }).api.workspaces[call]!(...args),
