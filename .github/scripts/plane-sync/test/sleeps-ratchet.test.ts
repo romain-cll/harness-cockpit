@@ -3,16 +3,55 @@ import { join, relative } from 'node:path';
 import { describe, expect, test } from 'vitest';
 import { CATEGORIES, countCategories, type Category } from '../src/sleeps-count';
 
-// COCKPIT-80: a ratchet over the pauses and deadlines left in the test files. The counter lives in
-// `../src/sleeps-count.ts` (`countCategories(source)`: occurrences per category in one file's text, lines
-// whose trimmed text starts with `//` or `*` skipped); this file holds its unit cases, the baseline and
-// the repo check. A count above its baseline fails (a new pause or deadline), a count below fails too
-// (lower the baseline in the same change, so the ratchet only ever tightens).
+// COCKPIT-80, COCKPIT-81: a per-file ratchet over the waits left in the test files. The counter lives
+// in `../src/sleeps-count.ts`: `countCategories(source)` returns `{ counts, allowed }`, the occurrences
+// per category in one file's text (lines whose trimmed text starts with `//` or `*` skipped) and the
+// lines that end with `// legitimate poll: <reason>` (counted nowhere, returned with their reason).
+// This file holds its unit cases, the per-file baseline, the `ALLOWED` list and the repo check. A count
+// above its file's entry fails (a new wait), a count below fails too (lower the entry in the same change,
+// so the ratchet only ever tightens), and the allowed lines found must be exactly `ALLOWED`.
 //
 // Like agents-md.test.ts it lives here because no package owns a repo-wide check, and it only reads files.
 
-/** The counts the test files hold at the end of COCKPIT-80. Lower a number here when a test below it. */
-const BASELINE: Record<Category, number> = { pauses: 75, timeouts: 350, polls: 235, deadlines: 8 };
+type Counts = Record<Category, number>;
+type Baseline = Record<string, Partial<Record<Category, number>>>;
+type Found = Record<string, Counts>;
+interface AllowedLine {
+  file: string;
+  line: string;
+  reason: string;
+}
+
+/**
+ * The counts each test file holds, non-zero entries only (a file absent holds none). Lower a number
+ * here when a test below it, and delete the entry when it reaches zero.
+ * `launch.ts` keeps the three lines of the definition of `poll` while other files call it; the one
+ * `setTimeout(` of `launch-helpers.test.ts` is the page-side timer that AC9's element waits for.
+ */
+const BASELINE: Baseline = {
+  '.github/scripts/plane-sync/test/lint.test.ts': { timeouts: 1 },
+  'apps/desktop/test/app.test.ts': { pauses: 42, timeouts: 204, polls: 176, deadlines: 1 },
+  'apps/desktop/test/composer.ts': { timeouts: 14, polls: 1 },
+  'apps/desktop/test/daemon.test.ts': { pauses: 3, timeouts: 47, polls: 32 },
+  'apps/desktop/test/global-teardown.test.ts': { pauses: 2, polls: 1 },
+  'apps/desktop/test/launch-helpers.test.ts': { pauses: 1 },
+  'apps/desktop/test/launch.ts': { pauses: 1, timeouts: 1, deadlines: 1 },
+  'apps/desktop/test/live-terminals.test.ts': { pauses: 1 },
+  'apps/desktop/test/new-workspace.test.ts': { timeouts: 1, polls: 4 },
+  'apps/desktop/test/workspace-panes.test.ts': { pauses: 5, timeouts: 65, polls: 29, deadlines: 1 },
+  'packages/daemon/test/cli.test.ts': { pauses: 1 },
+  'packages/daemon/test/client.test.ts': { pauses: 2 },
+  'packages/daemon/test/helpers.ts': { pauses: 2, deadlines: 1 },
+  'packages/daemon/test/status.test.ts': { pauses: 1 },
+  'packages/daemon/test/terminals.test.ts': { pauses: 2 },
+  'packages/harnesses/test/detect.test.ts': { pauses: 2, deadlines: 1 },
+  'packages/harnesses/test/status.test.ts': { pauses: 1, timeouts: 7, polls: 4 },
+  'packages/shell-env/test/resolve-shell-env.test.ts': { pauses: 4, deadlines: 1 },
+  'packages/workspaces/test/changes.test.ts': { pauses: 2, timeouts: 9, polls: 9 },
+};
+
+/** The `// legitimate poll: <reason>` lines the test files may hold: a re-check loop whose source cannot notify. */
+const ALLOWED: AllowedLine[] = [];
 
 const repoRoot = join(import.meta.dirname, '..', '..', '..', '..');
 const SELF = join(import.meta.dirname, 'sleeps-ratchet.test.ts');
@@ -39,38 +78,51 @@ function testFiles(): string[] {
   return found.sort();
 }
 
-type Found = Record<Category, Record<string, number>>;
-
-function countRepo(): Found {
-  const found = Object.fromEntries(CATEGORIES.map((category) => [category, {}])) as Found;
-  for (const file of testFiles()) {
-    const counts = countCategories(readFileSync(file, 'utf8'));
-    for (const category of CATEGORIES) if (counts[category] > 0) found[category][relative(repoRoot, file)] = counts[category];
+function countRepo(): { found: Found; allowed: AllowedLine[] } {
+  const found: Found = {};
+  const allowed: AllowedLine[] = [];
+  for (const path of testFiles()) {
+    const file = relative(repoRoot, path);
+    const result = countCategories(readFileSync(path, 'utf8'));
+    if (CATEGORIES.some((category) => result.counts[category] > 0)) found[file] = result.counts;
+    for (const each of result.allowed) allowed.push({ file, line: each.line, reason: each.reason });
   }
-  return found;
+  return { found, allowed };
 }
 
-const total = (files: Record<string, number>) => Object.values(files).reduce((sum, count) => sum + count, 0);
-
-/** What is wrong with the counts against the baseline: one message per category above or below it. */
-function verdict(found: Found, baseline: Record<Category, number>): string[] {
+/** What is wrong with the counts against the baseline: one message per file and category above or below its entry. */
+function verdict(found: Found, baseline: Baseline): string[] {
   const problems: string[] = [];
-  for (const category of CATEGORIES) {
-    const count = total(found[category]);
-    const files = Object.entries(found[category])
-      .map(([file, each]) => `${file} (${each})`)
-      .join(', ');
-    if (count > baseline[category]) {
-      problems.push(`${category}: ${count} is above the baseline ${baseline[category]}; remove the new ones. Files: ${files}`);
-    } else if (count < baseline[category]) {
-      problems.push(`${category}: ${count} is below the baseline ${baseline[category]}; lower the baseline to ${count}. Files: ${files}`);
+  for (const file of [...new Set([...Object.keys(found), ...Object.keys(baseline)])].sort()) {
+    for (const category of CATEGORIES) {
+      const count = found[file]?.[category] ?? 0;
+      const entry = baseline[file]?.[category] ?? 0;
+      if (count > entry) {
+        problems.push(`${file}: ${category} is ${count}, above its baseline ${entry}; remove the new ones`);
+      } else if (count < entry) {
+        problems.push(`${file}: ${category} is ${count}, below its baseline ${entry}; lower the entry of ${file} to ${count}`);
+      }
     }
   }
   return problems;
 }
 
+const key = (each: AllowedLine) => `${each.file} | ${each.line} | ${each.reason}`;
+
+/** The allowed lines found that `ALLOWED` lacks, and the entries of `ALLOWED` that no line matches. */
+function allowedProblems(found: AllowedLine[], allowed: AllowedLine[]): string[] {
+  const listed = new Set(allowed.map(key));
+  const present = new Set(found.map(key));
+  return [
+    ...found.filter((each) => !listed.has(key(each))).map((each) => `${each.file}: add to ALLOWED: ${each.line} (${each.reason})`),
+    ...allowed.filter((each) => !present.has(key(each))).map((each) => `${each.file}: remove from ALLOWED, its line is gone: ${each.line}`),
+  ];
+}
+
+const none: Counts = { pauses: 0, timeouts: 0, polls: 0, deadlines: 0 };
+
 describe('the counter', () => {
-  test('AC7 — counts the pauses: sleep(, setTimeout(, waitForTimeout(, Atomics.wait( and a shell "sleep <n>"', () => {
+  test('COCKPIT-80 — counts the pauses: sleep(, setTimeout(, waitForTimeout(, Atomics.wait( and a shell "sleep <n>"', () => {
     const source = [
       'await sleep(100);',
       'await new Promise((done) => setTimeout(done, 20));',
@@ -79,10 +131,10 @@ describe('the counter', () => {
       "writeFileSync(stub, 'while true; do sleep 0.1; done');",
       'await sleep(1); await sleep(2);',
     ].join('\n');
-    expect(countCategories(source)).toEqual({ pauses: 7, timeouts: 0, polls: 0, deadlines: 0 });
+    expect(countCategories(source).counts).toEqual({ ...none, pauses: 7 });
   });
 
-  test('AC7 — counts the "timeout:" options, the poll( calls and the Date.now() + deadlines, each in its own category', () => {
+  test('COCKPIT-80 — counts the "timeout:" options, the poll( calls and the Date.now() + deadlines, each in its own category', () => {
     const source = [
       'await button.click({ timeout: UI_TIMEOUT });',
       'await locator.waitFor({ state: "hidden", timeout: 15_000 });',
@@ -90,16 +142,15 @@ describe('the counter', () => {
       'const deadline = Date.now() + 3_000;',
       'while (Date.now() < deadline) await next();',
     ].join('\n');
-    expect(countCategories(source)).toEqual({ pauses: 0, timeouts: 2, polls: 1, deadlines: 1 });
+    expect(countCategories(source).counts).toEqual({ pauses: 0, timeouts: 2, polls: 1, deadlines: 1 });
   });
 
-  test('AC7 — the definition of poll is not a poll( call (its "timeout:" parameter is still a "timeout:" hit)', () => {
+  test('COCKPIT-80 — the definition of poll is not a poll( call (its "timeout:" parameter is still a "timeout:" hit)', () => {
     const source = 'export async function poll<T>(read: () => T, done: (value: T) => boolean, timeout: number): Promise<T> {';
-    expect(countCategories(source)).toEqual({ pauses: 0, timeouts: 1, polls: 0, deadlines: 0 });
-    expect(countCategories('function poll(read, done, timeout) {').polls).toBe(0);
+    expect(countCategories(source).counts).toEqual({ ...none, timeouts: 1 });
   });
 
-  test('AC7 — skips the lines whose trimmed text starts with // or *', () => {
+  test('COCKPIT-80 — skips the lines whose trimmed text starts with // or *', () => {
     const source = [
       '// await sleep(100) was here, with a timeout: 5_000',
       '  // poll( and Date.now() + 1',
@@ -107,41 +158,116 @@ describe('the counter', () => {
       '/** not skipped by the rule, but it holds nothing */',
       '    await sleep(5); // a trailing comment on a counted line',
     ].join('\n');
-    expect(countCategories(source)).toEqual({ pauses: 1, timeouts: 0, polls: 0, deadlines: 0 });
+    expect(countCategories(source).counts).toEqual({ ...none, pauses: 1 });
   });
 
-  test('AC7 — counts nothing in a file with none', () => {
-    expect(countCategories("import { test } from 'vitest';\ntest('x', () => {});\n")).toEqual({ pauses: 0, timeouts: 0, polls: 0, deadlines: 0 });
+  test('AC1 — counts vi.waitFor(, expect.poll(, waitForFunction( and setInterval( under polls, each occurrence once, next to poll(', () => {
+    const source = [
+      'await vi.waitFor(() => expect(read()).toBe(1), { interval: 50 });',
+      'await expect.poll(() => read()).toBe(2);',
+      'await page.waitForFunction(() => window.ready);',
+      'const timer = setInterval(tick, 100);',
+      'const found = await poll(() => read(), Boolean, UI_TIMEOUT);',
+      'await vi.waitFor(a); await vi.waitFor(b);',
+    ].join('\n');
+    expect(countCategories(source).counts).toEqual({ ...none, polls: 7 });
+  });
+
+  test('AC2 — a line ending with "// legitimate poll: <reason>" counts nothing and is returned with its reason', () => {
+    const source = [
+      'await sleep(100); await vi.waitFor(() => alive(pid), { timeout: 5_000 }); // legitimate poll: a pid in another process tree cannot notify',
+      'await sleep(5);',
+    ].join('\n');
+    const { counts, allowed } = countCategories(source);
+    expect(counts).toEqual({ ...none, pauses: 1 });
+    expect(allowed).toHaveLength(1);
+    expect(allowed[0]!.reason).toBe('a pid in another process tree cannot notify');
+    expect(allowed[0]!.line).toContain('vi.waitFor(');
+  });
+
+  test('AC2 — a "// legitimate poll:" comment with no reason does not excuse the line', () => {
+    const source = ['await sleep(100); // legitimate poll:', 'await sleep(100); // legitimate poll:    '].join('\n');
+    const { counts, allowed } = countCategories(source);
+    expect(counts).toEqual({ ...none, pauses: 2 });
+    expect(allowed).toEqual([]);
+  });
+
+  test('counts nothing and allows nothing in a file with none', () => {
+    expect(countCategories("import { test } from 'vitest';\ntest('x', () => {});\n")).toEqual({ counts: none, allowed: [] });
   });
 });
 
 describe('the verdict', () => {
-  const found = (counts: Partial<Record<Category, Record<string, number>>>): Found => ({ pauses: {}, timeouts: {}, polls: {}, deadlines: {}, ...counts });
-  const baseline = { pauses: 2, timeouts: 3, polls: 1, deadlines: 0 };
+  const baseline: Baseline = { 'a.ts': { pauses: 2, timeouts: 1 }, 'b.ts': { polls: 1 } };
 
-  test('AC7 — equal to the baseline passes', () => {
-    expect(verdict(found({ pauses: { 'a.ts': 2 }, timeouts: { 'a.ts': 1, 'b.ts': 2 }, polls: { 'c.ts': 1 } }), baseline)).toEqual([]);
+  test('AC3 — equal to every entry passes', () => {
+    const found: Found = { 'a.ts': { ...none, pauses: 2, timeouts: 1 }, 'b.ts': { ...none, polls: 1 } };
+    expect(verdict(found, baseline)).toEqual([]);
   });
 
-  test('AC7 — above the baseline fails, naming the category, the count and the files', () => {
-    const problems = verdict(found({ pauses: { 'a.ts': 2, 'b.ts': 1 }, timeouts: { 'a.ts': 3 }, polls: { 'c.ts': 1 } }), baseline);
+  test('AC3 — above the entry fails, naming the file, the category and both counts', () => {
+    const found: Found = { 'a.ts': { ...none, pauses: 3, timeouts: 1 }, 'b.ts': { ...none, polls: 1 } };
+    const problems = verdict(found, baseline);
     expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('a.ts');
     expect(problems[0]).toContain('pauses');
     expect(problems[0]).toContain('3');
-    expect(problems[0]).toContain('a.ts');
-    expect(problems[0]).toContain('b.ts');
+    expect(problems[0]).toContain('2');
   });
 
-  test('AC7 — below the baseline fails, asking to lower the baseline to the new count', () => {
-    const problems = verdict(found({ pauses: { 'a.ts': 2 }, timeouts: { 'a.ts': 2 }, polls: { 'c.ts': 1 } }), baseline);
+  test('AC3 — a file absent from the baseline has 0: any count in it fails, naming it', () => {
+    const found: Found = { 'a.ts': { ...none, pauses: 2, timeouts: 1 }, 'b.ts': { ...none, polls: 1 }, 'new.ts': { ...none, timeouts: 1 } };
+    const problems = verdict(found, baseline);
     expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('new.ts');
     expect(problems[0]).toContain('timeouts');
-    expect(problems[0]).toMatch(/lower the baseline to 2/);
+  });
+
+  test("AC3 — below the entry fails, asking to lower that file's entry to the new count (one file's slack never covers another's excess)", () => {
+    const found: Found = { 'a.ts': { ...none, pauses: 1, timeouts: 1 }, 'b.ts': { ...none, polls: 1 } };
+    const problems = verdict(found, baseline);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('a.ts');
+    expect(problems[0]).toContain('pauses');
+    expect(problems[0]).toMatch(/lower the entry .* to 1/);
+    const swapped: Found = { 'a.ts': { ...none, pauses: 1, timeouts: 1 }, 'b.ts': { ...none, polls: 2 } };
+    expect(verdict(swapped, baseline)).toHaveLength(2);
+  });
+});
+
+describe('the allowed lines', () => {
+  const line = { file: 'a.ts', line: 'await vi.waitFor(alive); // legitimate poll: no event', reason: 'no event' };
+
+  test('AC4 — a line found and listed passes', () => {
+    expect(allowedProblems([line], [line])).toEqual([]);
+  });
+
+  test('AC4 — a new "// legitimate poll:" line fails until it is added to ALLOWED', () => {
+    const problems = allowedProblems([line], []);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('a.ts');
+    expect(problems[0]).toContain('add to ALLOWED');
+  });
+
+  test('AC4 — an entry whose line is gone fails until it is removed', () => {
+    const problems = allowedProblems([], [line]);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('a.ts');
+    expect(problems[0]).toContain('remove from ALLOWED');
   });
 });
 
 describe('the test files', () => {
-  test('AC7 — hold exactly the baseline count of pauses, timeout options, poll deadlines and other deadlines', () => {
-    expect(verdict(countRepo(), BASELINE)).toEqual([]);
+  test('AC4 — the allowed lines found are exactly the ALLOWED list', () => {
+    expect(allowedProblems(countRepo().allowed, ALLOWED)).toEqual([]);
+  });
+
+  test('AC5 — launch.ts holds only the three lines of the definition of poll: one pause, one timeout option, one deadline, no poll( call', () => {
+    const { found } = countRepo();
+    expect(found['apps/desktop/test/launch.ts']).toEqual({ pauses: 1, timeouts: 1, polls: 0, deadlines: 1 });
+  });
+
+  test('AC5 — every file holds exactly its baseline entry', () => {
+    expect(verdict(countRepo().found, BASELINE)).toEqual([]);
   });
 });
