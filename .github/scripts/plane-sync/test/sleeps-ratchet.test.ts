@@ -30,14 +30,8 @@ interface AllowedLine {
  */
 const BASELINE: Baseline = {
   '.github/scripts/plane-sync/test/lint.test.ts': { timeouts: 1 },
-  'apps/desktop/test/composer.ts': { timeouts: 14, polls: 1 },
-  'apps/desktop/test/daemon.test.ts': { pauses: 3, timeouts: 47, polls: 32 },
-  'apps/desktop/test/global-teardown.test.ts': { pauses: 2, polls: 1 },
   'apps/desktop/test/launch-helpers.test.ts': { pauses: 1 },
   'apps/desktop/test/launch.ts': { pauses: 1, timeouts: 1, deadlines: 1 },
-  'apps/desktop/test/live-terminals.test.ts': { pauses: 1 },
-  'apps/desktop/test/new-workspace.test.ts': { timeouts: 1, polls: 4 },
-  'apps/desktop/test/workspace-panes.test.ts': { pauses: 5, timeouts: 65, polls: 29, deadlines: 1 },
   'packages/daemon/test/cli.test.ts': { pauses: 1 },
   'packages/daemon/test/client.test.ts': { pauses: 2 },
   'packages/daemon/test/helpers.ts': { pauses: 2, deadlines: 1 },
@@ -51,6 +45,9 @@ const BASELINE: Baseline = {
 
 /** The `// legitimate poll: <reason>` lines the test files may hold: a re-check loop whose source cannot notify. */
 const ALLOWED: AllowedLine[] = [];
+
+/** The desktop test files COCKPIT-81 part 2 cleans: none keeps a baseline entry. */
+const PART_2_FILES = ['workspace-panes.test.ts', 'daemon.test.ts', 'global-teardown.test.ts', 'live-terminals.test.ts', 'new-workspace.test.ts', 'composer.ts'];
 
 const repoRoot = join(import.meta.dirname, '..', '..', '..', '..');
 const SELF = join(import.meta.dirname, 'sleeps-ratchet.test.ts');
@@ -269,6 +266,36 @@ describe('the test files', () => {
   test('COCKPIT-81 part 1 AC1 — app.test.ts holds no pause, no timeout option, no poll and no deadline, and has no baseline entry', () => {
     expect(countRepo().found['apps/desktop/test/app.test.ts']).toBeUndefined();
     expect(BASELINE['apps/desktop/test/app.test.ts']).toBeUndefined();
+  });
+
+  test('COCKPIT-81 part 2 AC1 — workspace-panes, daemon, global-teardown, live-terminals, new-workspace and composer hold no pause, no timeout option, no poll and no deadline, have no baseline entry, and every allowed line they hold is listed in ALLOWED', () => {
+    const { found, allowed } = countRepo();
+    const files = PART_2_FILES.map((name) => `apps/desktop/test/${name}`);
+    for (const file of files) {
+      expect(found[file], file).toBeUndefined();
+      expect(BASELINE[file], file).toBeUndefined();
+    }
+    const inPart = (each: AllowedLine) => files.includes(each.file);
+    expect(allowedProblems(allowed.filter(inPart), ALLOWED.filter(inPart))).toEqual([]);
+  });
+
+  test('COCKPIT-81 part 2 AC3 — the title of daemon AC7/AC10 no longer says the processes still run "5 s later"', () => {
+    const source = readFileSync(join(repoRoot, 'apps/desktop/test/daemon.test.ts'), 'utf8');
+    const titles = source.split('\n').filter((line) => /^\s*test\('AC7, AC10 — /.test(line));
+    expect(titles).toHaveLength(1);
+    expect(titles[0]).not.toMatch(/5 s later/);
+  });
+
+  test('COCKPIT-81 part 2 AC4 — quitApp (daemon.test.ts, workspace-panes.test.ts) runs app.quit() on setImmediate, with no 300 ms timer and no poll of isRunning', () => {
+    for (const name of ['daemon.test.ts', 'workspace-panes.test.ts']) {
+      const source = readFileSync(join(repoRoot, 'apps/desktop/test', name), 'utf8');
+      const start = source.indexOf('async function quitApp(');
+      expect(start, `${name} defines quitApp`).toBeGreaterThanOrEqual(0);
+      const body = source.slice(start, source.indexOf('\n}\n', start));
+      expect(body, name).toMatch(/setImmediate\(.*app\.quit\(\)/);
+      expect(body, name).not.toMatch(/300|setTimeout|poll\(|isRunning/);
+      expect(body, name).toMatch(/exit/);
+    }
   });
 
   test('AC5 — every file holds exactly its baseline entry', () => {

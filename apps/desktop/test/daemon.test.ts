@@ -343,13 +343,15 @@ const hasEnded = (pid: number) => {
   }
 };
 
+// The line the setup command prints with its pid, and how a test finds the pid in a terminal's text.
+const SETUP_PID = /setup-pid-(\d+)\r?\n/;
+
 // Adds the repository, creates a workspace and starts its teardown (a `commands` terminal, like a
 // setup) through `window.api`. The terminal is found through the test's own connection to the daemon:
 // the main process numbers its terminals itself (`ptyId`), the daemon numbers its own and the two are
 // not mapped, so it is the daemon's `commands` terminal that runs in this workspace's folder. Its
-// command prints its pid (`exec` keeps it for the `sleep`); `exited` resolves when the daemon says the
-// terminal ended.
-async function startSetup(session: Session, daemon: DaemonClient, repo: { root: string }, name: string): Promise<{ pid: number; exited: Promise<void> }> {
+// command prints its pid (`exec` keeps it for the `sleep`); the id returned is the daemon's.
+async function beginSetup(session: Session, daemon: DaemonClient, repo: { root: string }, name: string): Promise<number> {
   const { page } = session;
   await stubPicker(session, repo.root);
   await page.evaluate(() => (window as unknown as ApiWindow).api.projects!.add!());
@@ -359,8 +361,13 @@ async function startSetup(session: Session, daemon: DaemonClient, repo: { root: 
   const started = await page.evaluate(([root, path]) => (window as unknown as ApiWindow).api.workspaces!.teardown!(root, path, { cols: 80, rows: 24 }), [repo.root, path] as const);
   expect(started.status).toBe('started');
   const info = (await daemon.list()).find((terminal) => terminal.kind === 'commands' && terminal.cwd === path);
-  const terminal = await watchTerminal(daemon, must(info, 'the setup terminal in the daemon').id);
-  const [, pid] = await terminal.find(/setup-pid-(\d+)\r?\n/);
+  return must(info, 'the setup terminal in the daemon').id;
+}
+
+// `beginSetup`, then the pid the setup prints; `exited` resolves when the daemon says the terminal ended.
+async function startSetup(session: Session, daemon: DaemonClient, repo: { root: string }, name: string): Promise<{ pid: number; exited: Promise<void> }> {
+  const terminal = await watchTerminal(daemon, await beginSetup(session, daemon, repo, name));
+  const [, pid] = await terminal.find(SETUP_PID);
   return { pid: Number(pid), exited: terminal.exited };
 }
 
@@ -554,6 +561,37 @@ describe('daemon: built app', () => {
     await poll(() => tabNames(reopened!), (names) => names.length === 2, UI_TIMEOUT);
     expect(await shellPid(reopened!)).toBe(known.shells[0]);
     await expectDot(reopened!, known.session, 'Working');
+  });
+
+  test('COCKPIT-81 part 2 AC2 — a setup whose pid line is already on the screen when the test attaches still gives its pid (the attach serializes the screen: no newline after the last row)', async () => {
+    repo = makeRepoWithSetup();
+    const livePage = (await pagesOf(session!)).at(-1)!;
+    const live = { ...session!, page: livePage } as Session;
+    const socket = must(daemonFile(home, 'sock', build), 'the daemon sock');
+    const early = await connectDaemon(socket);
+    const late = await connectDaemon(socket);
+
+    try {
+      const id = await beginSetup(live, early, repo, 'setup-late');
+      // The setup has printed its line once a first attach has seen it, so the next attach only gets the screen.
+      const watched = await watchTerminal(early, id);
+      const seen = await watched.find(/setup-pid-\d+/);
+      const { screen } = await late.attach(id);
+
+      expect(screen, 'the line is on the serialized screen').toContain(seen[0]);
+      expect(screen, 'no newline follows the last row').not.toMatch(/setup-pid-\d+[^\r\n]*\r?\n/);
+      const found = SETUP_PID.exec(screen);
+      expect(found, 'the pattern the tests find a setup pid with matches the late screen').not.toBeNull();
+      expect(Number(found![1])).toBeGreaterThan(0);
+
+      // The setup ends with its page.
+      await livePage.reload();
+      await livePage.getByText(versionLabel).waitFor();
+      await watched.exited;
+    } finally {
+      early.close();
+      late.close();
+    }
   });
 
   test('AC7, AC10 — a setup (commands terminal) ends when its page reloads, and is not shown again; when the app is killed with SIGKILL the daemon, the shells and the session still run 5 s later and the setup is gone', async () => {
