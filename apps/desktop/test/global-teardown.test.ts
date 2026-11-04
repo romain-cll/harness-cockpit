@@ -2,7 +2,6 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { setTimeout as sleep } from 'node:timers/promises';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import config from '../vitest.config';
 import { killDaemonsUnder, setup, teardown } from './global-teardown';
@@ -16,7 +15,7 @@ import { makeTestDir, RUN_ROOT_ENV } from './run-root';
 
 const folders: string[] = [];
 const children: ChildProcess[] = [];
-const exited = new WeakMap<ChildProcess, Promise<void>>();
+const exited = new WeakMap<ChildProcess, Promise<boolean>>();
 let savedRoot: string | undefined;
 
 beforeEach(() => {
@@ -38,10 +37,11 @@ afterEach(() => {
   for (const folder of folders.splice(0)) rmSync(folder, { recursive: true, force: true });
 });
 
+// Says it started, then lives as long as its stdin stays open (the test holds the other end).
 const script = (() => {
   const dir = mkdtempSync(join(tmpdir(), 'standin-script-'));
   const file = join(dir, 'wait.mjs');
-  writeFileSync(file, 'setInterval(() => {}, 1000);\n');
+  writeFileSync(file, "process.stdout.write('started\\n');\nprocess.stdin.resume();\n");
   return file;
 })();
 
@@ -56,22 +56,22 @@ function makeRoot() {
 }
 
 async function standIn(args: string[]): Promise<ChildProcess> {
-  const child = spawn(process.execPath, [script, ...args], { detached: true, stdio: 'ignore' });
+  const child = spawn(process.execPath, [script, ...args], { detached: true, stdio: ['pipe', 'pipe', 'ignore'] });
   children.push(child);
-  exited.set(child, new Promise((resolve) => child.once('exit', () => resolve())));
+  exited.set(child, new Promise((resolve) => child.once('exit', () => resolve(true))));
+  // The command line is readable once the process has exec'ed: its script runs, and says so.
   await new Promise<void>((resolve, reject) => {
-    child.once('spawn', () => resolve());
     child.once('error', reject);
+    child.once('exit', () => reject(new Error('the stand-in exited before it started')));
+    child.stdout!.once('data', () => resolve());
   });
-  // The command line is readable once the process has exec'ed.
-  await sleep(100);
   return child;
 }
 
 const pidFile = (dir: string, name: string, pid: number) => writeFileSync(join(dir, name), String(pid));
 
-const hasExited = async (child: ChildProcess, timeout = 5_000) =>
-  Promise.race([exited.get(child)!.then(() => true), sleep(timeout).then(() => false)]);
+// Resolves with true when the child has exited.
+const hasExited = (child: ChildProcess) => exited.get(child)!;
 
 const isAlive = (child: ChildProcess) => {
   try {
@@ -143,7 +143,9 @@ describe('global setup and teardown', () => {
 
     expect(await hasExited(running), 'the running daemon is killed').toBe(true);
     expect(await hasExited(stopped), 'the stopped daemon is killed').toBe(true);
-    expect(await hasExited(stranger, 500), 'a process that is not a Cockpit daemon is left alone').toBe(false);
+    // The kills of one call went out together, and the exits above were reaped in later turns of the loop (libuv
+    // reaps every child that has exited in one pass): a stranger that had been killed would have exited by now.
+    expect(stranger.exitCode === null && stranger.signalCode === null, 'a process that is not a Cockpit daemon is left alone').toBe(true);
     expect(isAlive(stranger)).toBe(true);
     expect(isAlive(ofAnotherRun), 'a daemon of another run is left alone').toBe(true);
   });

@@ -1,7 +1,6 @@
 import { basename } from 'node:path';
 import { expect } from 'vitest';
 import { type Locator, type Page } from 'playwright-core';
-import { UI_TIMEOUT, poll } from './launch';
 
 // COCKPIT-66: the New workspace page (the composer at `/`) as the tests drive it, shared by the test
 // files that create workspaces and sessions. The project, agent and base selects have no accessible
@@ -37,9 +36,9 @@ export const waitForMessage = async (page: Page) => {
 // DOM during its exit animation, is never this one.
 export const openPopup = async (page: Page, trigger: Locator) => {
   const id = await trigger.getAttribute('id');
-  await trigger.click({ timeout: UI_TIMEOUT });
+  await trigger.click();
   const menu = page.locator(`[role="menu"][aria-labelledby="${id}"]`);
-  await menu.waitFor({ timeout: UI_TIMEOUT });
+  await menu.waitFor();
   return menu;
 };
 export const itemsOf = (menu: Locator) => menu.locator('[role^="menuitem"]');
@@ -58,36 +57,37 @@ export const closePopups = async (page: Page) => {
 // Goes to the composer for a project (a path, or `none` for no project) as the app's own links do.
 export async function openComposer(page: Page, project?: string) {
   await page.goto(urlIn(page, project === undefined ? '/' : `/?project=${encodeURIComponent(project)}`));
-  await promptBox(page).waitFor({ timeout: UI_TIMEOUT });
+  await promptBox(page).waitFor();
 }
 
 // Goes to the composer through the sidebar, as a user does and without reloading the page (the Sessions
 // "+", or "New workspace…" in the project's menu); falls back to the URL when the sidebar offers no way.
 export async function openComposerFromSidebar(page: Page, project: string) {
-  try {
-    if (project === 'none') {
-      await page.getByRole('button', { name: 'Start session', exact: true }).click({ timeout: 3_000 });
-    } else {
-      await page.getByTitle(project, { exact: true }).first().hover({ timeout: 3_000 });
-      await page.getByRole('button', { name: `Actions for ${basename(project)}`, exact: true }).click({ timeout: 3_000 });
-      await page.getByRole('menuitem', { name: 'New workspace…' }).click({ timeout: 3_000 });
-    }
-    await promptBox(page).waitFor({ timeout: UI_TIMEOUT });
-  } catch {
-    await closePopups(page);
+  const row = page.getByTitle(project, { exact: true }).first();
+  if (project !== 'none' && (await row.count()) === 0) {
+    // The sidebar lists no such project: the URL is the way.
     await openComposer(page, project);
+    return;
   }
+  if (project === 'none') {
+    await page.getByRole('button', { name: 'Start session', exact: true }).click();
+  } else {
+    await row.hover();
+    await page.getByRole('button', { name: `Actions for ${basename(project)}`, exact: true }).click();
+    await page.getByRole('menuitem', { name: 'New workspace…' }).click();
+  }
+  await promptBox(page).waitFor();
 }
 
 export async function pickAgent(page: Page, name: string) {
   const menu = await openPopup(page, agentSelect(page));
-  await itemsOf(menu).filter({ hasText: new RegExp(`^\\s*${name}`) }).first().click({ timeout: UI_TIMEOUT });
+  await itemsOf(menu).filter({ hasText: new RegExp(`^\\s*${name}`) }).first().click();
   await waitForAgent(page, name);
 }
 
 export async function detectAgain(page: Page) {
   const menu = await openPopup(page, agentSelect(page));
-  await itemsOf(menu).filter({ hasText: /^\s*Detect again\s*$/ }).click({ timeout: UI_TIMEOUT });
+  await itemsOf(menu).filter({ hasText: /^\s*Detect again\s*$/ }).click();
 }
 
 export const waitForAgent = (page: Page, text: string) => agentSelect(page).filter({ hasText: exactly(text) }).waitFor();
@@ -110,10 +110,10 @@ export const basePopup = (page: Page) =>
   });
 
 export async function chooseBase(page: Page, base: string) {
-  await baseSelect(page).click({ timeout: UI_TIMEOUT });
-  await searchBranches(page).waitFor({ timeout: UI_TIMEOUT });
+  await baseSelect(page).click();
+  await searchBranches(page).waitFor();
   const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  await page.locator('[role="option"]').filter({ hasText: new RegExp(`^\\s*${escaped}\\s*$`) }).click({ timeout: UI_TIMEOUT });
+  await page.locator('[role="option"]').filter({ hasText: new RegExp(`^\\s*${escaped}\\s*$`) }).click();
   await waitForBase(page, base);
 }
 
@@ -164,13 +164,11 @@ export const tabsOf = (page: Page) =>
     return { labels: tabs.map(label), selected: tabs.filter((tab) => tab.getAttribute('aria-selected') === 'true').map(label) };
   });
 
-// Waits for the new stored session of the workspace at `path` (not one of `known`) and for a selected tab.
+// Gives the new stored session of the workspace at `path` (not one of `known`) and waits for a selected tab. The
+// composer navigates to the workspace page after `startSession` answered (the session stored), so one read of the
+// stored sessions is enough once the page is there.
 export async function waitForWorkspaceSession(page: Page, path: string, known: Set<string>) {
-  const stored = await poll(
-    async () => (await storedSessions(page)).find((each) => each.directory === path && !known.has(each.id)),
-    Boolean,
-    15_000,
-  );
+  const stored = (await storedSessions(page)).find((each) => each.directory === path && !known.has(each.id));
   expect(stored, `a session stored for ${path}`).toBeTruthy();
   await page.locator('[role="tab"][aria-selected="true"]').first().waitFor();
   return stored!;
@@ -208,7 +206,7 @@ export async function sendFromComposer(
   }
   await promptBox(page).fill(prompt);
   if (enter) await promptBox(page).press('Enter');
-  else await createButton(page).click({ timeout: UI_TIMEOUT });
+  else await createButton(page).click();
   if (project === 'none') return { id: await waitForNewSession(page, previous) };
   const path = await waitForWorkspacePage(page);
   if (agent === 'Terminal') return { path };

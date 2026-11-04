@@ -11,12 +11,13 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { statusLaunch } from '@cockpit/harnesses';
-import { type ElementHandle, type Frame, type Page } from 'playwright-core';
+import { type ElementHandle, type Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 import {
   MAIN_PROCESS_ERROR,
   appDir,
   daemonSocketIn,
+  evaluateUntil,
   fifo,
   freePort,
   gonePipe,
@@ -28,7 +29,12 @@ import {
   launchPackaged,
   launchSpawned,
   packagedAppDir,
+  startClock,
   stopGroup,
+  truthy,
+  untilIn,
+  untilRead,
+  untilScript,
   versionLabel,
   type Session,
 } from './launch';
@@ -331,112 +337,6 @@ const allConsoleErrorsOf = async (page: Page) =>
   (await page.consoleMessages({ filter: 'all' })).filter((m) => m.type() === 'error').map((m) => m.text());
 
 const allPageErrorsOf = (page: Page) => page.pageErrors({ filter: 'all' });
-
-// COCKPIT-81: the waits of this file are on the event that marks the step done. `untilRead` and `untilIn` are
-// `untilDom` (launch.ts) with a value: `read` runs in the page (or on `element`) from its source text, at once
-// and after each DOM mutation, and the promise resolves with the first value `done(value, arg)` accepts.
-// `read` and `done` must be self-contained, and `read` synchronous.
-const truthy = (value: unknown) => Boolean(value);
-
-// A criterion's time bound ("within 5 s") stays a check, as a measure: the test waits for the event with no
-// timeout of its own, and `within` then fails when more than `boundMs` passed since `startClock()` ran, which is
-// at the action the criterion starts its clock from.
-const startClock = () => {
-  const start = performance.now();
-  return (what: string, boundMs: number) => expect(performance.now() - start, `${what} took longer than ${boundMs} ms`).toBeLessThan(boundMs);
-};
-
-// The script both run: `call` reads the value, `root` is what the observer watches. It reads again on DOM
-// mutations and on what changes geometry or style with none: a transition or animation ending, a resize of the
-// window or of the root. `id` names its last read in the page (`__waitLast`) for `pendingWaits`.
-const untilScript = (read: object, done: object, arg: unknown, call: string, root: string, id: string, uses: Record<string, object> = {}) => `new Promise((resolve, reject) => {
-    ${Object.entries(uses).map(([name, each]) => `const ${name} = ${each.toString()};`).join('\n    ')}
-    const read = ${read.toString()};
-    const done = ${done.toString()};
-    const arg = ${JSON.stringify(arg)};
-    const events = ['transitionend', 'transitioncancel', 'animationend'];
-    const stop = () => {
-      observer.disconnect();
-      resize.disconnect();
-      for (const name of events) document.removeEventListener(name, check, true);
-      window.removeEventListener('resize', check);
-      delete window.__waitLast?.[${JSON.stringify(id)}];
-    };
-    const check = () => {
-      let value;
-      try {
-        value = ${call};
-        (window.__waitLast ??= {})[${JSON.stringify(id)}] = String(JSON.stringify(value)).slice(0, 2000);
-        if (!done(value, arg)) return;
-      } catch (error) {
-        stop();
-        reject(error);
-        return;
-      }
-      stop();
-      resolve(value);
-    };
-    const observer = new MutationObserver(check);
-    const resize = new ResizeObserver(check);
-    observer.observe(${root}, { subtree: true, childList: true, attributes: true, characterData: true });
-    resize.observe(${root} === document ? document.documentElement : ${root});
-    for (const name of events) document.addEventListener(name, check, true);
-    window.addEventListener('resize', check);
-    check();
-  })`;
-
-// The waits running in a page, for the diagnostic below: a wait that never ends is ended by the test's own guard
-// and says nothing, so the page keeps the last value each one read.
-type PendingWait = { frame: Frame; id: string; label: string };
-const pendingWaits = new Set<PendingWait>();
-
-async function evaluateUntil<R>(frame: Frame, read: object, arg: unknown, script: (id: string) => string): Promise<R> {
-  const label = `${read.toString().replace(/\s+/g, ' ').slice(0, 100)} waiting for ${JSON.stringify(arg)?.slice(0, 200)}`;
-  const pending: PendingWait = { frame, id: randomUUID(), label };
-  pendingWaits.add(pending);
-  try {
-    return (await frame.evaluate(script(pending.id))) as R;
-  } finally {
-    pendingWaits.delete(pending);
-  }
-}
-
-// A test the guard ended while a wait ran names what that wait last read, in the test's error.
-afterEach(async ({ task }) => {
-  const waiting = [...pendingWaits];
-  pendingWaits.clear();
-  const error = task.result?.errors?.[0];
-  if (task.result?.state !== 'fail' || !error || waiting.length === 0) return;
-  const lines = await Promise.all(
-    waiting.map(async ({ frame, id, label }) => {
-      const last = await frame.evaluate((id) => (window as unknown as { __waitLast?: Record<string, string> }).__waitLast?.[id], id).catch(() => '(the page is gone)');
-      return `  ${label}\n    last read: ${last}`;
-    }),
-  );
-  error.message += `\nWaits still running when the test ended:\n${lines.join('\n')}`;
-});
-
-async function untilRead<A, R>(page: Page, read: (arg: A) => R, done: (value: R, arg: A) => boolean, arg?: A): Promise<R> {
-  return evaluateUntil<R>(page.mainFrame(), read, arg, (id) => untilScript(read, done, arg, 'read(arg)', 'document', id));
-}
-
-// The script finds the element by a mark it carries meanwhile: a string handed to a handle's `evaluate` is an
-// expression, not a function that gets the element.
-async function untilIn<A, R>(element: ElementHandle<HTMLElement>, read: (element: HTMLElement, arg: A) => R, done: (value: R, arg: A) => boolean, arg?: A): Promise<R> {
-  const mark = randomUUID();
-  const frame = (await element.ownerFrame())!;
-  await element.evaluate((target, mark) => target.setAttribute('data-waiting', mark), mark);
-  try {
-    return await evaluateUntil<R>(
-      frame,
-      read,
-      arg,
-      (id) => `(() => { const element = document.querySelector('[data-waiting="${mark}"]'); return ${untilScript(read, done, arg, 'read(element, arg)', 'element', id)}; })()`,
-    );
-  } finally {
-    await element.evaluate((target) => target.removeAttribute('data-waiting')).catch(() => {});
-  }
-}
 
 // --- Terminal page helpers ---------------------------------------------------
 
@@ -3703,6 +3603,28 @@ const storedSessions = (page: Page) =>
     () => (window as unknown as { api: { sessions: { list(): Promise<StoredSession[]> } } }).api.sessions.list(),
   );
 
+// Resolves once the router has nothing left to load. The sidebar's start flow (`started` in projects.tsx) adds the
+// tab, then `await router.invalidate()`, then navigates to the workspace page: the tab shows before the flow ends,
+// and a user action in between (a click on the Sessions "+") is overridden by that late navigation. The router
+// reports `onResolved` when a load ends; the navigation that follows is issued in the same microtask chain, so by
+// the time this answer reaches the test it is already pending again or done.
+const routerSettled = (page: Page) =>
+  page.evaluate(
+    () =>
+      new Promise<void>((resolve) => {
+        const router = (window as unknown as { __TSR_ROUTER__: { state: { status: string }; subscribe: (type: 'onResolved', fn: () => void) => () => void } })
+          .__TSR_ROUTER__;
+        if (router.state.status === 'idle') {
+          resolve();
+          return;
+        }
+        const stop = router.subscribe('onResolved', () => {
+          stop();
+          resolve();
+        });
+      }),
+  );
+
 // Waits for the page of a new session called `pageName`. Outside any project that is its page
 // (`/sessions/<id>`, `previous` being the id of the session page that was open before, if any). In a workspace
 // (COCKPIT-70, `known` being the ids of the sessions stored before the start) it is the workspace page, the
@@ -3716,6 +3638,7 @@ async function waitForSessionPage(page: Page, previous: string | undefined, page
     const fresh = (await storedSessions(page)).find((stored) => stored.name === pageName && stored.project !== undefined && !known.has(stored.id));
     expect(fresh, `${pageName} is stored for a workspace`).toBeTruthy();
     await page.waitForURL((url) => url.searchParams.get('path') === fresh!.directory);
+    await routerSettled(page);
     return fresh!.id;
   }
   await page.getByRole('heading', { name: pageName, exact: true }).waitFor();

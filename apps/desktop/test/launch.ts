@@ -1,4 +1,5 @@
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { close, constants, open, openSync, read, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
@@ -6,7 +7,9 @@ import { Socket, createConnection, createServer, type AddressInfo } from 'node:n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { chromium, type Browser, type Page } from 'playwright-core';
+import type { DaemonClient } from '@cockpit/daemon';
+import { chromium, type Browser, type ElementHandle, type Frame, type Page } from 'playwright-core';
+import { afterEach, expect } from 'vitest';
 import { makeTestDir, runRoot } from './run-root';
 
 // Launching the app the ways it runs (the dev server, the built app, the packaged app) and
@@ -36,6 +39,8 @@ export interface Session {
   cockpitHome: string;
   /** Everything the app wrote to stdout and stderr. */
   output(): string;
+  /** Resolves with the match once the app's output holds `pattern` (at once if it already does); rejects if the app exits first. */
+  outputMatch(pattern: RegExp): Promise<RegExpExecArray>;
   /**
    * Evaluates an expression in the app's main process, through the Node
    * inspector, and returns its value. `require` is available in it (the
@@ -323,6 +328,48 @@ export function gonePipe(): { snippet: string; gone: Promise<void> } {
   return { snippet: `exec 9> '${path}'`, gone };
 }
 
+const exitTables = new WeakMap<DaemonClient, Map<number, { ended: Promise<void>; end(): void }>>();
+
+// The exit of terminal `id` as the client has heard it: the daemon sends it to a client that attached the terminal.
+function exitOf(daemon: DaemonClient, id: number) {
+  let table = exitTables.get(daemon);
+  if (!table) {
+    const mine = new Map<number, { ended: Promise<void>; end(): void }>();
+    table = mine;
+    exitTables.set(daemon, mine);
+    daemon.onExit((event) => exitOf(daemon, event.id).end());
+  }
+  let each = table.get(id);
+  if (!each) {
+    let end!: () => void;
+    each = { ended: new Promise<void>((resolve) => (end = resolve)), end: () => end() };
+    table.set(id, each);
+  }
+  return each;
+}
+
+/**
+ * Finds the terminal of the daemon whose screen shows the pid a program printed (`pid<marker>-<pid>` or
+ * `pid:<pid>`, with `<marker>` letters and digits) and attaches it, so `ended` resolves when the daemon says that
+ * terminal ended: its process is reaped. `daemon` is the test's own connection.
+ */
+export async function watchTerminalEnd(daemon: DaemonClient, pid: number): Promise<{ ended: Promise<void> }> {
+  const printed = new RegExp(`pid[0-9a-z]*[-:]${pid}(?![0-9])`);
+  for (const { id } of await daemon.list()) {
+    const { ended } = exitOf(daemon, id);
+    // A terminal that ended meanwhile is none of those listed.
+    const attached = await daemon.attach(id).catch(() => undefined);
+    if (attached && printed.test(attached.screen)) return { ended };
+  }
+  throw new Error(`no terminal of the daemon shows the pid ${pid}`);
+}
+
+/** Resolves once the daemon says terminal `id` ended: at once if it already has (the daemon refuses to attach it). */
+export async function terminalEnd(daemon: DaemonClient, id: number): Promise<void> {
+  const { ended } = exitOf(daemon, id);
+  if (await daemon.attach(id).then(() => true, () => false)) await ended;
+}
+
 /**
  * Resolves once `predicate(arg)` holds in the page, checked at once and after each DOM mutation
  * (a `MutationObserver`), for a condition no locator state expresses. `predicate` must be
@@ -347,6 +394,112 @@ export async function untilDom<A>(page: Page, predicate: (arg: A) => boolean, ar
     observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
     check();
   })`);
+}
+
+// COCKPIT-81: the waits of the tests are on the event that marks the step done. `untilRead` and `untilIn` are
+// `untilDom` (launch.ts) with a value: `read` runs in the page (or on `element`) from its source text, at once
+// and after each DOM mutation, and the promise resolves with the first value `done(value, arg)` accepts.
+// `read` and `done` must be self-contained, and `read` synchronous.
+export const truthy = (value: unknown) => Boolean(value);
+
+// A criterion's time bound ("within 5 s") stays a check, as a measure: the test waits for the event with no
+// timeout of its own, and `within` then fails when more than `boundMs` passed since `startClock()` ran, which is
+// at the action the criterion starts its clock from.
+export const startClock = () => {
+  const start = performance.now();
+  return (what: string, boundMs: number) => expect(performance.now() - start, `${what} took longer than ${boundMs} ms`).toBeLessThan(boundMs);
+};
+
+// The script both run: `call` reads the value, `root` is what the observer watches. It reads again on DOM
+// mutations and on what changes geometry or style with none: a transition or animation ending, a resize of the
+// window or of the root. `id` names its last read in the page (`__waitLast`) for `pendingWaits`.
+export const untilScript = (read: object, done: object, arg: unknown, call: string, root: string, id: string, uses: Record<string, object> = {}) => `new Promise((resolve, reject) => {
+    ${Object.entries(uses).map(([name, each]) => `const ${name} = ${each.toString()};`).join('\n    ')}
+    const read = ${read.toString()};
+    const done = ${done.toString()};
+    const arg = ${JSON.stringify(arg)};
+    const events = ['transitionend', 'transitioncancel', 'animationend'];
+    const stop = () => {
+      observer.disconnect();
+      resize.disconnect();
+      for (const name of events) document.removeEventListener(name, check, true);
+      window.removeEventListener('resize', check);
+      delete window.__waitLast?.[${JSON.stringify(id)}];
+    };
+    const check = () => {
+      let value;
+      try {
+        value = ${call};
+        (window.__waitLast ??= {})[${JSON.stringify(id)}] = String(JSON.stringify(value)).slice(0, 2000);
+        if (!done(value, arg)) return;
+      } catch (error) {
+        stop();
+        reject(error);
+        return;
+      }
+      stop();
+      resolve(value);
+    };
+    const observer = new MutationObserver(check);
+    const resize = new ResizeObserver(check);
+    observer.observe(${root}, { subtree: true, childList: true, attributes: true, characterData: true });
+    resize.observe(${root} === document ? document.documentElement : ${root});
+    for (const name of events) document.addEventListener(name, check, true);
+    window.addEventListener('resize', check);
+    check();
+  })`;
+
+// The waits running in a page, for the diagnostic below: a wait that never ends is ended by the test's own guard
+// and says nothing, so the page keeps the last value each one read.
+type PendingWait = { frame: Frame; id: string; label: string };
+const pendingWaits = new Set<PendingWait>();
+
+export async function evaluateUntil<R>(frame: Frame, read: object, arg: unknown, script: (id: string) => string): Promise<R> {
+  const label = `${read.toString().replace(/\s+/g, ' ').slice(0, 100)} waiting for ${JSON.stringify(arg)?.slice(0, 200)}`;
+  const pending: PendingWait = { frame, id: randomUUID(), label };
+  pendingWaits.add(pending);
+  try {
+    return (await frame.evaluate(script(pending.id))) as R;
+  } finally {
+    pendingWaits.delete(pending);
+  }
+}
+
+// A test the guard ended while a wait ran names what that wait last read, in the test's error.
+afterEach(async ({ task }) => {
+  const waiting = [...pendingWaits];
+  pendingWaits.clear();
+  const error = task.result?.errors?.[0];
+  if (task.result?.state !== 'fail' || !error || waiting.length === 0) return;
+  const lines = await Promise.all(
+    waiting.map(async ({ frame, id, label }) => {
+      const last = await frame.evaluate((id) => (window as unknown as { __waitLast?: Record<string, string> }).__waitLast?.[id], id).catch(() => '(the page is gone)');
+      return `  ${label}\n    last read: ${last}`;
+    }),
+  );
+  error.message += `\nWaits still running when the test ended:\n${lines.join('\n')}`;
+});
+
+export async function untilRead<A, R>(page: Page, read: (arg: A) => R, done: (value: R, arg: A) => boolean, arg?: A): Promise<R> {
+  return evaluateUntil<R>(page.mainFrame(), read, arg, (id) => untilScript(read, done, arg, 'read(arg)', 'document', id));
+}
+
+// The script finds the element by a mark it carries meanwhile: a string handed to a handle's `evaluate` is an
+// expression, not a function that gets the element.
+export async function untilIn<A, R>(element: ElementHandle<HTMLElement>, read: (element: HTMLElement, arg: A) => R, done: (value: R, arg: A) => boolean, arg?: A): Promise<R> {
+  const mark = randomUUID();
+  const frame = (await element.ownerFrame())!;
+  await element.evaluate((target, mark) => target.setAttribute('data-waiting', mark), mark);
+  try {
+    return await evaluateUntil<R>(
+      frame,
+      read,
+      arg,
+      (id) => `(() => { const element = document.querySelector('[data-waiting="${mark}"]'); return ${untilScript(read, done, arg, 'read(element, arg)', 'element', id)}; })()`,
+    );
+  } finally {
+    await element.evaluate((target) => target.removeAttribute('data-waiting')).catch(() => {});
+  }
 }
 
 // What a spawned app (or dev server) writes to stdout and stderr, and the lines tests wait for in it.
@@ -479,6 +632,7 @@ export async function launchSpawned(
       dataDir,
       cockpitHome,
       output: watch.output,
+      outputMatch: watch.match,
       evaluateInMain: inspector.evaluate,
       disconnectInspector: inspector.close,
       isRunning: () => child.exitCode === null,
@@ -569,6 +723,7 @@ export async function launchDev(
       dataDir,
       cockpitHome,
       output: watch.output,
+      outputMatch: watch.match,
       evaluateInMain: inspector.evaluate,
       disconnectInspector: inspector.close,
       isRunning: () => dev.exitCode === null,

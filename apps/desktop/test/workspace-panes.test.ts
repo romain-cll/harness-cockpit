@@ -1,24 +1,28 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { request as httpRequest } from 'node:http';
 import { homedir, userInfo } from 'node:os';
 import { basename, join } from 'node:path';
-import { setTimeout as sleep } from 'node:timers/promises';
+import { connectDaemon, type DaemonClient } from '@cockpit/daemon';
 import { type ElementHandle, type Locator, type Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 import {
   MAIN_PROCESS_ERROR,
-  UI_TIMEOUT,
   daemonSocketIn,
+  fifo,
+  heldProcess,
   isAlive,
   launchDev,
   launchPackaged,
   launchSpawned,
-  poll,
+  untilIn,
+  untilRead,
   versionLabel,
   waitForGroupGone,
+  terminalEnd,
+  watchTerminalEnd,
   type Session,
 } from './launch';
 import { sendFromComposer } from './composer';
@@ -46,7 +50,6 @@ const launchBuiltWith = (env: NodeJS.ProcessEnv, dataDir?: string | null, home?:
 const STUB = `#!/bin/sh
 if [ "$1" = "--version" ]; then
   #VERSION_LOG#
-  [ -e "$0.slow" ] && sleep 1
   if [ -e "$0.noversion" ]; then echo "no version here"; else echo 9.9.9; fi
   exit 0
 fi
@@ -83,7 +86,7 @@ interface Fixture {
   install(name: string): void;
 }
 
-function makeFixture(binaries: string[], { slowVersion = false } = {}): Fixture {
+function makeFixture(binaries: string[]): Fixture {
   const root = realpathSync(makeTestDir('w-'));
   const bin = join(root, 'bin');
   mkdirSync(bin);
@@ -111,7 +114,6 @@ function makeFixture(binaries: string[], { slowVersion = false } = {}): Fixture 
   expect(execFileSync(shell, ['-ilc', 'printf %s "$PATH"'], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } })).toBe(`${bin}:/usr/bin:/bin`);
   writeFileSync(runLog, '');
   writeFileSync(shellLog, '');
-  if (slowVersion) for (const name of binaries) writeFileSync(join(bin, `${name}.slow`), '');
   return { root, bin, shell, shellLog, runLog, env: () => ({ ...process.env, SHELL: shell }), install };
 }
 
@@ -199,8 +201,8 @@ async function stubPicker(session: Session, pick: string) {
 async function addRepository(session: Session, repo: TempRepo) {
   const { page } = session;
   await stubPicker(session, repo.root);
-  await page.getByRole('button', { name: 'Add project', exact: true }).click({ timeout: UI_TIMEOUT });
-  await page.getByRole('button', { name: `Actions for ${repo.name}`, exact: true }).waitFor({ state: 'attached', timeout: UI_TIMEOUT });
+  await page.getByRole('button', { name: 'Add project', exact: true }).click();
+  await page.getByRole('button', { name: `Actions for ${repo.name}`, exact: true }).waitFor({ state: 'attached' });
 }
 
 /** The sidebar row of a workspace: a link whose text starts with its branch. */
@@ -221,7 +223,7 @@ async function createWorkspace(session: Session, repo: TempRepo, name: string): 
   expect(result.status).toBe('created');
   await dispatchFocus(page);
   // Listed in the sidebar, whatever the row is made of.
-  await page.locator('aside').getByText(name, { exact: true }).first().waitFor({ timeout: UI_TIMEOUT });
+  await page.locator('aside').getByText(name, { exact: true }).first().waitFor();
   return worktreePath(session, repo, name);
 }
 
@@ -230,11 +232,13 @@ async function createWorkspace(session: Session, repo: TempRepo, name: string): 
 // the URL says nothing about what the page shows: a test waits for the page's own region, never for the URL.
 const currentWorkspace = new WeakMap<Page, string>();
 
-const workspaceRegion = (page: Page) => {
+const regionName = (page: Page) => {
   const name = currentWorkspace.get(page);
   if (name === undefined) throw new Error('no workspace page was opened on this page');
-  return page.getByRole('region', { name, exact: true });
+  return name;
 };
+
+const workspaceRegion = (page: Page) => page.getByRole('region', { name: regionName(page), exact: true });
 
 /** Waits for the page of the workspace at `path` to be rendered, then checks the URL is its own. */
 async function onWorkspacePage(page: Page, path: string, name = basename(path)) {
@@ -250,8 +254,8 @@ async function openWorkspace(page: Page, name: string, path: string) {
 }
 
 async function goHome(page: Page) {
-  await page.getByRole('link', { name: 'New workspace', exact: true }).click({ timeout: UI_TIMEOUT });
-  await page.getByRole('heading', { name: 'New workspace', exact: true }).waitFor({ timeout: UI_TIMEOUT });
+  await page.getByRole('link', { name: 'New workspace', exact: true }).click();
+  await page.getByRole('heading', { name: 'New workspace', exact: true }).waitFor();
 }
 
 // A pane is the tab bar (`tablist`) of the workspace region, found by role and auto-waited. The panes are rendered
@@ -301,18 +305,35 @@ const closeButton = (list: Locator, label: string, nth = 0) => list.getByRole('b
 // Hovers the tab (a close button may show on hover only) and clicks its close button.
 async function clickClose(page: Page, index: number, label: string, nth = 0) {
   const list = await pane(page, index);
-  await tabLabeled(list, label, nth).hover({ timeout: UI_TIMEOUT });
-  await closeButton(list, label, nth).click({ timeout: UI_TIMEOUT });
+  await tabLabeled(list, label, nth).hover();
+  await closeButton(list, label, nth).click();
 }
 
+// The labels of the tabs of the pane at `index` of a workspace page's region (the panes ordered as `pane` does: left to
+// right, then top to bottom), null while there is no such pane. Self-contained: it runs in `untilRead`.
+const readPaneLabels = ({ region, index }: { region: string; index: number; expected?: string[] }) => {
+  const root = [...document.querySelectorAll('[role="region"]')].find((element) => element.getAttribute('aria-label') === region);
+  const bars = [...(root?.querySelectorAll('[role="tablist"]') ?? [])]
+    .map((bar) => ({ bar, left: Math.round(bar.getBoundingClientRect().left), top: Math.round(bar.getBoundingClientRect().top) }))
+    .sort((a, b) => a.left - b.left || a.top - b.top);
+  const found = bars[index]?.bar;
+  if (!found) return null;
+  return [...found.querySelectorAll('[role="tab"]')].map((tab) => (tab.getAttribute('title') ?? tab.querySelector('[title]')?.getAttribute('title') ?? tab.textContent ?? '').trim());
+};
+
 async function expectLabels(page: Page, index: number, expected: string[], selected?: string) {
-  const labels = await poll(async () => labelsOf(await pane(page, index)), (found) => JSON.stringify(found) === JSON.stringify(expected), UI_TIMEOUT);
+  const labels = await untilRead(
+    page,
+    readPaneLabels,
+    (found, arg: { region: string; index: number; expected: string[] }) => JSON.stringify(found) === JSON.stringify(arg.expected),
+    { region: regionName(page), index, expected },
+  );
   expect(labels).toEqual(expected);
   if (selected !== undefined) expect(await selectedLabelOf(await pane(page, index))).toBe(selected);
 }
 
 async function selectTab(page: Page, index: number, label: string, nth = 0) {
-  await tabLabeled(await pane(page, index), label, nth).click({ timeout: UI_TIMEOUT });
+  await tabLabeled(await pane(page, index), label, nth).click();
 }
 
 // The visible terminals (the selected tab of each pane).
@@ -331,23 +352,43 @@ async function visibleTerminals(page: Page): Promise<Terminal[]> {
 // The visible terminal of pane `index`: the one under its tab bar.
 async function terminalOf(page: Page, index: number): Promise<Terminal> {
   const bar = (await (await pane(page, index)).elementHandle())!;
-  const found = await page.waitForFunction((bar) => {
-    const area = bar.getBoundingClientRect();
-    return (
-      [...document.querySelectorAll('.xterm')].find((element) => {
-        const box = element.getBoundingClientRect();
-        const centre = box.left + box.width / 2;
-        return (
-          box.width > 0 &&
-          box.height > 0 &&
-          getComputedStyle(element).visibility === 'visible' &&
-          centre >= area.left &&
-          centre <= area.right &&
-          box.top >= area.bottom - 1
-        );
-      }) ?? null
-    );
-  }, bar);
+  // Resolves with the visible terminal under the bar once there is one, looked for at once and after each DOM mutation,
+  // transition or resize (the terminal's box is placed by the layout).
+  const found = await page.evaluateHandle(
+    (area) =>
+      new Promise<Element>((resolve) => {
+        const under = () => {
+          const bounds = area.getBoundingClientRect();
+          return [...document.querySelectorAll('.xterm')].find((element) => {
+            const box = element.getBoundingClientRect();
+            const centre = box.left + box.width / 2;
+            return (
+              box.width > 0 &&
+              box.height > 0 &&
+              getComputedStyle(element).visibility === 'visible' &&
+              centre >= bounds.left &&
+              centre <= bounds.right &&
+              box.top >= bounds.bottom - 1
+            );
+          });
+        };
+        const events = ['transitionend', 'transitioncancel', 'animationend'];
+        const check = () => {
+          const element = under();
+          if (!element) return;
+          observer.disconnect();
+          for (const name of events) document.removeEventListener(name, check, true);
+          window.removeEventListener('resize', check);
+          resolve(element);
+        };
+        const observer = new MutationObserver(check);
+        observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+        for (const name of events) document.addEventListener(name, check, true);
+        window.addEventListener('resize', check);
+        check();
+      }),
+    bar as ElementHandle<HTMLElement>,
+  );
   return found.asElement() as Terminal;
 }
 
@@ -364,14 +405,22 @@ async function keyboardTerminal(page: Page): Promise<Terminal | null> {
 
 const isSame = (a: Terminal, b: Terminal) => a.evaluate((one, other) => one === other, b);
 
-async function expectKeyboardIn(page: Page, terminal: Terminal, what: string) {
-  const deadline = Date.now() + UI_TIMEOUT;
-  for (;;) {
-    const active = await keyboardTerminal(page);
-    if (active && (await isSame(active, terminal))) return;
-    if (Date.now() > deadline) throw new Error(`the keyboard is not in ${what}`);
-    await sleep(100);
-  }
+// Resolves once the keyboard is in the terminal: at once if it is, else on the `focusin` that puts it there.
+async function expectKeyboardIn(_page: Page, terminal: Terminal, what: string) {
+  const inTerminal = await terminal.evaluate(
+    (element) =>
+      new Promise<boolean>((resolve) => {
+        const held = () => document.activeElement !== null && element.contains(document.activeElement);
+        if (held()) return resolve(true);
+        const onFocus = () => {
+          if (!held()) return;
+          document.removeEventListener('focusin', onFocus, true);
+          resolve(true);
+        };
+        document.addEventListener('focusin', onFocus, true);
+      }),
+  );
+  expect(inTerminal, `the keyboard is in ${what}`).toBe(true);
 }
 
 // The index of the pane whose terminal holds the keyboard.
@@ -390,17 +439,15 @@ async function typeLine(page: Page, text: string) {
 }
 
 const rowsOf = (terminal: Terminal) =>
-  terminal.evaluate((element) => [...element.querySelectorAll('.xterm-rows > div')].map((row) => (row.textContent ?? '').replace(/ /g, ' ').trimEnd()));
+  terminal.evaluate((element) => [...element.querySelectorAll('.xterm-rows > div')].map((row) => (row.textContent ?? '').replace(/\u00a0/g, ' ').trimEnd()));
 
-async function waitForRow(page: Page, text: string | RegExp, terminal: Terminal) {
-  await page.waitForFunction(
-    ([element, source]) => {
-      const pattern = new RegExp(source);
-      return [...element.querySelectorAll('.xterm-rows > div')].some((row) => pattern.test((row.textContent ?? '').replace(/ /g, ' ').trimEnd()));
-    },
-    [terminal, typeof text === 'string' ? `^${escapeRegExp(text)}$` : text.source] as const,
-    { timeout: 15_000 },
-  );
+// The rows of a terminal, read at once and after each DOM mutation until `done(rows, arg)` accepts them. `read` and
+// `done` run in the page: both are self-contained.
+const readRows = (element: HTMLElement) => [...element.querySelectorAll('.xterm-rows > div')].map((row) => (row.textContent ?? '').replace(/\u00a0/g, ' ').trimEnd());
+const untilRows = <A>(terminal: Terminal, done: (rows: string[], arg: A) => boolean, arg?: A) => untilIn(terminal, readRows, done, arg);
+
+async function waitForRow(_page: Page, text: string | RegExp, terminal: Terminal) {
+  await untilRows(terminal, (rows, source: string) => rows.some((row) => new RegExp(source).test(row)), typeof text === 'string' ? `^${escapeRegExp(text)}$` : text.source);
 }
 
 async function captureRow(page: Page, pattern: RegExp, terminal: Terminal): Promise<string[]> {
@@ -415,37 +462,52 @@ async function captureRow(page: Page, pattern: RegExp, terminal: Terminal): Prom
 // The `cwd:<path>` line the stub prints, read across the rows it wraps over in a narrow pane.
 async function expectCwd(terminal: Terminal, path: string) {
   const want = `cwd:${path}`;
-  const read = async () => {
-    const rows = await rowsOf(terminal);
+  // Self-contained: it runs in the page.
+  const read = (element: HTMLElement, wanted: string) => {
+    const rows = [...element.querySelectorAll('.xterm-rows > div')].map((row) => (row.textContent ?? '').replace(/\u00a0/g, ' ').trimEnd());
     const first = rows.findIndex((row) => row.startsWith('cwd:'));
     if (first < 0) return '';
-    if (rows[first]!.length >= want.length) return rows[first]!;
+    if (rows[first]!.length >= wanted.length) return rows[first]!;
     let text = rows[first]!;
-    for (let next = first + 1; next < rows.length && text.length < want.length; next++) text += rows[next]!;
-    return text.length === want.length ? text : text.slice(0, want.length + 1);
+    for (let next = first + 1; next < rows.length && text.length < wanted.length; next++) text += rows[next]!;
+    return text.length === wanted.length ? text : text.slice(0, wanted.length + 1);
   };
-  expect(await poll(read, (found) => found === want, 15_000)).toBe(want);
+  expect(await untilIn(terminal, read, (found, wanted: string) => found === wanted, want)).toBe(want);
 }
 
-const waitForPrompt = (page: Page, terminal: Terminal) =>
-  page.waitForFunction(
-    (element) => [...element.querySelectorAll('.xterm-rows > div')].some((row) => (row.textContent ?? '').trim() !== ''),
-    terminal,
-    { timeout: 20_000 },
-  );
+const waitForPrompt = (_page: Page, terminal: Terminal) => untilRows(terminal, (rows) => rows.some((row) => row.trim() !== ''));
+
+// The test's own connection to the daemon (the built app's block opens it): the `exit` the daemon sends tells that a
+// terminal's process is gone. A pid is watched from the moment its terminal prints it.
+let daemonLine: DaemonClient | undefined;
+const endOf = new Map<number, Promise<void>>();
+
+async function watchEnd(pid: number) {
+  if (daemonLine) endOf.set(pid, (await watchTerminalEnd(daemonLine, pid)).ended);
+}
 
 // Types where the keyboard is and returns the pid a shell prints.
 async function shellPid(page: Page, terminal: Terminal): Promise<number> {
   await waitForPrompt(page, terminal);
   await typeLine(page, 'echo pid-$$');
-  return Number((await captureRow(page, /^pid-(\d+)$/, terminal))[0]);
+  const pid = Number((await captureRow(page, /^pid-(\d+)$/, terminal))[0]);
+  await watchEnd(pid);
+  return pid;
 }
 
 async function agentPid(page: Page, terminal: Terminal): Promise<number> {
-  return Number((await captureRow(page, /^pid:(\d+)$/, terminal))[0]);
+  const pid = Number((await captureRow(page, /^pid:(\d+)$/, terminal))[0]);
+  await watchEnd(pid);
+  return pid;
 }
 
-const endsWithin = async (pid: number, timeout = 5_000) => !(await poll(() => isAlive(pid), (alive) => !alive, timeout));
+// Resolves with true once the daemon has told that the process of a terminal whose pid was read ended.
+async function hasEnded(pid: number): Promise<boolean> {
+  const ended = endOf.get(pid);
+  if (!ended) throw new Error(`the end of process ${pid} was not watched`);
+  await ended;
+  return true;
+}
 
 // --- Separators (COCKPIT-45) -------------------------------------------------
 //
@@ -525,25 +587,29 @@ const separatorLine = (separator: Locator, orientation: 'vertical' | 'horizontal
     return null;
   }, orientation);
 
-// What `stty size` answers against what the terminal displays; a late resize is read again for up to 5 s.
+// Two frames: a layout change has been through its `ResizeObserver` callbacks, so the terminal has fitted and sent
+// its resize to the main process.
+const afterRender = (page: Page) => page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
+// What `stty size` answers against what the terminal displays. The renderer sends the terminal's resize when it fits
+// (at a layout change, before the next frame ends) and the main process hands the messages on in order, so the keys
+// typed after those frames reach the shell after the resize: the answer is the size the terminal displays, no later.
 async function expectSizeMatchesDisplay(page: Page, terminal: Terminal) {
-  await terminal.click({ timeout: UI_TIMEOUT });
+  await terminal.click();
   await waitForPrompt(page, terminal);
+  await afterRender(page);
   const digit = String(1 + (Date.now() % 9));
   await typeLine(page, `printf '%0600d\\n' 0 | tr 0 ${digit}`);
+  const rows = await untilRows(
+    terminal,
+    (found, wanted: string) => found.filter((row) => new RegExp(`^${wanted}+$`).test(row)).reduce((sum, row) => sum + row.length, 0) >= 600,
+    digit,
+  );
   const line = new RegExp(`^${digit}+$`);
-  const total = (rows: string[]) => rows.filter((row) => line.test(row)).reduce((sum, row) => sum + row.length, 0);
-  const rows = await poll(() => rowsOf(terminal), (found) => total(found) >= 600, 15_000);
   const shown = [rows.length, Math.max(...rows.filter((row) => line.test(row)).map((row) => row.length))];
-  let tag = 0;
-  const read = async () => {
-    const mark = `sz${Date.now()}x${tag++}`;
-    await typeLine(page, `printf '${mark} %s\\n' "$(stty size)"`);
-    const [rowsAnswer, colsAnswer] = (await captureRow(page, new RegExp(`^${mark} (\\d+) (\\d+)$`), terminal)).map(Number);
-    return [rowsAnswer!, colsAnswer!];
-  };
-  const matches = (size: number[]) => size[0] === shown[0] && size[1] === shown[1];
-  const answer = await poll(read, matches, 5_000);
+  const mark = `sz${Date.now()}x${sttyMarks++}`;
+  await typeLine(page, `printf '${mark} %s\\n' "$(stty size)"`);
+  const answer = (await captureRow(page, new RegExp(`^${mark} (\\d+) (\\d+)$`), terminal)).map(Number);
   expect(answer, `stty size against the displayed rows and columns ${shown}`).toEqual(shown);
 }
 
@@ -569,7 +635,7 @@ async function openNewTabMenu(page: Page, index = 0): Promise<Locator> {
   return menu;
 }
 
-const detectionDone = (page: Page) => poll(() => page.getByRole('menuitem').filter({ hasText: LOADING_ITEM }).count(), (count) => count === 0, 15_000);
+const detectionDone = (page: Page) => page.getByRole('menuitem').filter({ hasText: LOADING_ITEM }).first().waitFor({ state: 'detached' });
 
 const topLevelItems = async (menu: Locator) => (await menuItems(menu).allInnerTexts()).map(normalized);
 
@@ -635,25 +701,32 @@ async function reportStatus(session: Session, id: string, event: 'working' | 'wa
 }
 
 // The status icon of a workspace row: its accessible name and `title`, its size, and what a row with
-// no status shows (the dashed circle, `aria-hidden`, and the color of the name).
-const rowStatus = async (page: Page, name: string) => {
-  await workspaceRow(page, name).waitFor({ timeout: UI_TIMEOUT });
-  return workspaceRow(page, name).evaluate((row, name) => {
-    const img = row.querySelector('[role="img"][aria-label]');
-    const hidden = row.querySelector('svg[aria-hidden="true"]');
-    const nameLeaf = [...row.querySelectorAll('*')].find((element) => element.children.length === 0 && (element.textContent ?? '').trim() === name);
-    return {
-      label: img?.getAttribute('aria-label') ?? null,
-      title: img?.getAttribute('title') ?? null,
-      iconSize: (img?.querySelector('svg') ?? hidden)?.getBoundingClientRect().width ?? null,
-      hiddenIcon: !!hidden,
-      nameColor: nameLeaf ? getComputedStyle(nameLeaf).color : null,
-    };
-  }, name);
+// no status shows (the dashed circle, `aria-hidden`, and the color of the name). Null while the row is not there.
+// Self-contained: it runs in `untilRead`.
+const readRowStatus = ({ name }: { name: string; label?: string | null }) => {
+  const pattern = new RegExp(`^\\s*${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s|$)`);
+  const row = [...document.querySelectorAll('aside a[href*="/workspace"]')].find((each) => pattern.test(each.textContent ?? ''));
+  if (!row) return null;
+  const img = row.querySelector('[role="img"][aria-label]');
+  const hidden = row.querySelector('svg[aria-hidden="true"]');
+  const nameLeaf = [...row.querySelectorAll('*')].find((element) => element.children.length === 0 && (element.textContent ?? '').trim() === name);
+  return {
+    label: img?.getAttribute('aria-label') ?? null,
+    title: img?.getAttribute('title') ?? null,
+    iconSize: (img?.querySelector('svg') ?? hidden)?.getBoundingClientRect().width ?? null,
+    hiddenIcon: !!hidden,
+    nameColor: nameLeaf ? getComputedStyle(nameLeaf).color : null,
+  };
 };
 
-const waitForRowStatus = (page: Page, name: string, label: string | null) =>
-  poll(() => rowStatus(page, name), (found) => found.label === label, 3_000);
+const rowStatus = async (page: Page, name: string) => {
+  await workspaceRow(page, name).waitFor();
+  return (await page.evaluate(readRowStatus, { name }))!;
+};
+
+// Waits until the row shows the status `label` (null: none), read at once and after each DOM mutation.
+const waitForRowStatus = async (page: Page, name: string, label: string | null) =>
+  (await untilRead(page, readRowStatus, (found, arg: { name: string; label: string | null }) => found?.label === arg.label, { name, label }))!;
 
 // --- Daemon ------------------------------------------------------------------
 
@@ -671,9 +744,11 @@ const childPidsOf = (pid: number): number[] =>
     .map(([child]) => child!);
 
 async function quitApp(session: Session): Promise<void> {
-  await session.evaluateInMain(`(() => { const { app } = require('electron'); setTimeout(() => app.quit(), 300); })()`);
+  // `require` only exists during the evaluation: `app` is taken before the next turn of the loop, which runs after
+  // the evaluation has answered (a quit during it would end the app before the inspector answered).
+  await session.evaluateInMain(`(() => { const { app } = require('electron'); setImmediate(() => app.quit()); })()`);
   await session.disconnectInspector();
-  expect(await poll(() => session.isRunning(), (running) => !running, 10_000), 'the app exits').toBe(false);
+  // The app's exit: its process group is gone once its `close` fires (the exit, and every holder of its stdio).
   await waitForGroupGone(session.pid);
 }
 
@@ -715,9 +790,17 @@ const stubNotifications = (session: Session) =>
   session.evaluateInMain(`(() => {
     const { Notification, BrowserWindow } = require('electron');
     globalThis.__notified = [];
-    Notification.prototype.show = function () { globalThis.__notified.push({ title: this.title, body: this.body, notification: this }); };
+    globalThis.__onShown = [];
+    Notification.prototype.show = function () {
+      globalThis.__notified.push({ title: this.title, body: this.body, notification: this });
+      for (const listener of globalThis.__onShown.splice(0)) listener();
+    };
     BrowserWindow.getFocusedWindow = () => null;
   })()`);
+
+// Resolves once the stubbed `Notification.prototype.show` has been called (it tells `globalThis.__onShown`), at once if it has.
+const notificationShown = (session: Session) =>
+  session.evaluateInMain<void>(`new Promise((resolve) => { if (globalThis.__notified.length > 0) resolve(); else globalThis.__onShown.push(resolve); })`);
 
 // --- New workspace composer ----------------------------------------------------
 
@@ -740,13 +823,13 @@ describe('workspace panes: built app', () => {
   const pids = { shell: 0, second: 0, third: 0, claude: 0, codex: 0, claudeTwo: 0, codexTwo: 0 };
 
   beforeAll(async () => {
-    // The stubs' `--version` sleeps 1 s while their `.slow` file exists (the first detection).
-    fx = makeFixture(['claude', 'codex'], { slowVersion: true });
+    fx = makeFixture(['claude', 'codex']);
     repo = makeRepo('panes-repo');
     repoTwo = makeRepo('panes-other');
-    writeConfig(repo, { setup: ['echo setup-one', 'while [ ! -f "$COCKPIT_ROOT_PATH/go" ]; do sleep 0.1; done'] });
+    writeConfig(repo, { setup: ['echo setup-one'] });
     session = await launchBuiltWith(fx.env());
     await session.page.getByText(versionLabel).waitFor();
+    daemonLine = await connectDaemon(daemonSocketIn(session.cockpitHome));
     await addRepository(session, repo);
     ws.alpha = await createWorkspace(session, repo, 'alpha');
     ws.beta = await createWorkspace(session, repo, 'beta');
@@ -754,6 +837,8 @@ describe('workspace panes: built app', () => {
   });
 
   afterAll(async () => {
+    daemonLine?.close();
+    daemonLine = undefined;
     await session?.close();
     if (fx) rmSync(fx.root, { recursive: true, force: true });
     for (const each of [repo, repoTwo]) if (each) rmSync(each.parent, { recursive: true, force: true });
@@ -768,7 +853,8 @@ describe('workspace panes: built app', () => {
       const open = await overlays.count();
       if (open === 0 || (await page.evaluate(() => !!document.activeElement?.closest('.xterm')))) break;
       await page.keyboard.press('Escape');
-      await poll(() => overlays.count(), (count) => count < open, 1_000);
+      // The count falls below `open` when one of them has left the DOM.
+      await overlays.nth(open - 1).waitFor({ state: 'detached' });
     }
   });
 
@@ -786,7 +872,7 @@ describe('workspace panes: built app', () => {
   test('AC2 — a workspace is one 28 px row with 30 px of left padding, named after its branch, with no git-branch icon and no session rows; its + and … buttons stay', async () => {
     const { page } = session;
     const row = workspaceRow(page, 'alpha');
-    await row.waitFor({ timeout: UI_TIMEOUT });
+    await row.waitFor();
     const facts = await row.evaluate((element) => {
       const box = element.getBoundingClientRect();
       const item = element.closest('li')!;
@@ -800,7 +886,7 @@ describe('workspace panes: built app', () => {
     });
     expect(facts).toEqual({ height: 28, paddingLeft: '30px', branchIcons: 0, sessionLinks: 0, text: 'alpha' });
 
-    await row.hover({ timeout: UI_TIMEOUT });
+    await row.hover();
     expect(await page.getByRole('button', { name: 'Start session in alpha', exact: true }).count()).toBe(1);
     expect(await page.getByRole('button', { name: 'Actions for alpha', exact: true }).count()).toBe(1);
   });
@@ -814,7 +900,7 @@ describe('workspace panes: built app', () => {
     expect(await row.evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(await tokenColor(page, '--sidebar-accent'));
     expect(await workspaceRow(page, 'beta').getAttribute('aria-current')).toBeNull();
 
-    await page.getByText('No tab open', { exact: true }).waitFor({ timeout: UI_TIMEOUT });
+    await page.getByText('No tab open', { exact: true }).waitFor();
     expect(await page.getByRole('button', { name: 'New tab', exact: true }).count()).toBeGreaterThan(0);
   });
 
@@ -826,8 +912,6 @@ describe('workspace panes: built app', () => {
     // opens: its "Detecting agent CLIs…" item is the composer's test now (the same state of the shared store).
     const menu = await openNewTabMenu(page);
     await detectionDone(page);
-    // From now on a detection takes no time.
-    for (const name of ['claude', 'codex']) unlinkSync(join(fx.bin, `${name}.slow`));
 
     expect(await topLevelItems(menu)).toEqual(['Claude Code', 'Codex', 'Open harness', 'Terminal']);
     const text = normalized(await menu.innerText());
@@ -901,7 +985,7 @@ describe('workspace panes: built app', () => {
     try {
       const menu = await openNewTabMenu(page);
       await menuItemNamed(menu, 'Claude Code').click();
-      await poll(() => projectsMessage(page).first().innerText().catch(() => ''), (text) => text.startsWith('Could not start Claude Code:'), UI_TIMEOUT);
+      await projectsMessage(page).filter({ hasText: /^\s*Could not start Claude Code:/ }).first().waitFor();
       expect(await projectsMessage(page).first().innerText()).toContain('not found');
       expect(await labelsOf(await pane(page, 0))).toEqual(['Claude Code 1', 'Codex 1']);
       expect(sessionsInState(session.dataDir)).toHaveLength(before);
@@ -1035,13 +1119,16 @@ describe('workspace panes: built app', () => {
       expect(other.closeShown, `${other.label} hides its close button`).toBe(false);
     }
     // The close button of another tab shows on hover.
-    await tabLabeled(list, 'Terminal').hover({ timeout: UI_TIMEOUT });
-    const shown = () =>
-      closeButton(list, 'Terminal').evaluate((button) => {
+    await tabLabeled(list, 'Terminal').hover();
+    const shown = await untilIn(
+      (await closeButton(list, 'Terminal').elementHandle()) as ElementHandle<HTMLElement>,
+      (button) => {
         const style = getComputedStyle(button);
         return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) > 0;
-      });
-    expect(await poll(shown, Boolean, 2_000), 'the close button of another tab shows on hover').toBe(true);
+      },
+      (visible) => visible,
+    );
+    expect(shown, 'the close button of another tab shows on hover').toBe(true);
 
     // The terminal sits 8 px below the tab bar; only the selected tab's terminal is visible.
     const terminal = await terminalOf(page, 0);
@@ -1070,8 +1157,20 @@ describe('workspace panes: built app', () => {
     expect(order.close).toBeGreaterThan(order.separator);
 
     await session.evaluateInMain(`require('electron').clipboard.writeText('before')`);
+    // The page copies with `navigator.clipboard.writeText`: the test tells when that write has settled.
+    await page.evaluate(() => {
+      const clipboard = navigator.clipboard;
+      const original = clipboard.writeText.bind(clipboard);
+      (window as unknown as { __copied: Promise<void> }).__copied = new Promise<void>((resolve) => {
+        clipboard.writeText = async (text: string) => {
+          await original(text);
+          resolve();
+        };
+      });
+    });
     await pickContextItem(menu, 'Copy path');
-    expect(await poll(() => session.evaluateInMain<string>(`require('electron').clipboard.readText()`), (text) => text === ws.alpha, UI_TIMEOUT)).toBe(ws.alpha);
+    await page.evaluate(() => (window as unknown as { __copied: Promise<void> }).__copied);
+    expect(await session.evaluateInMain<string>(`require('electron').clipboard.readText()`)).toBe(ws.alpha);
   });
 
   test('AC14 — "Split right" and "Split down" divide a pane into equal halves with a new selected shell tab holding the keyboard; splits nest, panes are 8 px padded and 1 px apart in --border, and every terminal\'s stty size matches its display', async () => {
@@ -1243,13 +1342,13 @@ describe('workspace panes: built app', () => {
 
   test('AC27 — with the sidebar hidden, "Show sidebar" sits at least 72 px from the left and the first tab starts right of it; the empty part of the top tab bar drags the window, its tabs and buttons do not', async () => {
     const { page } = session;
-    await page.getByRole('button', { name: 'Hide sidebar', exact: true }).click({ timeout: UI_TIMEOUT });
+    await page.getByRole('button', { name: 'Hide sidebar', exact: true }).click();
     try {
       const show = page.getByRole('button', { name: 'Show sidebar', exact: true });
-      await show.waitFor({ timeout: UI_TIMEOUT });
+      await show.waitFor();
       const showBox = (await show.boundingBox())!;
       expect(showBox.x).toBeGreaterThanOrEqual(72);
-      const first = (await tabLabeled(await pane(page, 0), 'Claude Code 1').boundingBox({ timeout: UI_TIMEOUT }))!;
+      const first = (await tabLabeled(await pane(page, 0), 'Claude Code 1').boundingBox())!;
       expect(first.x).toBeGreaterThanOrEqual(showBox.x + showBox.width - 1);
 
       const regions = await (await pane(page, 0)).evaluate((bar) => {
@@ -1282,8 +1381,8 @@ describe('workspace panes: built app', () => {
       expect(regions.buttons.length).toBeGreaterThan(0);
       expect(regions.buttons.every((region) => region === 'no-drag')).toBe(true);
     } finally {
-      await page.getByRole('button', { name: 'Show sidebar', exact: true }).click({ timeout: UI_TIMEOUT });
-      await page.getByRole('button', { name: 'Hide sidebar', exact: true }).waitFor({ timeout: UI_TIMEOUT });
+      await page.getByRole('button', { name: 'Show sidebar', exact: true }).click();
+      await page.getByRole('button', { name: 'Hide sidebar', exact: true }).waitFor();
     }
   });
 
@@ -1292,7 +1391,7 @@ describe('workspace panes: built app', () => {
     // The pane last clicked: the first one.
     await selectTab(page, 0, 'Claude Code 1');
     await (await terminalOf(page, 0)).click();
-    await workspaceRow(page, 'alpha').hover({ timeout: UI_TIMEOUT });
+    await workspaceRow(page, 'alpha').hover();
     await page.getByRole('button', { name: 'Start session in alpha', exact: true }).click();
     await detectionDone(page);
     await menuItemNamed(rowMenu(page, 'alpha'), 'Claude Code').click();
@@ -1303,7 +1402,7 @@ describe('workspace panes: built app', () => {
 
     // Then the second pane.
     await (await terminalOf(page, 1)).click();
-    await workspaceRow(page, 'alpha').hover({ timeout: UI_TIMEOUT });
+    await workspaceRow(page, 'alpha').hover();
     await page.getByRole('button', { name: 'Start session in alpha', exact: true }).click();
     await detectionDone(page);
     await menuItemNamed(rowMenu(page, 'alpha'), 'Codex').click();
@@ -1321,14 +1420,14 @@ describe('workspace panes: built app', () => {
     expect(none).toMatchObject({ label: null, hiddenIcon: true, iconSize: 14 });
     expect(none.nameColor).toBe(await tokenColor(page, '--muted-foreground'));
 
-    await workspaceRow(page, 'beta').hover({ timeout: UI_TIMEOUT });
+    await workspaceRow(page, 'beta').hover();
     for (let n = 1; n <= 3; n++) {
-      await page.getByRole('button', { name: 'Start session in beta', exact: true }).click({ timeout: UI_TIMEOUT });
+      await page.getByRole('button', { name: 'Start session in beta', exact: true }).click();
       await detectionDone(page);
       await menuItemNamed(rowMenu(page, 'beta'), 'Claude Code').click();
       await onWorkspacePage(page, ws.beta);
       await expectLabels(page, 0, Array.from({ length: n }, (_, index) => `Claude Code ${index + 1}`), `Claude Code ${n}`);
-      await workspaceRow(page, 'beta').hover({ timeout: UI_TIMEOUT });
+      await workspaceRow(page, 'beta').hover();
     }
     const id = (name: string) => sessionNamed(session.dataDir, name, ws.beta)!.id;
     const [one, two, three] = [id('Claude Code 1'), id('Claude Code 2'), id('Claude Code 3')] as [string, string, string];
@@ -1374,6 +1473,9 @@ describe('workspace panes: built app', () => {
     const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
     const done = join(session.dataDir, 'later.flag');
     rmSync(done, { force: true });
+    // The command of the bottom pane holds until the test releases it, and tells when it has printed and written `done`.
+    const held = heldProcess();
+    const ended = fifo();
     await expectLabels(page, 0, ['Claude Code 1', 'Codex 1', 'Terminal', 'Claude Code 2'], 'Claude Code 2');
     await expectLabels(page, 1, ['Terminal', 'Codex 2'], 'Codex 2');
     // COCKPIT-45 AC9: the splits are left at 60% (right split) and 40% (down split), not equal halves.
@@ -1397,14 +1499,16 @@ describe('workspace panes: built app', () => {
     await bottom.click();
     await typeLine(page, 'echo m3-$((30+3))');
     await waitForRow(page, 'm3-33', bottom);
-    await typeLine(page, `sleep 2; echo later-$((6*7)); : > '${done}'`);
+    await typeLine(page, `${held.snippet}; echo later-$((6*7)); : > '${done}'; echo > '${ended.path}'`);
 
     try {
       await goHome(page);
       expect(existsSync(done), 'the command has not printed yet when the user leaves').toBe(false);
       for (const pid of Object.values(pids)) if (pid) expect(isAlive(pid), `process ${pid} while Home`).toBe(true);
       await page.setViewportSize({ width: viewport.width - 300, height: viewport.height - 150 });
-      expect(await poll(() => existsSync(done), Boolean, 15_000), 'the command ended while Home').toBe(true);
+      await held.release();
+      await ended.line();
+      expect(existsSync(done), 'the command ended while Home').toBe(true);
 
       // Another workspace meanwhile: the processes of the workspace not shown keep running.
       await openWorkspace(page, 'beta', ws.beta);
@@ -1445,30 +1549,30 @@ describe('workspace panes: built app', () => {
     // The bottom pane's only tab: the pane goes, the pane above fills the area and takes the keyboard.
     await pickContextItem(await contextMenu(page, 2, 'Terminal'), 'Close tab');
     await expectPaneCount(page, 2);
-    expect(await endsWithin(pids.third), 'the closed shell is gone within 5 s').toBe(true);
+    expect(await hasEnded(pids.third), 'the closed shell is gone').toBe(true);
     await expectLabels(page, 1, ['Terminal', 'Codex 2']);
     await expectKeyboardIn(page, await terminalOf(page, 1), 'the sibling pane');
 
     // A running agent: a dialog first.
     await clickClose(page, 1, 'Codex 2');
     const dialog = page.getByRole('alertdialog').or(page.getByRole('dialog')).filter({ hasText: 'Close Codex 2?' });
-    await dialog.waitFor({ timeout: UI_TIMEOUT });
+    await dialog.waitFor();
     expect(normalized(await dialog.innerText())).toContain('Codex is still running in this tab. Closing it ends the agent; the workspace stays in the sidebar.');
     expect(await dialog.getByRole('button', { name: 'Cancel', exact: true }).count()).toBe(1);
-    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click({ timeout: UI_TIMEOUT });
-    await dialog.waitFor({ state: 'hidden', timeout: UI_TIMEOUT });
+    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await dialog.waitFor({ state: 'hidden' });
     await clickClose(page, 1, 'Codex 2');
-    await dialog.waitFor({ timeout: UI_TIMEOUT });
+    await dialog.waitFor();
     await page.keyboard.press('Escape');
-    await dialog.waitFor({ state: 'hidden', timeout: UI_TIMEOUT });
+    await dialog.waitFor({ state: 'hidden' });
     await expectLabels(page, 1, ['Terminal', 'Codex 2']);
     expect(isAlive(pids.codexTwo)).toBe(true);
 
     await clickClose(page, 1, 'Codex 2');
-    await dialog.waitFor({ timeout: UI_TIMEOUT });
-    await dialog.getByRole('button', { name: 'Close tab', exact: true }).click({ timeout: UI_TIMEOUT });
+    await dialog.waitFor();
+    await dialog.getByRole('button', { name: 'Close tab', exact: true }).click();
     await expectLabels(page, 1, ['Terminal'], 'Terminal');
-    expect(await endsWithin(pids.codexTwo), 'the agent is gone within 5 s').toBe(true);
+    expect(await hasEnded(pids.codexTwo), 'the agent is gone').toBe(true);
     // The session stays stored and the workspace row stays.
     expect(sessionNamed(session.dataDir, 'Codex 2', ws.alpha)).toBeDefined();
     expect(await workspaceRow(page, 'alpha').count()).toBe(1);
@@ -1476,7 +1580,7 @@ describe('workspace panes: built app', () => {
     // The last tab of the pane: it goes, the first pane fills the window and takes the keyboard.
     await clickClose(page, 1, 'Terminal');
     await expectPaneCount(page, 1);
-    expect(await endsWithin(pids.second)).toBe(true);
+    expect(await hasEnded(pids.second)).toBe(true);
     await expectLabels(page, 0, ['Claude Code 1', 'Codex 1', 'Terminal', 'Claude Code 2']);
     await expectKeyboardIn(page, await terminalOf(page, 0), 'the remaining pane');
 
@@ -1484,7 +1588,7 @@ describe('workspace panes: built app', () => {
     await selectTab(page, 0, 'Terminal');
     await clickClose(page, 0, 'Terminal');
     await expectLabels(page, 0, ['Claude Code 1', 'Codex 1', 'Claude Code 2'], 'Codex 1');
-    expect(await endsWithin(pids.shell)).toBe(true);
+    expect(await hasEnded(pids.shell)).toBe(true);
 
     // An agent that ended closes with no dialog.
     await selectTab(page, 0, 'Claude Code 2');
@@ -1494,7 +1598,7 @@ describe('workspace panes: built app', () => {
     await clickClose(page, 0, 'Claude Code 2');
     await expectLabels(page, 0, ['Claude Code 1', 'Codex 1'], 'Codex 1');
     expect(await page.getByRole('alertdialog').or(page.getByRole('dialog')).count()).toBe(0);
-    expect(await endsWithin(pids.claudeTwo)).toBe(true);
+    expect(await hasEnded(pids.claudeTwo)).toBe(true);
     expect(isAlive(pids.claude) && isAlive(pids.codex)).toBe(true);
   });
 
@@ -1506,8 +1610,8 @@ describe('workspace panes: built app', () => {
     const shell = await terminalOf(page, 0);
     const pid = await shellPid(page, shell);
     await clickClose(page, 0, 'Terminal');
-    await page.getByText('No tab open', { exact: true }).waitFor({ timeout: UI_TIMEOUT });
-    expect(await endsWithin(pid)).toBe(true);
+    await page.getByText('No tab open', { exact: true }).waitFor();
+    expect(await hasEnded(pid)).toBe(true);
     expect(await page.getByRole('button', { name: 'New tab', exact: true }).count()).toBeGreaterThan(0);
   });
 
@@ -1518,9 +1622,12 @@ describe('workspace panes: built app', () => {
     await openWorkspace(page, 'alpha', ws.alpha);
     // Waits for every menu to be gone, so the next click never meets an open popup.
     const closeMenus = async () => {
-      for (let attempt = 0; attempt < 3 && (await page.getByRole('menu').count()) > 0; attempt++) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const open = await page.getByRole('menu').count();
+        if (open === 0) break;
         await page.keyboard.press('Escape');
-        await poll(() => page.getByRole('menu').count(), (count) => count === 0, 2_000);
+        // The count falls below `open` when one of them has left the DOM (a submenu goes before its parent).
+        await page.getByRole('menu').nth(open - 1).waitFor({ state: 'detached' });
       }
       await page.getByRole('menu').first().waitFor({ state: 'detached' });
     };
@@ -1530,8 +1637,17 @@ describe('workspace panes: built app', () => {
       await detectionDone(page);
       return (await menuItems(menu).allInnerTexts()).map(normalized);
     };
-    const readMenu = async () => {
-      const items = await readMenuItems(await openNewTabMenu(page));
+    // The items of the "New tab" menu once they are the ones `wait` asks for: a menu opened right after "Detect again"
+    // lists what was detected before until the new answer arrives, and the DOM is the only place that tells when it does.
+    const readMenu = async (wait: { equals: string[] } | { includes: string }) => {
+      const menu = await openNewTabMenu(page);
+      await detectionDone(page);
+      const items = await untilIn(
+        (await menu.elementHandle()) as ElementHandle<HTMLElement>,
+        (element) => [...element.querySelectorAll('[role="menuitem"]')].map((item) => (item as HTMLElement).innerText.replace(/\s+/g, ' ').trim()),
+        (found, arg: { equals?: string[]; includes?: string }) => (arg.equals ? JSON.stringify(found) === JSON.stringify(arg.equals) : found.includes(arg.includes!)),
+        wait,
+      );
       await closeMenus();
       return items;
     };
@@ -1540,7 +1656,7 @@ describe('workspace panes: built app', () => {
       await openNewTabMenu(page);
       await detectionDone(page);
       const submenu = await openHarnessSubmenu(page);
-      await submenu.getByRole('menuitem').filter({ hasText: 'Detect again' }).click({ timeout: UI_TIMEOUT });
+      await submenu.getByRole('menuitem').filter({ hasText: 'Detect again' }).click();
       await closeMenus();
       return before;
     };
@@ -1552,14 +1668,14 @@ describe('workspace panes: built app', () => {
     };
 
     try {
-      expect(await readMenu()).toEqual(['Claude Code', 'Codex', 'Open harness', 'Terminal']);
+      expect(await readMenu({ equals: ['Claude Code', 'Codex', 'Open harness', 'Terminal'] })).toEqual(['Claude Code', 'Codex', 'Open harness', 'Terminal']);
       fx.install('opencode');
       writeFileSync(join(fx.bin, 'opencode.noversion'), '');
       const before = await detectAgain();
-      await poll(async () => versionRuns(fx).length, (count) => count >= before + 3, UI_TIMEOUT);
+      // OpenCode is listed once the detection has run every `--version` again.
+      expect(await readMenu({ equals: ['Claude Code', 'Codex', 'OpenCode', 'Open harness', 'Terminal'] })).toEqual(['Claude Code', 'Codex', 'OpenCode', 'Open harness', 'Terminal']);
       // Each found harness once more.
       expect(versionRuns(fx).slice(before).sort()).toEqual(['claude --version', 'codex --version', 'opencode --version']);
-      expect(await readMenu()).toEqual(['Claude Code', 'Codex', 'OpenCode', 'Open harness', 'Terminal']);
       await openNewTabMenu(page);
       await detectionDone(page);
       const submenu = await openHarnessSubmenu(page);
@@ -1567,15 +1683,15 @@ describe('workspace panes: built app', () => {
       await closeMenus();
 
       // The workspace row's menu shows the same result (the composer's agent select is COCKPIT-66's).
-      await workspaceRow(page, 'alpha').hover({ timeout: UI_TIMEOUT });
-      await page.getByRole('button', { name: 'Start session in alpha', exact: true }).click({ timeout: UI_TIMEOUT });
+      await workspaceRow(page, 'alpha').hover();
+      await page.getByRole('button', { name: 'Start session in alpha', exact: true }).click();
       expect(await readMenuItems(rowMenu(page, 'alpha'))).toEqual(['Claude Code', 'Codex', 'OpenCode']);
       await closeMenus();
 
       // Removing the stubs: they disappear, and with none left, nothing but "Terminal" starts.
       for (const name of ['claude', 'codex', 'opencode']) renameSync(join(fx.bin, name), join(fx.bin, `${name}.off`));
       await detectAgain();
-      await poll(async () => (await readMenu()).includes('No agent CLI found'), Boolean, UI_TIMEOUT);
+      expect(await readMenu({ includes: 'No agent CLI found' })).toContain('No agent CLI found');
       const menu = await openNewTabMenu(page);
       await detectionDone(page);
       const none = page.getByRole('menuitem').filter({ hasText: 'No agent CLI found' });
@@ -1589,8 +1705,8 @@ describe('workspace panes: built app', () => {
     }
 
     const restored = await detectAgain();
-    await poll(async () => versionRuns(fx).length, (count) => count > restored, UI_TIMEOUT);
-    await poll(readMenu, (items) => items.join() === 'Claude Code,Codex,Open harness,Terminal', UI_TIMEOUT);
+    expect(await readMenu({ equals: ['Claude Code', 'Codex', 'Open harness', 'Terminal'] })).toEqual(['Claude Code', 'Codex', 'Open harness', 'Terminal']);
+    expect(versionRuns(fx).length).toBeGreaterThan(restored);
   });
 
   // --- Restoring ---
@@ -1611,8 +1727,8 @@ describe('workspace panes: built app', () => {
     await expectPaneCount(page, 2);
 
     await page.reload();
-    await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
-    await page.waitForURL((url) => url.pathname === '/workspace', { timeout: UI_TIMEOUT });
+    await page.getByText(versionLabel).waitFor();
+    await page.waitForURL((url) => url.pathname === '/workspace');
     await expectLabels(page, 0, ['Claude Code 1', 'Codex 1', 'Terminal', 'Terminal'], 'Claude Code 1');
     await expectPaneCount(page, 1);
     expect(await visibleTerminals(page)).toHaveLength(1);
@@ -1624,14 +1740,16 @@ describe('workspace panes: built app', () => {
     await waitForRow(page, 'marker-before-reload', await terminalOf(page, 0));
     // Another workspace whose processes ended: nothing to restore.
     await openWorkspace(page, 'beta', ws.beta);
-    await page.getByText('No tab open', { exact: true }).waitFor({ timeout: UI_TIMEOUT });
+    await page.getByText('No tab open', { exact: true }).waitFor();
   });
 
   // --- Entry points ---
 
   test('AC21 — the composer with an agent opens the workspace page with one selected agent tab that runs the setup through the CLI, then the agent; the row says Setting up meanwhile', async () => {
     const { page } = session;
-    rmSync(join(repo.root, 'go'), { force: true });
+    // The setup holds after its first command until the test releases it.
+    const held = heldProcess();
+    writeConfig(repo, { setup: ['echo setup-one', held.snippet] });
     await createThroughComposer(page, repo, 'dagent', 'Claude Code');
     const path = worktreePath(session, repo, 'dagent');
     await onWorkspacePage(page, path);
@@ -1639,15 +1757,17 @@ describe('workspace panes: built app', () => {
     const terminal = await terminalOf(page, 0);
     await waitForRow(page, /^cockpit setup · dagent · \.cockpit\/config\.json$/, terminal);
     await waitForRow(page, '$ echo setup-one', terminal);
+    // The CLI has read its commands: the next workspaces' setup is the plain one again.
+    writeConfig(repo, { setup: ['echo setup-one'] });
     await waitForRow(page, 'setup-one', terminal);
-    const label = () => workspaceRow(page, 'dagent').locator('xpath=ancestor::li[1]').innerText();
-    await poll(label, (text) => text.includes('Setting up'), UI_TIMEOUT);
-    expect(await label()).toContain('Setting up');
-    writeFileSync(join(repo.root, 'go'), '');
+    const item = workspaceRow(page, 'dagent').locator('xpath=ancestor::li[1]');
+    await item.filter({ hasText: 'Setting up' }).waitFor();
+    expect(await item.innerText()).toContain('Setting up');
+    await held.release();
     await waitForRow(page, '✓ Setup done', terminal);
     await waitForRow(page, 'ready', terminal);
     expect((await captureRow(page, /^cwd:(.+)$/, terminal))[0]).toBe(path);
-    await poll(label, (text) => !text.includes('Setting up'), UI_TIMEOUT);
+    await item.filter({ hasNotText: 'Setting up' }).waitFor();
     expect(sessionNamed(session.dataDir, 'Claude Code 1', path)).toMatchObject({ project: repo.root });
   });
 
@@ -1684,7 +1804,7 @@ describe('workspace panes: built app', () => {
     await goHome(page);
 
     await reportStatus(session, claudeId, 'waiting');
-    await poll(() => session.evaluateInMain<number>('globalThis.__notified.length'), (count) => count > 0, UI_TIMEOUT);
+    await notificationShown(session);
     expect(await session.evaluateInMain('globalThis.__notified.at(-1).title')).toBe('Claude Code 1');
     await session.evaluateInMain(`(() => {
       const window = require('electron').BrowserWindow.getAllWindows()[0];
@@ -1700,19 +1820,25 @@ describe('workspace panes: built app', () => {
     await goHome(page);
     await session.evaluateInMain('globalThis.__notified.length = 0');
     await reportStatus(session, outside, 'waiting');
-    await poll(() => session.evaluateInMain<number>('globalThis.__notified.length'), (count) => count > 0, UI_TIMEOUT);
+    await notificationShown(session);
     await session.evaluateInMain('globalThis.__notified.at(-1).notification.emit("click")');
-    await page.waitForURL((url) => url.pathname === `/sessions/${outside}`, { timeout: UI_TIMEOUT });
+    await page.waitForURL((url) => url.pathname === `/sessions/${outside}`);
   });
 
   test('AC5 — a session outside any project keeps its page: one terminal, no tabs', async () => {
     const { page } = session;
     await goHome(page);
     await sendFromComposer(page, 'none', { prompt: 'outside', agent: 'Codex' });
-    await page.getByRole('heading', { name: 'Codex 1', exact: true }).waitFor({ timeout: UI_TIMEOUT });
+    await page.getByRole('heading', { name: 'Codex 1', exact: true }).waitFor();
     expect(new URL(page.url()).pathname).toMatch(/^\/sessions\/[^/]+$/);
     expect(await page.locator('[role="tablist"]').count()).toBe(0);
-    const terminals = await poll(() => visibleTerminals(page), (found) => found.length === 1, UI_TIMEOUT);
+    // One terminal shows on the page: waited for as a count of the terminals that are visible.
+    await untilRead(
+      page,
+      () => [...document.querySelectorAll('.xterm')].filter((element) => element.getBoundingClientRect().width > 0 && getComputedStyle(element).visibility === 'visible').length,
+      (count) => count === 1,
+    );
+    const terminals = await visibleTerminals(page);
     expect(terminals).toHaveLength(1);
     await waitForRow(page, 'ready', terminals[0]!);
   });
@@ -1779,17 +1905,17 @@ describe('workspace panes: built app', () => {
     await openWorkspace(page, 'alpha', ws.alpha);
     const column = page.getByRole('complementary', { name: 'Right bar', exact: true });
     const show = page.getByRole('button', { name: 'Show right bar', exact: true });
-    await show.waitFor({ timeout: UI_TIMEOUT });
+    await show.waitFor();
     const rail = (await column.boundingBox())!;
     expect(Math.abs(rail.x + rail.width - (await page.evaluate(() => innerWidth)))).toBeLessThanOrEqual(1);
     expect(rail.width, 'the rail').toBeLessThan(100);
 
-    await show.click({ timeout: UI_TIMEOUT });
-    await page.getByText('against main', { exact: true }).waitFor({ timeout: UI_TIMEOUT });
+    await show.click();
+    await page.getByText('against main', { exact: true }).waitFor();
     expect((await column.boundingBox())!.width, 'the bar').toBeGreaterThan(300);
 
-    await page.getByRole('button', { name: 'Hide right bar', exact: true }).click({ timeout: UI_TIMEOUT });
-    await show.waitFor({ timeout: UI_TIMEOUT });
+    await page.getByRole('button', { name: 'Hide right bar', exact: true }).click();
+    await show.waitFor();
     expect((await column.boundingBox())!.width, 'the rail is back').toBeLessThan(100);
 
     await goHome(page);
@@ -1809,20 +1935,20 @@ describe('workspace panes: built app', () => {
     const agent = await agentPid(page, await terminalOf(page, 0));
     writeFileSync(join(ws.gamma, 'README.md'), 'uncommitted\n');
 
-    await workspaceRow(page, 'gamma').hover({ timeout: UI_TIMEOUT });
-    await page.getByRole('button', { name: 'Actions for gamma', exact: true }).click({ timeout: UI_TIMEOUT });
-    await page.getByRole('menuitem', { name: 'Delete workspace…' }).click({ timeout: UI_TIMEOUT });
+    await workspaceRow(page, 'gamma').hover();
+    await page.getByRole('button', { name: 'Actions for gamma', exact: true }).click();
+    await page.getByRole('menuitem', { name: 'Delete workspace…' }).click();
     const confirm = page.getByRole('alertdialog').or(page.getByRole('dialog')).filter({ hasText: 'Delete gamma?' });
-    await confirm.getByRole('button', { name: 'Delete', exact: true }).click({ timeout: UI_TIMEOUT });
+    await confirm.getByRole('button', { name: 'Delete', exact: true }).click();
     // At the dirty step the dialog's title turns into "gamma has uncommitted changes".
     const dirty = page.getByRole('alertdialog').or(page.getByRole('dialog')).filter({ hasText: 'has uncommitted changes' });
-    await dirty.waitFor({ timeout: 15_000 });
+    await dirty.waitFor();
     // The uncommitted-changes step ends nothing.
     expect(isAlive(shellId) && isAlive(agent)).toBe(true);
-    await dirty.getByRole('button', { name: 'Delete anyway', exact: true }).click({ timeout: UI_TIMEOUT });
-    await workspaceRow(page, 'gamma').waitFor({ state: 'detached', timeout: 15_000 });
-    expect(await endsWithin(shellId), 'the shell is gone within 5 s').toBe(true);
-    expect(await endsWithin(agent), 'the agent is gone within 5 s').toBe(true);
+    await dirty.getByRole('button', { name: 'Delete anyway', exact: true }).click();
+    await workspaceRow(page, 'gamma').waitFor({ state: 'detached' });
+    expect(await hasEnded(shellId), 'the shell is gone').toBe(true);
+    expect(await hasEnded(agent), 'the agent is gone').toBe(true);
 
     // Removing a project ends the processes of its workspaces, which come back with no tab.
     await addRepository(session, repoTwo);
@@ -1832,14 +1958,14 @@ describe('workspace panes: built app', () => {
     const omegaShell = await shellPid(page, await terminalOf(page, 0));
     await newTab(page, 'Codex');
     const omegaAgent = await agentPid(page, await terminalOf(page, 0));
-    await page.getByRole('button', { name: `Actions for ${repoTwo.name}`, exact: true }).hover({ timeout: UI_TIMEOUT });
-    await page.getByRole('button', { name: `Actions for ${repoTwo.name}`, exact: true }).click({ timeout: UI_TIMEOUT });
-    await page.getByRole('menuitem', { name: /Remove from Cockpit/ }).click({ timeout: UI_TIMEOUT });
-    expect(await endsWithin(omegaShell)).toBe(true);
-    expect(await endsWithin(omegaAgent)).toBe(true);
+    await page.getByRole('button', { name: `Actions for ${repoTwo.name}`, exact: true }).hover();
+    await page.getByRole('button', { name: `Actions for ${repoTwo.name}`, exact: true }).click();
+    await page.getByRole('menuitem', { name: /Remove from Cockpit/ }).click();
+    expect(await hasEnded(omegaShell)).toBe(true);
+    expect(await hasEnded(omegaAgent)).toBe(true);
     await addRepository(session, repoTwo);
     await openWorkspace(page, 'omega', omega);
-    await page.getByText('No tab open', { exact: true }).waitFor({ timeout: UI_TIMEOUT });
+    await page.getByText('No tab open', { exact: true }).waitFor();
     expect(isAlive(pids.claude), 'the other project\'s processes are untouched').toBe(true);
   });
 
@@ -1884,33 +2010,43 @@ describe('workspace panes: built app', () => {
     }
     await waitForRow(page, 'resumed-42', terminal);
 
-    // A spawn left pending across a reload: killed once the daemon answers.
+    // A spawn left pending across a reload: killed once the daemon answers. The main process tells when its `pty:spawn`
+    // has answered (the terminal exists in the daemon, and has been asked to end), and the daemon when that terminal ended.
     const children = childPidsOf(daemon).sort((a, b) => a - b);
+    const known = new Set((await daemonLine!.list()).map((terminal) => terminal.id));
     const mark = session.output().length;
+    await replacePtySpawn(
+      session,
+      `async (...args) => { try { return await original(...args); } finally { globalThis.__spawnSettled?.(); } }`,
+    );
+    await session.evaluateInMain(`(() => { globalThis.__spawnAnswered = new Promise((resolve) => { globalThis.__spawnSettled = resolve; }); })()`);
     process.kill(daemon, 'SIGSTOP');
     try {
       await newTab(page, 'Terminal');
       await page.reload();
-      await page.getByText(versionLabel).waitFor({ timeout: UI_TIMEOUT });
+      await page.getByText(versionLabel).waitFor();
     } finally {
       process.kill(daemon, 'SIGCONT');
     }
-    expect(await poll(() => childPidsOf(daemon).sort((a, b) => a - b), (found) => found.join() === children.join(), 10_000)).toEqual(children);
+    await session.evaluateInMain(`globalThis.__spawnAnswered`);
+    await restorePtySpawn(session);
+    for (const { id } of (await daemonLine!.list()).filter((terminal) => !known.has(terminal.id))) await terminalEnd(daemonLine!, id);
+    expect(childPidsOf(daemon).sort((a, b) => a - b)).toEqual(children);
     expect(session.output().slice(mark)).not.toContain('Error occurred in handler');
     expect(session.output().slice(mark)).not.toMatch(MAIN_PROCESS_ERROR);
   });
 
   test('AC20 — with the daemon killed every tab shows [Process ended], and a new tab runs a command in a new daemon', async () => {
     const { page } = session;
-    await page.waitForURL((url) => url.pathname === '/workspace', { timeout: UI_TIMEOUT });
+    await page.waitForURL((url) => url.pathname === '/workspace');
     const labels = await labelsOf(await pane(page, 0));
     expect(labels.length).toBeGreaterThan(2);
     const old = daemonPidIn(session.cockpitHome);
+    // The tabs show the daemon's end once the app has seen its connection close, which the process's end brings.
     process.kill(old, 'SIGKILL');
-    await poll(() => isAlive(old), (alive) => !alive, 5_000);
 
     for (let index = 0; index < labels.length; index++) {
-      await (await pane(page, 0)).getByRole('tab').nth(index).click({ timeout: UI_TIMEOUT });
+      await (await pane(page, 0)).getByRole('tab').nth(index).click();
       await waitForRow(page, /^\[Process ended\]$/, await terminalOf(page, 0));
     }
     expect(session.isRunning()).toBe(true);
@@ -1960,10 +2096,10 @@ describe('workspace panes: the background service cannot start', () => {
     const path = join(session.dataDir, 'wt-down');
     gitIn(repo.root, 'worktree', 'add', '-b', 'down', path);
     await dispatchFocus(page);
-    await page.locator('aside').getByText('down', { exact: true }).first().waitFor({ timeout: UI_TIMEOUT });
-    await workspaceRow(page, 'down').click({ timeout: UI_TIMEOUT });
-    await page.waitForURL((url) => url.pathname === '/workspace', { timeout: UI_TIMEOUT });
-    await page.getByText("Cockpit's background service could not start", { exact: true }).waitFor({ timeout: UI_TIMEOUT });
+    await page.locator('aside').getByText('down', { exact: true }).first().waitFor();
+    await workspaceRow(page, 'down').click();
+    await page.waitForURL((url) => url.pathname === '/workspace');
+    await page.getByText("Cockpit's background service could not start", { exact: true }).waitFor();
     expect(await page.getByRole('button', { name: 'Try again', exact: true }).count()).toBe(1);
     expect(await page.locator('[role="tablist"]').count()).toBe(0);
     expect(await page.locator('.xterm').count()).toBe(0);
@@ -2160,14 +2296,23 @@ describe('workspace panes: packaged app with the launchd environment', () => {
     // The developer's login shell starts slowly and drops what is typed before its prompt.
     await waitForPrompt(page, terminal);
     await typeLine(page, 'printf %s "$PATH"');
-    const printed = () =>
-      terminal.evaluate((element) => {
-        const rows = [...element.querySelectorAll('.xterm-rows > div')].map((row) => (row.textContent ?? '').replace(/ /g, ' '));
-        const command = rows.findLastIndex((row) => /printf %s "\$PATH"\s*$/.test(row));
-        return command < 0 ? '' : rows.slice(command + 1).join('');
-      });
+    // What the command printed, read in the terminal at once and after each DOM mutation until it holds every directory.
+    // Self-contained: it runs in the page.
+    const printed = (element: HTMLElement) => {
+      const rows = [...element.querySelectorAll('.xterm-rows > div')].map((row) => (row.textContent ?? '').replace(/ /g, ' '));
+      const command = rows.findLastIndex((row) => /printf %s "\$PATH"\s*$/.test(row));
+      return command < 0 ? '' : rows.slice(command + 1).join('');
+    };
     const missingFrom = (text: string) => directories.filter((directory) => !normalizeFnm(text).includes(directory));
-    const output = await poll(printed, (text) => missingFrom(text).length === 0, 20_000);
+    const output = await untilIn(
+      terminal,
+      printed,
+      (text, wanted: string[]) => {
+        const normalizedText = text.replace(/fnm_multishells\/[^/:]+/g, 'fnm_multishells/<id>');
+        return wanted.every((directory) => normalizedText.includes(directory));
+      },
+      directories,
+    );
     expect(missingFrom(output)).toEqual([]);
     expect(output.startsWith(LAUNCHD_PATH)).toBe(false);
   }, 120_000);
