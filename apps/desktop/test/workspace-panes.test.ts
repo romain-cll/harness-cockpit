@@ -447,6 +447,84 @@ async function agentPid(page: Page, terminal: Terminal): Promise<number> {
 
 const endsWithin = async (pid: number, timeout = 5_000) => !(await poll(() => isAlive(pid), (alive) => !alive, timeout));
 
+// --- Separators (COCKPIT-45) -------------------------------------------------
+//
+// The line between two panes is an element with `role="separator"` and `aria-orientation` (`vertical` between
+// panes side by side, `horizontal` between panes stacked). A pane is the element carrying the percent box
+// (`left`, `top`, `width`, `height`) around a tab bar; the area is its offset parent.
+
+interface Rect {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  width: number;
+  height: number;
+}
+
+const paneRect = async (page: Page, index: number): Promise<Rect> =>
+  (await pane(page, index)).evaluate((list) => {
+    const { left, top, right, bottom, width, height } = list.closest('[style*="left"]')!.getBoundingClientRect();
+    return { left, top, right, bottom, width, height };
+  });
+
+const areaRect = async (page: Page): Promise<Rect> =>
+  (await pane(page, 0)).evaluate((list) => {
+    const { left, top, right, bottom, width, height } = (list.closest('[style*="left"]') as HTMLElement).offsetParent!.getBoundingClientRect();
+    return { left, top, right, bottom, width, height };
+  });
+
+async function separatorOf(page: Page, orientation: 'vertical' | 'horizontal'): Promise<Locator> {
+  const separator = page.locator(`[role="separator"][aria-orientation="${orientation}"]:visible`);
+  await separator.first().waitFor();
+  expect(await separator.count(), `one ${orientation} separator between the panes`).toBe(1);
+  return separator;
+}
+
+// A real pointer drag from the middle of the separator to `to` (the other coordinate stays).
+async function dragSeparator(page: Page, separator: Locator, to: { x?: number; y?: number }, release = true) {
+  const box = (await separator.boundingBox())!;
+  const from = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  await page.mouse.move(from.x, from.y);
+  await page.mouse.down();
+  await page.mouse.move(to.x ?? from.x, to.y ?? from.y, { steps: 8 });
+  if (release) await page.mouse.up();
+}
+
+let sttyMarks = 0;
+
+// What `stty size` answers in the terminal: [rows, columns].
+async function sttySize(page: Page, terminal: Terminal): Promise<[number, number]> {
+  await terminal.click();
+  await waitForPrompt(page, terminal);
+  const mark = `ss${Date.now()}x${sttyMarks++}`;
+  await typeLine(page, `printf '${mark} %s\\n' "$(stty size)"`);
+  const [rows, columns] = (await captureRow(page, new RegExp(`^${mark} (\\d+) (\\d+)$`), terminal)).map(Number);
+  return [rows!, columns!];
+}
+
+// The colour of the thin line of a separator: its own thin element (a background), else the 1 px border of the
+// pane after it, which is what shows when the separator draws nothing.
+const separatorLine = (separator: Locator, orientation: 'vertical' | 'horizontal') =>
+  separator.evaluate((element, orientation) => {
+    const vertical = orientation === 'vertical';
+    for (const each of [element, ...element.querySelectorAll('*')]) {
+      const { width, height } = each.getBoundingClientRect();
+      const color = getComputedStyle(each).backgroundColor;
+      const thin = vertical ? width > 0 && width <= 1.01 && height > 50 : height > 0 && height <= 1.01 && width > 50;
+      if (thin && color !== 'rgba(0, 0, 0, 0)' && color !== 'transparent') return color;
+    }
+    const centre = element.getBoundingClientRect();
+    const x = vertical ? centre.left + centre.width / 2 + 0.5 : centre.left + centre.width / 2;
+    const y = vertical ? centre.top + centre.height / 2 : centre.top + centre.height / 2 + 0.5;
+    for (const each of document.elementsFromPoint(x, y)) {
+      const style = getComputedStyle(each);
+      if (vertical && style.borderLeftWidth === '1px') return style.borderLeftColor;
+      if (!vertical && style.borderTopWidth === '1px') return style.borderTopColor;
+    }
+    return null;
+  }, orientation);
+
 // What `stty size` answers against what the terminal displays; a late resize is read again for up to 5 s.
 async function expectSizeMatchesDisplay(page: Page, terminal: Terminal) {
   await terminal.click({ timeout: UI_TIMEOUT });
@@ -1060,6 +1138,109 @@ describe('workspace panes: built app', () => {
     for (const index of [0, 1, 2]) await expectSizeMatchesDisplay(page, await terminalOf(page, index));
   });
 
+  // --- Resizing the splits (COCKPIT-45): alpha is p0 | (p1 / p2) from the test above, in equal halves ---
+
+  test('AC1, AC3 — dragging the separator of a split right to 70% of the area resizes both panes (± 1 px), refits both terminals, and the terminal that held the keyboard still holds it', async () => {
+    const { page } = session;
+    await openWorkspace(page, 'alpha', ws.alpha);
+    await expectPaneCount(page, 3);
+    const area = await areaRect(page);
+    const [left, right] = [await terminalOf(page, 0), await terminalOf(page, 1)];
+    const before = { left: (await sttySize(page, left))[1], right: (await sttySize(page, right))[1] };
+
+    // The right terminal holds the keyboard (the last click) when the separator is pressed.
+    await dragSeparator(page, await separatorOf(page, 'vertical'), { x: area.left + 0.7 * area.width });
+    await expectKeyboardIn(page, right, 'the terminal that held it before the drag');
+    await typeLine(page, 'echo kb-$((7*6))');
+    await waitForRow(page, 'kb-42', right);
+
+    const widths = [(await paneRect(page, 0)).width, (await paneRect(page, 1)).width, (await paneRect(page, 2)).width];
+    expect(Math.abs(widths[0]! - 0.7 * area.width)).toBeLessThanOrEqual(1);
+    expect(Math.abs(widths[1]! - 0.3 * area.width)).toBeLessThanOrEqual(1);
+    expect(Math.abs(widths[2]! - 0.3 * area.width)).toBeLessThanOrEqual(1);
+
+    await expectSizeMatchesDisplay(page, left);
+    await expectSizeMatchesDisplay(page, right);
+    expect((await sttySize(page, left))[1], 'columns of the left terminal').toBeGreaterThan(before.left);
+    expect((await sttySize(page, right))[1], 'columns of the right terminal').toBeLessThan(before.right);
+  });
+
+  test('AC2 — dragging the separator of a split down makes the heights follow the pointer (± 1 px) and refits both terminals', async () => {
+    const { page } = session;
+    const area = await areaRect(page);
+    const [top, bottom] = [await terminalOf(page, 1), await terminalOf(page, 2)];
+    const before = { top: (await sttySize(page, top))[0], bottom: (await sttySize(page, bottom))[0] };
+
+    await dragSeparator(page, await separatorOf(page, 'horizontal'), { y: area.top + 0.6 * area.height });
+
+    const heights = [(await paneRect(page, 1)).height, (await paneRect(page, 2)).height];
+    expect(Math.abs(heights[0]! - 0.6 * area.height)).toBeLessThanOrEqual(1);
+    expect(Math.abs(heights[1]! - 0.4 * area.height)).toBeLessThanOrEqual(1);
+
+    await expectSizeMatchesDisplay(page, top);
+    await expectSizeMatchesDisplay(page, bottom);
+    expect((await sttySize(page, top))[0], 'rows of the top terminal').toBeGreaterThan(before.top);
+    expect((await sttySize(page, bottom))[0], 'rows of the bottom terminal').toBeLessThan(before.bottom);
+  });
+
+  test('AC7 — over a separator the cursor is col-resize (right split) or row-resize (down split), its line takes --ring while hovered or dragged, and --border otherwise', async () => {
+    const { page } = session;
+    const [ring, border] = [await tokenColor(page, '--ring'), await tokenColor(page, '--border')];
+    const area = await areaRect(page);
+    const away = { x: area.left + 60, y: area.top + area.height / 2 };
+
+    for (const [orientation, cursor] of [['vertical', 'col-resize'], ['horizontal', 'row-resize']] as const) {
+      const separator = await separatorOf(page, orientation);
+      await page.mouse.move(away.x, away.y);
+      expect(await separatorLine(separator, orientation), `${orientation} separator, pointer away`).toBe(border);
+
+      await separator.hover();
+      expect(await separator.evaluate((element) => getComputedStyle(element).cursor)).toBe(cursor);
+      expect(await separatorLine(separator, orientation), `${orientation} separator, hovered`).toBe(ring);
+
+      // Pressed and moved: still the ring, and the cursor does not change.
+      await dragSeparator(page, separator, orientation === 'vertical' ? { x: (await paneRect(page, 1)).left + 12 } : { y: (await paneRect(page, 2)).top + 12 }, false);
+      expect(await separatorLine(separator, orientation), `${orientation} separator, dragged`).toBe(ring);
+      expect(await separator.evaluate((element) => getComputedStyle(element).cursor)).toBe(cursor);
+      await page.mouse.up();
+
+      await page.mouse.move(away.x, away.y);
+      expect(await separatorLine(separator, orientation), `${orientation} separator, pointer away again`).toBe(border);
+    }
+  });
+
+  test('AC5 — a drag to the edge of the window stops where a pane would be narrower than 160 px (split right) or shorter than 100 px (split down)', async () => {
+    const { page } = session;
+    const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
+
+    await dragSeparator(page, await separatorOf(page, 'vertical'), { x: viewport.width - 1 });
+    for (const index of [1, 2]) expect(Math.abs((await paneRect(page, index)).width - 160), `width of pane ${index}`).toBeLessThanOrEqual(1);
+    expect((await paneRect(page, 0)).width).toBeGreaterThan(300);
+
+    await dragSeparator(page, await separatorOf(page, 'horizontal'), { y: viewport.height - 1 });
+    expect(Math.abs((await paneRect(page, 2)).height - 100), 'height of the bottom pane').toBeLessThanOrEqual(1);
+    expect((await paneRect(page, 1)).height).toBeGreaterThan(300);
+  });
+
+  test('AC6 — a double-click on a separator goes back to equal halves (± 1 px) and refits both terminals', async () => {
+    const { page } = session;
+    const area = await areaRect(page);
+
+    await (await separatorOf(page, 'vertical')).dblclick();
+    const widths = [(await paneRect(page, 0)).width, (await paneRect(page, 1)).width];
+    expect(Math.abs(widths[0]! - area.width / 2)).toBeLessThanOrEqual(1);
+    expect(Math.abs(widths[1]! - area.width / 2)).toBeLessThanOrEqual(1);
+    await expectSizeMatchesDisplay(page, await terminalOf(page, 0));
+    await expectSizeMatchesDisplay(page, await terminalOf(page, 1));
+
+    await (await separatorOf(page, 'horizontal')).dblclick();
+    const heights = [(await paneRect(page, 1)).height, (await paneRect(page, 2)).height];
+    expect(Math.abs(heights[0]! - area.height / 2)).toBeLessThanOrEqual(1);
+    expect(Math.abs(heights[1]! - area.height / 2)).toBeLessThanOrEqual(1);
+    await expectSizeMatchesDisplay(page, await terminalOf(page, 1));
+    await expectSizeMatchesDisplay(page, await terminalOf(page, 2));
+  });
+
   test('AC27 — with the sidebar hidden, "Show sidebar" sits at least 72 px from the left and the first tab starts right of it; the empty part of the top tab bar drags the window, its tabs and buttons do not', async () => {
     const { page } = session;
     await page.getByRole('button', { name: 'Hide sidebar', exact: true }).click({ timeout: UI_TIMEOUT });
@@ -1187,7 +1368,7 @@ describe('workspace panes: built app', () => {
 
   // --- Leaving and coming back ---
 
-  test('AC18, AC20 — Home, another workspace and back keep the panes, tabs, selections, outputs, processes and the keyboard; a window resized meanwhile is fitted on return, in the shown and in a hidden tab', async () => {
+  test('AC18, AC20, AC9 — Home, another workspace and back keep the panes, their sizes, tabs, selections, outputs, processes and the keyboard; a window resized meanwhile is fitted on return, in the shown and in a hidden tab', async () => {
     const { page } = session;
     await openWorkspace(page, 'alpha', ws.alpha);
     const viewport = await page.evaluate(() => ({ width: innerWidth, height: innerHeight }));
@@ -1195,6 +1376,17 @@ describe('workspace panes: built app', () => {
     rmSync(done, { force: true });
     await expectLabels(page, 0, ['Claude Code 1', 'Codex 1', 'Terminal', 'Claude Code 2'], 'Claude Code 2');
     await expectLabels(page, 1, ['Terminal', 'Codex 2'], 'Codex 2');
+    // COCKPIT-45 AC9: the splits are left at 60% (right split) and 40% (down split), not equal halves.
+    const areaBefore = await areaRect(page);
+    await dragSeparator(page, await separatorOf(page, 'vertical'), { x: areaBefore.left + 0.6 * areaBefore.width });
+    await dragSeparator(page, await separatorOf(page, 'horizontal'), { y: areaBefore.top + 0.4 * areaBefore.height });
+    const ratios = async () => {
+      const area = await areaRect(page);
+      return { column: (await paneRect(page, 0)).width / area.width, row: (await paneRect(page, 1)).height / area.height };
+    };
+    const resized = await ratios();
+    expect(Math.abs(resized.column - 0.6), 'left column after the drag').toBeLessThanOrEqual(0.01);
+    expect(Math.abs(resized.row - 0.4), 'top right pane after the drag').toBeLessThanOrEqual(0.01);
     // Markers in the shells, a command that prints later in the bottom pane, the keyboard there.
     await selectTab(page, 1, 'Terminal');
     const second = await terminalOf(page, 1);
@@ -1220,6 +1412,10 @@ describe('workspace panes: built app', () => {
       await openWorkspace(page, 'alpha', ws.alpha);
 
       await expectPaneCount(page, 3);
+      // COCKPIT-45 AC9: the proportions survive Home and back, the window being smaller.
+      const returned = await ratios();
+      expect(Math.abs(returned.column - resized.column), 'left column share after Home and back').toBeLessThanOrEqual(0.01);
+      expect(Math.abs(returned.row - resized.row), 'top right pane share after Home and back').toBeLessThanOrEqual(0.01);
       await expectLabels(page, 0, ['Claude Code 1', 'Codex 1', 'Terminal', 'Claude Code 2'], 'Claude Code 2');
       await expectLabels(page, 1, ['Terminal', 'Codex 2'], 'Terminal');
       await expectLabels(page, 2, ['Terminal'], 'Terminal');
