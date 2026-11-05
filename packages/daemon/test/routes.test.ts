@@ -51,7 +51,7 @@ describe('GET /terminals', () => {
     expect(await get(files.socket, `Bearer ${'0'.repeat(64)}`)).toEqual({ status: 401, text: '' });
   });
 
-  test('AC15 — a daemon in any state answers: one that another build superseded still lists the terminals it keeps, and an empty one lists none', async () => {
+  test('AC15 — a daemon in any state answers: one that another build superseded still lists the terminals it keeps', async () => {
     const { files } = await startDaemon();
     const owner = await connectTo(files.socket);
     const shell = await owner.client.spawn(shellOptions);
@@ -62,10 +62,15 @@ describe('GET /terminals', () => {
 
     expect(answer.status).toBe(200);
     expect((JSON.parse(answer.text) as Array<{ id: number }>).map((entry) => entry.id)).toEqual([shell]);
+  });
 
-    owner.client.kill(shell);
-    await owner.when(() => owner.exits.some((exit) => exit.id === shell));
-    expect(JSON.parse((await get(files.socket, `Bearer ${tokenOf(files)}`)).text)).toEqual([]);
+  test('AC15 — a daemon that was never superseded and runs no terminal answers 200 with an empty list', async () => {
+    const { files } = await startDaemon();
+
+    const answer = await get(files.socket, `Bearer ${tokenOf(files)}`);
+
+    expect(answer.status).toBe(200);
+    expect(JSON.parse(answer.text)).toEqual([]);
   });
 });
 

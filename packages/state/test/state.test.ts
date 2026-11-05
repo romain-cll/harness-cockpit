@@ -912,6 +912,7 @@ describe('COCKPIT-69 AC13 — the open mark of a workspace session', () => {
     expect(state.sessions[0]!.open).toBe(true);
     expect(next).not.toBe(state);
 
+    mkdirSync(dir, { recursive: true });
     saveState(dir, next);
     const before = snapshot();
     expect(loadState(dir).sessions).toEqual(next.sessions);
