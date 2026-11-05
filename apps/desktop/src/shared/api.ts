@@ -25,8 +25,6 @@ export type PtySpawnRequest = Pick<PtySpawnOptions, 'cols' | 'rows'> &
   Partial<PtySpawnOptions> & {
     /** The linked worktree the terminal belongs to: its `cwd` unless one is given, and the daemon lists it with it. */
     workspace?: string;
-    /** With `workspace`: run `cockpit setup --shell` (the repository's setup, then the login shell) instead of the login shell. */
-    setup?: boolean;
   };
 
 /** A terminal the daemon is running that the page can show again; `status` is what its session last reported. */
@@ -68,6 +66,8 @@ export interface Workspace {
   path: string;
   name: string;
   branch: string | null;
+  /** The main process is still setting it up (its worktree, then its session): the row and the page say so. */
+  settingUp?: true;
 }
 
 /**
@@ -100,6 +100,28 @@ export type BranchesResult =
   | Refused;
 
 export type CreateWorkspaceResult = { status: 'created'; workspace: Workspace } | Refused;
+
+/** `reserved`: the workspace exists as a row at `path` (a branch `name`) while the main process makes it. */
+export type ComposeResult = { status: 'reserved'; path: string; name: string } | Refused;
+
+/** A workspace whose worktree could not be created: kept until dismissed, with what the composer needs to show the send again. */
+export interface FailedSetup {
+  id: string;
+  project: string;
+  path: string;
+  name: string;
+  message: string;
+  prompt: string;
+  /** The harness id of the send, or `terminal`. */
+  agent: string;
+  base: string;
+}
+
+/** A workspace stopped setting up; `message` says why its agent could not start (the workspace stays). */
+export interface SettledSetup {
+  path: string;
+  message?: string;
+}
 
 /** What deleting a workspace would lose: `uncommitted` changes, and whether its branch is `merged` (`null`: no branch). */
 export type RemovalResult = { status: 'read'; uncommitted: boolean; merged: boolean | null } | Refused;
@@ -273,6 +295,18 @@ export interface Api {
      * worktree under `$COCKPIT_HOME/worktrees`.
      */
     create(project: string, task: string, base: string): Promise<CreateWorkspaceResult>;
+    /**
+     * Reserves a branch named after the task and the worktree's path, answers at once, and makes the worktree
+     * then starts `harness` (`terminal`: the setup shell) in the main process, which needs no page for it:
+     * `onSettled` tells the end. A refusal here reserved nothing.
+     */
+    compose(project: string, task: string, base: string, harness: string): Promise<ComposeResult>;
+    /** The workspaces whose worktree could not be created and that nobody dismissed. */
+    failedSetups(): Promise<FailedSetup[]>;
+    /** Forgets a failed setup. */
+    dismissSetup(id: string): Promise<void>;
+    /** Calls `listener` when a workspace stopped setting up, whatever the outcome; returns the unsubscribe function. */
+    onSettled(listener: (settled: SettledSetup) => void): () => void;
     /** Reads what removing the worktree would lose, without writing anything. */
     removal(project: string, path: string): Promise<RemovalResult>;
     /**

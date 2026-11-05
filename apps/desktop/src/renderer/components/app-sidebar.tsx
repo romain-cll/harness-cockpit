@@ -1,6 +1,6 @@
 import { Link } from '@tanstack/react-router';
 import { PanelLeftCloseIcon, SquarePenIcon, TriangleAlertIcon } from 'lucide-react';
-import type { DaemonStatus, Project, Session } from '../../shared/api';
+import type { DaemonStatus, FailedSetup, Project, Session } from '../../shared/api';
 import { toggleSidebar } from '@/components/collapsed';
 import { Projects } from '@/components/projects';
 import { linkRowClass, Sessions } from '@/components/sessions';
@@ -12,12 +12,14 @@ export function AppSidebar({
   sessions,
   daemon,
   git,
+  failedSetups,
 }: {
   version: string;
   projects: Project[];
   sessions: Session[];
   daemon: DaemonStatus;
   git: 'ok' | 'missing';
+  failedSetups: FailedSetup[];
 }) {
   return (
     <aside className="flex w-[220px] shrink-0 flex-col gap-3 bg-sidebar p-2 text-sidebar-foreground select-none [&_button]:font-normal [&_svg]:[stroke-width:1.25]">
@@ -42,7 +44,7 @@ export function AppSidebar({
           </div>
         </div>
       )}
-      <Projects projects={projects} sessions={sessions} />
+      <Projects projects={projects} sessions={sessions} failedSetups={failedSetups} />
       <Sessions sessions={sessions} daemon={daemon} />
       <footer className="shrink-0 px-2 text-[11px] text-subtle">Cockpit {version}</footer>
     </aside>

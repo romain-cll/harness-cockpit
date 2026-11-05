@@ -548,7 +548,7 @@ describe('sessions: built app', () => {
     expect(namesIn(ws.plus.path)).toEqual(['Claude Code 1', 'Claude Code 2']);
   });
 
-  test('workspace sessions AC7 — a save that fails after the spawn keeps the new workspace and its files, shows "Could not start Claude Code: …" in the composer, leaves no harness process and the sessions unchanged', async () => {
+  test('workspace sessions AC7 — a save that fails after the spawn keeps the new workspace and its files, shows "Could not start Claude Code: …" under Projects (COCKPIT-89), leaves no harness process and the sessions unchanged', async () => {
     const { page } = session;
     const before = {
       state: stateSnapshot(session.dataDir),
@@ -574,12 +574,12 @@ describe('sessions: built app', () => {
       expect(existsSync(join(path, 'README.md'))).toBe(true);
       expect(linkedWorktrees(repo)).toContainEqual({ path, branch: 'save-fails' });
 
-      const message = await waitForMessage(page);
-      expect(message.startsWith('Could not start Claude Code:')).toBe(true);
+      // The workspace page opened with the send; the refusal shows in the sidebar's message slot under Projects.
+      const status = page.locator('aside [role="status"]').filter({ hasText: /^\s*Could not start Claude Code:/ }).first();
+      await status.waitFor();
       // Only a save after a successful spawn raises it.
-      expect(message).toContain('EISDIR');
-      expect(new URL(page.url()).pathname).toBe('/');
-      expect(await promptBox(page).inputValue()).toBe('save fails');
+      expect(await status.innerText()).toContain('EISDIR');
+      expect(new URL(page.url()).pathname).toBe('/workspace');
 
       // The harness was spawned (the message carries the save error), then killed by the rollback.
       // The rollback kills the spawned harness: its exit is reported to the page, which has logged since the click.

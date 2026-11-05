@@ -7,23 +7,24 @@ import { restoreFromDaemon, selectSessionTab } from '@/components/workspace-pane
 
 export const Route = createRootRoute({
   loader: async () => {
-    const [version, projects, sessions, daemon, git] = await Promise.all([
+    const [version, projects, sessions, daemon, git, failedSetups] = await Promise.all([
       window.api.getVersion(),
       window.api.projects.list(),
       window.api.sessions.list(),
       window.api.daemon.status(),
       window.api.projects.git(),
+      window.api.workspaces.failedSetups(),
     ]);
     // The shells and sessions the daemons run come back with their screens, once per page load. The page
     // does not wait for them: a daemon that does not answer must not keep it from opening.
     void restoreFromDaemon();
-    return { version, projects, sessions, daemon, git };
+    return { version, projects, sessions, daemon, git, failedSetups };
   },
   component: RootLayout,
 });
 
 function RootLayout() {
-  const { version, projects, sessions, daemon, git } = Route.useLoaderData();
+  const { version, projects, sessions, daemon, git, failedSetups } = Route.useLoaderData();
   const router = useRouter();
   const navigate = useNavigate();
   // The right column belongs to the workspace page.
@@ -60,11 +61,11 @@ function RootLayout() {
   );
   return (
     <div className="flex h-screen">
-      {!sidebarHidden && <AppSidebar version={version} projects={projects} sessions={sessions} daemon={daemon} git={git} />}
+      {!sidebarHidden && <AppSidebar version={version} projects={projects} sessions={sessions} daemon={daemon} git={git} failedSetups={failedSetups} />}
       <main className="flex min-w-0 flex-1 flex-col bg-background p-2">
         <Outlet />
       </main>
-      {workspace &&
+      {workspace && !workspace.workspace.settingUp &&
         (rightBarOpen ? (
           <ChangesPanel key={workspace.workspace.path} project={workspace.project} workspace={workspace.workspace} />
         ) : (

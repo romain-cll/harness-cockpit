@@ -1,12 +1,10 @@
-import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { open, type FileHandle } from 'node:fs/promises';
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { type FileHandle } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { type Locator, type Page } from 'playwright-core';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
-import { MAIN_PROCESS_ERROR, launchSpawned, startClock, untilRead, versionLabel, type Session } from './launch';
+import { MAIN_PROCESS_ERROR, launchSpawned, startClock, versionLabel, type Session } from './launch';
 import { makeTestDir } from './run-root';
 import {
   agentSelect,
@@ -18,7 +16,6 @@ import {
   isDisabledItem,
   itemTexts,
   itemsOf,
-  messageOf,
   waitForMessage,
   norm,
   openComposer,
@@ -31,14 +28,39 @@ import {
   waitForAgent,
   waitForBase,
   storedSessions,
-  tabsOf,
   waitForNewSession,
+  waitForSelectedTab,
   waitForWorkspacePage,
 } from './composer';
 import { projectColour } from '../src/renderer/components/project-colour';
 import { openPopup } from './composer';
 import { afterIpcAnswers, countIpcCalls, ipcCalls, stateSnapshot } from './support/projects';
 import { expectNoErrors, launchBuiltWith, makeSessionsFixture, sessionEntries, sessionIdOf, type SessionsFixture } from './support/sessions';
+import {
+  entryOf,
+  git,
+  gitOrNull,
+  holdGit,
+  installStub,
+  loadingText,
+  localBranches,
+  makeClone,
+  makeFixture,
+  makeLight,
+  openFifo,
+  releaseFifo,
+  removeStub,
+  sessionsInState,
+  shellRuns,
+  signalled,
+  startsOf,
+  tabs,
+  waitForRow,
+  worktreeIn,
+  worktreesDirIn,
+  type Fixture,
+  type Repo,
+} from './support/composer-fixture';
 
 // COCKPIT-66: the New workspace page (the composer at `/`). One built-app launch with a fake login
 // shell whose `PATH` holds stub agent CLIs (a stub is a `#!/bin/sh` file that logs its launch, so no
@@ -46,169 +68,7 @@ import { expectNoErrors, launchBuiltWith, makeSessionsFixture, sessionEntries, s
 // tests run in order on that launch: the first ones see the detection still running (the stubs'
 // `--version` waits for a gate file), the later ones change what is on the `PATH` and detect again.
 
-// --- Fixture -----------------------------------------------------------------
-
-const gitEnv: NodeJS.ProcessEnv = {
-  ...process.env,
-  GIT_CONFIG_GLOBAL: '/dev/null',
-  GIT_CONFIG_NOSYSTEM: '1',
-  GIT_AUTHOR_NAME: 'Test',
-  GIT_AUTHOR_EMAIL: 'test@example.com',
-  GIT_COMMITTER_NAME: 'Test',
-  GIT_COMMITTER_EMAIL: 'test@example.com',
-};
-
-const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, env: gitEnv, encoding: 'utf8' }).trim();
-const gitOrNull = (cwd: string, ...args: string[]) => {
-  try {
-    return git(cwd, ...args);
-  } catch {
-    return null;
-  }
-};
-
-interface Repo {
-  parent: string;
-  root: string;
-  name: string;
-}
-
-function makeLight(name: string): Repo {
-  const parent = realpathSync(makeTestDir('p-'));
-  const root = join(parent, name);
-  mkdirSync(root);
-  git(root, 'init', '--quiet', '-b', 'main');
-  git(root, 'commit', '--quiet', '--allow-empty', '-m', 'initial');
-  return { parent, root, name };
-}
-
-// A clone with `origin` (branches `develop`, `feature/x` and `release/1.0` besides `main`), a local commit
-// on `main` that `origin/main` lacks, and the local branches `local-topic` and `topic/nested`: the default
-// base is `origin/main`.
-function makeClone(name: string): Repo {
-  const upstream = makeLight(`${name}-upstream`);
-  for (const branch of ['develop', 'feature/x', 'release/1.0']) git(upstream.root, 'branch', branch);
-  const parent = realpathSync(makeTestDir('p-'));
-  const root = join(parent, name);
-  git(parent, 'clone', '--quiet', upstream.root, root);
-  git(root, 'commit', '--allow-empty', '-m', 'local only');
-  git(root, 'branch', 'local-topic');
-  git(root, 'branch', 'topic/nested');
-  return { parent, root, name };
-}
-
-const sha8 = (root: string) => createHash('sha256').update(root).digest('hex').slice(0, 8);
-const localBranches = (repo: Repo) => git(repo.root, 'for-each-ref', '--format=%(refname:short)', 'refs/heads').split('\n').filter(Boolean).sort();
-
-// The stub agent: logs every `--version` run, waits on the FIFO `<stub>.gate` while there is one, prints `9.9.9`
-// (nothing with `<stub>.noversion`), and as a session logs its working directory and arguments (what the status
-// feature adds before them is set aside), prints the idle title, then one title per line of
-// `<stub>.titles.<folder>` and writes a line to the FIFO `<stub>.titles.<folder>.done`, `<folder>` being the name of its working
-// directory, and echoes what it reads until `exit`. It never pauses: `cockpit setup`'s markers order its titles
-// against anything printed before it started. The titles are per folder because a session's agent may start
-// after its test ended: it must not print the titles the next test meant for its own session.
-function stubScript(runLog: string) {
-  return `#!/bin/sh
-if [ "$1" = "--version" ]; then
-  echo "$(basename "$0") --version" >> '${runLog}'
-  if [ -p "$0.gate" ]; then { read -r _ <&3; } 3<>"$0.gate" 2>/dev/null; fi
-  [ -e "$0.noversion" ] || echo 9.9.9
-  exit 0
-fi
-case "$1" in
-  --settings) shift 2 ;;
-  --no-daemon) shift; if [ "$1" = -c ]; then shift 2; fi ;;
-  --standalone) shift ;;
-esac
-{ echo "---"; echo "cwd=$(pwd -P)"; for a in "$@"; do echo "arg=$a"; done; } >> "$0.starts"
-printf '\\033]0;✳ Claude Code\\007'
-echo ready
-titles="$0.titles.$(basename "$(pwd -P)")"
-if [ -e "$titles" ]; then
-  while IFS= read -r title; do printf '\\033]0;%s\\007' "$title"; done < "$titles"
-  if [ -p "$titles.done" ]; then { echo >&3; } 3<>"$titles.done" 2>/dev/null; fi
-fi
-while IFS= read -r line; do
-  [ "$line" = exit ] && exit 3
-  echo "got:$line"
-done
-`;
-}
-
-interface Fixture {
-  root: string;
-  bin: string;
-  shellLog: string;
-  runLog: string;
-  env(): NodeJS.ProcessEnv;
-}
-
-function makeFixture(): Fixture {
-  const root = realpathSync(makeTestDir('s-'));
-  const bin = join(root, 'bin');
-  mkdirSync(bin);
-  const runLog = join(root, 'runs.log');
-  const shell = join(root, 'login-shell');
-  const shellLog = join(root, 'shell-args.log');
-  // Started as a login shell with no command (`-l`) it is an interactive /bin/sh with a prompt of its own;
-  // run with `-ilc <script>` (the app resolving its environment) it runs the script with the stubs' `PATH`.
-  writeFileSync(
-    shell,
-    `#!/bin/sh\n[ "$1" = --warmup ] && exit 0\necho "$*" >> '${shellLog}'\n[ "$*" = -l ] && { PS1='login-shell> '; export PS1; exec /bin/sh -i; }\nPATH='${bin}:/usr/bin:/bin' /bin/sh -c "$2"\n`,
-  );
-  chmodSync(shell, 0o755);
-  execFileSync(shell, ['--warmup']);
-  // A `git` first on the PATH that, while the FIFO `<root>/git-block` exists, writes a line to the FIFO
-  // `<root>/git-waiting` and holds `worktree add` until a line comes through `git-block`; it logs each
-  // `worktree add` in `git-adds.log` and runs the real git.
-  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
-  const wrapper = join(bin, 'git');
-  writeFileSync(
-    wrapper,
-    `#!/bin/sh\nif [ "$1" = worktree ] && [ "$2" = add ]; then\n  echo add >> '${root}/git-adds.log'\n  if [ -p '${root}/git-block' ]; then { echo >&3; } 3<>'${root}/git-waiting' 2>/dev/null; { read -r _ <&3; } 3<>'${root}/git-block' 2>/dev/null; fi\nfi\nexec '${realGit}' "$@"\n`,
-  );
-  chmodSync(wrapper, 0o755);
-  // macOS scans a new executable the first time it runs.
-  execFileSync(wrapper, ['--version']);
-  const fx: Fixture = { root, bin, shellLog, runLog, env: () => ({ ...process.env, SHELL: shell }) };
-  writeFileSync(runLog, '');
-  writeFileSync(shellLog, '');
-  return fx;
-}
-
-function installStub(fx: Fixture, name: string, { noVersion = false }: { noVersion?: boolean } = {}) {
-  const stub = join(fx.bin, name);
-  writeFileSync(stub, stubScript(fx.runLog));
-  chmodSync(stub, 0o755);
-  if (noVersion) writeFileSync(`${stub}.noversion`, '');
-  // macOS scans a new executable the first time it runs; that run is not one the app made.
-  const logged = readFileSync(fx.runLog, 'utf8');
-  execFileSync(stub, ['--version'], { encoding: 'utf8' });
-  writeFileSync(fx.runLog, logged);
-}
-
-const removeStub = (fx: Fixture, name: string) => rmSync(join(fx.bin, name), { force: true });
-
-// A FIFO between the test and a stub. Both sides open it read-write, so neither open blocks, and the test holds
-// it open, so a line written before the other side reads it stays in the pipe. A stub waits on one with `read`
-// until the test writes a line, or writes a line the test waits for: no side polls a file.
-async function openFifo(path: string): Promise<FileHandle> {
-  rmSync(path, { force: true });
-  execFileSync('mkfifo', [path]);
-  return open(path, 'r+');
-}
-
-// Lets every stub waiting on the FIFO go on, then removes it so a stub that comes later does not wait.
-async function releaseFifo(fifo: FileHandle, path: string) {
-  await fifo.write('\n'.repeat(16));
-  rmSync(path, { force: true });
-  await fifo.close();
-}
-
-// Waits for a stub to write a line to the FIFO.
-const signalled = async (fifo: FileHandle) => {
-  await fifo.read(Buffer.alloc(1), 0, 1, null);
-};
+// --- Fixture: shared with workspace-setup.test.ts (support/composer-fixture.ts) ---
 
 const gates = new Map<string, FileHandle>();
 async function setGate(fx: Fixture, names: string[], closed: boolean) {
@@ -230,40 +90,6 @@ const versionRuns = (fx: Fixture) => {
   return counts;
 };
 
-interface Start {
-  cwd: string;
-  args: string[];
-}
-
-// What the stub `name` was started with, one entry per start.
-function startsOf(fx: Fixture, name: string): Start[] {
-  const file = join(fx.bin, `${name}.starts`);
-  if (!existsSync(file)) return [];
-  return readFileSync(file, 'utf8')
-    .split('---\n')
-    .filter(Boolean)
-    .map((record) => {
-      const lines = record.split('\n').filter(Boolean);
-      return {
-        cwd: lines.find((line) => line.startsWith('cwd='))!.slice('cwd='.length),
-        args: lines.filter((line) => line.startsWith('arg=')).map((line) => line.slice('arg='.length)),
-      };
-    });
-}
-
-const shellRuns = (fx: Fixture) => readFileSync(fx.shellLog, 'utf8').split('\n').filter((line) => line === '-l').length;
-
-interface StoredSession {
-  id: string;
-  name: string;
-  harness: string;
-  directory: string;
-  project?: string;
-}
-
-const sessionsInState = (dataDir: string): StoredSession[] =>
-  (JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')) as { sessions?: StoredSession[] }).sessions ?? [];
-
 // --- Page helpers ------------------------------------------------------------
 
 const tokenColour = (page: Page, token: string, property: 'color' | 'backgroundColor' = 'color') =>
@@ -281,29 +107,12 @@ const tokenColour = (page: Page, token: string, property: 'color' | 'backgroundC
 
 const waitForSessionPage = waitForNewSession;
 
-// The labels of the tabs of the workspace page and which are selected (a tab bears the session's name until
-// its program sets a title, then that title).
-const tabs = tabsOf;
-
 // The rows of the terminal on the page.
 const terminalRows = (page: Page) =>
   page
     .locator('.xterm-rows:visible')
     .first()
     .evaluate((element) => [...element.children].map((row) => (row.textContent ?? '').replace(/ /g, ' ').trimEnd()));
-// The same rows read in the page, at once and after each DOM mutation, until one is the text. Self-contained: it runs in `untilRead`.
-const readVisibleRows = () => {
-  const terminal = [...document.querySelectorAll('.xterm-rows')].find((element) => {
-    const { width, height } = element.getBoundingClientRect();
-    return width > 0 && height > 0 && getComputedStyle(element).visibility !== 'hidden';
-  });
-  return terminal ? [...terminal.children].map((row) => (row.textContent ?? '').replace(/\u00a0/g, ' ').trimEnd()) : [];
-};
-const waitForRow = async (page: Page, text: string) => {
-  const rows = await untilRead(page, readVisibleRows, (found, wanted: string) => found.includes(wanted), text);
-  expect(rows, `the terminal shows "${text}"`).toContain(text);
-};
-
 const mainBox = async (locator: Locator) => (await locator.boundingBox())!;
 
 // --- The launch --------------------------------------------------------------
@@ -318,10 +127,9 @@ describe('new workspace page: built app', () => {
   let refuse: Repo;
   let home: string;
 
-  const worktreeOf = (repo: Repo, branch: string) => join(home, 'worktrees', `${repo.name}-${sha8(repo.root)}`, branch);
-  const worktreesDirOf = (repo: Repo) => join(home, 'worktrees', `${repo.name}-${sha8(repo.root)}`);
+  const worktreeOf = (repo: Repo, branch: string) => worktreeIn(home, repo, branch);
+  const worktreesDirOf = (repo: Repo) => worktreesDirIn(home, repo);
   const listing = (repo: Repo) => (existsSync(worktreesDirOf(repo)) ? readdirSync(worktreesDirOf(repo)).sort() : []);
-  const entryOf = (page: Page, path: string) => page.locator(`aside [title="${path}"]`).first();
   const linkInSessions = (page: Page, id: string) =>
     page
       .locator('aside section')
@@ -710,41 +518,6 @@ describe('new workspace page: built app', () => {
     expect(localBranches(clone)).not.toContain('first-line-second-line');
   });
 
-  test('AC15 — while a send is running the button is disabled and Enter sends nothing more; the send ends with one workspace and one session', async () => {
-    const { page } = session;
-    const blockPath = join(fx.root, 'git-block');
-    const waitingPath = join(fx.root, 'git-waiting');
-    const addsLog = join(fx.root, 'git-adds.log');
-    const adds = () => (existsSync(addsLog) ? readFileSync(addsLog, 'utf8').split('\n').filter(Boolean).length : 0);
-    const before = { adds: adds(), sessions: sessionsInState(dataDir).length };
-    await openComposer(page, clone.root);
-    await waitForAgent(page, 'Claude Code');
-    await waitForBase(page, 'origin/main');
-    await promptBox(page).fill('Blocked send');
-    const waiting = await openFifo(waitingPath);
-    const block = await openFifo(blockPath);
-    try {
-      await createButton(page).click();
-      await signalled(waiting);
-      expect(await createButton(page).isDisabled(), 'the button is disabled while the worktree is being made').toBe(true);
-      await promptBox(page).press('Enter');
-      await createButton(page).click({ force: true }).catch(() => {});
-      expect(new URL(page.url()).pathname, 'nothing was sent meanwhile').toBe('/');
-      expect(adds(), 'a single worktree is being made').toBe(before.adds + 1);
-    } finally {
-      await releaseFifo(block, blockPath);
-      await waiting.close();
-      rmSync(waitingPath, { force: true });
-    }
-    await waitForWorkspacePage(page, worktreeOf(clone, 'blocked-send'));
-    // The workspace's setup runs in this session's terminal: let it end so it does not write setup.log later.
-    await waitForRow(page, '✓ Setup done');
-    expect(adds()).toBe(before.adds + 1);
-    expect(localBranches(clone)).toContain('blocked-send');
-    expect(localBranches(clone)).not.toContain('blocked-send-2');
-    expect(sessionsInState(dataDir)).toHaveLength(before.sessions + 1);
-  }, 60_000);
-
   // --- Send -----------------------------------------------------------------------------------------
 
   test('AC16, AC18 — Enter sends: the worktree is created from the base under COCKPIT_HOME on the prompt\'s slug, `cockpit setup` runs and the agent starts in it with the trimmed prompt as one argument, the session is stored with its project, the workspace page opens with the session as its one, selected tab and the composer is cleared', async () => {
@@ -762,12 +535,12 @@ describe('new workspace page: built app', () => {
     await promptBox(page).press('Enter');
 
     await waitForWorkspacePage(page, path);
-    // The composer navigates to the workspace page after the session started: it is stored by now.
+    // The page opens while the worktree is made; the session's tab joins it once the session is stored.
+    await waitForSelectedTab(page);
     const stored = sessionsInState(dataDir).find((each) => each.directory === path);
-    expect(stored, 'the session is stored when its workspace page shows').toBeDefined();
+    expect(stored, 'the session is stored when its tab shows').toBeDefined();
     const id = stored!.id;
     // The page is the workspace's, with the session as its one tab, selected.
-    await page.locator('[role="tab"][aria-selected="true"]').first().waitFor();
     const shown = await tabs(page);
     expect(shown.labels).toHaveLength(1);
     expect(shown.selected[0]).toMatch(/Claude Code/);
@@ -798,7 +571,7 @@ describe('new workspace page: built app', () => {
     expect(await promptBox(page).inputValue()).toBe('');
   }, 60_000);
 
-  test('AC17 — "Terminal" with a project creates the worktree and opens its workspace page with one shell tab showing the output of `cockpit setup --shell` (the setup, then the login shell, no agent); no session is stored', async () => {
+  test('AC17, COCKPIT-89 AC2 — "Terminal" with a project, its worktree held: the workspace page opens at once on the loading page; once the hold is released it shows one shell tab with the output of `cockpit setup --shell` (the setup, then the login shell, no agent) and no session is stored', async () => {
     const { page } = session;
     const branch = 'run-the-tests';
     const path = worktreeOf(clone, branch);
@@ -808,11 +581,19 @@ describe('new workspace page: built app', () => {
     await pickAgent(page, 'Terminal');
     await waitForBase(page, 'origin/main');
     await promptBox(page).fill('Run the tests');
-    await createButton(page).click();
+    const held = await holdGit(fx, 'git');
+    try {
+      await createButton(page).click();
+      await held.reached();
+      await waitForWorkspacePage(page, path);
+      await loadingText(page).waitFor();
+      expect(existsSync(path), 'the worktree does not exist yet').toBe(false);
+    } finally {
+      await held.release();
+    }
 
-    await waitForWorkspacePage(page, path);
+    await waitForSelectedTab(page);
     expect(existsSync(path)).toBe(true);
-    await page.getByRole('tab').first().waitFor();
     expect(await tabs(page)).toEqual({ labels: ['Terminal'], selected: ['Terminal'] });
     await waitForRow(page, `cockpit setup · ${branch} · .cockpit/config.json`);
     await waitForRow(page, '✓ Setup done');
@@ -865,67 +646,9 @@ describe('new workspace page: built app', () => {
     await promptBox(page).fill('Run the tests!');
     await createButton(page).click();
     await waitForWorkspacePage(page, worktreeOf(clone, 'run-the-tests-2'));
+    await waitForSelectedTab(page);
     expect(localBranches(clone)).toContain('run-the-tests-2');
     expect(localBranches(clone)).toContain('run-the-tests');
-  }, 60_000);
-
-  test('AC20 — a refused worktree creation shows the message in the composer (role="status", destructive), creates nothing and keeps the prompt and selections; once the cause is gone the next send works', async () => {
-    const { page } = session;
-    // A file where the project\'s worktrees folder must be: git cannot create the worktree.
-    const blocker = worktreesDirOf(refuse);
-    mkdirSync(join(home, 'worktrees'), { recursive: true });
-    writeFileSync(blocker, 'in the way');
-    const before = { branches: localBranches(refuse), sessions: sessionsInState(dataDir).length };
-
-    await openComposer(page, refuse.root);
-    await waitForAgent(page, 'Claude Code');
-    await waitForBase(page, 'main');
-    await promptBox(page).fill('Cannot be created');
-    await createButton(page).click();
-
-    const message = await waitForMessage(page);
-    expect(message).not.toBe('');
-    const colour = await page.locator('main').getByRole('status').filter({ hasText: /\S/ }).first().evaluate((element) => getComputedStyle(element).color);
-    expect(colour).toBe(await tokenColour(page, '--destructive'));
-    expect(new URL(page.url()).pathname).toBe('/');
-    expect(await promptBox(page).inputValue()).toBe('Cannot be created');
-    expect(await textOf(projectSelect(page))).toContain(refuse.name);
-    expect(await textOf(agentSelect(page))).toBe('Claude Code');
-    expect(localBranches(refuse)).toEqual(before.branches);
-    expect(sessionsInState(dataDir)).toHaveLength(before.sessions);
-
-    rmSync(blocker);
-    await createButton(page).click();
-    await waitForWorkspacePage(page, worktreeOf(refuse, 'cannot-be-created'));
-    expect(existsSync(worktreeOf(refuse, 'cannot-be-created'))).toBe(true);
-    await page.getByRole('link', { name: 'New workspace', exact: true }).click();
-    await promptBox(page).waitFor();
-    expect(await messageOf(page)).toBe('');
-  }, 60_000);
-
-  test('AC20 — a worktree created but an agent that cannot start leaves the workspace listed and shows "Could not start <name>: …" in the composer', async () => {
-    const { page } = session;
-    const path = worktreeOf(refuse, 'start-fails');
-    await openComposer(page, refuse.root);
-    await waitForAgent(page, 'Claude Code');
-    await waitForBase(page, 'main');
-    // Removed after it was detected: the start finds it gone.
-    removeStub(fx, 'claude');
-    await promptBox(page).fill('Start fails');
-    await createButton(page).click();
-
-    const message = await waitForMessage(page);
-    expect(message).toMatch(/^Could not start Claude Code: /);
-    expect(new URL(page.url()).pathname).toBe('/');
-    expect(existsSync(path)).toBe(true);
-    expect(localBranches(refuse)).toContain('start-fails');
-    await entryOf(page, path).waitFor();
-    expect(await promptBox(page).inputValue()).toBe('Start fails');
-
-    installStub(fx, 'claude');
-    await createButton(page).click();
-    await waitForWorkspacePage(page, worktreeOf(refuse, 'start-fails-2'));
-    expect(localBranches(refuse)).toContain('start-fails-2');
   }, 60_000);
 
   // --- The workspace name from the agent's title ----------------------------------------------------
