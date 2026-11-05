@@ -129,12 +129,12 @@ export function makeFixture(): Fixture {
   // `<root>/git-waiting` and holds `worktree add` until a line comes through `git-block`; it logs each
   // `worktree add` in `git-adds.log` and runs the real git. The same goes for the branch listing the
   // reservation of a name reads (`for-each-ref --format=%(refname:short)`) with `read-block` and `read-waiting`
-  // (COCKPIT-89 AC11).
+  // (COCKPIT-89 AC11). A `worktree add` that ends writes a line to the FIFO `add-done` when there is one.
   const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
   const wrapper = join(bin, 'git');
   writeFileSync(
     wrapper,
-    `#!/bin/sh\nif [ "$1" = worktree ] && [ "$2" = add ]; then\n  echo add >> '${root}/git-adds.log'\n  if [ -p '${root}/git-block' ]; then { echo >&3; } 3<>'${root}/git-waiting' 2>/dev/null; { read -r _ <&3; } 3<>'${root}/git-block' 2>/dev/null; fi\nfi\nif [ "$1" = for-each-ref ] && [ "$2" = '--format=%(refname:short)' ] && [ -p '${root}/read-block' ]; then\n  { echo >&3; } 3<>'${root}/read-waiting' 2>/dev/null; { read -r _ <&3; } 3<>'${root}/read-block' 2>/dev/null\nfi\nexec '${realGit}' "$@"\n`,
+    `#!/bin/sh\nif [ "$1" = worktree ] && [ "$2" = add ]; then\n  echo add >> '${root}/git-adds.log'\n  if [ -p '${root}/git-block' ]; then { echo >&3; } 3<>'${root}/git-waiting' 2>/dev/null; { read -r _ <&3; } 3<>'${root}/git-block' 2>/dev/null; fi\nfi\nif [ "$1" = for-each-ref ] && [ "$2" = '--format=%(refname:short)' ] && [ -p '${root}/read-block' ]; then\n  { echo >&3; } 3<>'${root}/read-waiting' 2>/dev/null; { read -r _ <&3; } 3<>'${root}/read-block' 2>/dev/null\nfi\nif [ "$1" = worktree ] && [ "$2" = add ]; then\n  '${realGit}' "$@"; code=$?\n  if [ -p '${root}/add-done' ]; then { echo >&3; } 3<>'${root}/add-done' 2>/dev/null; fi\n  exit $code\nfi\nexec '${realGit}' "$@"\n`,
   );
   chmodSync(wrapper, 0o755);
   // macOS scans a new executable the first time it runs.
@@ -247,16 +247,27 @@ export const waitForRow = async (page: Page, text: string) => {
 // resolves once a call is held.
 export interface Hold {
   reached(): Promise<void>;
+  /** Starts listening for the end of the held `worktree add` (before `release()`, `'git'` only); `await` the result once released. */
+  watchEnd(): Promise<() => Promise<void>>;
   release(): Promise<void>;
 }
 export async function holdGit(fx: Fixture, call: 'git' | 'read'): Promise<Hold> {
   const blockPath = join(fx.root, `${call}-block`);
   const waitingPath = join(fx.root, `${call}-waiting`);
+  const donePath = join(fx.root, 'add-done');
   const waiting = await openFifo(waitingPath);
   const block = await openFifo(blockPath);
   let released = false;
   return {
     reached: () => signalled(waiting),
+    watchEnd: async () => {
+      const done = await openFifo(donePath);
+      return async () => {
+        await signalled(done);
+        rmSync(donePath, { force: true });
+        await done.close();
+      };
+    },
     release: async () => {
       if (released) return;
       released = true;

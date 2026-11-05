@@ -1,11 +1,11 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { afterEach, describe, expect, test, vi } from 'vitest';
-import { availableBranch, branchSlug, createWorktree, listWorktrees, nameWorkspace } from '../src/index';
+import { availableBranch, branchSlug, createWorktree, listWorktrees, nameWorkspace, reservedPath, WorkspaceError } from '../src/index';
 
 // COCKPIT-66: the branch of a workspace is the slug of the task, renamed to the slug of the agent's
 // title; the readable name lives in `branch.<branch>.cockpitName`. Real git, temporary repositories.
@@ -272,5 +272,52 @@ describe('nameWorkspace', () => {
     expect(config(repo, 'branch.already-pushed.cockpitName')).toBe('A better name');
     expect(config(repo, 'branch.already-pushed.cockpitBase')).toBe('main');
     expect(git(workspace.path, 'rev-parse', '--abbrev-ref', '@{upstream}')).toBe('origin/already-pushed');
+  });
+});
+
+describe('reservedPath', () => {
+  // COCKPIT-89: the path a workspace is reserved under is the one git reports once it exists, which is the
+  // canonical one: a worktrees root behind a symbolic link (macOS `/var`, a linked home) must not tell them apart.
+  test('COCKPIT-89 AC1 — with a symbolic link in the root the reserved path equals createWorktree\'s, and is not the link\'s', async () => {
+    const repo = await makeRepo();
+    const real = await tempDir();
+    const link = join(await tempDir(), 'worktrees-link');
+    await symlink(real, link);
+
+    const reserved = await reservedPath({ repo, root: link, branch: 'fix-bug', env: testEnv });
+    const created = await createWorktree({ repo, root: link, branch: 'fix-bug', base: 'main', env: testEnv });
+
+    expect(reserved).toBe(created.path);
+    expect(reserved.startsWith(`${real}/`)).toBe(true);
+    expect(reserved.startsWith(`${link}/`)).toBe(false);
+    expect((await listWorktrees(repo, { env: testEnv })).map((worktree) => worktree.path)).toContain(reserved);
+  });
+
+  test('COCKPIT-89 AC1 — a root that does not exist yet is created, behind the link too, as createWorktree does', async () => {
+    const repo = await makeRepo();
+    const real = await tempDir();
+    const link = join(await tempDir(), 'worktrees-link');
+    await symlink(real, link);
+    const root = join(link, 'not', 'yet');
+
+    const reserved = await reservedPath({ repo, root, branch: 'fix-bug', env: testEnv });
+
+    expect(existsSync(join(real, 'not', 'yet'))).toBe(true);
+    expect(reserved).toBe(join(real, 'not', 'yet', `my-repo-${createHash('sha256').update(repo).digest('hex').slice(0, 8)}`, 'fix-bug'));
+  });
+
+  test('COCKPIT-89 AC10 — a root that cannot be created is FS_FAILED, naming the errno code, as for createWorktree', async () => {
+    const repo = await makeRepo();
+    const root = join(await tempDir(), 'worktrees');
+    await writeFile(root, 'not a folder');
+
+    const failure = (promise: Promise<unknown>) => promise.then(() => undefined, (error: unknown) => error);
+    const reserved = await failure(reservedPath({ repo, root, branch: 'fix-bug', env: testEnv }));
+    const created = await failure(createWorktree({ repo, root, branch: 'fix-bug', base: 'main', env: testEnv }));
+
+    expect(reserved).toBeInstanceOf(WorkspaceError);
+    expect((reserved as WorkspaceError).code).toBe('FS_FAILED');
+    expect((reserved as WorkspaceError).message).toBe((created as WorkspaceError).message);
+    expect((reserved as WorkspaceError).message).toContain('EEXIST');
   });
 });

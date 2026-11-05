@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { type Page } from 'playwright-core';
@@ -17,6 +17,7 @@ import {
   pickAgent,
   projectSelect,
   promptBox,
+  sendFromComposer,
   storedSessions,
   textOf,
   useAgent,
@@ -26,10 +27,10 @@ import {
   waitForSelectedTab,
   waitForWorkspacePage,
 } from './composer';
-import { afterIpcAnswers, ipcAnswered, waitForSetupLabel } from './support/projects';
+import { afterIpcAnswers, ipcAnswered, removeThroughMenu, waitForSetupLabel } from './support/projects';
 import { daemonPidIn } from './support/panes';
 import { locationsSeen, recordLocations, watchStarts } from './support/sessions';
-import { activePane, goHome } from './support/terminal';
+import { activePane, goHome, type PtyWindow } from './support/terminal';
 import {
   entryOf,
   git,
@@ -64,6 +65,15 @@ const rowItem = (page: Page, path: string) => page.locator('aside li').filter({ 
 const rightBar = (page: Page) => page.getByRole('complementary', { name: 'Right bar' });
 // The sidebar's message under Projects.
 const projectsMessage = (page: Page) => page.locator('aside [role="status"]').filter({ hasText: /\S/ });
+// The reason the main process kept for the refusal of the workspace at `path` (`api.workspaces.failedSetups()`).
+const refusalOf = async (page: Page, path: string) => {
+  const failed = await page.evaluate(
+    () => (window as unknown as { api: { workspaces: { failedSetups(): Promise<Array<{ path: string; message: string }>> } } }).api.workspaces.failedSetups(),
+  );
+  const found = failed.find((each) => each.path === path);
+  expect(found, `a refusal kept for ${path}`).toBeTruthy();
+  return found!.message;
+};
 // Waits for the next `workspaces:settled` event of the main process (a setup ended, whatever its outcome) from the
 // moment this is called; `await` the result after the action that settles. The api name is the IPC's: `api.workspaces.onSettled`.
 const watchSettled = async (page: Page) => {
@@ -85,6 +95,7 @@ describe('workspace setup status: built app', () => {
   let dataDir: string;
   let clone: Repo;
   let refuse: Repo;
+  let doomed: Repo;
   let home: string;
 
   const worktreeOf = (repo: Repo, branch: string) => worktreeIn(home, repo, branch);
@@ -98,8 +109,9 @@ describe('workspace setup status: built app', () => {
     writeFileSync(join(clone.root, '.cockpit', 'config.json'), JSON.stringify({ setup: ['echo setup-ran >> "$COCKPIT_ROOT_PATH/setup.log"'] }));
     refuse = makeLight('wss-refuse');
     git(refuse.root, 'branch', 'side');
+    doomed = makeLight('wss-doomed');
     dataDir = makeTestDir('d-');
-    writeFileSync(join(dataDir, 'state.json'), JSON.stringify({ version: 1, projects: [clone, refuse].map((repo) => ({ path: repo.root })) }));
+    writeFileSync(join(dataDir, 'state.json'), JSON.stringify({ version: 1, projects: [clone, refuse, doomed].map((repo) => ({ path: repo.root })) }));
     session = await launchSpawned(createRequire(import.meta.url)('electron') as string, ['.'], true, dataDir, fx.env());
     home = join(realpathSync(dataDir), 'h');
     await session.page.getByText(versionLabel).waitFor();
@@ -107,7 +119,7 @@ describe('workspace setup status: built app', () => {
 
   afterAll(async () => {
     await session?.close();
-    for (const folder of [dataDir, fx?.root, clone?.parent, refuse?.parent]) {
+    for (const folder of [dataDir, fx?.root, clone?.parent, refuse?.parent, doomed?.parent]) {
       if (folder) rmSync(folder, { recursive: true, force: true });
     }
   });
@@ -313,13 +325,10 @@ describe('workspace setup status: built app', () => {
     expect(startsOf(fx, 'claude').slice(startsBefore)).toEqual([{ cwd: path, args: [prompt] }]);
   }, 60_000);
 
-  test('COCKPIT-89 AC6 — a refused creation while the user is on the loading page removes the row and shows the refusal in the page only with "Back to composer" (kept by a reload); the button opens the composer with the send\'s text, project, agent and base and no refusal, and a new send works', async () => {
+  test('COCKPIT-89 AC6 — a refused creation while the user is on the loading page removes the row and shows the refusal in the page only, with its reason and "Back to composer" (kept by a reload); the button opens the composer with the send\'s text, project, agent and base and no refusal, and a new send works', async () => {
     const { page } = session;
     const branch = 'cannot-be-created';
     const path = worktreeOf(refuse, branch);
-    // The project's worktrees folder, made unwritable while the creation is held: git cannot create the worktree.
-    const folder = worktreesDirOf(refuse);
-    mkdirSync(folder, { recursive: true });
     const before = { branches: localBranches(refuse), sessions: sessionsInState(dataDir).length };
 
     await openComposer(page, refuse.root);
@@ -334,20 +343,22 @@ describe('workspace setup status: built app', () => {
       await held.reached();
       await waitForWorkspacePage(page, path);
       await loadingText(page).waitFor();
-      chmodSync(folder, 0o555);
+      // The base is gone when git runs: the creation is refused, naming it.
+      git(refuse.root, 'branch', '-D', 'side');
     } finally {
       await held.release();
     }
     try {
       await backToComposer(page, 'main').waitFor();
     } finally {
-      // Writable again whatever happened: the later tests and the cleanup need the folder.
-      chmodSync(folder, 0o755);
+      git(refuse.root, 'branch', '-f', 'side', 'main');
     }
 
     await entryOf(page, path).waitFor({ state: 'detached' });
     expect(await loadingText(page).count()).toBe(0);
-    expect((await mainText(page)).replace('Back to composer', '').trim(), 'the page says why').not.toBe('');
+    const reason = await refusalOf(page, path);
+    expect(reason, 'the reason names the base git could not find').toMatch(/\bside\b/);
+    expect(await mainText(page), 'the page shows the reason itself').toContain(norm(reason));
     expect(await backToComposer(page, 'aside').count(), 'not under Projects').toBe(0);
     expect(await projectsMessage(page).count(), 'nothing under Projects').toBe(0);
     expect(localBranches(refuse)).toEqual(before.branches);
@@ -357,6 +368,7 @@ describe('workspace setup status: built app', () => {
     await page.reload();
     await backToComposer(page, 'main').waitFor();
     expect(new URL(page.url()).pathname).toBe('/workspace');
+    expect(await mainText(page)).toContain(norm(reason));
     expect(await backToComposer(page, 'aside').count()).toBe(0);
 
     await backToComposer(page, 'main').click();
@@ -375,14 +387,13 @@ describe('workspace setup status: built app', () => {
     expect(existsSync(path)).toBe(true);
   }, 60_000);
 
-  test('COCKPIT-89 AC7 — a refused creation after the user left the page removes the row and shows the refusal under Projects with "Back to composer", kept by a reload until clicked; the button opens the composer as in AC6 and removes the refusal', async () => {
+  test('COCKPIT-89 AC7 — a refused creation after the user left the page removes the row and shows the refusal under Projects with its reason and "Back to composer", kept by a reload until clicked; the button opens the composer as in AC6 and removes the refusal', async () => {
     const { page } = session;
     const branch = 'refused-later';
     const path = worktreeOf(refuse, branch);
     // The page the user goes to: a workspace of the same project made with git itself (listed once the page loads).
     const other = worktreeOf(refuse, 'elsewhere');
-    const folder = worktreesDirOf(refuse);
-    mkdirSync(folder, { recursive: true });
+    mkdirSync(worktreesDirOf(refuse), { recursive: true });
     git(refuse.root, 'worktree', 'add', '--quiet', '-b', 'elsewhere', other, 'main');
     const before = { branches: localBranches(refuse), sessions: sessionsInState(dataDir).length };
 
@@ -401,22 +412,24 @@ describe('workspace setup status: built app', () => {
       await entryOf(page, other).click();
       await waitForWorkspacePage(page, other);
       await page.getByRole('button', { name: 'New tab', exact: true }).first().waitFor();
-      // The project's folder cannot be written to: git cannot create the worktree.
-      chmodSync(folder, 0o555);
+      // The base is gone when git runs: the creation is refused, naming it.
+      git(refuse.root, 'branch', '-D', 'side');
     } finally {
       await held.release();
     }
     try {
       await backToComposer(page, 'aside').waitFor();
     } finally {
-      chmodSync(folder, 0o755);
+      git(refuse.root, 'branch', '-f', 'side', 'main');
     }
 
     await entryOf(page, path).waitFor({ state: 'detached' });
     expect(new URL(page.url()).searchParams.get('path'), 'the user stays where they went').toBe(other);
     expect(await backToComposer(page, 'main').count()).toBe(0);
-    // The refusal says why next to its button.
-    expect(norm(await backToComposer(page, 'aside').locator('xpath=..').innerText()).replace('Back to composer', '').trim()).not.toBe('');
+    const reason = await refusalOf(page, path);
+    expect(reason, 'the reason names the base git could not find').toMatch(/\bside\b/);
+    // Under Projects the refusal names the workspace, then says why, above its button.
+    expect(norm(await backToComposer(page, 'aside').locator('xpath=..').innerText())).toBe(`Could not create ${branch}: ${norm(reason)} Back to composer`);
     expect(localBranches(refuse)).toEqual(before.branches);
     expect(sessionsInState(dataDir)).toHaveLength(before.sessions);
 
@@ -502,6 +515,82 @@ describe('workspace setup status: built app', () => {
       expect(await page.evaluate(() => (window as unknown as { __rowSeen: boolean }).__rowSeen), 'no row appeared').toBe(false);
       expect(await entryOf(page, path).count()).toBe(0);
       expect(localBranches(clone)).not.toContain('no-root');
+    } finally {
+      rmSync(root, { force: true });
+      renameSync(aside, root);
+    }
+  }, 60_000);
+
+  // The terminals the app lists whose folder is `path`, a shell started in the workspace or a session in it.
+  const terminalsIn = (page: Page, path: string) =>
+    page.evaluate(
+      async (path) =>
+        (await (window as unknown as PtyWindow).api.pty.list()).filter((terminal) => {
+          const listed = terminal as { cwd?: string; workspace?: string };
+          return listed.cwd === path || listed.workspace === path;
+        }).length,
+      path,
+    );
+
+  test('COCKPIT-89 — removing the project while its "Terminal" workspace is setting up starts no terminal in that workspace once the creation ends, also after a reload', async () => {
+    const { page } = session;
+    const path = worktreeOf(doomed, 'remove-during-setup');
+    await openComposer(page, doomed.root);
+    await waitForAgent(page, 'Claude Code');
+    await pickAgent(page, 'Terminal');
+    await waitForBase(page, 'main');
+    await promptBox(page).fill('Remove during setup');
+    const held = await holdGit(fx, 'git');
+    const ended = await held.watchEnd();
+    try {
+      await createButton(page).click();
+      await held.reached();
+      await waitForWorkspacePage(page, path);
+      await loadingText(page).waitFor();
+      await removeThroughMenu(page, doomed.root);
+    } finally {
+      await held.release();
+    }
+    await ended();
+
+    // Another send, begun after the creation ended, comes through the same steps and ends with a terminal on the
+    // page: whatever the first one was going to do after its creation has been done or dropped by then.
+    await sendFromComposer(page, refuse, { prompt: 'After the removal' });
+    expect(await terminalsIn(page, path), 'no terminal runs in the removed project\'s workspace').toBe(0);
+    await page.reload();
+    await page.getByText(versionLabel).waitFor();
+    expect(await terminalsIn(page, path), 'none after a reload either').toBe(0);
+  }, 60_000);
+
+  test('COCKPIT-89 AC10 — a reservation refused after the user left the composer (the worktrees folder cannot be created, the branch listing still held) shows its message under Projects and leaves the page they went to alone', async () => {
+    const { page } = session;
+    const root = join(home, 'worktrees');
+    const aside = `${root}.aside`;
+    mkdirSync(root, { recursive: true });
+    renameSync(root, aside);
+    writeFileSync(root, 'not a folder');
+    try {
+      await openComposer(page, clone.root);
+      await waitForAgent(page, 'Claude Code');
+      await pickAgent(page, 'Terminal');
+      await waitForBase(page, 'origin/main');
+      await promptBox(page).fill('Reservation refused later');
+      const held = await holdGit(fx, 'read');
+      try {
+        await createButton(page).click();
+        await held.reached();
+        await recordLocations(page);
+        await goHome(page);
+      } finally {
+        await held.release();
+      }
+      const message = projectsMessage(page).filter({ hasText: /^\s*Cockpit could not create its worktrees folder .*: EEXIST\.\s*$/ });
+      await message.first().waitFor();
+      await afterIpcAnswers(page);
+      expect(new URL(page.url()).pathname, 'the page the user went to stays').toBe('/');
+      expect((await locationsSeen(page)).filter((href) => href.startsWith('/workspace'))).toEqual([]);
+      expect(await messageOf(page), 'nothing in the composer they went to').toBe('');
+      expect(await entryOf(page, worktreeOf(clone, 'reservation-refused-later')).count()).toBe(0);
     } finally {
       rmSync(root, { force: true });
       renameSync(aside, root);
