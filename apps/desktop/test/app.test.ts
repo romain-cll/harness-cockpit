@@ -8641,7 +8641,11 @@ describe('dev server default folders', () => {
     // `bun run dev` tree (bun and install-electron included); the Electron binary is already in node_modules.
     const devFolder = await devFolderOfThisWorktree();
     const userHome = realpathSync(makeTestDir('u'));
-    const session = await launchDevWith({ ...process.env, SHELL: '/bin/sh', HOME: userHome }, null, null);
+    // A fake login shell whose PATH holds no real agent CLI: harness detection must not run the machine's
+    // `opencode`, which would write under the temporary HOME while it is removed. `bun run dev` finds bun
+    // through the launching process's PATH, which `fx.env()` keeps.
+    const fx = makeSessionsFixture([]);
+    const session = await launchDevWith({ ...fx.env(), HOME: userHome }, null, null);
     try {
       await session.page.getByText(versionLabel).waitFor();
       const home = devHomeIn(userHome, devFolder);
@@ -8655,6 +8659,7 @@ describe('dev server default folders', () => {
     } finally {
       await session.close();
       rmSync(userHome, { recursive: true, force: true });
+      rmSync(fx.root, { recursive: true, force: true });
     }
   });
 });
@@ -8864,13 +8869,17 @@ describe('single instance: packaged app', () => {
   let userHome: string;
   let front: Awaited<ReturnType<typeof watchFrontmost>>;
   let env: NodeJS.ProcessEnv;
+  let fx: SessionsFixture;
 
   beforeAll(async () => {
     front = await watchFrontmost();
     dataDir = makeTestDir('d-');
     // A short folder: the socket path is limited to 103 bytes on macOS.
     userHome = makeTestDir('u');
-    env = { ...process.env, SHELL: '/bin/sh', HOME: userHome };
+    // A fake login shell whose PATH holds no real agent CLI: detection must not run the machine's, which
+    // would write under the temporary HOME while it is removed.
+    fx = makeSessionsFixture([]);
+    env = { ...fx.env(), HOME: userHome };
     // COCKPIT_HOME unset: the packaged app's default home.
     session = await launchSpawned(join(packagedAppDir(), 'Contents/MacOS/Cockpit'), [], true, dataDir, env, null);
     await session.page.getByText(versionLabel).waitFor();
@@ -8882,6 +8891,7 @@ describe('single instance: packaged app', () => {
     await session?.close();
     if (dataDir) rmSync(dataDir, { recursive: true, force: true });
     if (userHome) rmSync(userHome, { recursive: true, force: true });
+    if (fx) rmSync(fx.root, { recursive: true, force: true });
   });
 
   test('AC6 — with COCKPIT_HOME unset and HOME=<tmp>, the daemon\'s socket is <tmp>/.cockpit/daemon-1-<build>.sock and <tmp>/.cockpit-dev does not exist', () => {
