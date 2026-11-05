@@ -371,7 +371,6 @@ describe('watchWorktree', () => {
       const seen = witness.calls();
       await writeFile(join(dir, 'after-close.txt'), 'x\n');
       await witness.reached(seen + 1);
-      expect(witness.calls()).toBeGreaterThan(seen);
       // The two watchers have streams of their own and arm their debounce on their own events: the witness
       // may have fired an instant before a watcher that was not closed would. A second write, a debounce
       // later for both, is what the witness fires on after that watcher would have.
@@ -554,15 +553,28 @@ describe('watchWorktree on the git metadata', () => {
     return { changed, reached, close: () => watcher.close() };
   }
 
+  /**
+   * Runs two changes of the kind under test and waits for the watcher's second call. The watcher's own start
+   * can call `onChange` once on its own (a probe's late event, about 200 ms after `watchWorktree` resolved),
+   * and that call alone would satisfy the wait for the first change: the kind is seen once a second call has
+   * come for the second change.
+   */
+  async function reportsBoth(reached: (n: number) => Promise<void>, [first, second]: [() => unknown, () => unknown]) {
+    await first();
+    await reached(1);
+    await second();
+    await reached(2);
+  }
+
   test('AC13 — a git commit made in the worktree calls onChange', async () => {
     const { worktree } = await makeShippableWorkspace();
     await writeFile(join(worktree, 'a.txt'), 'edited\n');
-    const { changed, reached, close } = await watched(worktree);
+    const { reached, close } = await watched(worktree);
     try {
-      git(worktree, 'commit', '-q', '-am', 'edit a');
-
-      await reached(1);
-      expect(changed).toHaveBeenCalled();
+      await reportsBoth(reached, [
+        () => git(worktree, 'commit', '-q', '-am', 'edit a'),
+        () => git(worktree, 'commit', '-q', '--allow-empty', '-m', 'an empty commit'),
+      ]);
     } finally {
       close();
     }
@@ -571,12 +583,15 @@ describe('watchWorktree on the git metadata', () => {
   test('AC13 — a git push -u origin <branch> made in the worktree calls onChange', async () => {
     const { worktree } = await makeShippableWorkspace();
     await commitFile(worktree, 'one.txt', 'one');
-    const { changed, reached, close } = await watched(worktree);
+    const { reached, close } = await watched(worktree);
     try {
-      git(worktree, 'push', '-q', '-u', 'origin', 'feat');
-
-      await reached(1);
-      expect(changed).toHaveBeenCalled();
+      await reportsBoth(reached, [
+        () => git(worktree, 'push', '-q', '-u', 'origin', 'feat'),
+        async () => {
+          await commitFile(worktree, 'two.txt', 'two');
+          git(worktree, 'push', '-q', 'origin', 'feat');
+        },
+      ]);
     } finally {
       close();
     }
@@ -588,12 +603,16 @@ describe('watchWorktree on the git metadata', () => {
     git(await tempDir(), 'clone', '--quiet', origin, other);
     await commitFile(other, 'theirs.txt', 'theirs');
     git(other, 'push', '--quiet', 'origin', 'main');
-    const { changed, reached, close } = await watched(worktree);
+    const { reached, close } = await watched(worktree);
     try {
-      git(repo, 'fetch', '--quiet', 'origin');
-
-      await reached(1);
-      expect(changed).toHaveBeenCalled();
+      await reportsBoth(reached, [
+        () => git(repo, 'fetch', '--quiet', 'origin'),
+        async () => {
+          await commitFile(other, 'theirs-again.txt', 'theirs again');
+          git(other, 'push', '--quiet', 'origin', 'main');
+          git(repo, 'fetch', '--quiet', 'origin');
+        },
+      ]);
     } finally {
       close();
     }
@@ -605,12 +624,15 @@ describe('watchWorktree on the git metadata', () => {
     // of packed-refs is then the only change in the watched places.
     git(repo, 'pack-refs', '--all');
     git(repo, 'branch', 'extra');
-    const { changed, reached, close } = await watched(worktree);
+    const { reached, close } = await watched(worktree);
     try {
-      git(repo, 'pack-refs', '--all');
-
-      await reached(1);
-      expect(changed).toHaveBeenCalled();
+      await reportsBoth(reached, [
+        () => git(repo, 'pack-refs', '--all'),
+        () => {
+          git(repo, 'branch', 'extra-again');
+          git(repo, 'pack-refs', '--all');
+        },
+      ]);
     } finally {
       close();
     }
@@ -624,15 +646,16 @@ describe('watchWorktree on the git metadata', () => {
     const stale = join(worktree, 'a.txt');
     await writeFile(stale, await readFile(stale));
     await utimes(stale, new Date(1_600_000_000_000), new Date(1_600_000_000_000));
-    const { changed, reached, close } = await watched(worktree);
+    const { reached, close } = await watched(worktree);
     try {
       // What the watcher watches besides the worktree itself: the worktree's git folder, the remote refs and packed-refs.
       const [gitDir, commonDir] = git(worktree, 'rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir').split('\n');
       const watchedPlaces = [worktree, gitDir!, join(commonDir!, 'refs', 'remotes'), join(commonDir!, 'packed-refs')];
       const before = watchedPlaces.map(snapshot);
-      // The comparison below is not empty: the worktree and its git folder are listed.
+      // The comparison below is not empty: the worktree and its git folder are listed, and the index is stale.
       expect(before[0]!.length).toBeGreaterThan(1);
       expect(before[1]!.length).toBeGreaterThan(1);
+      expect(git(worktree, 'diff-files', '--name-only')).toBe('a.txt');
 
       for (let round = 0; round < 3; round++) {
         await branchStatus(worktree, { env: testEnv });
@@ -640,13 +663,16 @@ describe('watchWorktree on the git metadata', () => {
       }
 
       // The cause: the reads wrote nothing in the places the watcher watches (the events of a write would
-      // reach it, a debounce later). A quiet period cannot show it, so the places are compared.
+      // reach it, a debounce later), and the index is still stale: a plain `git status` would have refreshed
+      // it. A quiet period cannot show it (the watcher's own start calls `onChange` once, late), so the
+      // places are compared.
       expect(watchedPlaces.map(snapshot)).toEqual(before);
-      expect(changed).not.toHaveBeenCalled();
+      expect(git(worktree, 'diff-files', '--name-only')).toBe('a.txt');
 
-      git(worktree, 'commit', '-q', '--allow-empty', '-m', 'an empty commit');
-      await reached(1);
-      expect(changed).toHaveBeenCalled();
+      await reportsBoth(reached, [
+        () => git(worktree, 'commit', '-q', '--allow-empty', '-m', 'an empty commit'),
+        () => git(worktree, 'commit', '-q', '--allow-empty', '-m', 'another empty commit'),
+      ]);
     } finally {
       close();
     }

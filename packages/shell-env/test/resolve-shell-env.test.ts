@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { chmodSync, close, constants, mkdtempSync, open, read, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import * as os from 'node:os';
 import { homedir, tmpdir, userInfo } from 'node:os';
@@ -59,6 +59,11 @@ afterEach(() => {
   vi.mocked(userInfo).mockImplementation(real.userInfo);
   vi.mocked(os.homedir).mockImplementation(real.homedir);
 });
+
+/** Resolves once the process has exited (macOS's `caffeinate -w <pid>` returns then; it may return before the process is reaped). */
+function exited(pid: number): Promise<void> {
+  return new Promise((resolve) => execFile('/usr/bin/caffeinate', ['-w', String(pid)], () => resolve()));
+}
 
 /** Whether a process has ended: no longer listed, or a zombie (killed, not reaped yet: `kill(pid, 0)` still sees it). */
 function hasEnded(pid: number): boolean {
@@ -154,6 +159,8 @@ describe('resolveShellEnv', () => {
     expect(pids).toHaveLength(2);
     // Every holder of the pipe, the shell and its child, is gone.
     await gone;
+    // And so are the two processes: `caffeinate -w` returns at a process's exit (at once if it is gone).
+    await Promise.all(pids.map(exited));
     expect(pids.map(hasEnded)).toEqual([true, true]);
   });
 
