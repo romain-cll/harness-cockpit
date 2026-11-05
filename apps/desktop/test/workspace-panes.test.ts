@@ -405,22 +405,22 @@ async function keyboardTerminal(page: Page): Promise<Terminal | null> {
 
 const isSame = (a: Terminal, b: Terminal) => a.evaluate((one, other) => one === other, b);
 
-// Resolves once the keyboard is in the terminal: at once if it is, else on the `focusin` that puts it there.
-async function expectKeyboardIn(_page: Page, terminal: Terminal, what: string) {
-  const inTerminal = await terminal.evaluate(
+// Resolves once the keyboard is in the terminal: at once if it is, else on the `focusin` that puts it there. The wait
+// is the check (a keyboard that never arrives ends on the test's guard), so it asserts nothing after it.
+async function expectKeyboardIn(_page: Page, terminal: Terminal, _what: string) {
+  await terminal.evaluate(
     (element) =>
-      new Promise<boolean>((resolve) => {
+      new Promise<void>((resolve) => {
         const held = () => document.activeElement !== null && element.contains(document.activeElement);
-        if (held()) return resolve(true);
+        if (held()) return resolve();
         const onFocus = () => {
           if (!held()) return;
           document.removeEventListener('focusin', onFocus, true);
-          resolve(true);
+          resolve();
         };
         document.addEventListener('focusin', onFocus, true);
       }),
   );
-  expect(inTerminal, `the keyboard is in ${what}`).toBe(true);
 }
 
 // The index of the pane whose terminal holds the keyboard.

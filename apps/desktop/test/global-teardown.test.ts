@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, test } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import config from '../vitest.config';
 import { killDaemonsUnder, setup, teardown } from './global-teardown';
 import { makeTestDir, RUN_ROOT_ENV } from './run-root';
@@ -139,13 +139,23 @@ describe('global setup and teardown', () => {
     pidFile(mine.home, 'daemon-1-dddd4444.pid', stranger.pid!);
     pidFile(another.home, 'daemon-1-cccc3333.pid', ofAnotherRun.pid!);
 
-    killDaemonsUnder(mine.root);
+    // `killDaemonsUnder` runs in this process: the signals it sends are observed at their cause. A process that was
+    // killed may still be exiting when the exits above have been seen, so its state afterwards is no proof.
+    const kill = vi.spyOn(process, 'kill');
+    let signalled: number[];
+    try {
+      killDaemonsUnder(mine.root);
+      signalled = kill.mock.calls.map(([pid]) => pid);
+    } finally {
+      kill.mockRestore();
+    }
 
+    expect(signalled, 'the running daemon is signalled').toContain(running.pid);
+    expect(signalled, 'the stopped daemon is signalled').toContain(stopped.pid);
+    expect(signalled, 'a process that is not a Cockpit daemon is not signalled').not.toContain(stranger.pid);
+    expect(signalled, 'a daemon of another run is not signalled').not.toContain(ofAnotherRun.pid);
     expect(await hasExited(running), 'the running daemon is killed').toBe(true);
     expect(await hasExited(stopped), 'the stopped daemon is killed').toBe(true);
-    // The kills of one call went out together, and the exits above were reaped in later turns of the loop (libuv
-    // reaps every child that has exited in one pass): a stranger that had been killed would have exited by now.
-    expect(stranger.exitCode === null && stranger.signalCode === null, 'a process that is not a Cockpit daemon is left alone').toBe(true);
     expect(isAlive(stranger)).toBe(true);
     expect(isAlive(ofAnotherRun), 'a daemon of another run is left alone').toBe(true);
   });

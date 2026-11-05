@@ -61,23 +61,27 @@ export async function openComposer(page: Page, project?: string) {
 }
 
 // Goes to the composer through the sidebar, as a user does and without reloading the page (the Sessions
-// "+", or "New workspace…" in the project's menu); falls back to the URL when the sidebar offers no way.
+// "+", or "New workspace…" in the project's menu). A project the app does not list has no row to use, so the
+// URL is the way; one it lists has its row rendered sooner or later, and the click waits for it.
 export async function openComposerFromSidebar(page: Page, project: string) {
-  const row = page.getByTitle(project, { exact: true }).first();
-  if (project !== 'none' && (await row.count()) === 0) {
-    // The sidebar lists no such project: the URL is the way.
+  if (project === 'none') {
+    await page.getByRole('button', { name: 'Start session', exact: true }).click();
+  } else if (await isListed(page, project)) {
+    await page.getByTitle(project, { exact: true }).first().hover();
+    await page.getByRole('button', { name: `Actions for ${basename(project)}`, exact: true }).click();
+    await page.getByRole('menuitem', { name: 'New workspace…' }).click();
+  } else {
     await openComposer(page, project);
     return;
   }
-  if (project === 'none') {
-    await page.getByRole('button', { name: 'Start session', exact: true }).click();
-  } else {
-    await row.hover();
-    await page.getByRole('button', { name: `Actions for ${basename(project)}`, exact: true }).click();
-    await page.getByRole('menuitem', { name: 'New workspace…' }).click();
-  }
   await promptBox(page).waitFor();
 }
+
+const isListed = (page: Page, project: string) =>
+  page.evaluate(
+    async (path) => (await (window as unknown as { api: { projects: { list(): Promise<{ path: string }[]> } } }).api.projects.list()).some((each) => each.path === path),
+    project,
+  );
 
 export async function pickAgent(page: Page, name: string) {
   const menu = await openPopup(page, agentSelect(page));

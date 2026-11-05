@@ -304,25 +304,37 @@ async function pagesOf(session: Session): Promise<Page[]> {
 }
 
 // Resolves with the URLs of the app's windows once `done(urls, arg)` accepts them, checked at once and on each window's
-// creation, closing and navigation. `done` must be self-contained: it runs in the main process.
+// creation, closing and navigation; every listener it added is removed when it resolves. `done` must be
+// self-contained: it runs in the main process.
 const untilWindows = (session: Session, done: (urls: string[], arg: any) => boolean, arg?: unknown) =>
   session.evaluateInMain<string[]>(`new Promise((resolve) => {
     const { app, BrowserWindow } = require('electron');
     const done = ${done.toString()};
     const arg = ${JSON.stringify(arg)};
     const watched = new WeakSet();
+    const removals = [];
+    const listen = (emitter, name, listener) => {
+      emitter.on(name, listener);
+      removals.push(() => emitter.removeListener(name, listener));
+    };
+    let settled = false;
     const check = () => {
+      if (settled) return;
       const windows = BrowserWindow.getAllWindows();
       for (const window of windows) {
         if (watched.has(window)) continue;
         watched.add(window);
-        window.once('closed', check);
-        for (const name of ['did-navigate', 'did-navigate-in-page', 'did-finish-load']) window.webContents.on(name, check);
+        listen(window, 'closed', check);
+        for (const name of ['did-navigate', 'did-navigate-in-page', 'did-finish-load']) listen(window.webContents, name, check);
       }
       const urls = windows.map((window) => window.webContents.getURL());
-      if (done(urls, arg)) resolve(urls);
+      if (!done(urls, arg)) return;
+      settled = true;
+      for (const remove of removals) remove();
+      resolve(urls);
     };
-    app.on('browser-window-created', () => setImmediate(check));
+    const created = () => setImmediate(check);
+    listen(app, 'browser-window-created', created);
     check();
   })`);
 
@@ -454,13 +466,13 @@ describe('daemon: built app', () => {
   let session: Session | undefined;
   let repo: { parent: string; root: string } | undefined;
   const known = { daemon: 0, session: '', sessionPid: 0, shells: [] as number[], workspace: '' };
-  // COCKPIT-80 AC10: a process that is none of the test's, whose command ends with `sleep 300` and
-  // whose pid is lower than any setup's, runs for the whole describe: a setup picked out by a
-  // machine-wide `ps` pattern would be this one, every run.
+  // COCKPIT-80 AC10: a process that is none of the test's, whose command line is the setup's
+  // (`echo setup-pid-$$-ready; read _ < '<fifo>'`) and whose pid is lower than any setup's, runs for the
+  // whole describe: a setup picked out by a machine-wide `ps` pattern would be this one, every run.
   let foreign: ChildProcess;
 
   beforeAll(async () => {
-    foreign = spawn('/bin/sleep', ['300'], { stdio: 'ignore' });
+    foreign = spawn('/bin/sh', ['-c', `echo setup-pid-$$-ready; ${heldProcess().snippet}`], { stdio: 'ignore' });
     foreign.unref();
     await once(foreign, 'spawn');
     fx = makeFixture();
@@ -536,7 +548,9 @@ describe('daemon: built app', () => {
 
   test('AC2 — when the app quits (app.quit()) the daemon, the session and the two shells are still alive', async () => {
     await quitApp(session!);
-    // The daemon has seen the app's connection close by the time it answers a new connection.
+    // The daemon has seen the app's connection close by the time it answers a new connection. `aliveOf` is a
+    // snapshot: a process the daemon had signalled on that close but that is not gone yet would still read alive. The
+    // next test carries the claim: it types into the same shells and the session after the relaunch.
     await daemonSettled(home, build);
 
     expect(aliveOf([known.daemon, known.sessionPid, ...known.shells])).toEqual([true, true, true, true]);
@@ -698,7 +712,7 @@ describe('daemon: built app', () => {
       expect(isAlive(known.daemon)).toBe(true);
       expect(hasEnded(second.pid), 'the daemon ends the commands terminal of the killed app').toBe(true);
       expect(aliveOf([known.daemon, known.sessionPid, ...known.shells])).toEqual([true, true, true, true]);
-      expect(isAlive(foreign.pid!), 'the foreign sleep is no setup: still running').toBe(true);
+      expect(isAlive(foreign.pid!), 'the foreign process is no setup: still running').toBe(true);
     } finally {
       daemon.close();
     }
@@ -1357,6 +1371,8 @@ describe('daemon: packaged app smoke path', () => {
     const sessionPid = factsOf(fx)[0]!.pid;
     await quitApp(session);
 
+    // A snapshot after the daemon has seen the close (as in AC2): the relaunch below, which shows the marker of the
+    // shell and the session again, carries the claim that they were not killed.
     await daemonSettled(home);
     expect(aliveOf([daemon, shell, sessionPid])).toEqual([true, true, true]);
 
