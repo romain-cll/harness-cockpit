@@ -2,6 +2,7 @@ import { createFileRoute, rootRouteId, useLoaderData } from '@tanstack/react-rou
 import { workspaceOf } from '@/components/changes-panel';
 import { DaemonDown } from '@/components/daemon-down';
 import { PageHeader } from '@/components/page-header';
+import { SettingUp, SetupRefused } from '@/components/workspace-setup';
 import { WorkspacePanes } from '@/components/workspace-panes';
 
 export const Route = createFileRoute('/workspace')({
@@ -11,8 +12,12 @@ export const Route = createFileRoute('/workspace')({
 
 function WorkspacePage() {
   const { path } = Route.useSearch();
-  const { projects, daemon } = useLoaderData({ from: rootRouteId });
+  const { projects, daemon, failedSetups } = useLoaderData({ from: rootRouteId });
   const found = workspaceOf(path, projects);
+  const refused = failedSetups.find((failed) => failed.path === path);
+
+  if (found?.workspace.settingUp) return <SettingUp workspace={found.workspace} />;
+  if (!found && refused) return <SetupRefused failed={refused} />;
 
   // Panes are the page's top row; the other views have a header of their own.
   if (found && daemon.status === 'running') return <WorkspacePanes key={path} project={found.project} workspace={found.workspace} />;

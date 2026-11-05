@@ -1,6 +1,7 @@
 import { createRouter, RouterProvider } from '@tanstack/react-router';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
+import { showSettled } from '@/components/workspace-panes';
 import { routeTree } from './routeTree.gen';
 import './styles.css';
 
@@ -14,6 +15,10 @@ declare module '@tanstack/react-router' {
     router: typeof router;
   }
 }
+
+// Subscribed before the first load: a workspace that stops setting up between the page's list and its
+// subscription would be missed.
+window.api.workspaces.onSettled((settled) => void showSettled(settled).finally(() => router.invalidate()));
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

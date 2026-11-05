@@ -1,7 +1,7 @@
 import { useRouter } from '@tanstack/react-router';
 import { Columns2Icon, CopyIcon, PanelLeftOpenIcon, PlusIcon, Rows2Icon, SquareTerminalIcon, XIcon } from 'lucide-react';
 import { useRef, useState, useSyncExternalStore } from 'react';
-import type { Project, Session, StartSessionResult, Workspace } from '../../shared/api';
+import type { Project, Session, SettledSetup, StartSessionResult, Workspace } from '../../shared/api';
 import { toggleSidebar, useSidebarCollapsed } from '@/components/collapsed';
 import { HarnessIcon } from '@/components/harness-icon';
 import {
@@ -133,11 +133,10 @@ function addToView(path: string, tab: Tab, pane?: string) {
   });
 }
 
-// A shell in the worktree; with `setup` it runs the repository's setup first. A tab with a terminal
-// whose spawn is pending already takes keys.
-function newShell(path: string, setup = false): Tab {
+// A shell in the worktree. A tab with a terminal whose spawn is pending already takes keys.
+function newShell(path: string): Tab {
   const key = nextId('t');
-  const { entry, started } = createLiveTerminal(({ cols, rows }) => window.api.pty.spawn({ cols, rows, workspace: path, ...(setup && { setup }) }));
+  const { entry, started } = createLiveTerminal(({ cols, rows }) => window.api.pty.spawn({ cols, rows, workspace: path }));
   started.catch((error: unknown) => {
     // The tab may have been closed before the spawn rejected.
     if (views.get(path)?.tabs.get(key)?.live !== entry) return;
@@ -147,8 +146,8 @@ function newShell(path: string, setup = false): Tab {
 }
 
 /** A new shell tab at the end of the pane (the focused one by default), selected, with the keyboard. */
-export function openShellTab(path: string, { pane, setup }: { pane?: string; setup?: boolean } = {}) {
-  addToView(path, newShell(path, setup), pane);
+export function openShellTab(path: string, { pane }: { pane?: string } = {}) {
+  addToView(path, newShell(path), pane);
 }
 
 /** The tab of a session the store holds, at the end of the pane (the focused one by default). */
@@ -270,6 +269,16 @@ async function restore(again: boolean): Promise<void> {
     const layout = addTab(view.layout, first.id, key);
     commit(workspace, { ...view, layout: selectTab(layout, first.id, first.selected ?? key), tabs: new Map(view.tabs).set(key, tab) });
   }
+}
+
+/**
+ * A workspace stopped setting up (COCKPIT-89): the terminals the main process started for it join the page as
+ * tabs, the first selected and holding the keyboard, and a refused start shows under Projects.
+ */
+export async function showSettled({ path, message }: SettledSetup): Promise<void> {
+  if (message !== undefined) setProjectsMessage(message);
+  await restoreFromDaemon(true);
+  if (views.get(path)?.tabs.size) refocus(path);
 }
 
 // --- The message slot and the row status --------------------------------------------

@@ -33,6 +33,10 @@ const api: Api = {
   workspaces: {
     branches: (project) => ipcRenderer.invoke('workspaces:branches', project),
     create: (project, task, base) => ipcRenderer.invoke('workspaces:create', project, task, base),
+    compose: (project, task, base, harness) => ipcRenderer.invoke('workspaces:compose', project, task, base, harness),
+    failedSetups: () => ipcRenderer.invoke('workspaces:failed-setups'),
+    dismissSetup: (id) => ipcRenderer.invoke('workspaces:dismiss-setup', id),
+    onSettled: (listener) => subscribe('workspaces:settled', listener),
     removal: (project, path) => ipcRenderer.invoke('workspaces:removal', project, path),
     remove: (project, path, options) => ipcRenderer.invoke('workspaces:remove', project, path, options),
     apps: () => ipcRenderer.invoke('workspaces:apps'),
