@@ -1,10 +1,10 @@
 export { connectDaemon, DaemonNotAnsweringError, ensureDaemon } from './client';
 export type { DaemonChild, DaemonClient, EnsureDaemonOptions, TimeoutOptions } from './client';
-export { runDaemonEntry } from './entry';
+export { reportReady, runDaemonEntry } from './entry';
 export type { EntryIo } from './entry';
 export { daemonFiles, listDaemonFiles, tokenPathOf } from './paths';
 export type { DaemonFiles } from './paths';
-export { PROTOCOL_VERSION, SCROLLBACK } from './protocol';
+export { PROTOCOL_VERSION, READY_FD, SCROLLBACK } from './protocol';
 export type {
   Attached,
   Hello,

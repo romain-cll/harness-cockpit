@@ -1,7 +1,7 @@
 import { readFileSync, statSync } from 'node:fs';
 import { request, type ClientRequest } from 'node:http';
 import type { Socket } from 'node:net';
-import { setTimeout as sleep } from 'node:timers/promises';
+import type { Readable } from 'node:stream';
 import { daemonFiles, tokenPathOf } from './paths';
 import {
   encode,
@@ -59,10 +59,6 @@ export interface TimeoutOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 5_000;
-// A daemon writes its token just after it listens: a client that connects in between reads the
-// token of an earlier daemon, is answered 401, and reads it again.
-const TOKEN_ATTEMPTS = 3;
-const TOKEN_RETRY_MS = 50;
 
 /**
  * Connects to a daemon's socket, authenticating with the `.token` next to it. Gives up with a
@@ -83,41 +79,36 @@ export function connectDaemon(socketPath: string, { timeoutMs = DEFAULT_TIMEOUT_
       current?.destroy();
     }, timeoutMs);
 
-    const attempt = (left: number) => {
-      if (settled) return;
-      let token: string;
-      try {
-        token = readFileSync(tokenPathOf(socketPath), 'utf8');
-      } catch (error) {
-        return settle(() => reject(error));
-      }
-      let answered = false;
-      const req = request({
-        socketPath,
-        path: '/attach',
-        headers: { connection: 'Upgrade', upgrade: UPGRADE, authorization: `Bearer ${token}` },
-      });
-      current = req;
-      // Stays registered: a server that answered 401 and closed makes the write fail (EPIPE,
-      // ECONNRESET) after the answer, which is no news.
-      req.on('error', (error) => {
-        if (!answered) settle(() => reject(error));
-      });
-      req.once('response', (res) => {
-        answered = true;
-        res.on('error', () => {});
-        res.resume();
-        if (res.statusCode === 401 && left > 1) return void setTimeout(() => attempt(left - 1), TOKEN_RETRY_MS);
-        settle(() => reject(new Error(`the background service refused the connection (HTTP ${res.statusCode})`)));
-      });
-      req.once('upgrade', (_res, socket: Socket, head) => {
-        answered = true;
-        if (settled) return socket.destroy();
-        settle(() => resolve(createClient(socket, head, socketPath, timeoutMs)));
-      });
-      req.end();
-    };
-    attempt(TOKEN_ATTEMPTS);
+    let token: string;
+    try {
+      token = readFileSync(tokenPathOf(socketPath), 'utf8');
+    } catch (error) {
+      return settle(() => reject(error));
+    }
+    let answered = false;
+    const req = request({
+      socketPath,
+      path: '/attach',
+      headers: { connection: 'Upgrade', upgrade: UPGRADE, authorization: `Bearer ${token}` },
+    });
+    current = req;
+    // Stays registered: a server that answered 401 and closed makes the write fail (EPIPE,
+    // ECONNRESET) after the answer, which is no news.
+    req.on('error', (error) => {
+      if (!answered) settle(() => reject(error));
+    });
+    req.once('response', (res) => {
+      answered = true;
+      res.on('error', () => {});
+      res.resume();
+      settle(() => reject(new Error(`the background service refused the connection (HTTP ${res.statusCode})`)));
+    });
+    req.once('upgrade', (_res, socket: Socket, head) => {
+      answered = true;
+      if (settled) return socket.destroy();
+      settle(() => resolve(createClient(socket, head, socketPath, timeoutMs)));
+    });
+    req.end();
   });
 }
 
@@ -221,6 +212,8 @@ function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutM
 /** The shape of the child `ensureDaemon` waits on: a Node `ChildProcess` fits. */
 export interface DaemonChild {
   on(event: 'exit', listener: (code: number | null, signal: string | null) => void): unknown;
+  /** Index 3 is the readiness pipe (`READY_FD`): the daemon writes one line on it once it is ready. */
+  readonly stdio: ArrayLike<unknown>;
 }
 
 export interface EnsureDaemonOptions extends TimeoutOptions {
@@ -259,26 +252,31 @@ export async function ensureDaemon({ home, build, spawn, timeoutMs }: EnsureDaem
   // The log is appended to: what the daemon says is what comes after this.
   const logStart = statSync(log, { throwIfNoEntry: false })?.size ?? 0;
   const child = spawn();
-  let exit: { code: number | null; signal: string | null } | undefined;
-  child.on('exit', (code, signal) => (exit = { code, signal }));
-  const deadline = Date.now() + START_TIMEOUT_MS;
-  for (;;) {
-    try {
-      return await connect();
-    } catch (error) {
-      if (error instanceof DaemonNotAnsweringError) throw error;
-      // Not listening yet.
-    }
-    if (exit) {
-      throw new Error(
-        lastLine(log, logStart) ??
-          (exit.signal
-            ? `the background service was killed by ${exit.signal} before listening`
-            : `the background service exited with code ${exit.code} before listening`),
-      );
-    }
-    if (Date.now() > deadline) throw new Error(lastLine(log, logStart) ?? `the background service did not start within ${START_TIMEOUT_MS / 1000} s`);
-    await sleep(25);
+  const pipe = child.stdio[3] as Readable | null | undefined;
+  pipe?.on('error', () => {});
+  let timer: NodeJS.Timeout | undefined;
+  const outcome = await new Promise<{ ready: true } | { code: number | null; signal: string | null } | { capped: true }>((resolve) => {
+    // The cap stays: a daemon that is alive and never says it is ready cannot notify.
+    timer = setTimeout(() => resolve({ capped: true }), START_TIMEOUT_MS);
+    pipe?.once('data', () => resolve({ ready: true }));
+    child.on('exit', (code, signal) => resolve({ code, signal }));
+  });
+  clearTimeout(timer);
+  pipe?.destroy();
+
+  if ('ready' in outcome) return connect();
+  if ('capped' in outcome) throw new Error(lastLine(log, logStart) ?? `the background service did not start within ${START_TIMEOUT_MS / 1000} s`);
+  // Exited without the line: a daemon of this build may still answer (another starter's).
+  try {
+    return await connect();
+  } catch (error) {
+    if (error instanceof DaemonNotAnsweringError) throw error;
+    throw new Error(
+      lastLine(log, logStart) ??
+        (outcome.signal
+          ? `the background service was killed by ${outcome.signal} before listening`
+          : `the background service exited with code ${outcome.code} before listening`),
+    );
   }
 }
 
