@@ -1,7 +1,7 @@
 import { createFileRoute, rootRouteId, useLoaderData, useNavigate } from '@tanstack/react-router';
 import { useEffect, useSyncExternalStore } from 'react';
 import { workspaceOf } from '@/components/changes-panel';
-import { DaemonDown } from '@/components/daemon-down';
+import { DaemonDown, ServiceStopped } from '@/components/daemon-down';
 import { getSessionTerminal, subscribe } from '@/components/live-terminals';
 import { PageHeader } from '@/components/page-header';
 import { Terminal } from '@/components/terminal';
@@ -36,6 +36,7 @@ function SessionPage() {
   return (
     <>
       <PageHeader title={session?.name ?? 'Session'} />
+      {daemon.status === 'stopped' && <ServiceStopped terminals={daemon.terminals} className="mb-2" />}
       {daemon.status === 'down' ? (
         <DaemonDown status={daemon} />
       ) : entry ? (

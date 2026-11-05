@@ -50,6 +50,8 @@ export type SessionReport =
 export interface TerminalInfo {
   id: number;
   kind: TerminalKind;
+  /** The program the terminal was spawned with. */
+  command: string;
   cwd: string;
   cols: number;
   rows: number;

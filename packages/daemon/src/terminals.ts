@@ -76,7 +76,7 @@ export function createTerminals(onEnd: () => void) {
       headless.loadAddon(serializer);
 
       const id = ++lastId;
-      const info: TerminalInfo = { id, kind, cwd, cols, rows, ...(sessionId !== undefined && { sessionId }), ...(workspace !== undefined && { workspace }) };
+      const info: TerminalInfo = { id, kind, command, cwd, cols, rows, ...(sessionId !== undefined && { sessionId }), ...(workspace !== undefined && { workspace }) };
       const terminal: Terminal = {
         info,
         pty,

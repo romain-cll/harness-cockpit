@@ -22,6 +22,9 @@ export interface Session {
   createdAt: string;
   // The root of the project whose workspace it runs in; absent outside any project.
   project?: string;
+  // Set when a workspace session starts, cleared when its tab closes or its terminal exits: a session still
+  // marked open that no daemon holds lost its terminal. Absent on sessions stored before the mark.
+  open?: boolean;
 }
 
 export interface State {
@@ -60,8 +63,12 @@ function isProject(value: unknown): value is Project {
 
 function isSession(value: unknown): value is Session {
   if (typeof value !== 'object' || value === null) return false;
-  const { id, name, harness, directory, createdAt, project } = value as Record<string, unknown>;
-  return [id, name, harness, directory, createdAt].every((field) => typeof field === 'string') && (project === undefined || typeof project === 'string');
+  const { id, name, harness, directory, createdAt, project, open } = value as Record<string, unknown>;
+  return (
+    [id, name, harness, directory, createdAt].every((field) => typeof field === 'string') &&
+    (project === undefined || typeof project === 'string') &&
+    (open === undefined || typeof open === 'boolean')
+  );
 }
 
 // A file written before projects or sessions existed lacks them: they read as empty.
@@ -115,6 +122,11 @@ export function rememberApp(state: State, kind: 'editor' | 'terminal', id: strin
 
 export function addSession(state: State, session: Session): State {
   return { ...state, sessions: [...state.sessions, session] };
+}
+
+// Clears the open mark of the session `id`.
+export function closeSession(state: State, id: string): State {
+  return { ...state, sessions: state.sessions.map((session) => (session.id === id ? { ...session, open: false } : session)) };
 }
 
 // `<harness name> <n>`, n being one more than the sessions of that harness so far

@@ -53,7 +53,7 @@ const sessionWorkspaces = new Map<string, string>();
 // Workspace path -> `running` or `failed`. Replaced, never mutated.
 let workspaceSetups: ReadonlyMap<string, 'running' | 'failed'> = new Map();
 
-const STATUS_DOTS: Record<SessionStatus, string> = { working: 'Working', waiting: 'Needs input', finished: 'Ready' };
+export const STATUS_DOTS: Record<SessionStatus, string> = { working: 'Working', waiting: 'Needs input', finished: 'Ready' };
 
 // "Exited N" for a non-zero exit code; a signal (node-pty gives exit code 0 with it) and a pty host
 // death (no exit code) are plain ends.

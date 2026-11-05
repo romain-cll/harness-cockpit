@@ -2,6 +2,7 @@ import { createRootRoute, Outlet, useLocation, useNavigate, useRouter } from '@t
 import { useEffect } from 'react';
 import { AppSidebar } from '@/components/app-sidebar';
 import { useSidebarCollapsed } from '@/components/collapsed';
+import { RestartServiceDialog } from '@/components/daemon-down';
 import { ChangesPanel, RightRail, useRightBar, workspaceOf } from '@/components/changes-panel';
 import { restoreFromDaemon, selectSessionTab } from '@/components/workspace-panes';
 
@@ -40,6 +41,8 @@ function RootLayout() {
   }, [router]);
   // The main process changed a workspace (named after its agent's title): list the projects again.
   useEffect(() => window.api.projects.onChanged(() => void router.invalidate()), [router]);
+  // The service died, started or failed to start: read its status again.
+  useEffect(() => window.api.daemon.onChanged(() => void router.invalidate()), [router]);
   // A session the sidebar does not list yet (started by another caller than its menus) reported: list again.
   useEffect(
     () => window.api.sessions.onStatus((sessionId) => sessions.some(({ id }) => id === sessionId) || void router.invalidate()),
@@ -65,6 +68,7 @@ function RootLayout() {
       <main className="flex min-w-0 flex-1 flex-col bg-background p-2">
         <Outlet />
       </main>
+      <RestartServiceDialog />
       {workspace && !workspace.workspace.settingUp &&
         (rightBarOpen ? (
           <ChangesPanel key={workspace.workspace.path} project={workspace.project} workspace={workspace.workspace} />

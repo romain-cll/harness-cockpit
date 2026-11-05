@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import { clearStaleSocket, daemonFiles } from './paths';
-import { encode, lineReader, PROTOCOL_VERSION, UPGRADE, type Hello, type Message, type Request, type SessionEventName, type SessionReport, type SetupEventName } from './protocol';
+import { encode, lineReader, PROTOCOL_VERSION, UPGRADE, type Hello, type Message, type Request, type SessionEventName, type SessionReport, type SetupEventName, type TerminalInfo } from './protocol';
 import { SESSION_EVENTS, SETUP_EVENTS } from './status';
 import { createTerminals, type Subscriber } from './terminals';
 
@@ -34,7 +34,7 @@ interface Connection extends Subscriber {
 /**
  * Listens on `daemon-<protocol>-<build>.sock` (HTTP over a Unix socket) with a fresh token in
  * the `.token` next to it, written once it listens: of two daemons started together the one that
- * does not get the socket gives up without touching a file. `POST /session-events` takes the harness hooks' reports; `GET /attach`
+ * does not get the socket gives up without touching a file. `POST /session-events` takes the harness hooks' reports; `GET /terminals` and `POST /shutdown` list and end the daemon; `GET /attach`
  * upgrades to a stream of JSON lines that a client drives the terminals with. Rejects, touching
  * nothing, when another daemon holds the socket or the path is not a socket.
  */
@@ -61,10 +61,14 @@ export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon>
     for (const { socket } of connections) if (!socket.destroyed) socket.write(encode(message));
   };
 
-  const server = createServer((req, res) => handle(req, res, token, (report) => {
-    if (!terminals.report(report)) return false;
-    broadcast({ type: 'status', ...report });
-    return true;
+  const server = createServer((req, res) => handle(req, res, token, {
+    onSessionEvent: (report) => {
+      if (!terminals.report(report)) return false;
+      broadcast({ type: 'status', ...report });
+      return true;
+    },
+    list: () => terminals.list().filter(({ kind }) => kind !== 'commands'),
+    shutdown: () => void close(),
   }));
 
   server.on('upgrade', (req, socket: Socket) => {
@@ -210,10 +214,22 @@ function handle(
   req: IncomingMessage,
   res: ServerResponse,
   token: string,
-  onSessionEvent: (report: SessionReport) => boolean,
+  { onSessionEvent, list, shutdown }: { onSessionEvent: (report: SessionReport) => boolean; list: () => TerminalInfo[]; shutdown: () => void },
 ): void {
   if (!authorized(req.headers.authorization, token)) {
     res.writeHead(401).end();
+    req.resume();
+    return;
+  }
+  // `GET /terminals` and `POST /shutdown` are frozen across protocols: a later app uses them to list and end
+  // a daemon it cannot talk to.
+  if (req.method === 'GET' && req.url === '/terminals') {
+    reply(res, 200, list());
+    req.resume();
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/shutdown') {
+    res.writeHead(202).end(shutdown);
     req.resume();
     return;
   }
@@ -267,6 +283,6 @@ function parseEvent(text: string): SessionReport | string {
   return { sessionId, event: event as SessionEventName | SetupEventName };
 }
 
-function reply(res: ServerResponse, status: number, body: { error: string }): void {
+function reply(res: ServerResponse, status: number, body: { error: string } | TerminalInfo[]): void {
   res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(body));
 }

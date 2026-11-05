@@ -199,3 +199,6 @@ const rank = (label: string) => {
 export function workspaceStatus(labels: string[]): string | null {
   return labels.reduce<string | null>((best, label) => (best === null || rank(label) < rank(best) ? label : best), null);
 }
+
+/** The banner of a page after the daemon died with `count` terminals. */
+export const stoppedMessage = (count: number) => `Background service stopped · ${count} terminal${count === 1 ? '' : 's'} ended`;
