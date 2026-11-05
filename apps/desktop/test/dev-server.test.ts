@@ -15,7 +15,7 @@ describeMode('dev server', launchDev);
 // One smoke path through the sessions IPC in the dev server: the page, the
 // main process, the pty host and the disk. It needs a launch of its own with
 // the fake login shell that holds the stubs. The packaged app's smoke path is
-// folded into the first launch of the AC9 restart test below. The
+// folded into the first launch of the AC9 restart test in `packaged.test.ts`. The
 // launchd-environment mode has none: its point is the user's real login shell,
 // where a session would run a real CLI.
 describe('sessions smoke path: dev server', () => {

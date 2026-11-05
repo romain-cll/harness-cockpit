@@ -433,7 +433,7 @@ export async function startSetup(session: Session, daemon: DaemonClient, repo: {
   return { pid: Number(pid), exited: terminal.exited };
 }
 
-// --- Built app: terminals and sessions survive --------------------------------
+// --- Packaged app: smoke path -------------------------------------------------
 
 
 function packagedExecutable(): string {

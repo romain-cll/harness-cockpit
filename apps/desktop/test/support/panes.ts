@@ -14,8 +14,8 @@ import { makeTestDir } from '../run-root';
 
 
 // COCKPIT-70: the workspace page, panes with tabs of agents and shells. The built app runs the full
-// block (a launch of its own, the tests below share it and run in order); the dev server and the
-// packaged app each run one smoke path, and the launchd-environment mode its shell test.
+// block in `workspace-panes.test.ts` (a launch of its own, its tests share it and run in order); the
+// dev server and the packaged app each run one smoke path, and the launchd-environment mode its shell test.
 //
 // What the tests rely on in the page (the mockups carry no test hooks):
 //  - the workspace row is a link (`aside a`) to `/workspace?path=<worktree path>` whose text starts with the branch;

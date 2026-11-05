@@ -15,7 +15,7 @@ import { allConsoleErrorsOf, allPageErrorsOf, applicationType, captureRow, dropT
 // packaged app and the packaged app with the minimal environment launchd gives
 // an app opened from the Finder or the Dock, and checks each one starts,
 // renders, logs no error, stays in the background and writes its data in its
-// own folder. In CI only, it also launches the packaged app without the
+// own folder. In CI only, `packaged.test.ts` also launches the packaged app without the
 // background switch.
 
 

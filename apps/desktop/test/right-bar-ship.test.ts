@@ -32,8 +32,8 @@ describe('changes sidebar: built app', () => {
     }
   });
 
-  // COCKPIT-38: the ship section of the sidebar. It runs after the tests above, on a project of its own
-  // with a local bare `origin`, a workspace per story, and the stub `gh` of the launch.
+  // COCKPIT-38: the ship section of the sidebar. It runs on a project of its own with a local bare
+  // `origin`, a workspace per story, and the stub `gh` of the launch.
   describe('ship section', () => {
     let ship: TempRepo;
     let origin: string;

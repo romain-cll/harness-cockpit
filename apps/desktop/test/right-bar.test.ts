@@ -17,7 +17,7 @@ describe('changes sidebar: built app', () => {
 
   beforeAll(async () => {
     fx = makeSessionsFixture(['claude'], { gitLog: true });
-    // A stub `gh` for the ship section (COCKPIT-38).
+    // A stub `gh` on the launch's PATH, so the open bar never reaches a real one (COCKPIT-38).
     addGhFixture(fx);
     repo = makeChangesRepo('changes-ws');
     session = await launchBuiltWith({ ...fx.env(), ...GIT_APP_ENV });

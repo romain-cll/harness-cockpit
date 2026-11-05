@@ -183,10 +183,10 @@ describe('built app', () => {
 
   // Last of the session on purpose: the refusal must come without any error, and
   // an app that lets the failure through would log one that the "logs no error"
-  // checks of the tests above would then report in their place.
+  // checks of the earlier tests would then report in their place.
   test('tabs AC9 — once the pty host is dead, spawn resolves with an id no session used', async () => {
     const { page } = session;
-    // Kills the host (again): `old` is the last session it ran.
+    // Kills the host: `old` is the last session it ran.
     const old = await killPtyHost(page);
 
     const fresh = await spawnShell(page);
