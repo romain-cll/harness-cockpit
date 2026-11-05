@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { close, constants, existsSync, open, openSync, read, readdirSync, readFileSync, writeSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -246,6 +246,20 @@ describe('cloneRepository', () => {
     expect(readdirSync(empty)).toEqual([]);
   });
 
+  test('AC14 — a dangling symbolic link at the path counts as existing: DESTINATION_EXISTS, and the link stays', async () => {
+    const source = await makeRepo();
+    const dir = await tempDir();
+    const link = join(dir, 'dangling');
+    await symlink(join(dir, 'nowhere'), link);
+
+    const error = (await failure(cloneRepository({ url: source, path: link, env: testEnv }))) as WorkspaceError;
+
+    expect(error).toBeInstanceOf(WorkspaceError);
+    expect(error.code).toBe('DESTINATION_EXISTS');
+    expect((await lstat(link)).isSymbolicLink()).toBe(true);
+    expect(await readlink(link)).toBe(join(dir, 'nowhere'));
+  });
+
   test('AC15 — aborting the signal while git runs ends git, removes the partial folder and rejects', async () => {
     const parent = await tempDir();
     const path = join(parent, 'a', 'held');
@@ -425,6 +439,34 @@ describe('initRepository', () => {
     expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
     expect(git(repo, 'rev-list', '--count', 'HEAD')).toBe('2');
     expect(readFileSync(join(repo, 'README.md'), 'utf8')).toBe('hello\n');
+  });
+
+  test('AC28 — a bare layout (.git with core.bare=true) is refused with GIT_DIR_EXISTS and nothing changes', async () => {
+    const folder = await plainFolder();
+    git(folder, 'init', '-q', '--bare', join(folder, '.git'));
+    const entries = (dir: string) => readdirSync(dir, { recursive: true }).map(String).sort();
+    const before = { files: entries(folder), head: readFileSync(join(folder, '.git', 'HEAD'), 'utf8'), config: readFileSync(join(folder, '.git', 'config'), 'utf8') };
+
+    const error = (await failure(initRepository({ path: folder, env: testEnv }))) as WorkspaceError;
+
+    expect(error).toBeInstanceOf(WorkspaceError);
+    expect(error.code).toBe('GIT_DIR_EXISTS');
+    expect(before.config).toContain('bare = true');
+    expect({ files: entries(folder), head: readFileSync(join(folder, '.git', 'HEAD'), 'utf8'), config: readFileSync(join(folder, '.git', 'config'), 'utf8') }).toEqual(before);
+  });
+
+  test('a failing git init (an invalid init.defaultBranch) leaves no .git, and a retry with a valid config succeeds', async () => {
+    const folder = await plainFolder();
+    const broken = { ...testEnv, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'init.defaultBranch', GIT_CONFIG_VALUE_0: 'bad..name' };
+    const before = contentsOf(folder);
+
+    const error = await failure(initRepository({ path: folder, env: broken }));
+
+    expect(error).toBeInstanceOf(WorkspaceError);
+    expect(existsSync(join(folder, '.git'))).toBe(false);
+    expect(contentsOf(folder)).toEqual(before);
+    await initRepository({ path: folder, env: testEnv });
+    expect(git(folder, 'rev-list', '--count', 'HEAD')).toBe('1');
   });
 
   test('AC26 — an identity but a commit that fails anyway (a global pre-commit hook refuses): rejects with git\'s message, removes .git and leaves the files', async () => {

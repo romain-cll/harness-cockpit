@@ -518,6 +518,7 @@ describe('new project: built app', () => {
       rmSync(blocker, { recursive: true, force: true });
     }
 
+    // A refusal ("already has a .git that git cannot use") would keep the dialog open: its closing is the check.
     await initialize.click();
     await dialog.waitFor({ state: 'hidden' });
 
@@ -525,7 +526,6 @@ describe('new project: built app', () => {
     await waitForEntry(page, plain.root);
     await expectProjects();
     expect(gitIn(plain.root, 'rev-list', '--count', 'HEAD')).toBe('1');
-    expect(await dialog.getByText('cannot use').count()).toBe(0);
   });
 
   test('AC11 — Clone runs git clone with the login-shell environment into <location>/<name> (parents created), lists and stores the project, closes the dialog and leaves the page', async () => {
@@ -865,5 +865,49 @@ describe('initialize over a .git git cannot use: built app', () => {
     expect(gitIn(repo.root, 'rev-list', '--count', 'HEAD')).toBe('2');
     expect(stateSnapshot(session.dataDir)).toEqual(before);
     expect(await entryTitles(page)).toEqual([]);
+  });
+});
+
+// --- A project whose folder was replaced by a file ------------------------------------------------------------------
+
+describe('a project whose folder is now a file: built app', () => {
+  let session: Session;
+  let dataDir: string;
+  let stays: ReturnType<typeof makeRepo>;
+  let replaced: string;
+
+  beforeAll(async () => {
+    stays = makeRepo('stays-listed');
+    dataDir = makeTestDir('d-');
+    replaced = join(dataDir, 'was-a-project');
+    writeFileSync(replaced, 'a file now\n');
+    writeFileSync(join(dataDir, 'state.json'), JSON.stringify({ version: 1, projects: [{ path: replaced }, { path: stays.root }], sessions: [] }));
+    session = await launchSpawned(createRequire(import.meta.url)('electron') as string, ['.'], true, dataDir);
+    await session.page.getByText(versionLabel).waitFor();
+    await stubPicker(session, null);
+  });
+
+  afterAll(async () => {
+    try {
+      if (session) await expectNoErrors(session);
+    } finally {
+      await session?.close();
+      rmSync(dataDir, { recursive: true, force: true });
+      if (stays) rmSync(stays.parent, { recursive: true, force: true });
+    }
+  });
+
+  test('AC30 — the page renders and only that project shows "Folder not found" with "Remove from Cockpit" and "Update path…"', async () => {
+    const { page } = session;
+    await untilRead(page, readSidebarLines, (lines) => lines.includes('Folder not found'));
+
+    expect(await entryTitles(page)).toEqual([replaced, stays.root]);
+    expect((await sidebarLines(page)).filter((line) => line === 'Folder not found')).toHaveLength(1);
+    expect(await page.locator('aside').getByRole('button', { name: 'Remove from Cockpit', exact: true }).count()).toBe(1);
+    expect(await page.locator('aside').getByRole('button', { name: 'Update path…', exact: true }).count()).toBe(1);
+    await page.reload();
+    await page.getByText(versionLabel).waitFor();
+    await untilRead(page, readSidebarLines, (lines) => lines.includes('Folder not found'));
+    expect(await entryTitles(page)).toEqual([replaced, stays.root]);
   });
 });
