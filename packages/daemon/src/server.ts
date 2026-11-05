@@ -68,7 +68,7 @@ export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon>
       return true;
     },
     list: () => terminals.list().filter(({ kind }) => kind !== 'commands'),
-    shutdown: () => void close(),
+    shutdown: () => void close({ waitForTerminals: true }),
   }));
 
   server.on('upgrade', (req, socket: Socket) => {
@@ -173,9 +173,12 @@ export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon>
   renameSync(temporaryPath, files.token);
   writeFileSync(files.pid, String(process.pid));
 
-  function close(): Promise<void> {
+  // `waitForTerminals`: the files go and the daemon exits once every terminal has exited, SIGKILL after the
+  // hang-up's grace included; otherwise as soon as the hang-ups are sent.
+  function close({ waitForTerminals = false }: { waitForTerminals?: boolean } = {}): Promise<void> {
     return (closing ??= (async () => {
       terminals.killAll();
+      if (waitForTerminals) await terminals.whenEmpty();
       // What was sent before the end (an exit event) reaches the client.
       await Promise.all([...connections].map(({ socket }) => new Promise<void>((resolve) => socket.end(resolve))));
       for (const { socket } of connections) socket.destroy();

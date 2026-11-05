@@ -36,6 +36,7 @@ import {
   removeProject,
   saveState,
   sessionName,
+  type Session,
   type State,
 } from '@cockpit/state';
 import {
@@ -429,19 +430,20 @@ function end(daemon: Daemon, remote: number, exit: TerminalExit): void {
     pendingNames.delete(terminal.sessionId);
     // A terminal that ended on its own is not lost: only a daemon that died (`exitCode: null`) leaves the mark.
     // One the page asked to kill (a deleted workspace) is left as it is.
-    if (exit.exitCode !== null && !terminal.closing) markClosed(terminal.sessionId);
+    if (exit.exitCode !== null && !terminal.closing) markClosed(({ id }) => id === terminal.sessionId);
   }
   // One nobody attached to yet (a workspace's, started by the main process) tells every window.
   const hearers = terminal.owner ? [terminal.owner] : BrowserWindow.getAllWindows().map(({ webContents }) => webContents);
   for (const contents of hearers) if (!contents.isDestroyed()) contents.send('pty:exit', terminal.appId, exit);
 }
 
-// A workspace session is marked open in `state.json` from its start until its tab closes (`sessions:dismiss`; a
-// deleted workspace keeps its sessions as they are) or its terminal exits by itself: one still marked that no
-// daemon holds lost its terminal with a daemon.
-function markClosed(sessionId: string): void {
-  if (!state.sessions.some(({ id, open }) => id === sessionId && open)) return;
-  const next = closeSession(state, sessionId);
+// A workspace session is marked open in `state.json` from its start until its tab closes (`sessions:dismiss`),
+// its terminal exits by itself, or its workspace or project goes (the session stays stored): one still marked that
+// no daemon holds lost its terminal with a daemon.
+function markClosed(match: (session: Session) => boolean): void {
+  const open = state.sessions.filter((session) => session.open && match(session));
+  if (open.length === 0) return;
+  const next = open.reduce((current, { id }) => closeSession(current, id), state);
   saveState(app.getPath('userData'), next);
   state = next;
 }
@@ -497,7 +499,14 @@ function spawnDaemon(): ChildProcess {
 
 // This app's daemon, started when it is not running. Rejects with the reason it cannot start.
 function ensureOwnDaemon(): Promise<Daemon> {
-  if (ownDaemon?.alive) return Promise.resolve(ownDaemon);
+  if (ownDaemon?.alive) {
+    // Terminals lost with another build's daemon are over: nothing stopped is left to restart.
+    if (lostTerminals > 0) {
+      lostTerminals = 0;
+      announceDaemonChange();
+    }
+    return Promise.resolve(ownDaemon);
+  }
   startingOwn ??= (async () => {
     const before = JSON.stringify(daemonStatus());
     try {
@@ -828,6 +837,7 @@ function startProjects(
     if (next.projects.length === state.projects.length) return;
     saveState(userData, next);
     state = next;
+    markClosed(({ project }) => project === path);
   });
 
   // Runs `action` for a project of the state, turning a git failure into a refusal (or into what
@@ -976,10 +986,14 @@ function startProjects(
             forceBranch: options.forceBranch,
             env: await shellEnv,
           });
+          markClosed(({ directory }) => directory === path);
           return { status: 'removed', branchKept: false };
         },
         (error) => {
-          if (error.code === 'BRANCH_NOT_MERGED') return { status: 'removed', branchKept: true };
+          if (error.code === 'BRANCH_NOT_MERGED') {
+            markClosed(({ directory }) => directory === path);
+            return { status: 'removed', branchKept: true };
+          }
           if (error.code === 'DIRTY_WORKTREE') return { status: 'dirty' };
           return undefined;
         },
@@ -1255,7 +1269,7 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
   });
   ipcMain.handle('sessions:dismiss', (event, sessionId: string) => {
     if (!isFromApp(event)) throw new Error('sessions:dismiss refused: unexpected origin');
-    markClosed(sessionId);
+    markClosed(({ id }) => id === sessionId);
   });
 
   // Starts the harness for `contents`, the window that owns the terminal, or for none.

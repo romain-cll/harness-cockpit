@@ -6,7 +6,7 @@ import { StatusIcon } from '@/components/sessions';
 import { AlertDialog, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog';
 import { Button } from '@/components/ui/button';
 import { restoreFromDaemon } from '@/components/workspace-panes';
-import { stoppedMessage } from '@/components/workspace-layout';
+import { restartMessage, stoppedMessage } from '@/components/workspace-layout';
 import { cn } from 'cn';
 import type { DaemonStatus, OutdatedTerminal } from '../../shared/api';
 
@@ -136,7 +136,7 @@ export function RestartServiceDialog() {
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>Restart the background service?</AlertDialogTitle>
-          <AlertDialogDescription>Restarting it ends {terminals.length === 1 ? 'this terminal' : `these ${terminals.length} terminals`}:</AlertDialogDescription>
+          <AlertDialogDescription>{restartMessage(terminals.length)}</AlertDialogDescription>
         </AlertDialogHeader>
         <ul className="flex flex-col gap-1 text-xs">
           {terminals.map(({ kind, name, program, status }, index) => (
