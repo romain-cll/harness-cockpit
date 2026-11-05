@@ -46,6 +46,7 @@ import {
   checkGit,
   cloneRepository,
   commitAll,
+  commitsAfter,
   createWorktree,
   fileDiff,
   findRepositoryRoot,
@@ -88,6 +89,7 @@ import type {
   ChangesResult,
   CloneRequest,
   CommitResult,
+  CommitsAfterResult,
   ComposeResult,
   CreatePullRequestResult,
   CreateRequest,
@@ -1324,6 +1326,15 @@ function startProjects(
           return { status: 'refused', message: `Could not merge the pull request: ${error.message}` };
         }
       }),
+  );
+
+  ipcMain.handle('workspaces:commits-after', (event, project: string, path: string, headOid: string): Promise<CommitsAfterResult> =>
+    forProject<CommitsAfterResult>(event, 'workspaces:commits-after', project, async () => {
+      if (!/^[0-9a-f]{40}$/i.test(String(headOid))) return { status: 'refused', message: 'The pull request head is unknown.' };
+      const workspace = await findWorkspace({ project, path });
+      if ('status' in workspace) return workspace;
+      return { status: 'read', count: await commitsAfter(path, headOid, { env: await shellEnv }) };
+    }),
   );
 
   // One `gh` run for the project's workspaces; none when no workspace has a branch or the repository has no remote.

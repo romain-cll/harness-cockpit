@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 import { useLayoutEffect, useRef, useState } from 'react';
 import Markdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import type { MergeMethod, Project, PullRequest, Workspace } from '../../shared/api';
 import { checksHeader, checkTime, overallReview, sortChecks } from '@/components/pull-request-format';
 import { projectColour } from '@/components/project-colour';
@@ -35,30 +36,42 @@ const METHODS: Record<MergeMethod, string> = {
 const MERGE_BUTTON = 'bg-brand text-brand-foreground hover:bg-brand/90';
 
 /**
- * The merge button, the menu of its method and the confirmation dialog of an open pull request. `onMerged` asks for
- * the pull request to be read again. Why `gh` refused a merge shows under the row.
+ * The merge button, the menu of its method and the confirmation dialog of an open pull request. The local commits
+ * after the head the bar read are counted when the button is clicked, before the dialog opens. `onMerged` asks for the
+ * pull request to be read again. Why `gh` refused a merge shows under the row.
  */
 export function MergeRow({
   project,
   workspace,
   pullRequest,
-  base,
-  unpushed,
   onMerged,
 }: {
   project: Project;
   workspace: Workspace;
   pullRequest: PullRequest;
-  /** The branch the pull request goes into, `undefined` until the changes are read. */
-  base: string | undefined;
-  unpushed: number;
   onMerged: () => void;
 }) {
   const [method, setMethod] = useState<MergeMethod>('squash');
   const [confirming, setConfirming] = useState(false);
+  // The local commits that will not be merged, `null` when none or unknown.
+  const [unpushed, setUnpushed] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string>();
   const label = METHODS[method];
+
+  async function confirm() {
+    setBusy(true);
+    let count: number | null = null;
+    try {
+      const result = await window.api.workspaces.commitsAfter(project.path, workspace.path, pullRequest.headOid);
+      if (result.status === 'read') count = result.count;
+    } catch {
+      // No line about local commits.
+    }
+    setUnpushed(count);
+    setBusy(false);
+    setConfirming(true);
+  }
 
   async function merge() {
     setConfirming(false);
@@ -79,9 +92,9 @@ export function MergeRow({
     <div className="flex flex-col gap-1.5">
       <div className="flex gap-px">
         <Button
-          disabled={busy || base === undefined}
+          disabled={busy}
           className={`h-7 flex-1 gap-1.5 rounded-l-lg rounded-r-none text-xs ${MERGE_BUTTON}`}
-          onClick={() => setConfirming(true)}
+          onClick={() => void confirm()}
         >
           <GitMergeIcon className="size-3.5" />
           {label}
@@ -109,8 +122,8 @@ export function MergeRow({
       <AlertDialog open={confirming} onOpenChange={setConfirming}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>{`${label} #${pullRequest.number} into ${base}?`}</AlertDialogTitle>
-            {unpushed > 0 && (
+            <AlertDialogTitle>{`${label} #${pullRequest.number} into ${pullRequest.base}?`}</AlertDialogTitle>
+            {unpushed !== null && unpushed > 0 && (
               <AlertDialogDescription>
                 {`${unpushed} local ${unpushed === 1 ? 'commit is' : 'commits are'} not pushed and will not be merged.`}
               </AlertDialogDescription>
@@ -233,9 +246,10 @@ export function DescriptionSection({ body }: { body: string }) {
       <h3 className="text-[11px] text-subtle">Description</h3>
       <div
         ref={box}
-        className={`text-xs/[18px] break-words text-foreground [&_:is(h1,h2,h3,h4,h5,h6)]:text-muted-foreground [&_a]:text-brand [&_a]:underline [&_code]:font-mono [&_code]:text-[11px] [&_ol]:list-decimal [&_ol]:pl-4 [&_p:not(:first-child)]:mt-2 [&_strong]:font-normal [&_ul]:list-disc [&_ul]:pl-4 ${expanded ? '' : 'max-h-24 overflow-hidden'}`}
+        className={`text-xs/[18px] break-words text-foreground [&_:is(h1,h2,h3,h4,h5,h6)]:text-muted-foreground [&_a]:text-brand [&_a]:underline [&_code]:font-mono [&_code]:text-[11px] [&_.contains-task-list]:list-none [&_.contains-task-list]:pl-0 [&_input]:mr-1.5 [&_ol]:list-decimal [&_ol]:pl-4 [&_p:not(:first-child)]:mt-2 [&_pre]:whitespace-pre-wrap [&_strong]:font-normal [&_td]:pr-3 [&_th]:pr-3 [&_th]:text-left [&_th]:font-normal [&_ul]:list-disc [&_ul]:pl-4 ${expanded ? '' : 'max-h-24 overflow-hidden'}`}
       >
         <Markdown
+          remarkPlugins={[remarkGfm]}
           components={{
             a: ({ href, children }) => (
               <a href={href} target="_blank" rel="noreferrer">

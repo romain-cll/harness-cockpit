@@ -105,6 +105,17 @@ export async function hasRemote(path: string, { env }: GitEnv = {}): Promise<boo
   return (await git(['remote'], { cwd: path, env })).trim() !== '';
 }
 
+/** The commits of HEAD after `oid` (`git rev-list --count <oid>..HEAD`); `null` when git cannot tell, an unknown oid included. */
+export async function commitsAfter(path: string, oid: string, { env }: GitEnv = {}): Promise<number | null> {
+  await checkGit(env);
+  try {
+    return Number((await git(['rev-list', '--count', `${oid}..HEAD`], { cwd: path, env })).trim());
+  } catch (error) {
+    if (error instanceof WorkspaceError && error.code === 'GIT_FAILED') return null;
+    throw error;
+  }
+}
+
 /** The readable names kept in git config, by branch: one `git config` call for the repository. */
 async function cockpitNames(repo: string, env?: NodeJS.ProcessEnv): Promise<Map<string, string>> {
   const names = new Map<string, string>();

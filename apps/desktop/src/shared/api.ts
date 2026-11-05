@@ -210,6 +210,8 @@ export interface PullRequest {
   author: string;
   body: string;
   headOid: string;
+  /** The branch the pull request is into. */
+  base: string;
   /** GitHub's `reviewDecision` as it is, `''` when the repository requires no review. */
   reviewDecision: string;
   /** Each check, named `<workflow> / <name>`; the times are gh's raw strings. */
@@ -230,6 +232,9 @@ export type MergeMethod = 'squash' | 'merge' | 'rebase';
 export type PullRequestStatesResult = { status: 'read'; states: Record<string, PullRequestState> } | Refused;
 
 export type MergePullRequestResult = { status: 'merged' } | Refused;
+
+/** The commits of the workspace's HEAD after an oid; `count` is `null` when git cannot tell. */
+export type CommitsAfterResult = { status: 'read'; count: number | null } | Refused;
 
 /**
  * Where a workspace's branch stands: `uncommitted` changes to commit, `unpushed` commits to push.
@@ -430,6 +435,8 @@ export interface Api {
     createPullRequest(project: string, path: string, title: string, body: string): Promise<CreatePullRequestResult>;
     /** Merges the pull request with `gh pr merge`, refused by gh when the branch's head is no longer `headOid`. */
     mergePullRequest(project: string, path: string, number: number, method: MergeMethod, headOid: string): Promise<MergePullRequestResult>;
+    /** The commits of the workspace's HEAD after `headOid` (40 hexadecimal characters), `git rev-list --count`. */
+    commitsAfter(project: string, path: string, headOid: string): Promise<CommitsAfterResult>;
     /** The state of the newest pull request of every workspace's branch of the project, in one `gh` run. */
     pullRequestStates(project: string): Promise<PullRequestStatesResult>;
   };

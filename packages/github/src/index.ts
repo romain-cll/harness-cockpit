@@ -43,6 +43,8 @@ export interface PullRequest {
   author: string;
   body: string;
   headOid: string;
+  /** `baseRefName`: the branch the pull request is into. */
+  base: string;
   /** gh's raw `reviewDecision`, `''` when the repository requires no review. */
   reviewDecision: string;
   checkRuns: CheckRun[];
@@ -115,6 +117,7 @@ interface ListedPullRequest {
   state: string;
   body?: string;
   headRefOid?: string;
+  baseRefName?: string;
   reviewDecision?: string;
   author?: { login?: string } | null;
   statusCheckRollup?: Record<string, unknown>[] | null;
@@ -152,7 +155,7 @@ export async function findPullRequest(
       '--limit',
       '1',
       '--json',
-      'number,title,url,state,author,body,headRefOid,latestReviews,reviewDecision,statusCheckRollup',
+      'number,title,url,state,author,baseRefName,body,headRefOid,latestReviews,reviewDecision,statusCheckRollup',
     ],
     cwd,
     env,
@@ -175,6 +178,7 @@ export async function findPullRequest(
     author: newest.author?.login ?? 'ghost',
     body: newest.body ?? '',
     headOid: newest.headRefOid ?? '',
+    base: newest.baseRefName ?? '',
     reviewDecision: newest.reviewDecision ?? '',
     checkRuns: rollup.map(checkRunOf),
     reviews: (newest.latestReviews ?? [])

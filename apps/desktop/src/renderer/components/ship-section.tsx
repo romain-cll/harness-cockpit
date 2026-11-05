@@ -221,16 +221,14 @@ export function ShipSection({
               </a>
             </div>
             <p className="text-[13px] leading-[18px] break-words text-foreground">{found.title}</p>
-            {git?.branch && base !== undefined && (
-              <p className="font-mono text-[11px] break-all text-muted-foreground">{`${git.branch} → ${base}`}</p>
+            {git?.branch && (
+              <p className="font-mono text-[11px] break-all text-muted-foreground">{`${git.branch} → ${found.base}`}</p>
             )}
             {found.state === 'open' && (
               <MergeRow
                 project={project}
                 workspace={workspace}
                 pullRequest={found}
-                base={base}
-                unpushed={unpushed}
                 onMerged={pullRequestChanged}
               />
             )}
