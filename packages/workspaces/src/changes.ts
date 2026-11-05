@@ -41,8 +41,14 @@ const PROBE_TIMEOUT_MS = 2000;
  */
 export function isFolderTouch(event: string, filename: string | null, dir: string): boolean {
   if (event !== 'change' || filename === null || filename !== basename(dir)) return false;
-  const entry = lstatSync(join(dir, filename), { throwIfNoEntry: false });
-  return entry === undefined || entry.isDirectory();
+  try {
+    const entry = lstatSync(join(dir, filename), { throwIfNoEntry: false });
+    return entry === undefined || entry.isDirectory();
+  } catch {
+    // This runs in the `fs.watch` callback, where a throw is uncaught (a `chmod 000` of the folder
+    // reports itself): no answer means no touch, so the event counts as a change.
+    return false;
+  }
 }
 
 /** Git's output trimmed, or `null` when git exits with a non-zero code. */
