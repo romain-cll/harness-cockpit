@@ -9,6 +9,7 @@ import { WorkspaceError } from '../src/git';
 import {
   createWorktree,
   findRepositoryRoot,
+  hasRemote,
   listBranches,
   listWorktrees,
   readWorkspaceConfig,
@@ -1539,5 +1540,19 @@ describe('Electron boundary', () => {
       const names = Array.isArray(value) ? value : Object.keys((value as object | undefined) ?? {});
       expect(names, field).not.toContain('electron');
     }
+  });
+});
+
+describe('hasRemote', () => {
+  test('COCKPIT-75 AC18 — a repository with no git remote has none, with a remote it has one, from the main working tree and from a linked worktree', async () => {
+    const repo = await makeRepo();
+    const linked = await addWorktree(repo, 'linked', 'linked-branch');
+    expect(await hasRemote(repo, { env: testEnv })).toBe(false);
+    expect(await hasRemote(linked, { env: testEnv })).toBe(false);
+
+    const { clone } = await makeClone();
+    const linkedClone = await addWorktree(clone, 'linked', 'linked-clone-branch');
+    expect(await hasRemote(clone, { env: testEnv })).toBe(true);
+    expect(await hasRemote(linkedClone, { env: testEnv })).toBe(true);
   });
 });
