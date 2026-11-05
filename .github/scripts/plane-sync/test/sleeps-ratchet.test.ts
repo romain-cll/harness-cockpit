@@ -302,9 +302,16 @@ describe('the test files', () => {
     expect(countRepo().found['apps/desktop/test/launch.ts']).toBeUndefined();
   });
 
-  test('COCKPIT-81 part 1 AC1 — app.test.ts holds no pause, no timeout option, no poll and no deadline, and has no baseline entry', () => {
-    expect(countRepo().found['apps/desktop/test/app.test.ts']).toBeUndefined();
-    expect(BASELINE['apps/desktop/test/app.test.ts']).toBeUndefined();
+  test('COCKPIT-81 part 1 AC1 — every *.test.ts of apps/desktop/test (the files that replaced the former app.test.ts) holds no pause, no timeout option, no poll and no deadline, and has no baseline entry', () => {
+    const { found } = countRepo();
+    const files = testFiles()
+      .map((path) => relative(repoRoot, path))
+      .filter((file) => file.startsWith('apps/desktop/test/') && file.endsWith('.test.ts'));
+    expect(files.length).toBeGreaterThan(0);
+    for (const file of files) {
+      expect(found[file], file).toBeUndefined();
+      expect(BASELINE[file], file).toBeUndefined();
+    }
   });
 
   test('COCKPIT-81 part 2 AC1 — workspace-panes, daemon, global-teardown, live-terminals, new-workspace and composer hold no pause, no timeout option, no poll and no deadline, have no baseline entry, and every allowed line they hold is listed in ALLOWED', () => {
@@ -325,16 +332,18 @@ describe('the test files', () => {
     expect(titles[0]).not.toMatch(/5 s later/);
   });
 
-  test('COCKPIT-81 part 2 AC4 — quitApp (daemon.test.ts, workspace-panes.test.ts) runs app.quit() on setImmediate, with no 300 ms timer and no poll of isRunning', () => {
-    for (const name of ['daemon.test.ts', 'workspace-panes.test.ts']) {
-      const source = readFileSync(join(repoRoot, 'apps/desktop/test', name), 'utf8');
-      const start = source.indexOf('async function quitApp(');
-      expect(start, `${name} defines quitApp`).toBeGreaterThanOrEqual(0);
-      const body = source.slice(start, source.indexOf('\n}\n', start));
-      expect(body, name).toMatch(/setImmediate\(.*app\.quit\(\)/);
-      expect(body, name).not.toMatch(/300|setTimeout|poll\(|isRunning/);
-      expect(body, name).toMatch(/exit/);
-    }
+  test('COCKPIT-81 part 2 AC4 — quitApp (launch.ts) runs app.quit() on setImmediate, with no 300 ms timer and no poll of isRunning, and is defined nowhere else in apps/desktop/test', () => {
+    const source = readFileSync(join(repoRoot, 'apps/desktop/test/launch.ts'), 'utf8');
+    const start = source.indexOf('async function quitApp(');
+    expect(start, 'launch.ts defines quitApp').toBeGreaterThanOrEqual(0);
+    const body = source.slice(start, source.indexOf('\n}\n', start));
+    expect(body).toMatch(/setImmediate\(.*app\.quit\(\)/);
+    expect(body).not.toMatch(/300|setTimeout|poll\(|isRunning/);
+    expect(body).toMatch(/exit/);
+    const defining = testFiles()
+      .map((path) => relative(repoRoot, path))
+      .filter((file) => file.startsWith('apps/desktop/test/') && readFileSync(join(repoRoot, file), 'utf8').includes('async function quitApp('));
+    expect(defining).toEqual(['apps/desktop/test/launch.ts']);
   });
 
   test('COCKPIT-81 part 3 AC1 — no file of packages/*/test or .github/scripts/plane-sync/test holds a pause, timeout option, poll or deadline, has a baseline entry, or holds a "// legitimate poll:" line that is not in ALLOWED', () => {
@@ -358,8 +367,9 @@ describe('the test files', () => {
     expect(countCategories(source).counts.timeouts).toBe(0);
   });
 
-  test('COCKPIT-81 part 3 AC4 — BASELINE is empty and no test file holds any count at all', () => {
+  test('COCKPIT-81 part 3 AC4 — BASELINE and ALLOWED are empty and no test file holds any count at all', () => {
     expect(BASELINE).toEqual({});
+    expect(ALLOWED).toEqual([]);
     expect(countRepo().found).toEqual({});
   });
 
