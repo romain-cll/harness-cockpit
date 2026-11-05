@@ -23,31 +23,68 @@ interface AllowedLine {
 }
 
 /**
- * The counts each test file holds, non-zero entries only (a file absent holds none). Lower a number
- * here when a test below it, and delete the entry when it reaches zero.
- * `launch.ts` keeps the three lines of the definition of `poll` while other files call it; the one
- * `setTimeout(` of `launch-helpers.test.ts` is the page-side timer that AC9's element waits for.
+ * The counts each test file holds, non-zero entries only (a file absent holds none). COCKPIT-81 part 3
+ * left it empty: a new pause, `timeout:`, poll or deadline in any test file fails the ratchet. Do not add
+ * an entry; a re-check loop whose source cannot notify goes in `ALLOWED` instead.
  */
-const BASELINE: Baseline = {
-  '.github/scripts/plane-sync/test/lint.test.ts': { timeouts: 1 },
-  'apps/desktop/test/launch-helpers.test.ts': { pauses: 1 },
-  'apps/desktop/test/launch.ts': { pauses: 1, timeouts: 1, deadlines: 1 },
-  'packages/daemon/test/cli.test.ts': { pauses: 1 },
-  'packages/daemon/test/client.test.ts': { pauses: 2 },
-  'packages/daemon/test/helpers.ts': { pauses: 2, deadlines: 1 },
-  'packages/daemon/test/status.test.ts': { pauses: 1 },
-  'packages/daemon/test/terminals.test.ts': { pauses: 2 },
-  'packages/harnesses/test/detect.test.ts': { pauses: 2, deadlines: 1 },
-  'packages/harnesses/test/status.test.ts': { pauses: 1, timeouts: 7, polls: 4 },
-  'packages/shell-env/test/resolve-shell-env.test.ts': { pauses: 4, deadlines: 1 },
-  'packages/workspaces/test/changes.test.ts': { pauses: 2, timeouts: 9, polls: 9 },
-};
+const BASELINE: Baseline = {};
 
 /** The `// legitimate poll: <reason>` lines the test files may hold: a re-check loop whose source cannot notify. */
 const ALLOWED: AllowedLine[] = [];
 
 /** The desktop test files COCKPIT-81 part 2 cleans: none keeps a baseline entry. */
 const PART_2_FILES = ['workspace-panes.test.ts', 'daemon.test.ts', 'global-teardown.test.ts', 'live-terminals.test.ts', 'new-workspace.test.ts', 'composer.ts'];
+
+/**
+ * The number of `test(` cases and of `expect(` calls per file of `packages/* /test` and `.github/scripts/plane-sync/test`
+ * at COCKPIT-81 part 3's base commit (6701963), counted by `countCases`. A file may not go below its entry
+ * (no test or assertion removed or weakened); lowering one means the PR names the replaced check and its replacement.
+ */
+const PART_3_FLOOR: Record<string, { tests: number; expects: number }> = {
+  '.github/scripts/plane-sync/test/agents-md.test.ts': { tests: 2, expects: 2 },
+  '.github/scripts/plane-sync/test/lint.test.ts': { tests: 10, expects: 21 },
+  '.github/scripts/plane-sync/test/readme.test.ts': { tests: 9, expects: 13 },
+  '.github/scripts/plane-sync/test/sync.test.ts': { tests: 27, expects: 88 },
+  '.github/scripts/plane-sync/test/ticket.test.ts': { tests: 11, expects: 14 },
+  '.github/scripts/plane-sync/test/workflow.test.ts': { tests: 4, expects: 9 },
+  'packages/daemon/test/boundary.test.ts': { tests: 3, expects: 2 },
+  'packages/daemon/test/cli.test.ts': { tests: 6, expects: 16 },
+  'packages/daemon/test/client.test.ts': { tests: 13, expects: 22 },
+  'packages/daemon/test/entry.test.ts': { tests: 1, expects: 3 },
+  'packages/daemon/test/helpers.ts': { tests: 0, expects: 1 },
+  'packages/daemon/test/paths.test.ts': { tests: 2, expects: 4 },
+  'packages/daemon/test/setup-markers.test.ts': { tests: 5, expects: 8 },
+  'packages/daemon/test/start.test.ts': { tests: 6, expects: 26 },
+  'packages/daemon/test/status.test.ts': { tests: 11, expects: 35 },
+  'packages/daemon/test/terminals.test.ts': { tests: 17, expects: 46 },
+  'packages/daemon/test/title.test.ts': { tests: 6, expects: 11 },
+  'packages/github/test/github.test.ts': { tests: 18, expects: 31 },
+  'packages/harnesses/test/catalogue.test.ts': { tests: 16, expects: 20 },
+  'packages/harnesses/test/detect.test.ts': { tests: 12, expects: 18 },
+  'packages/harnesses/test/prompt-title.test.ts': { tests: 6, expects: 6 },
+  'packages/harnesses/test/status.test.ts': { tests: 17, expects: 53 },
+  'packages/launchers/test/launchers.test.ts': { tests: 23, expects: 33 },
+  'packages/shell-env/test/resolve-shell-env.test.ts': { tests: 9, expects: 50 },
+  'packages/state/test/state.test.ts': { tests: 54, expects: 189 },
+  'packages/workspaces/test/changes.test.ts': { tests: 28, expects: 81 },
+  'packages/workspaces/test/names.test.ts': { tests: 18, expects: 49 },
+  'packages/workspaces/test/workspaces.test.ts': { tests: 85, expects: 247 },
+};
+
+/** The `test(`, `test.each(` and `it(` cases and the `expect(` calls of a file, lines starting with `//` or `*` skipped. */
+function countCases(source: string): { tests: number; expects: number } {
+  let tests = 0;
+  let expects = 0;
+  for (const line of source.split('\n')) {
+    const text = line.trim();
+    if (text.startsWith('//') || text.startsWith('*')) continue;
+    tests += (line.match(/\b(?:test|it)(?:\.each)?\(/g) ?? []).length;
+    expects += (line.match(/\bexpect\(/g) ?? []).length;
+  }
+  return { tests, expects };
+}
+
+const inPart3 = (file: string) => file.startsWith('packages/') || file.startsWith('.github/scripts/plane-sync/test/');
 
 const repoRoot = join(import.meta.dirname, '..', '..', '..', '..');
 const SELF = join(import.meta.dirname, 'sleeps-ratchet.test.ts');
@@ -258,9 +295,11 @@ describe('the test files', () => {
     expect(allowedProblems(countRepo().allowed, ALLOWED)).toEqual([]);
   });
 
-  test('AC5 — launch.ts holds only the three lines of the definition of poll: one pause, one timeout option, one deadline, no poll( call', () => {
-    const { found } = countRepo();
-    expect(found['apps/desktop/test/launch.ts']).toEqual({ pauses: 1, timeouts: 1, polls: 0, deadlines: 1 });
+  test('COCKPIT-81 part 3 AC4 — launch.ts has no poll helper left (no caller is left), no timers import, and holds no pause, timeout option, poll or deadline', () => {
+    const source = readFileSync(join(repoRoot, 'apps/desktop/test/launch.ts'), 'utf8');
+    expect(/function poll\b/.test(source), 'launch.ts defines poll').toBe(false);
+    expect(/node:timers\/promises/.test(source), 'launch.ts imports node:timers/promises').toBe(false);
+    expect(countRepo().found['apps/desktop/test/launch.ts']).toBeUndefined();
   });
 
   test('COCKPIT-81 part 1 AC1 — app.test.ts holds no pause, no timeout option, no poll and no deadline, and has no baseline entry', () => {
@@ -296,6 +335,42 @@ describe('the test files', () => {
       expect(body, name).not.toMatch(/300|setTimeout|poll\(|isRunning/);
       expect(body, name).toMatch(/exit/);
     }
+  });
+
+  test('COCKPIT-81 part 3 AC1 — no file of packages/*/test or .github/scripts/plane-sync/test holds a pause, timeout option, poll or deadline, has a baseline entry, or holds a "// legitimate poll:" line that is not in ALLOWED', () => {
+    const { found, allowed } = countRepo();
+    expect(Object.keys(found).filter(inPart3)).toEqual([]);
+    expect(Object.keys(BASELINE).filter(inPart3)).toEqual([]);
+    expect(allowedProblems(allowed.filter((each) => inPart3(each.file)), ALLOWED.filter((each) => inPart3(each.file)))).toEqual([]);
+  });
+
+  test('COCKPIT-81 part 3 AC1 — daemon helpers.ts no longer defines until(), and no daemon test calls it (each caller waits on the client event)', () => {
+    const using = testFiles()
+      .map((path) => relative(repoRoot, path))
+      .filter((name) => name.startsWith('packages/daemon/test/') && /\buntil\(|function until\b/.test(readFileSync(join(repoRoot, name), 'utf8')));
+    expect(using).toEqual([]);
+  });
+
+  test('COCKPIT-81 part 3 AC2 — status.test.ts still asserts the hook timeouts of Claude Code (5) and Codex (3), written as expect(hook.timeout).toBe(n)', () => {
+    const source = readFileSync(join(repoRoot, 'packages/harnesses/test/status.test.ts'), 'utf8');
+    expect(/expect\(hook\.timeout\)\.toBe\(5\)/.test(source), 'no expect(hook.timeout).toBe(5)').toBe(true);
+    expect(/expect\(hook\.timeout\)\.toBe\(3\)/.test(source), 'no expect(hook.timeout).toBe(3)').toBe(true);
+    expect(countCategories(source).counts.timeouts).toBe(0);
+  });
+
+  test('COCKPIT-81 part 3 AC4 — BASELINE is empty and no test file holds any count at all', () => {
+    expect(BASELINE).toEqual({});
+    expect(countRepo().found).toEqual({});
+  });
+
+  test('COCKPIT-81 part 3 AC5 — no file of packages/*/test or .github/scripts/plane-sync/test holds fewer test( cases or expect( calls than at 6701963', () => {
+    const lower: string[] = [];
+    for (const [file, floor] of Object.entries(PART_3_FLOOR)) {
+      const now = countCases(readFileSync(join(repoRoot, file), 'utf8'));
+      if (now.tests < floor.tests) lower.push(`${file}: ${now.tests} test( cases, ${floor.tests} at 6701963`);
+      if (now.expects < floor.expects) lower.push(`${file}: ${now.expects} expect( calls, ${floor.expects} at 6701963`);
+    }
+    expect(lower).toEqual([]);
   });
 
   test('AC5 — every file holds exactly its baseline entry', () => {

@@ -1,4 +1,5 @@
-import { existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { close, constants, existsSync, open, read } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,6 +15,7 @@ const created: string[] = [];
 const leftoverPids: number[] = [];
 
 afterEach(async () => {
+  vi.useRealTimers();
   for (const pid of leftoverPids.splice(0)) {
     try {
       process.kill(pid, 'SIGKILL');
@@ -46,6 +48,36 @@ async function allStubs(): Promise<string> {
   await stub(dir, 'codex', 'echo "codex-cli 0.163.0"');
   await stub(dir, 'opencode', 'echo "opencode v2.0.31"');
   return dir;
+}
+
+/**
+ * A pipe the test holds: `snippet` makes the running shell hold its write end on descriptor 9, which its
+ * children inherit. `started` resolves with the first line the shell writes to it (`echo up >&9`), `gone`
+ * once no process holds the write end any more (end of file).
+ */
+function heldPipe(dir: string): { snippet: string; started: Promise<void>; gone: Promise<void> } {
+  const path = join(dir, 'pipe');
+  execFileSync('mkfifo', [path]);
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => (markStarted = resolve));
+  const gone = new Promise<void>((resolve, reject) => {
+    // The open returns once the first writer has opened the FIFO, so no end of file comes before it. The
+    // read blocks a thread of libuv's pool until a byte or the end of file: kqueue does not report a
+    // FIFO's end of file on macOS, so a stream over the descriptor would never end.
+    open(path, constants.O_RDONLY, (error, fd) => {
+      if (error) return reject(error);
+      const next = () =>
+        read(fd, Buffer.alloc(16), 0, 16, null, (failure, bytes) => {
+          if (failure) reject(failure);
+          else if (bytes > 0) {
+            markStarted();
+            next();
+          } else close(fd, () => resolve());
+        });
+      next();
+    });
+  });
+  return { snippet: `exec 9> '${path}'`, started, gone };
 }
 
 describe('detectHarnesses', () => {
@@ -135,16 +167,34 @@ describe('detectHarnesses', () => {
   test('AC11 — a --version that never exits is abandoned at the timeout, with its process group killed', async () => {
     const dir = await tempDir();
     const pidFile = join(dir, 'pids');
-    // The background child inherits the stub's stdout, so the pipe stays open.
+    const { snippet, started, gone } = heldPipe(dir);
+    const hold = join(dir, 'hold');
+    execFileSync('mkfifo', [hold]);
+    // The stub reports on the pipe once its first lines ran, so the product's clock is advanced only then:
+    // under load a stub can take longer than the timeout to run its first line. Its background child
+    // inherits the stub's stdout, so that pipe stays open, and the pipe of the test (descriptor 9) too;
+    // reading a FIFO nobody writes to keeps it alive.
     await stub(
       dir,
       'codex',
-      `echo $$ > "${pidFile}"\n/bin/sleep 300 &\necho $! >> "${pidFile}"\nwait`,
+      `${snippet}\necho $$ > "${pidFile}"\nread _ < "${hold}" &\necho $! >> "${pidFile}"\necho up >&9\nwait`,
     );
 
-    const started = Date.now();
-    const result = await detectHarnesses({ PATH: dir }, { timeoutMs: 2000 });
-    const elapsed = Date.now() - started;
+    // Only the product's timer is the test's clock: files, pipes and processes stay real.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    let settled = false;
+    const detection = detectHarnesses({ PATH: dir }, { timeoutMs: 2000 }).then((found) => {
+      settled = true;
+      return found;
+    });
+    await started;
+    // The stub holds stdout: only the timeout can end the detection.
+    expect(settled).toBe(false);
+
+    const advancedAt = Date.now();
+    vi.advanceTimersByTime(2000);
+    const result = await detection;
+    const elapsed = Date.now() - advancedAt;
 
     expect(result).toEqual([]);
     expect(elapsed).toBeLessThan(5000);
@@ -153,19 +203,8 @@ describe('detectHarnesses', () => {
     expect(pids).toHaveLength(2);
     leftoverPids.push(...pids);
 
-    const deadline = Date.now() + 3000;
-    const alive = (pid: number) => {
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch {
-        return false;
-      }
-    };
-    while (pids.some(alive) && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    expect(pids.map(alive)).toEqual([false, false]);
+    // Every holder of the pipe, the stub and its child, is gone.
+    await gone;
   }, 15000);
 
   test('AC12 — a --version that exits 0 without a x.y.z version gives version null', async () => {
