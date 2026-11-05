@@ -8,6 +8,7 @@ import {
   setRatio,
   singlePane,
   split,
+  stoppedMessage,
   tabLabel,
   workspaceStatus,
   type Layout,
@@ -370,5 +371,13 @@ describe('split and closeTab keep the ratios', () => {
 
   test('AC8 — closing the left pane of a resized split gives the whole area to the other one', () => {
     expect(rounded(boxes(closeTab(resized(), 'p1', 'a').layout))).toEqual([{ pane: 'p2', left: 0, top: 0, width: 100, height: 100 }]);
+  });
+});
+
+describe('stoppedMessage', () => {
+  test('AC2, AC3 — the banner reads "Background service stopped · N terminals ended", and "1 terminal ended" for a single one', () => {
+    expect(stoppedMessage(3)).toBe('Background service stopped · 3 terminals ended');
+    expect(stoppedMessage(2)).toBe('Background service stopped · 2 terminals ended');
+    expect(stoppedMessage(1)).toBe('Background service stopped · 1 terminal ended');
   });
 });

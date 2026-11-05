@@ -507,7 +507,7 @@ describe('daemon: built app, the daemon cannot start', () => {
     }
   });
 
-  test('AC10, AC11 — daemon-1-<build>.sock a folder: the view stays with the new reason while the cause remains, "Show log" opens the log with shell.openPath, and "Try again" after removing the cause starts the daemon and a terminal runs a command', async () => {
+  test('AC10, AC11, COCKPIT-69 AC1 — daemon-1-<build>.sock a folder: the view stays with the new reason while the cause remains, "Show log" opens the log with shell.openPath, and "Try again" after removing the cause starts the daemon and a terminal runs a command', async () => {
     await session!.close();
     rmSync(dataDir, { recursive: true, force: true });
     mkdirSync(dataDir);
@@ -527,6 +527,40 @@ describe('daemon: built app, the daemon cannot start', () => {
       const view = await makeWorkspace(session, 'view-ws', root);
       await page.getByTitle(view.path, { exact: true }).first().click();
       await failureView(page).waitFor();
+
+      // COCKPIT-69 AC1: the look of the view, in computed colours. Self-contained: it runs in the page.
+      const look = await page.evaluate((reasonText) => {
+        const colorOf = (token: string) => {
+          const probe = document.createElement('span');
+          probe.style.color = `var(${token})`;
+          document.body.append(probe);
+          const color = getComputedStyle(probe).color;
+          probe.remove();
+          return color;
+        };
+        const icon = document.querySelector('svg.lucide-server-crash');
+        const reasonElement = [...document.querySelectorAll('code, pre, [class*="mono"]')].find((element) => (element.textContent ?? '').includes(reasonText));
+        // The nearest block around the reason (itself included) that has a fill.
+        let block: Element | null = reasonElement ?? null;
+        while (block && getComputedStyle(block).backgroundColor === 'rgba(0, 0, 0, 0)') block = block.parentElement;
+        const button = (name: string) => [...document.querySelectorAll('button')].find((element) => element.textContent?.trim() === name);
+        const tryAgain = button('Try again') && getComputedStyle(button('Try again')!);
+        const showLog = button('Show log') && getComputedStyle(button('Show log')!);
+        return {
+          icon: icon && { color: getComputedStyle(icon).color, width: icon.getBoundingClientRect().width, height: icon.getBoundingClientRect().height },
+          reason: reasonElement && { color: getComputedStyle(reasonElement).color, font: getComputedStyle(reasonElement).fontFamily, fill: block && getComputedStyle(block).backgroundColor },
+          tryAgain: tryAgain && { fill: tryAgain.backgroundColor },
+          showLog: showLog && { border: showLog.borderTopWidth, fill: showLog.backgroundColor },
+          tokens: { destructive: colorOf('--destructive'), subtle: colorOf('--subtle'), hover: colorOf('--hover'), brand: colorOf('--brand') },
+        };
+      }, reason);
+      expect(look.icon, 'Lucide server-crash, 20 px, in --destructive').toEqual({ color: look.tokens.destructive, width: 20, height: 20 });
+      expect(look.reason?.font, 'monospace').toMatch(/mono/i);
+      expect(look.reason?.color, 'the reason in --subtle').toBe(look.tokens.subtle);
+      expect(look.reason?.fill, 'on a --hover block').toBe(look.tokens.hover);
+      expect(look.tryAgain?.fill, '"Try again" filled with --brand').toBe(look.tokens.brand);
+      expect(look.showLog?.border, '"Show log" outlined').not.toBe('0px');
+      expect(look.showLog?.fill, '"Show log" not filled with --brand').not.toBe(look.tokens.brand);
 
       // "Show log": the log file exists, shell.openPath receives it.
       await session.evaluateInMain(`(() => { globalThis.__opened = []; require('electron').shell.openPath = async (path) => { globalThis.__opened.push(path); globalThis.__onOpened?.(); return ''; }; })()`);
@@ -677,7 +711,7 @@ describe('daemon: built app, requests from another origin', () => {
     rmSync(dataDir, { recursive: true, force: true });
   });
 
-  test('AC22 — pty.list, pty.attach (of an existing terminal), daemon.status, daemon.retry and daemon.showLog reject from another origin: no daemon is started or contacted, shell.openPath is not called and the terminal\'s owner is unchanged', async () => {
+  test('AC22, COCKPIT-69 AC21 — pty.list, pty.attach (of an existing terminal), daemon.status, daemon.retry, daemon.showLog and the new sessions.ended, sessions.dismiss, daemon.outdated, daemon.restart and daemon.later reject from another origin: no daemon is started or contacted, shell.openPath is not called and the terminal\'s owner is unchanged', async () => {
     const build = uniqueBuild();
     const home = join(dataDir, 'h');
     // The daemon cannot start (its socket path is a folder), so its log exists and a retry would start it once the cause is gone.
@@ -698,7 +732,7 @@ describe('daemon: built app, requests from another origin', () => {
 
     const results = await session.evaluateInMain<Record<string, string>>(`(async () => {
       const handlers = require('electron').ipcMain._invokeHandlers;
-      const calls = { 'pty:list': [], 'daemon:status': [], 'daemon:retry': [], 'daemon:show-log': [] };
+      const calls = { 'pty:list': [], 'daemon:status': [], 'daemon:retry': [], 'daemon:show-log': [], 'sessions:ended': [], 'sessions:dismiss': ['a-session'], 'daemon:outdated': [], 'daemon:restart': [], 'daemon:later': [] };
       const results = {};
       for (const [channel, args] of Object.entries(calls)) {
         const handler = handlers.get(channel);
@@ -713,7 +747,17 @@ describe('daemon: built app, requests from another origin', () => {
       return results;
     })()`);
 
-    expect(results).toEqual({ 'pty:list': 'rejected', 'daemon:status': 'rejected', 'daemon:retry': 'rejected', 'daemon:show-log': 'rejected' });
+    expect(results).toEqual({
+      'pty:list': 'rejected',
+      'daemon:status': 'rejected',
+      'daemon:retry': 'rejected',
+      'daemon:show-log': 'rejected',
+      'sessions:ended': 'rejected',
+      'sessions:dismiss': 'rejected',
+      'daemon:outdated': 'rejected',
+      'daemon:restart': 'rejected',
+      'daemon:later': 'rejected',
+    });
     expect(await session.evaluateInMain<string[]>('globalThis.__opened'), 'shell.openPath is not called').toEqual([]);
     expect(daemonProcessesOf(build), 'no daemon is started').toEqual([]);
     expect(daemonFile(home, 'sock', build)).toBeUndefined();

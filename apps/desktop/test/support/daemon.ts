@@ -1,12 +1,12 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { request as httpRequest } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { connectDaemon, type DaemonClient } from '@cockpit/daemon';
-import { chromium, type Page } from 'playwright-core';
+import { chromium, type Locator, type Page } from 'playwright-core';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { sendFromComposer } from '../composer';
 import { heldProcess, isAlive, killDaemonsIn, launchDev, launchSpawned, MAIN_PROCESS_ERROR, quitApp, type Session, signalGroup, untilRead, versionLabel, waitForGroupGone } from '../launch';
@@ -433,6 +433,185 @@ export async function startSetup(session: Session, daemon: DaemonClient, repo: {
   return { pid: Number(pid), exited: terminal.exited };
 }
 
+// --- COCKPIT-69: the background service states --------------------------------
+
+// The banner of a workspace or session page after the daemon died: "Background service stopped · N terminals ended".
+// Without `count`, any number.
+export const stoppedBanner = (page: Page, count?: number) =>
+  page.getByText(
+    count === undefined
+      ? /Background service stopped\s*·\s*\d+ terminals? ended/
+      : new RegExp(`Background service stopped\\s*·\\s*${count} terminal${count === 1 ? '' : 's'} ended`),
+  );
+
+export const restartButton = (page: Page) => page.getByRole('button', { name: 'Restart', exact: true });
+
+// SIGKILL to the daemon of `build` (any, when omitted), then waits for it to be gone. Its files stay, as after a crash.
+export async function killDaemon(home: string, build?: string): Promise<number> {
+  const pid = must(daemonPid(home, build), 'the daemon pid');
+  process.kill(pid, 'SIGKILL');
+  await daemonEnded(pid);
+  return pid;
+}
+
+// The tab whose label holds `name`, the box around the tab (its icon and close button), and the "Ended" icon in it.
+export const tabNamed = (page: Page, name: string) => page.getByRole('tab').filter({ hasText: name });
+export const tabBox = (tab: Locator) => tab.locator('xpath=..');
+export const endedIconOf = (tab: Locator) => tabBox(tab).locator('[role="img"][aria-label="Ended"]');
+
+// Counts what the main process sends the page, so a test waits for the event: `watchEvents` once per page load, then
+// `untilEvents(page, name, n)` resolves when `n` have come (at once if they have).
+type EventName = 'changed' | 'exits';
+export const watchEvents = (page: Page) =>
+  page.evaluate(() => {
+    type Counter = { count: number; waiters: Array<() => void> };
+    const w = window as unknown as { api: { daemon: { onChanged(l: () => void): unknown }; pty: { onExit(l: () => void): unknown } }; __events?: Record<string, Counter> };
+    // The listeners are added once per page load; a later call only starts the counts again.
+    if (!w.__events) {
+      const events: Record<string, Counter> = { changed: { count: 0, waiters: [] }, exits: { count: 0, waiters: [] } };
+      w.__events = events;
+      const counting = (name: string) => () => {
+        events[name]!.count++;
+        for (const waiter of events[name]!.waiters.splice(0)) waiter();
+      };
+      w.api.daemon.onChanged(counting('changed'));
+      w.api.pty.onExit(counting('exits'));
+    }
+    for (const counter of Object.values(w.__events)) {
+      counter.count = 0;
+      counter.waiters = [];
+    }
+  });
+export const untilEvents = (page: Page, name: EventName, count: number) =>
+  page.evaluate(
+    ([name, count]) =>
+      new Promise<void>((resolve) => {
+        const entry = (window as unknown as { __events: Record<string, { count: number; waiters: Array<() => void> }> }).__events[name as string]!;
+        const check = () => (entry.count >= (count as number) ? resolve() : void entry.waiters.push(check));
+        check();
+      }),
+    [name, count] as const,
+  );
+
+// An agent tab started from the "+" menu of the first pane, as a user does.
+export const newAgentTab = async (page: Page) => {
+  await page.getByRole('button', { name: 'New tab', exact: true }).first().click();
+  await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).first().click();
+};
+
+// The one smoke path of the dev server and the packaged app (AC6): the daemon is killed, the banner shows, "Restart"
+// starts another daemon, the banner goes and a new shell runs a command. The page is on a workspace page with a terminal.
+export async function expectRestartSmoke(session: Session) {
+  const { page } = session;
+  const before = await killDaemon(session.cockpitHome);
+  await stoppedBanner(page).waitFor();
+  await restartButton(page).click();
+  await stoppedBanner(page).waitFor({ state: 'detached' });
+  expect(must(daemonPid(session.cockpitHome), 'the new daemon pid')).not.toBe(before);
+  await newShellTab(page);
+  await typeLine(page, 'echo restarted-$((6*7))');
+  await expectScreen(page, /^restarted-42$/m);
+  expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+}
+
+// The dialog offered when a daemon of another protocol holds terminals.
+export const restartDialog = (page: Page) => page.locator('[role="dialog"], [role="alertdialog"]').filter({ hasText: 'Restart the background service?' });
+
+export interface FakeTerminal {
+  id: number;
+  kind: 'shell' | 'session';
+  cwd: string;
+  cols: number;
+  rows: number;
+  command: string;
+  sessionId?: string;
+  workspace?: string;
+  status?: 'working' | 'waiting' | 'finished';
+}
+
+// How the fake answers `POST /shutdown`: 202 and gone, 409, or never.
+export type ShutdownMode = 'accept' | 'refuse' | 'silent';
+
+// A daemon of another protocol (2), which no real daemon can be: an HTTP server on its socket in this process, with
+// its token file, answering the two frozen routes. `calls` holds `<method> <path>` of each authorized request.
+export async function startFakeDaemon(home: string, terminals: FakeTerminal[], protocol = 2) {
+  mkdirSync(home, { recursive: true });
+  const base = join(home, `daemon-${protocol}-${uniqueBuild()}`);
+  const token = randomBytes(32).toString('hex');
+  const calls: string[] = [];
+  const waiters = new Set<() => void>();
+  const held = new Set<import('node:http').ServerResponse>();
+  const state = { mode: 'accept' as ShutdownMode, terminals: [...terminals] };
+  const server = createServer((req, res) => {
+    if (req.headers.authorization !== `Bearer ${token}`) {
+      res.writeHead(401).end();
+      return;
+    }
+    calls.push(`${req.method} ${req.url}`);
+    for (const waiter of waiters) waiter();
+    if (req.method === 'GET' && req.url === '/terminals') {
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(state.terminals));
+    } else if (req.method === 'POST' && req.url === '/shutdown') {
+      if (state.mode === 'refuse') res.writeHead(409, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'refused by the test' }));
+      else if (state.mode === 'silent') held.add(res);
+      else {
+        res.writeHead(202).end(() => void close());
+        state.terminals = [];
+      }
+    } else {
+      res.writeHead(404).end();
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(`${base}.sock`, resolve));
+  chmodSync(`${base}.sock`, 0o600);
+  // No `.pid`: the test's own pid would make `killDaemonsIn` kill the test itself.
+  writeFileSync(`${base}.token`, token, { mode: 0o600 });
+
+  async function close() {
+    for (const res of held) res.destroy();
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+      server.closeAllConnections();
+    });
+    for (const extension of ['sock', 'token']) rmSync(`${base}.${extension}`, { force: true });
+  }
+
+  return {
+    calls,
+    socket: `${base}.sock`,
+    set mode(mode: ShutdownMode) {
+      state.mode = mode;
+    },
+    /** Resolves once the fake has received `call` (`GET /terminals`) `times` times. */
+    called: (call: string, times = 1) =>
+      new Promise<void>((resolve) => {
+        const check = () => {
+          if (calls.filter((each) => each === call).length < times) return;
+          waiters.delete(check);
+          resolve();
+        };
+        waiters.add(check);
+        check();
+      }),
+    close,
+  };
+}
+
+// The files of a daemon of another protocol that nothing listens on any more (it was killed): a socket nobody holds and a token.
+export async function leaveStaleDaemon(home: string, protocol: number): Promise<void> {
+  mkdirSync(home, { recursive: true });
+  const base = join(home, `daemon-${protocol}-${uniqueBuild()}`);
+  const child = spawn(process.execPath, ['-e', "require('net').createServer().listen(process.argv[1], () => console.log('listening'))", `${base}.sock`], { stdio: ['ignore', 'pipe', 'inherit'] });
+  await new Promise<void>((resolve, reject) => {
+    child.on('error', reject);
+    child.stdout.on('data', (chunk: Buffer) => chunk.toString().includes('listening') && resolve());
+  });
+  const exited = once(child, 'exit');
+  child.kill('SIGKILL');
+  await exited;
+  writeFileSync(`${base}.token`, 'a-token', { mode: 0o600 });
+}
+
 // --- Packaged app: smoke path -------------------------------------------------
 
 
@@ -494,6 +673,10 @@ export const describeDaemonPackagedSmoke = () => describe('daemon: packaged app 
     await expectScreen(page, /^marker-shell-42$/m);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
   });
+
+  test('COCKPIT-69 AC6 — smoke path: the daemon killed (SIGKILL) shows the banner, "Restart" starts another daemon, the banner goes and a new shell runs a command', async () => {
+    await expectRestartSmoke(session!);
+  });
 });
 
 export const describeDaemonDevServerSmoke = () => describe('daemon: dev server smoke path', () => {
@@ -517,5 +700,9 @@ export const describeDaemonDevServerSmoke = () => describe('daemon: dev server s
     await typeLine(page, 'echo cockpit-$((6*7))');
     await expectScreen(page, /^cockpit-42$/m);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+  });
+
+  test('COCKPIT-69 AC6 — smoke path: the daemon killed (SIGKILL) shows the banner, "Restart" starts another daemon, the banner goes and a new shell runs a command', async () => {
+    await expectRestartSmoke(session!);
   });
 });
