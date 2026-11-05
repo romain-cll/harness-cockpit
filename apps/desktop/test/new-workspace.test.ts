@@ -36,6 +36,9 @@ import {
   waitForWorkspacePage,
 } from './composer';
 import { projectColour } from '../src/renderer/components/project-colour';
+import { openPopup } from './composer';
+import { afterIpcAnswers, countIpcCalls, ipcCalls, stateSnapshot } from './support/projects';
+import { expectNoErrors, launchBuiltWith, makeSessionsFixture, sessionEntries, sessionIdOf, type SessionsFixture } from './support/sessions';
 
 // COCKPIT-66: the New workspace page (the composer at `/`). One built-app launch with a fake login
 // shell whose `PATH` holds stub agent CLIs (a stub is a `#!/bin/sh` file that logs its launch, so no
@@ -685,7 +688,7 @@ describe('new workspace page: built app', () => {
     await closePopups(page);
   }, 60_000);
 
-  // AC13 (no agent CLI at all) runs on the launch without any, in app.test.ts.
+  // AC13 (no agent CLI at all) runs on the launch without any, below.
 
   test('AC15 — the button is disabled for a blank prompt (spaces only) and enabled for a filled one, and Shift+Enter inserts a new line without sending', async () => {
     const { page } = session;
@@ -1082,5 +1085,52 @@ describe('new workspace page: built app', () => {
     await openComposer(page);
     expect(await textOf(projectSelect(page))).toBe('No project');
     expect(await baseSelect(page).count()).toBe(0);
+  });
+});
+
+describe('built app without any agent CLI on the login shell PATH', () => {
+  let fx: SessionsFixture;
+  let session: Session;
+  let dataDir: string;
+
+  beforeAll(async () => {
+    fx = makeSessionsFixture([]);
+    dataDir = makeTestDir('d-');
+    session = await launchBuiltWith(fx.env(), dataDir);
+    await session.page.getByText(versionLabel).waitFor();
+  });
+
+  afterAll(async () => {
+    await session?.close();
+    if (fx) rmSync(fx.root, { recursive: true, force: true });
+    if (dataDir) rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  test('AC2, COCKPIT-66 AC13 — with no agent CLI the New workspace page\'s agent select shows "Terminal", its menu a disabled "No agent CLI found" item with the install hint above "Terminal", and no session starts', async () => {
+    const { page } = session;
+    const before = stateSnapshot(session.dataDir);
+
+    await waitForAgent(page, 'Terminal');
+    const menu = await openPopup(page, agentSelect(page));
+
+    expect(await itemTexts(menu)).toEqual([
+      'No agent CLI found Install Claude Code, Codex or OpenCode, then detect again. Until then, the workspace opens with a terminal.',
+      'Terminal',
+      'Detect again',
+    ]);
+    const missing = menu.locator('[role^="menuitem"]').first();
+    expect(await missing.evaluate((item) => item.getAttribute('aria-disabled') === 'true' || item.hasAttribute('data-disabled'))).toBe(true);
+
+    // A disabled item: the click starts nothing, so no `sessions:start` reached the main process by the time its
+    // later answers came.
+    await countIpcCalls(session, ['sessions:start']);
+    await missing.click({ force: true }).catch(() => {});
+    await afterIpcAnswers(page);
+    expect(await ipcCalls(session, 'sessions:start')).toBe(0);
+    await page.keyboard.press('Escape');
+    expect(await sessionEntries(page)).toEqual([]);
+    expect(sessionIdOf(page)).toBeUndefined();
+    expect(stateSnapshot(session.dataDir)).toEqual(before);
+    await expectNoErrors(session);
   });
 });
