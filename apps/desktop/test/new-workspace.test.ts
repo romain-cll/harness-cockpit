@@ -1099,6 +1099,8 @@ describe('built app without any agent CLI on the login shell PATH', () => {
     dataDir = makeTestDir('d-');
     session = await launchBuiltWith(fx.env(), dataDir);
     await session.page.getByText(versionLabel).waitFor();
+    // `/` is the empty state without a project (COCKPIT-72 AC1): the composer is at `/?project=none`.
+    await openComposer(session.page, 'none');
   });
 
   afterAll(async () => {
