@@ -1133,4 +1133,29 @@ describe('built app without any agent CLI on the login shell PATH', () => {
     expect(stateSnapshot(session.dataDir)).toEqual(before);
     await expectNoErrors(session);
   });
+
+  test('COCKPIT-68 AC26 — the agent menu\'s multi-line hint item is taller than 28 px, holds its text, and no two items overlap', async () => {
+    const { page } = session;
+    await waitForAgent(page, 'Terminal');
+    const menu = await openPopup(page, agentSelect(page));
+
+    const boxes = await itemsOf(menu).evaluateAll((items) =>
+      items.map((item) => {
+        // Layout boxes: the popup's opening animation scales its rects.
+        const element = item as HTMLElement;
+        const top = element.offsetTop;
+        return { top, bottom: top + element.offsetHeight, height: element.offsetHeight, text: (item.textContent ?? '').trim(), overflow: item.scrollHeight - item.clientHeight };
+      }),
+    );
+    await page.keyboard.press('Escape');
+
+    expect(boxes).toHaveLength(3);
+    const hint = boxes.find((box) => box.text.startsWith('No agent CLI found'))!;
+    expect(hint.height, 'the hint item').toBeGreaterThan(28);
+    for (const box of boxes) expect(box.overflow, `${box.text} fits its box`).toBeLessThanOrEqual(1);
+    const ordered = [...boxes].sort((a, b) => a.top - b.top);
+    for (let at = 1; at < ordered.length; at++) {
+      expect(ordered[at]!.top, `${ordered[at]!.text} starts below ${ordered[at - 1]!.text}`).toBeGreaterThanOrEqual(ordered[at - 1]!.bottom - 0.5);
+    }
+  });
 });

@@ -1,8 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 import { launchBuilt, type Session, untilRead, versionLabel } from './launch';
-import { addRepository, branchBox, collectedPtyData, collectPtyData, deleteButton, dialogTerminal, dispatchFocus, entryTitles, gitIn, holdWaiter, linkedWorktrees, localBranches, makeLightRepo, openDeleteDialog, openDialogs, readRecords, sidebarLines, teardownApi, type TempRepo, untilFewerOverlays, waiters, waitForDialogLine, waitForEntries, waitForEntry, waitForNoEntry, writeConfig, writeScripts } from './support/projects';
+import { addRepository, branchBox, collectedPtyData, collectPtyData, countIpcCalls, deleteButton, dialogTerminal, dispatchFocus, entryTitles, gitIn, holdWaiter, linkedWorktrees, localBranches, makeLightRepo, openDeleteDialog, openDialogs, readRecords, removeOptions, sidebarLines, teardownApi, type TempRepo, untilFewerOverlays, waiters, waitForDialogLine, waitForEntries, waitForEntry, waitForNoEntry, writeConfig, writeScripts } from './support/projects';
 import { expectNoErrors } from './support/sessions';
 import { dropTerminalWorkspace, focusPane, getShellPath, normalizeFnm, ptyHostPid, rowsOf, waitForRow, watchFrontmost } from './support/terminal';
 
@@ -237,6 +237,33 @@ describe('built app', () => {
       expect(existsSync(path)).toBe(false);
       expect(linesIn('td15.log')).toHaveLength(1);
     });
+
+    test('COCKPIT-68 AC25 — a failing teardown on a worktree with the warning on screen: one "Delete anyway" removes the worktree with its changes (force sent) and does not run the teardown again', async () => {
+      const { page } = session;
+      writeConfig(repo, { teardown: ['echo ran >> "$COCKPIT_ROOT_PATH/td25.log"; exit 4'] });
+      const path = await addExternal('td-force');
+      writeFileSync(join(path, 'unsaved.txt'), 'uncommitted work\n');
+      await countIpcCalls(session, ['workspaces:remove']);
+      const removesBefore = (await removeOptions(session)).length;
+
+      const dialog = await openDeleteDialog(page, path, 'td-force');
+      expect(await dialog.innerText()).toContain('It has uncommitted changes. They will be lost.');
+      await deleteButton(dialog).click();
+      await dialog.getByText('Teardown failed with exit code 4').waitFor();
+      expect(existsSync(path)).toBe(true);
+      expect(linesIn('td25.log')).toHaveLength(1);
+
+      await deleteButton(dialog, 'Delete anyway').click();
+      await dialog.first().waitFor({ state: 'hidden' });
+      await waitUnlisted(path);
+
+      expect(existsSync(path)).toBe(false);
+      expect(linkedWorktrees(repo).map((worktree) => worktree.path)).not.toContain(path);
+      expect(linesIn('td25.log')).toHaveLength(1);
+      const sent = (await removeOptions(session)).slice(removesBefore);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.force, 'the warning was on screen').toBe(true);
+    }, 60_000);
 
     test('AC15 — Escape on a running teardown ends its process and keeps the workspace', async () => {
       const { page } = session;

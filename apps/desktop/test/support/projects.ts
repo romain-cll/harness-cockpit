@@ -494,7 +494,7 @@ export async function openDeleteDialog(page: Page, path: string, name: string) {
 
 // The options of the calls of `workspaces:remove` counted so far (`countIpcCalls`), the third argument of each.
 export const removeOptions = async (session: Session) =>
-  (await ipcCallArgs(session, 'workspaces:remove')).map((args) => (args[2] ?? {}) as { force?: boolean; deleteBranch?: boolean; forceBranch?: boolean });
+  (await ipcCallArgs(session, 'workspaces:remove')).map((args) => (args[2] ?? {}) as { force?: boolean; deleteBranch?: boolean; forceBranch?: string });
 
 // The color the `muted-foreground` token resolves to, for "muted" lines.
 export const mutedColor = (page: Page) =>

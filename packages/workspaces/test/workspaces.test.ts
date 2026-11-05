@@ -612,12 +612,12 @@ describe('removalState', () => {
 });
 
 describe('removeWorktree forceBranch', () => {
-  test('COCKPIT-68 AC20 — deleteBranch with forceBranch deletes an unmerged branch (git branch -D) after removing the worktree', async () => {
+  test('COCKPIT-68 AC20 — deleteBranch with forceBranch naming the worktree\'s unmerged branch deletes it (git branch -D) after removing the worktree', async () => {
     const repo = await makeRepo();
     const path = await addWorktree(repo, 'unmerged-forced', 'unmerged-forced');
     commit(path, 'not on main');
 
-    await removeWorktree({ repo, path, deleteBranch: true, forceBranch: true, env: testEnv });
+    await removeWorktree({ repo, path, deleteBranch: true, forceBranch: 'unmerged-forced', env: testEnv });
 
     expect(existsSync(path)).toBe(false);
     expect((await listWorktrees(repo, { env: testEnv })).some((w) => w.path === path)).toBe(false);
@@ -629,10 +629,39 @@ describe('removeWorktree forceBranch', () => {
     const path = await addWorktree(repo, 'kept-forced', 'kept-forced');
     const head = commit(path, 'not on main');
 
-    await removeWorktree({ repo, path, forceBranch: true, env: testEnv });
+    await removeWorktree({ repo, path, forceBranch: 'kept-forced', env: testEnv });
 
     expect(existsSync(path)).toBe(false);
     expect(git(repo, 'rev-parse', 'kept-forced')).toBe(head);
+  });
+
+  test('COCKPIT-68 AC21 — forceBranch naming another branch than the worktree\'s unmerged one removes the worktree, rejects BRANCH_NOT_MERGED and both branches stay', async () => {
+    const repo = await makeRepo();
+    const named = await addWorktree(repo, 'named-work', 'named');
+    const namedHead = commit(named, 'work on the named branch');
+    const path = await addWorktree(repo, 'actual', 'actual');
+    const actualHead = commit(path, 'work on the actual branch');
+
+    const error = await rejection(removeWorktree({ repo, path, deleteBranch: true, forceBranch: 'named', env: testEnv }));
+
+    expect(error.code).toBe('BRANCH_NOT_MERGED');
+    expect(existsSync(path)).toBe(false);
+    expect((await listWorktrees(repo, { env: testEnv })).some((w) => w.path === path)).toBe(false);
+    expect(git(repo, 'rev-parse', 'actual')).toBe(actualHead);
+    expect(git(repo, 'rev-parse', 'named')).toBe(namedHead);
+  });
+
+  test('COCKPIT-68 AC21 — forceBranch naming another branch while the worktree\'s own is merged deletes it with git branch -d and the named branch stays', async () => {
+    const repo = await makeRepo();
+    const named = await addWorktree(repo, 'named-work', 'named');
+    const namedHead = commit(named, 'work on the named branch');
+    const path = await addWorktree(repo, 'merged-actual', 'merged-actual');
+
+    await removeWorktree({ repo, path, deleteBranch: true, forceBranch: 'named', env: testEnv });
+
+    expect(existsSync(path)).toBe(false);
+    expect(branchExists(repo, 'merged-actual')).toBe(false);
+    expect(git(repo, 'rev-parse', 'named')).toBe(namedHead);
   });
 });
 
