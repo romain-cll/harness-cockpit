@@ -263,7 +263,7 @@ describe('built app', () => {
       const sent = (await removeOptions(session)).slice(removesBefore);
       expect(sent).toHaveLength(1);
       expect(sent[0]!.force, 'the warning was on screen').toBe(true);
-    }, 60_000);
+    });
 
     test('AC15 — Escape on a running teardown ends its process and keeps the workspace', async () => {
       const { page } = session;
