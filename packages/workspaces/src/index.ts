@@ -284,9 +284,9 @@ export async function removalState({
 
 /**
  * Removes a clean linked worktree, or any with `force`, uncommitted changes included. With
- * `deleteBranch`, also deletes its branch if merged, or whatever its state with `forceBranch`
- * (`git branch -D`): when it is not merged, the worktree is still removed and the call rejects
- * with `BRANCH_NOT_MERGED`.
+ * `deleteBranch`, also deletes its branch if merged: when it is not merged, the worktree is still
+ * removed and the call rejects with `BRANCH_NOT_MERGED`. `forceBranch`, the name of a branch, makes it
+ * `git branch -D` only when that is the worktree's branch at removal; any other name changes nothing.
  */
 export async function removeWorktree({
   repo,
@@ -300,7 +300,7 @@ export async function removeWorktree({
   path: string;
   deleteBranch?: boolean;
   force?: boolean;
-  forceBranch?: boolean;
+  forceBranch?: string;
 } & GitEnv): Promise<void> {
   await checkGit(env);
   const worktrees = await list(repo, env);
@@ -315,7 +315,7 @@ export async function removeWorktree({
   if (!deleteBranch || worktree.branch === null) return;
   // A branch deleted by hand while checked out is still reported by the worktree: nothing to delete.
   if (!(await succeeds(['rev-parse', '--verify', '--quiet', `refs/heads/${worktree.branch}`], { cwd: main, env }))) return;
-  if (!(await succeeds(['branch', forceBranch ? '-D' : '-d', '--', worktree.branch], { cwd: main, env }))) {
+  if (!(await succeeds(['branch', forceBranch === worktree.branch ? '-D' : '-d', '--', worktree.branch], { cwd: main, env }))) {
     throw new WorkspaceError('BRANCH_NOT_MERGED', `branch is not merged: ${worktree.branch}`);
   }
 }

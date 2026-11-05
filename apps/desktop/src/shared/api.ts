@@ -277,9 +277,14 @@ export interface Api {
     removal(project: string, path: string): Promise<RemovalResult>;
     /**
      * Removes the worktree. `force` removes it with its uncommitted changes; `deleteBranch` also deletes its
-     * branch when merged, or whatever its state with `forceBranch`.
+     * branch when merged; `forceBranch`, the name of the branch the caller showed, deletes it whatever its state
+     * if it is still the worktree's branch.
      */
-    remove(project: string, path: string, options: { force: boolean; deleteBranch: boolean; forceBranch: boolean }): Promise<RemoveWorkspaceResult>;
+    remove(
+      project: string,
+      path: string,
+      options: { force?: boolean; deleteBranch?: boolean; forceBranch?: string },
+    ): Promise<RemoveWorkspaceResult>;
     /** The detected editors and terminals, looked up at each call. */
     apps(): Promise<AppsResult>;
     /** Shows the worktree in the Finder. Refused when the path is not a linked worktree of the project. */

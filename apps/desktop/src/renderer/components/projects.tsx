@@ -159,13 +159,13 @@ function OpenItems({ apps, onOpen, onReveal }: { apps?: AppsResult; onOpen: (app
       {editor && (
         <DropdownMenuItem onClick={() => onOpen(editor.id)}>
           <CodeXmlIcon />
-          Open in {editor.name}
+          <span className="truncate">Open in {editor.name}</span>
         </DropdownMenuItem>
       )}
       {terminal && (
         <DropdownMenuItem onClick={() => onOpen(terminal.id)}>
           <SquareTerminalIcon />
-          Open in {terminal.name}
+          <span className="truncate">Open in {terminal.name}</span>
         </DropdownMenuItem>
       )}
       {submenu('editor', apps.editors)}

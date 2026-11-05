@@ -759,7 +759,7 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
       event,
       project: string,
       path: string,
-      options: { force: boolean; deleteBranch: boolean; forceBranch: boolean },
+      options: { force?: boolean; deleteBranch?: boolean; forceBranch?: string },
     ): Promise<RemoveWorkspaceResult> =>
       forProject<RemoveWorkspaceResult>(
         event,

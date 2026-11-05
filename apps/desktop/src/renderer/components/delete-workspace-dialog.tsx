@@ -37,6 +37,8 @@ export function DeleteWorkspaceDialog({
   const labelId = useId();
   const [message, setMessage] = useState<string>();
   const [busy, setBusy] = useState(false);
+  // The branch box is shown once the read answered, for a workspace listed with a branch.
+  const boxShown = read && workspace.branch !== null;
   // The teardown runs once per dialog, in a terminal the dialog shows; it ends with the dialog.
   const [terminal, setTerminal] = useState<LiveTerminal>();
   const tornDown = useRef(false);
@@ -103,11 +105,12 @@ export function DeleteWorkspaceDialog({
           return;
         }
       }
-      // Force only what the dialog shows: the warning, and the "Not merged" hint with the box checked.
+      // Send only what the dialog shows: the warning forces the removal; the checked box deletes the branch,
+      // and with the "Not merged" hint on screen forces it, by the name shown.
       const result = await window.api.workspaces.remove(project.path, workspace.path, {
-        force: warning,
-        deleteBranch,
-        forceBranch: deleteBranch && merged === false,
+        force: warning || undefined,
+        deleteBranch: (boxShown && deleteBranch) || undefined,
+        forceBranch: boxShown && deleteBranch && merged === false ? workspace.branch! : undefined,
       });
       if (result.status === 'dirty') setWarning(true);
       else if (result.status === 'refused') setMessage(result.message);
@@ -128,7 +131,7 @@ export function DeleteWorkspaceDialog({
         </AlertDialogHeader>
         <div className="rounded-md border bg-muted px-2 py-1.5 text-xs break-all">{workspace.path}</div>
         {warning && <p className="text-xs/[18px] text-destructive">It has uncommitted changes. They will be lost.</p>}
-        {read && workspace.branch !== null && (
+        {boxShown && (
           <div className="flex flex-col gap-1">
             <label className="flex items-center gap-2 text-xs">
               <Checkbox checked={deleteBranch} onCheckedChange={setDeleteBranch} disabled={busy} aria-labelledby={labelId} />
