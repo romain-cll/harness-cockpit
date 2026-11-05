@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { connectTo, registerCleanup, shellOptions, startDaemon, until, waitForOutput, type Connection } from './helpers';
+import { conditions, connectTo, registerCleanup, shellOptions, startDaemon, waitForOutput, type Connection } from './helpers';
 
 // COCKPIT-66 (AC24): a session terminal whose program sets a title (OSC 0 or OSC 2) between the
 // "agent started" and "agent exited" markers `cockpit setup` writes (private OSC 6973) makes the daemon
@@ -19,35 +19,40 @@ async function start() {
   const daemon = await startDaemon();
   const connection = await connectTo(daemon.files.socket);
   const titles: Array<{ sessionId: string; title: string }> = [];
-  (connection.client as unknown as { onTitle(listener: (event: { sessionId: string; title: string }) => void): void }).onTitle((event) =>
-    titles.push({ sessionId: event.sessionId, title: event.title }),
-  );
-  return { ...daemon, connection, client: connection.client, titles };
+  const { fire, when } = conditions();
+  (connection.client as unknown as { onTitle(listener: (event: { sessionId: string; title: string }) => void): void }).onTitle((event) => {
+    titles.push({ sessionId: event.sessionId, title: event.title });
+    fire();
+  });
+  /** Resolves once `count` titles (at least) have arrived. */
+  const titled = (count: number) => when(() => titles.length >= count);
+  return { ...daemon, connection, client: connection.client, titles, titled };
 }
 
 let counter = 0;
 /**
  * Resolves once the terminal's headless copy holds a line written after everything sent before: the
- * stream is parsed in order, so every title event it holds was pushed (on the same socket, before the
- * answer to `attach`).
+ * line's output reached the client, and the answer to `attach` comes once the headless terminal parsed all
+ * it was given, so every title event it holds was pushed (on the same socket, before that answer).
  */
 async function settle(connection: Connection, id: unknown) {
   const n = ++counter;
   connection.client.write(id, `echo settled-$((${n}*1000))\n`);
-  await until(async () => (await connection.client.attach(id)).screen.includes(`settled-${n * 1000}`), `the line settled-${n * 1000}`);
+  await waitForOutput(connection, id, `settled-${n * 1000}`);
+  await connection.client.attach(id);
 }
 
 describe('title events (AC24)', () => {
   test('AC24 — only the titles between the "agent started" and "agent exited" markers give events: OSC 2 then OSC 0 give two, a repeat of the same title none; those before and after give none', async () => {
-    const { client, connection, titles } = await start();
+    const { client, connection, titles, titled } = await start();
     const id = await client.spawn({ ...shellOptions, kind: 'session', sessionId: 'session-1' });
 
     client.write(id, osc(2, 'Setup title') + marker('started') + osc(2, 'First title'));
-    await until(() => titles.length === 1, 'the first title');
+    await titled(1);
     client.write(id, osc(0, 'Second title'));
-    await until(() => titles.length === 2, 'the second title');
+    await titled(2);
     client.write(id, osc(0, 'Second title') + osc(2, 'Second title') + osc(0, 'Third title'));
-    await until(() => titles.length === 3, 'the third title');
+    await titled(3);
     client.write(id, marker('exited') + osc(0, 'Login shell title'));
     await settle(connection, id);
 
@@ -69,26 +74,26 @@ describe('title events (AC24)', () => {
   });
 
   test('AC24 — a title with non-ASCII characters arrives intact', async () => {
-    const { client, titles } = await start();
+    const { client, titles, titled } = await start();
     const id = await client.spawn({ ...shellOptions, kind: 'session', sessionId: 'session-1' });
 
     // Typed as octal escapes in the format: a line with raw multibyte bytes is mangled by the shell's
     // readline in the C locale, and the escapes of a `%s` argument would not be interpreted.
     client.write(id, marker('started') + "printf '\\033]0;\\342\\234\\263 Fix the caf\\303\\251 loop\\007'\n");
 
-    await until(() => titles.length === 1, 'the title');
+    await titled(1);
     expect(titles[0]!.title).toBe('✳ Fix the café loop');
   });
 
   test('AC24 — each session terminal reports its own sessionId', async () => {
-    const { client, titles } = await start();
+    const { client, titles, titled } = await start();
     const one = await client.spawn({ ...shellOptions, kind: 'session', sessionId: 'session-1' });
     const two = await client.spawn({ ...shellOptions, kind: 'session', sessionId: 'session-2' });
 
     client.write(two, marker('started') + osc(0, 'Title of two'));
-    await until(() => titles.length === 1, 'the title of the second');
+    await titled(1);
     client.write(one, marker('started') + osc(0, 'Title of one'));
-    await until(() => titles.length === 2, 'the title of the first');
+    await titled(2);
 
     expect(titles).toEqual([
       { sessionId: 'session-2', title: 'Title of two' },
@@ -97,7 +102,7 @@ describe('title events (AC24)', () => {
   });
 
   test('AC24 — shell and commands terminals send no title event, markers or not, while a session terminal started after them does', async () => {
-    const { client, connection, titles } = await start();
+    const { client, connection, titles, titled } = await start();
     const shell = await client.spawn(shellOptions);
     const commands = await client.spawn({ ...shellOptions, kind: 'commands' });
 
@@ -109,7 +114,7 @@ describe('title events (AC24)', () => {
     await settle(connection, commands);
     const session = await client.spawn({ ...shellOptions, kind: 'session', sessionId: 'session-1' });
     client.write(session, marker('started') + osc(0, 'Session title'));
-    await until(() => titles.length >= 1, 'the session title');
+    await titled(1);
 
     expect(titles).toEqual([{ sessionId: 'session-1', title: 'Session title' }]);
   });

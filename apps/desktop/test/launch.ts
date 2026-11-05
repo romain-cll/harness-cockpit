@@ -6,7 +6,6 @@ import { createRequire } from 'node:module';
 import { Socket, createConnection, createServer, type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { setTimeout as sleep } from 'node:timers/promises';
 import type { DaemonClient } from '@cockpit/daemon';
 import { chromium, type Browser, type ElementHandle, type Frame, type Page } from 'playwright-core';
 import { afterEach, expect } from 'vitest';
@@ -740,16 +739,6 @@ export async function launchDev(
     await killDaemonsIn(...daemonHomesOf(env, cockpitHome));
     removeDataDir();
     throw error;
-  }
-}
-
-// Reads until `done` accepts the value or `timeout` ms pass, and returns the last value.
-export async function poll<T>(read: () => T | Promise<T>, done: (value: T) => boolean, timeout: number): Promise<T> {
-  const deadline = Date.now() + timeout;
-  for (;;) {
-    const value = await read();
-    if (done(value) || Date.now() > deadline) return value;
-    await sleep(100);
   }
 }
 

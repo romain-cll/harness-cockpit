@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { describe, expect, test } from 'vitest';
 import { daemonFiles, SESSION_EVENTS } from '../src/index';
-import { collectUncaught, connectTo, listenFake, makeHome, registerCleanup, send, sendOrError, shellOptions, startDaemon, UNAUTHORIZED, until } from './helpers';
+import { collectUncaught, connectTo, listenFake, makeHome, registerCleanup, send, sendOrError, shellOptions, startDaemon, UNAUTHORIZED } from './helpers';
 
 // The session-events endpoint of the daemon (the control endpoint's rules, moved). The client a
 // harness hook runs against it is the `cockpit` CLI (`cli.test.ts`).
@@ -27,7 +27,7 @@ describe('POST /session-events', () => {
 
     expect(await post(files.socket, token, { sessionId, event })).toEqual({ status: 204, text: '' });
 
-    await until(() => connection.statuses.length === 1, 'the status event');
+    await connection.when(() => connection.statuses.length === 1);
     expect(connection.statuses).toEqual([{ sessionId, event }]);
     expect((await connection.client.list()).find((entry) => entry.sessionId === sessionId)?.status).toBe(event);
   });
@@ -41,7 +41,7 @@ describe('POST /session-events', () => {
 
     expect(await post(files.socket, token, { sessionId, event })).toEqual({ status: 204, text: '' });
 
-    await until(() => connection.statuses.length === 1, 'the status event');
+    await connection.when(() => connection.statuses.length === 1);
     expect(connection.statuses).toEqual([{ sessionId, event }]);
     const listed = (await connection.client.list()).find((entry) => entry.sessionId === sessionId);
     expect(listed).toMatchObject({ setup });
@@ -60,7 +60,8 @@ describe('POST /session-events', () => {
       ['setup-done', 'done'],
     ] as const) {
       expect(await post(files.socket, token, { sessionId, event })).toEqual({ status: 204, text: '' });
-      await until(async () => (await setupOf()) === expected, `the setup state ${expected}`);
+      // The daemon records the report before it answers 204.
+      expect(await setupOf()).toBe(expected);
     }
   });
 
@@ -69,7 +70,7 @@ describe('POST /session-events', () => {
 
     expect(await post(files.socket, token, { sessionId, event: 'exited', exitCode })).toEqual({ status: 204, text: '' });
 
-    await until(() => connection.statuses.length === 1, 'the exited event');
+    await connection.when(() => connection.statuses.length === 1);
     expect(connection.statuses).toEqual([{ sessionId, event: 'exited', exitCode }]);
     const listed = (await connection.client.list()).find((entry) => entry.sessionId === sessionId);
     expect(listed).toHaveProperty('exitCode', exitCode);
@@ -123,25 +124,17 @@ describe('POST /session-events', () => {
   test('AC13 — a body above 64 KiB gets 413 and the connection is closed without reading the rest', async () => {
     const { files, token } = await start();
 
-    const outcome = await new Promise<{ head: string; closed: boolean }>((resolve) => {
+    const outcome = await new Promise<{ head: string }>((resolve) => {
       const socket = connect(files.socket);
       let received = '';
-      let closed = false;
-      const finish = () => resolve({ head: received, closed });
-      const failsafe = setTimeout(finish, 5_000);
       socket.on('data', (chunk) => (received += chunk.toString('latin1')));
       socket.on('error', () => {});
-      socket.on('close', () => {
-        closed = true;
-        clearTimeout(failsafe);
-        finish();
-      });
+      socket.on('close', () => resolve({ head: received }));
       socket.write(`POST /session-events HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer ${token}\r\nContent-Length: 10000000\r\n\r\n`);
       socket.write(Buffer.alloc(66 * 1024, 'a'));
     });
 
     expect(outcome.head.split('\r\n')[0]).toMatch(/^HTTP\/1\.1 413\b/);
-    expect(outcome.closed).toBe(true);
   });
 
   test.each([

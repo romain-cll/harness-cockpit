@@ -119,7 +119,7 @@ describe('the Bun that compiles apps/cli (AC10)', () => {
       writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'fake', private: true, packageManager: 'bun@0.0.1' }));
 
       const outcome = await new Promise<{ code: number | null; output: string }>((resolve) =>
-        execFile('bun', ['run', 'build'], { cwd: copy, env: process.env, timeout: 60_000 }, (error, stdout, stderr) =>
+        execFile('bun', ['run', 'build'], { cwd: copy, env: process.env }, (error, stdout, stderr) =>
           resolve({ code: error ? ((error as NodeJS.ErrnoException & { code?: number }).code ?? 1) : 0, output: `${stdout}${stderr}` }),
         ),
       );

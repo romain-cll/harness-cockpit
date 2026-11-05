@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -331,28 +331,53 @@ describe('listChanges and fileDiff edge cases', () => {
   });
 });
 
+/**
+ * A callback spy that also says when it was called: `reached(n)` resolves once it has been called `n`
+ * times (at once if it has been), so a test waits on the watcher's own call.
+ */
+function counted() {
+  let count = 0;
+  const waiting = new Set<{ n: number; resolve: () => void }>();
+  const spy = vi.fn(() => {
+    count++;
+    for (const each of waiting) {
+      if (count < each.n) continue;
+      waiting.delete(each);
+      each.resolve();
+    }
+  });
+  const reached = (n: number) => (count >= n ? Promise.resolve() : new Promise<void>((resolve) => waiting.add({ n, resolve })));
+  return { spy, reached, calls: () => count };
+}
+
 describe('watchWorktree', () => {
   test('AC12 — a burst of writes gives one onChange, and none comes after close()', async () => {
     const dir = await tempDir();
-    const changed = vi.fn();
+    const changed = counted();
     // A second watcher on the same folder shows, once it fires, that the events of a write have arrived.
-    const witness = vi.fn();
-    const watcher = await watchWorktree(dir, changed);
-    const other = await watchWorktree(dir, witness);
+    const witness = counted();
+    const watcher = await watchWorktree(dir, changed.spy);
+    const other = await watchWorktree(dir, witness.spy);
     try {
       for (let index = 0; index < 10; index++) await writeFile(join(dir, `first-${index}.txt`), 'x\n');
-      await vi.waitFor(() => expect(changed).toHaveBeenCalled(), { timeout: 5_000 });
-      expect(changed).toHaveBeenCalledTimes(1);
+      await changed.reached(1);
+      expect(changed.spy).toHaveBeenCalledTimes(1);
 
       for (let index = 0; index < 10; index++) await writeFile(join(dir, `second-${index}.txt`), 'x\n');
-      await vi.waitFor(() => expect(changed).toHaveBeenCalledTimes(2), { timeout: 5_000 });
-      expect(changed).toHaveBeenCalledTimes(2);
+      await changed.reached(2);
+      expect(changed.spy).toHaveBeenCalledTimes(2);
 
       watcher.close();
-      const seen = witness.mock.calls.length;
+      const seen = witness.calls();
       await writeFile(join(dir, 'after-close.txt'), 'x\n');
-      await vi.waitFor(() => expect(witness.mock.calls.length).toBeGreaterThan(seen), { timeout: 5_000 });
-      expect(changed).toHaveBeenCalledTimes(2);
+      await witness.reached(seen + 1);
+      expect(witness.calls()).toBeGreaterThan(seen);
+      // The two watchers have streams of their own and arm their debounce on their own events: the witness
+      // may have fired an instant before a watcher that was not closed would. A second write, a debounce
+      // later for both, is what the witness fires on after that watcher would have.
+      await writeFile(join(dir, 'after-close-again.txt'), 'x\n');
+      await witness.reached(seen + 2);
+      expect(changed.spy).toHaveBeenCalledTimes(2);
     } finally {
       watcher.close();
       other.close();
@@ -522,21 +547,22 @@ describe('pushBranch', () => {
 // command that must be seen from the place where it writes nothing else the watcher already watched:
 // a fetch and a pack-refs from the main repository (their FETCH_HEAD is not the worktree's).
 describe('watchWorktree on the git metadata', () => {
-  /** Calls `onChange` counts: the watcher runs on `worktree` and is closed by the test's end. */
+  /** The `onChange` calls of a watcher on `worktree` (`changed`, and `reached(n)` to wait for the n-th), closed by `close`. */
   async function watched(worktree: string) {
-    const changed = vi.fn();
+    const { spy: changed, reached } = counted();
     const watcher = await watchWorktree(worktree, changed);
-    return { changed, close: () => watcher.close() };
+    return { changed, reached, close: () => watcher.close() };
   }
 
   test('AC13 — a git commit made in the worktree calls onChange', async () => {
     const { worktree } = await makeShippableWorkspace();
     await writeFile(join(worktree, 'a.txt'), 'edited\n');
-    const { changed, close } = await watched(worktree);
+    const { changed, reached, close } = await watched(worktree);
     try {
       git(worktree, 'commit', '-q', '-am', 'edit a');
 
-      await vi.waitFor(() => expect(changed).toHaveBeenCalled(), { timeout: 5_000 });
+      await reached(1);
+      expect(changed).toHaveBeenCalled();
     } finally {
       close();
     }
@@ -545,11 +571,12 @@ describe('watchWorktree on the git metadata', () => {
   test('AC13 — a git push -u origin <branch> made in the worktree calls onChange', async () => {
     const { worktree } = await makeShippableWorkspace();
     await commitFile(worktree, 'one.txt', 'one');
-    const { changed, close } = await watched(worktree);
+    const { changed, reached, close } = await watched(worktree);
     try {
       git(worktree, 'push', '-q', '-u', 'origin', 'feat');
 
-      await vi.waitFor(() => expect(changed).toHaveBeenCalled(), { timeout: 5_000 });
+      await reached(1);
+      expect(changed).toHaveBeenCalled();
     } finally {
       close();
     }
@@ -561,11 +588,12 @@ describe('watchWorktree on the git metadata', () => {
     git(await tempDir(), 'clone', '--quiet', origin, other);
     await commitFile(other, 'theirs.txt', 'theirs');
     git(other, 'push', '--quiet', 'origin', 'main');
-    const { changed, close } = await watched(worktree);
+    const { changed, reached, close } = await watched(worktree);
     try {
       git(repo, 'fetch', '--quiet', 'origin');
 
-      await vi.waitFor(() => expect(changed).toHaveBeenCalled(), { timeout: 5_000 });
+      await reached(1);
+      expect(changed).toHaveBeenCalled();
     } finally {
       close();
     }
@@ -577,11 +605,12 @@ describe('watchWorktree on the git metadata', () => {
     // of packed-refs is then the only change in the watched places.
     git(repo, 'pack-refs', '--all');
     git(repo, 'branch', 'extra');
-    const { changed, close } = await watched(worktree);
+    const { changed, reached, close } = await watched(worktree);
     try {
       git(repo, 'pack-refs', '--all');
 
-      await vi.waitFor(() => expect(changed).toHaveBeenCalled(), { timeout: 5_000 });
+      await reached(1);
+      expect(changed).toHaveBeenCalled();
     } finally {
       close();
     }
@@ -589,36 +618,49 @@ describe('watchWorktree on the git metadata', () => {
 
   test('AC13 — branchStatus and listChanges on a settled worktree call nothing, even with a stale index, and a commit still does', async () => {
     const { worktree } = await makeShippableWorkspace();
-    const { changed, close } = await watched(worktree);
+    // A tracked file with the same content and another mtime: a plain `git status` would refresh the
+    // index and write it, which the watcher on the gitdir would see again and again. Made before the
+    // watch starts, whose start reports nothing of what happened before it.
+    const stale = join(worktree, 'a.txt');
+    await writeFile(stale, await readFile(stale));
+    await utimes(stale, new Date(1_600_000_000_000), new Date(1_600_000_000_000));
+    const { changed, reached, close } = await watched(worktree);
     try {
-      // A tracked file with the same content and another mtime: a plain `git status` would refresh the
-      // index and write it, which the watcher on the gitdir would see again and again. The write is
-      // made under the watch and waited for until it stops reporting, so a late event of it (slow
-      // runner) cannot land in the window below: only events caused by the reads could fail it.
-      const stale = join(worktree, 'a.txt');
-      await writeFile(stale, await readFile(stale));
-      await utimes(stale, new Date(1_600_000_000_000), new Date(1_600_000_000_000));
-      await vi.waitFor(() => expect(changed).toHaveBeenCalled(), { timeout: 5_000 });
-      for (let calls = -1; calls !== changed.mock.calls.length; ) {
-        calls = changed.mock.calls.length;
-        await new Promise((resolve) => setTimeout(resolve, 600));
-      }
-      changed.mockClear();
+      // What the watcher watches besides the worktree itself: the worktree's git folder, the remote refs and packed-refs.
+      const [gitDir, commonDir] = git(worktree, 'rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir').split('\n');
+      const watchedPlaces = [worktree, gitDir!, join(commonDir!, 'refs', 'remotes'), join(commonDir!, 'packed-refs')];
+      const before = watchedPlaces.map(snapshot);
+      // The comparison below is not empty: the worktree and its git folder are listed.
+      expect(before[0]!.length).toBeGreaterThan(1);
+      expect(before[1]!.length).toBeGreaterThan(1);
 
       for (let round = 0; round < 3; round++) {
         await branchStatus(worktree, { env: testEnv });
         await listChanges(worktree, { env: testEnv });
       }
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
+
+      // The cause: the reads wrote nothing in the places the watcher watches (the events of a write would
+      // reach it, a debounce later). A quiet period cannot show it, so the places are compared.
+      expect(watchedPlaces.map(snapshot)).toEqual(before);
       expect(changed).not.toHaveBeenCalled();
 
       git(worktree, 'commit', '-q', '--allow-empty', '-m', 'an empty commit');
-      await vi.waitFor(() => expect(changed).toHaveBeenCalled(), { timeout: 5_000 });
+      await reached(1);
+      expect(changed).toHaveBeenCalled();
     } finally {
       close();
     }
   });
 });
+
+/** `root` and everything under it (if it is a folder, and exists) with size, modification time and inode: any write there changes the list. */
+function snapshot(root: string): string[] {
+  const names = existsSync(root) && lstatSync(root).isDirectory() ? readdirSync(root, { recursive: true }).map(String).sort() : [];
+  return ['', ...names].filter((name) => existsSync(join(root, name))).map((name) => {
+    const { size, mtimeMs, ino } = lstatSync(join(root, name));
+    return `${name} ${size} ${mtimeMs} ${ino}`;
+  });
+}
 
 describe('removeWorktree after a pull request merged', () => {
   test('AC11 — deletes a pushed branch whose commits are not on the base (squash-merge case), as it is merged into its upstream', async () => {

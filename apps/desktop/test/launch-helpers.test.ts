@@ -166,15 +166,16 @@ describe('with the built app', () => {
         probe.intervals++;
         return interval.apply(window, args);
       }) as typeof window.setInterval;
-      // The element the helper waits for appears 300 ms from now.
-      setTimeout(() => {
-        const element = document.createElement('div');
-        element.id = 'until-dom-probe';
-        document.body.append(element);
-      }, 300);
     });
 
-    await untilDom(page, (id: string) => document.getElementById(id) !== null, 'until-dom-probe');
+    // The helper starts first (its evaluation reaches the page before the next one), the test adds the element after.
+    const settled = untilDom(page, (id: string) => document.getElementById(id) !== null, 'until-dom-probe');
+    await page.evaluate(() => {
+      const element = document.createElement('div');
+      element.id = 'until-dom-probe';
+      document.body.append(element);
+    });
+    await settled;
 
     expect(await page.locator('#until-dom-probe').count()).toBe(1);
     const probe = await page.evaluate(() => (window as unknown as { __untilDomProbe: { observed: number; intervals: number } }).__untilDomProbe);

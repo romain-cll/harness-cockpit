@@ -2,7 +2,7 @@ import { rmSync, writeFileSync } from 'node:fs';
 import { describe, expect, test } from 'vitest';
 import { runCli } from '../src/cli';
 import { daemonFiles, SESSION_EVENTS } from '../src/index';
-import { connectTo, listenFake, listenSilent, makeHome, registerCleanup, shellOptions, startDaemon, until } from './helpers';
+import { connectTo, listenFake, listenSilent, makeHome, registerCleanup, sendOrError, shellOptions, startDaemon } from './helpers';
 
 // COCKPIT-56: the `cockpit` CLI. `runCli(argv, env, { stdout, stderr, exit })` is the logic of the
 // entry in `apps/cli/src/main.ts`, which only passes `process.argv.slice(2)`, `process.env`, the
@@ -44,7 +44,7 @@ describe('cockpit status', () => {
 
     expect(await runCliWith(['status', event], env)).toEqual({ out: '', err: '', exits: [0] });
 
-    await until(() => connection.statuses.length === 1, 'the status event');
+    await connection.when(() => connection.statuses.length === 1);
     expect(connection.statuses).toEqual([{ sessionId, event }]);
     expect((await connection.client.list()).find((entry) => entry.sessionId === sessionId)?.status).toBe(event);
   });
@@ -119,8 +119,9 @@ describe('cockpit usage', () => {
     for (const line of USAGE_LINES) expect(result.err).toContain(line);
     expect(result.err).not.toContain('--shell');
     expect(result.out).toBe('');
-    // A request, had there been one, would have reached the server by now.
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(requests).toEqual([]);
+    // A request of the CLI, had there been one, was written before it exited: it reaches the server before
+    // the test's own, sent on a connection opened after it.
+    await sendOrError(files.socket, { authorization: 'witness' });
+    expect(requests).toEqual(['witness']);
   });
 });

@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { runSetup, type SetupIo, type SetupReport } from '../src/setup';
-import { until } from './helpers';
+import { fifo, registerCleanup } from './helpers';
+
+registerCleanup();
 
 // COCKPIT-66 (AC23, AC24): `cockpit setup` writes the private OSC 6973 markers around the agent, in the
 // stream and in order, and its reports never hold the run back. `runSetup` with a fake io: the setup
@@ -49,7 +51,7 @@ beforeAll(() => {
   failingAgent = join(root, 'agent-exits-3');
   writeFileSync(agent, '#!/bin/sh\necho agent-ran >> "$LOG"\n');
   writeFileSync(failingAgent, '#!/bin/sh\necho agent-ran >> "$LOG"\nexit 3\n');
-  writeFileSync(shell, '#!/bin/sh\necho shell-ran >> "$LOG"\n');
+  writeFileSync(shell, '#!/bin/sh\necho shell-ran >> "$LOG"\n[ -z "$DONE" ] || echo done > "$DONE"\n');
   for (const stub of [agent, shell, failingAgent]) chmodSync(stub, 0o755);
   // macOS scans a new executable the first time it runs.
   const warm = join(root, 'warm.log');
@@ -122,10 +124,12 @@ describe('cockpit setup: agent markers', () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
     const io = makeIo(() => gate);
+    // The login shell, the last step of the run, writes to it once it has logged.
+    const shellRan = fifo();
 
-    const running = runSetup({ shell: true, agent: [agent] }, io, env());
+    const running = runSetup({ shell: true, agent: [agent] }, io, { ...env(), DONE: shellRan.path });
     try {
-      await until(() => events().length === 5, 'the whole run, with every report still unanswered', 5_000);
+      await shellRan.line();
       expect(events()).toEqual(['setup-ran', '<started>', 'agent-ran', '<exited>', 'shell-ran']);
     } finally {
       release();

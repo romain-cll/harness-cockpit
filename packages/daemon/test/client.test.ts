@@ -1,13 +1,15 @@
 import { EventEmitter } from 'node:events';
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
-import { describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { connectDaemon, daemonFiles, ensureDaemon, runDaemon } from '../src/index';
-import { BUILD, collectUncaught, listenFake, listenSilent, makeHome, onCleanup, registerCleanup, startDaemon, UNAUTHORIZED, UPGRADED, until } from './helpers';
+import { BUILD, collectUncaught, listenFake, listenSilent, makeHome, onCleanup, registerCleanup, startDaemon, UNAUTHORIZED, UPGRADED } from './helpers';
 
 // `ensureDaemon` with a fake `spawn`: the child is whatever the test makes of it (a daemon
 // started in this process, or a process that dies). A real detached Electron is the app tests'.
 
 registerCleanup();
+
+afterEach(() => void vi.useRealTimers());
 
 function fakeSpawn(home: string, behave: (child: EventEmitter) => void) {
   const calls: number[] = [];
@@ -20,13 +22,16 @@ function fakeSpawn(home: string, behave: (child: EventEmitter) => void) {
   return { spawn, calls, home };
 }
 
-// A fake child that is a daemon started in this process; `daemons` collects the handles.
-const startsDaemon = (home: string, daemons: Array<{ close(): Promise<void> }> = []) => () => {
-  void runDaemon({ home, build: BUILD }).then((daemon) => {
-    daemons.push(daemon);
-    onCleanup(() => daemon.close());
-  });
+// A fake child that is a daemon started in this process; `daemons` collects the handles, as the promises
+// `runDaemon` returns.
+const startsDaemon = (home: string, daemons: Array<Promise<{ close(): Promise<void> }>> = []) => () => {
+  const started = runDaemon({ home, build: BUILD });
+  daemons.push(started);
+  void started.then((daemon) => onCleanup(() => daemon.close()));
 };
+
+// The fake child exits once `ensureDaemon` has its `exit` listener (it adds it right after `spawn` returns).
+const exitsLater = (child: EventEmitter, ...exit: [number | null, string | null]) => void setImmediate(() => child.emit('exit', ...exit));
 
 describe('ensureDaemon', () => {
   test('AC1 — with no daemon of the build it spawns one and returns a connected client; a second call reuses it without spawning', async () => {
@@ -64,7 +69,7 @@ describe('ensureDaemon', () => {
     writeFileSync(log, 'Error: an earlier run failed\n');
     const fake = fakeSpawn(home, (child) => {
       appendFileSync(log, `starting\n${reason}\n`);
-      setTimeout(() => child.emit('exit', 1, null), 20);
+      exitsLater(child, 1, null);
     });
 
     const failure = await ensureDaemon({ home, build: BUILD, spawn: fake.spawn }).then(
@@ -81,16 +86,15 @@ describe('ensureDaemon', () => {
 describe('a daemon that dies (AC12)', () => {
   test('AC12 — the client reports the close when the daemon goes away, and the next ensureDaemon starts a new one', async () => {
     const home = makeHome();
-    const daemons: Array<{ close(): Promise<void> }> = [];
+    const daemons: Array<Promise<{ close(): Promise<void> }>> = [];
     const fake = fakeSpawn(home, startsDaemon(home, daemons));
     const client = await ensureDaemon({ home, build: BUILD, spawn: fake.spawn });
-    let closed = false;
-    client.onClose(() => (closed = true));
-    await until(() => daemons.length === 1, 'the daemon handle');
+    const closed = new Promise<void>((resolve) => client.onClose(resolve));
+    const daemon = await daemons[0]!;
 
-    await daemons[0]!.close();
+    await daemon.close();
 
-    await until(() => closed, 'onClose');
+    await closed;
     const next = await ensureDaemon({ home, build: BUILD, spawn: fake.spawn });
     onCleanup(() => next.close());
     expect(fake.calls).toHaveLength(2);
@@ -105,7 +109,7 @@ describe('a daemon that exits before it listens (AC21)', () => {
     mkdirSync(home, { recursive: true });
     const { log } = daemonFiles(home, 1, BUILD);
     prepare(log);
-    const fake = fakeSpawn(home, (child) => void setTimeout(() => child.emit('exit', ...exit), 20));
+    const fake = fakeSpawn(home, (child) => exitsLater(child, ...exit));
     return ensureDaemon({ home, build: BUILD, spawn: fake.spawn }).then(
       () => undefined,
       (error: Error) => error.message,
@@ -135,41 +139,63 @@ describe('connectDaemon against a server that is not a daemon', () => {
     return { home, files };
   };
 
+  // Only the product's timer is the test's clock (it runs when the daemon is known to be listening and
+  // silent, so a slow machine cannot expire it early); sockets and files stay real.
+  const advanceOnceSilent = async (arrived: Promise<void>, ms: number) => {
+    await arrived;
+    vi.advanceTimersByTime(ms);
+  };
+
   test('AC18 — a socket that accepts and never answers: connectDaemon gives up after the timeout, with a reason naming the socket', async () => {
     const { files } = fakeDaemon();
-    await listenSilent(files.socket);
+    const { connected } = await listenSilent(files.socket);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
 
-    const failure = await connectDaemon(files.socket, { timeoutMs: 300 }).then(
+    const failing = connectDaemon(files.socket, { timeoutMs: 300 }).then(
       () => undefined,
       (error: Error) => error,
     );
+    await advanceOnceSilent(connected, 300);
+    const failure = await failing;
 
     expect(failure?.message).toMatch(new RegExp(`^Cockpit's background service did not answer within [\\d.]+ s: ${files.socket}$`));
   }, 5_000);
 
   test('AC18 — hello that is never answered gives up after the timeout with the same reason', async () => {
     const { files } = fakeDaemon();
-    await listenFake(files.socket, ({ socket }) => socket.write(UPGRADED));
+    let helloSent!: () => void;
+    const hello = new Promise<void>((resolve) => (helloSent = resolve));
+    await listenFake(files.socket, ({ socket }) => {
+      // The next bytes on the connection are the client's hello.
+      socket.once('data', () => helloSent());
+      socket.write(UPGRADED);
+    });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const client = await connectDaemon(files.socket, { timeoutMs: 300 });
     onCleanup(() => client.close());
 
-    const failure = await client.hello(BUILD).then(
+    const failing = client.hello(BUILD).then(
       () => undefined,
       (error: Error) => error,
     );
+    await advanceOnceSilent(hello, 300);
+    const failure = await failing;
 
     expect(failure?.message).toMatch(new RegExp(`^Cockpit's background service did not answer within [\\d.]+ s: ${files.socket}$`));
   }, 5_000);
 
   test('AC18 — ensureDaemon on a socket that never answers rejects with that reason and starts no second daemon', async () => {
     const { home, files } = fakeDaemon();
-    await listenSilent(files.socket);
+    const { connected } = await listenSilent(files.socket);
     const fake = fakeSpawn(home, () => {});
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
 
-    const failure = await ensureDaemon({ home, build: BUILD, spawn: fake.spawn, timeoutMs: 300 }).then(
+    const failing = ensureDaemon({ home, build: BUILD, spawn: fake.spawn, timeoutMs: 300 }).then(
       () => undefined,
       (error: Error) => error,
     );
+    await advanceOnceSilent(connected, 300);
+    const failure = await failing;
 
     expect(failure?.message).toMatch(new RegExp(`^Cockpit's background service did not answer within [\\d.]+ s: ${files.socket}$`));
     expect(fake.calls).toHaveLength(0);

@@ -1,10 +1,9 @@
-import { spawn as spawnProcess } from 'node:child_process';
-import { chmodSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { execFileSync, spawn as spawnProcess } from 'node:child_process';
+import { chmodSync, closeSync, constants, mkdtempSync, openSync, rmSync, statSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
-import { createServer as createNetServer, type Socket } from 'node:net';
+import { createServer as createNetServer, Socket } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { setTimeout as sleep } from 'node:timers/promises';
 import { afterEach, expect } from 'vitest';
 import { connectDaemon, daemonFiles, runDaemon, type DaemonClient } from '../src/index';
 
@@ -74,6 +73,29 @@ export async function startDaemon(options: { home?: string; build?: string } = {
   return { home, build, daemon, files: daemonFiles(home, 1, build) };
 }
 
+/**
+ * Conditions on state that an event changes: `when(condition)` resolves once it holds, checked at once
+ * and after each `fire()`, which the source of the state calls at every event it emits. No timer.
+ */
+export function conditions(): { fire: () => void; when: (condition: () => boolean) => Promise<void> } {
+  const pending = new Set<() => void>();
+  return {
+    fire: () => {
+      for (const check of pending) check();
+    },
+    when: (condition) =>
+      new Promise<void>((resolve) => {
+        const check = () => {
+          if (!condition()) return;
+          pending.delete(check);
+          resolve();
+        };
+        pending.add(check);
+        check();
+      }),
+  };
+}
+
 export interface Connection {
   client: DaemonClient;
   data: Array<{ id: unknown; seq: number; data: string }>;
@@ -81,13 +103,17 @@ export interface Connection {
   statuses: Array<{ sessionId: string; event: string; exitCode?: number | null }>;
   closed: () => boolean;
   output: (id: unknown) => string;
+  /** Resolves once `condition()` holds, checked at once and at each data, exit, status or close event of this connection. */
+  when: (condition: () => boolean) => Promise<void>;
 }
 
 export async function connectTo(socketPath: string, build = BUILD): Promise<Connection> {
   const client = await connectDaemon(socketPath);
   onCleanup(() => client.close());
+  const { fire, when } = conditions();
   const connection: Connection = {
     client,
+    when,
     data: [],
     exits: [],
     statuses: [],
@@ -99,24 +125,55 @@ export async function connectTo(socketPath: string, build = BUILD): Promise<Conn
         .join(''),
   };
   let closed = false;
-  client.onData((event) => connection.data.push(event));
-  client.onExit((event) => connection.exits.push(event));
-  client.onStatus((event) => connection.statuses.push(event));
-  client.onClose(() => (closed = true));
+  client.onData((event) => void (connection.data.push(event), fire()));
+  client.onExit((event) => void (connection.exits.push(event), fire()));
+  client.onStatus((event) => void (connection.statuses.push(event), fire()));
+  client.onClose(() => void ((closed = true), fire()));
   await client.hello(build);
   return connection;
 }
 
-export async function until(condition: () => boolean | Promise<boolean>, what: string, timeout = 15_000): Promise<void> {
-  const deadline = Date.now() + timeout;
-  while (!(await condition())) {
-    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}`);
-    await sleep(20);
-  }
+export const waitForOutput = (connection: Connection, id: unknown, text: string) => connection.when(() => connection.output(id).includes(text));
+
+/** A FIFO: a line a process writes to `path` is an event, `line()` resolves with the first one. Released with the test. */
+export function fifo(): { path: string; line: () => Promise<string> } {
+  const path = join(makeHome(), 'fifo');
+  execFileSync('mkfifo', [path]);
+  // Read and write at once: a writer never blocks on a missing reader and no line is lost.
+  const reader = new Socket({ fd: openSync(path, constants.O_RDWR), readable: true, writable: false });
+  onCleanup(() => reader.destroy());
+  const first = new Promise<string>((resolve, reject) => {
+    let text = '';
+    reader.on('error', reject);
+    reader.on('data', (chunk) => {
+      text += chunk;
+      const end = text.indexOf('\n');
+      if (end < 0) return;
+      reader.destroy();
+      resolve(text.slice(0, end));
+    });
+  });
+  return { path, line: () => first };
 }
 
-export const waitForOutput = (connection: Connection, id: unknown, text: string, timeout?: number) =>
-  until(() => connection.output(id).includes(text), `"${text}" in the output of terminal ${String(id)}`, timeout);
+/**
+ * A process the test holds: `snippet` is shell text that replaces the running shell with `cat` reading a FIFO
+ * the test holds open for writing, so it lives until `release()` (which lets `cat` see the end of file) or is
+ * killed. Anything that ignored a signal before the `exec` keeps ignoring it. Released with the test.
+ */
+export function heldProcess(): { snippet: string; release: () => void } {
+  const path = join(makeHome(), 'hold');
+  execFileSync('mkfifo', [path]);
+  // Read and write at once: the open never waits for a reader, and the writer end stays ours.
+  const fd = openSync(path, constants.O_RDWR);
+  let open = true;
+  const release = () => {
+    if (open) closeSync(fd);
+    open = false;
+  };
+  onCleanup(release);
+  return { snippet: `exec cat < '${path}'`, release };
+}
 
 // eslint-disable-next-line no-control-regex
 export const stripAnsi = (text: string) => text.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007]*(?:\u0007|\u001b\\)|\u001b[()][A-Za-z0-9]|\u001b[=>78]/g, '');
@@ -180,7 +237,7 @@ export const sendOrError = (socketPath: string, options: Parameters<typeof send>
   );
 
 /**
- * Runs `run`, then lets the event loop go on for a moment, and gives back what reached
+ * Runs `run`, then lets the event loop turn once more (`setImmediate`), and gives back what reached
  * `uncaughtException` or `unhandledRejection` meanwhile (vitest's own handlers are set aside so
  * the run does not report them: the test does, as an assertion).
  */
@@ -194,7 +251,7 @@ export async function collectUncaught<T>(run: () => Promise<T>): Promise<{ resul
   for (const event of events) emitter.on(event, collect);
   try {
     const result = await run();
-    await sleep(100);
+    await new Promise((resolve) => setImmediate(resolve));
     return { result, uncaught };
   } finally {
     for (const event of events) emitter.off(event, collect);
@@ -211,12 +268,15 @@ export interface FakeRequest {
 /**
  * A server on `socketPath` that is not a daemon: it hands every request (the head, once it is
  * complete) to `onRequest`, which answers on the socket as the test wants. The connections are
- * destroyed with the test.
+ * destroyed with the test. `connected` resolves when the first connection arrives.
  */
-export async function listenFake(socketPath: string, onRequest: (request: FakeRequest) => void): Promise<void> {
+export async function listenFake(socketPath: string, onRequest: (request: FakeRequest) => void): Promise<{ connected: Promise<void> }> {
   const sockets = new Set<Socket>();
+  let markConnected!: () => void;
+  const connected = new Promise<void>((resolve) => (markConnected = resolve));
   const server = createNetServer((socket) => {
     sockets.add(socket);
+    markConnected();
     socket.on('close', () => sockets.delete(socket));
     socket.on('error', () => {});
     if (onRequest === NEVER) return;
@@ -235,6 +295,7 @@ export async function listenFake(socketPath: string, onRequest: (request: FakeRe
     for (const socket of sockets) socket.destroy();
     server.close();
   });
+  return { connected };
 }
 
 const NEVER = (): void => {};
