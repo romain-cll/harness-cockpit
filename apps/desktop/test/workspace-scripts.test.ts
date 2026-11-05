@@ -1,8 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
-import { launchBuilt, type Session, versionLabel } from './launch';
-import { addRepository, collectedPtyData, collectPtyData, deleteDialog, dialogTerminal, dispatchFocus, entryTitles, gitIn, holdWaiter, linkedWorktrees, localBranches, makeLightRepo, openDialogs, readRecords, startDeletion, teardownApi, type TempRepo, untilFewerOverlays, waiters, waitForEntries, waitForEntry, waitForLine, waitForNoEntry, writeConfig, writeScripts } from './support/projects';
+import { launchBuilt, type Session, untilRead, versionLabel } from './launch';
+import { addRepository, branchBox, collectedPtyData, collectPtyData, countIpcCalls, deleteButton, dialogTerminal, dispatchFocus, entryTitles, gitIn, holdWaiter, linkedWorktrees, localBranches, makeLightRepo, openDeleteDialog, openDialogs, readRecords, removeOptions, sidebarLines, teardownApi, type TempRepo, untilFewerOverlays, waiters, waitForDialogLine, waitForEntries, waitForEntry, waitForNoEntry, writeConfig, writeScripts } from './support/projects';
 import { expectNoErrors } from './support/sessions';
 import { dropTerminalWorkspace, focusPane, getShellPath, normalizeFnm, ptyHostPid, rowsOf, waitForRow, watchFrontmost } from './support/terminal';
 
@@ -87,15 +87,37 @@ describe('built app', () => {
       return path;
     }
 
-    // Opens the deletion dialog of a workspace and confirms it.
+    // Opens the deletion dialog of a workspace (`addExternal`'s `wt-<name>` folder holds the branch `<name>`), waits
+    // until it has read the workspace, and confirms it.
     async function confirmDeletion(path: string) {
       const { page } = session;
-      await startDeletion(page, path);
-      const dialog = openDialogs(page);
-      await dialog.first().waitFor();
-      await dialog.getByRole('button', { name: 'Delete', exact: true }).click();
-      return dialog;
+      const dialog = await openDeleteDialog(page, path, basename(path).slice('wt-'.length));
+      await deleteButton(dialog).click();
+      return openDialogs(page);
     }
+
+    // COCKPIT-68 AC17: what the dialog looks like while the teardown runs. Self-contained, for `untilRead`.
+    const readTeardownBlock = () => {
+      const dialog = document.querySelector('[role="alertdialog"], [role="dialog"]') as HTMLElement | null;
+      const xterm = dialog?.querySelector('.xterm') as HTMLElement | null;
+      if (!dialog || !xterm) return null;
+      let box: HTMLElement | null = xterm.parentElement;
+      while (box && box !== dialog && box.offsetHeight !== 120) box = box.parentElement;
+      // The element whose own text is the label (it may hold an icon besides).
+      const ownText = (element: Element) =>
+        [...element.childNodes].filter((node) => node.nodeType === Node.TEXT_NODE).map((node) => node.textContent ?? '').join('').trim();
+      const label = [...dialog.querySelectorAll('*')].find((element) => /^(Running teardown…|Teardown)$/.test(ownText(element)));
+      const del = [...dialog.querySelectorAll('button')].find((button) => /^\s*Delete\s*$/.test(button.textContent ?? ''));
+      return {
+        width: dialog.offsetWidth,
+        boxHeight: box && box !== dialog ? box.offsetHeight : null,
+        boxTop: box && box !== dialog ? box.getBoundingClientRect().top : null,
+        label: label ? ownText(label) : null,
+        labelBottom: label ? label.getBoundingClientRect().bottom : null,
+        deleteDisabled: !!del && (del.disabled || del.getAttribute('aria-disabled') === 'true'),
+        spinner: !!del?.querySelector('svg'),
+      };
+    };
 
     const records = (file: string) => readRecords(repo, file);
     const linesIn = (file: string) => {
@@ -103,7 +125,7 @@ describe('built app', () => {
       return existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean) : [];
     };
 
-    test('AC13, AC17, setup through the CLI AC11 — Delete runs `cockpit teardown` in a terminal of the dialog (header, "$ <command>" lines in order with their output, "✓ Teardown done", environment, worktree as cwd), and once it exits 0 the folder, the worktree, the branch and the row go', async () => {
+    test('AC13, AC17, setup through the CLI AC11, COCKPIT-68 AC17 — Delete runs `cockpit teardown` in a terminal of the dialog (header, "$ <command>" lines in order with their output, "✓ Teardown done", environment, worktree as cwd), and once it exits 0 the folder, the worktree, the branch and the row go', async () => {
       const { page } = session;
       const record = 'sh "$COCKPIT_ROOT_PATH/record.sh" teardown-env.txt';
       const wait = 'sh "$COCKPIT_ROOT_PATH/waitfor.sh" go-td';
@@ -112,7 +134,10 @@ describe('built app', () => {
       const path = await addExternal('td-ok');
       await collectPtyData(page);
 
-      const dialog = await confirmDeletion(path);
+      const opened = await openDeleteDialog(page, path, 'td-ok');
+      expect(await opened.evaluate((element) => (element as HTMLElement).offsetWidth), 'before Delete').toBe(420);
+      await deleteButton(opened).click();
+      const dialog = openDialogs(page);
       const pane = await dialogTerminal(page);
       await waitForRow(page, `$ ${wait}`, pane);
       const rows = await rowsOf(pane);
@@ -124,6 +149,14 @@ describe('built app', () => {
       expect(rows[at('$ echo teardown-second') + 1]).toBe('teardown-second');
       expect(at('$ echo teardown-second')).toBeLessThan(at(`$ ${wait}`));
       await waiter.pid();
+      // COCKPIT-68 AC17: the dialog grew to 460 px, "Running teardown…" sits above a 120 px terminal box, and Delete is
+      // disabled with a spinner.
+      const running = (await untilRead(page, readTeardownBlock, (found) => found !== null && found.width === 460))!;
+      expect(running.label).toBe('Running teardown…');
+      expect(running.boxHeight, 'the terminal box').toBe(120);
+      expect(running.labelBottom!, 'the label is above the box').toBeLessThanOrEqual(running.boxTop! + 1);
+      expect(running.deleteDisabled, 'Delete is disabled').toBe(true);
+      expect(running.spinner, 'Delete shows a spinner').toBe(true);
       // Nothing is removed while the teardown runs.
       expect(existsSync(path)).toBe(true);
       expect(await isListed(path)).toBe(true);
@@ -151,11 +184,11 @@ describe('built app', () => {
       expect(normalizeFnm(found[0]!.path!).endsWith(normalizeFnm(await getShellPath(page)))).toBe(true);
     }, 60_000);
 
-    test('AC14, setup through the CLI AC11 — a failing teardown keeps the worktree and the row and shows the output, the CLI\'s "✗ Teardown failed" line, "Teardown failed with exit code N" and Delete anyway, which removes the workspace (an unmerged branch is kept and says so) without running the teardown again', async () => {
+    test('AC14, setup through the CLI AC11, COCKPIT-68 AC17 — a failing teardown keeps the worktree and the row, labels the terminal "Teardown" and shows its output, the CLI\'s "✗ Teardown failed" line, "Teardown failed with exit code N" and "Delete anyway", which removes the worktree and keeps the unchecked branch without a "was kept" line and without running the teardown again', async () => {
       const { page } = session;
       writeConfig(repo, { teardown: ['echo td-fail-output', 'echo ran >> "$COCKPIT_ROOT_PATH/td14.log"; exit 5'] });
       const path = await addExternal('td-fail');
-      gitIn(path, 'commit', '--allow-empty', '-m', 'unmerged work');
+      const commit = (gitIn(path, 'commit', '--allow-empty', '-m', 'unmerged work'), gitIn(path, 'rev-parse', 'HEAD'));
       await collectPtyData(page);
 
       const dialog = await confirmDeletion(path);
@@ -165,40 +198,71 @@ describe('built app', () => {
       const printed = await collectedPtyData(page);
       expect(printed).toContain('cockpit teardown · td-fail · .cockpit/config.json');
       expect(printed).toContain('✗ Teardown failed: echo ran >> "$COCKPIT_ROOT_PATH/td14.log"; exit 5 exited with code 5');
-      expect(await dialog.getByRole('button', { name: 'Delete anyway', exact: true }).count()).toBe(1);
+      expect((await untilRead(page, readTeardownBlock, (found) => found?.label === 'Teardown'))!.label).toBe('Teardown');
+      expect(await deleteButton(dialog, 'Delete anyway').count()).toBe(1);
+      expect(await branchBox(dialog, 'td-fail').isChecked(), 'the box stays as it was shown').toBe(false);
       expect(existsSync(path)).toBe(true);
       expect(await isListed(path)).toBe(true);
       expect(linesIn('td14.log')).toHaveLength(1);
 
-      await dialog.getByRole('button', { name: 'Delete anyway', exact: true }).click();
+      await deleteButton(dialog, 'Delete anyway').click();
       await dialog.first().waitFor({ state: 'hidden' });
       await waitUnlisted(path);
 
       expect(existsSync(path)).toBe(false);
       expect(linkedWorktrees(repo).map((worktree) => worktree.path)).not.toContain(path);
       expect(localBranches(repo)).toContain('td-fail');
-      await waitForLine(page, 'Branch td-fail was kept: it is not merged.');
+      expect(gitIn(repo.root, 'rev-parse', 'td-fail')).toBe(commit);
+      expect((await entryTitles(page)).includes(path)).toBe(false);
+      expect((await sidebarLines(page)).filter((line) => line.startsWith('Branch '))).toEqual([]);
       expect(linesIn('td14.log')).toHaveLength(1);
     }, 60_000);
 
-    test('AC15 — after a teardown that exited 0, the uncommitted-changes step does not run it a second time', async () => {
-      const { page } = session;
-      writeConfig(repo, { teardown: ['echo ran >> "$COCKPIT_ROOT_PATH/td15.log"'] });
+    test('COCKPIT-68 AC15 — a teardown that writes a file into a worktree that was clean: nothing is removed, the dialog stays open with the warning, and the next Delete removes the worktree without running the teardown again', async () => {
+      writeConfig(repo, { teardown: ['echo ran >> "$COCKPIT_ROOT_PATH/td15.log"', 'touch "$COCKPIT_WORKSPACE_PATH/made-by-teardown.txt"'] });
       const path = await addExternal('td-dirty');
-      writeFileSync(join(path, 'notes.txt'), 'untracked\n');
 
-      await confirmDeletion(path);
-      const warning = deleteDialog(page, 'td-dirty has uncommitted changes');
-      await warning.waitFor();
+      const dialog = await confirmDeletion(path);
+      await waitForDialogLine(dialog, /^It has uncommitted changes\. They will be lost\.$/);
       expect(linesIn('td15.log')).toHaveLength(1);
+      expect(existsSync(join(path, 'made-by-teardown.txt'))).toBe(true);
       expect(existsSync(path)).toBe(true);
+      expect(await isListed(path)).toBe(true);
+      expect(await dialog.first().isVisible()).toBe(true);
 
-      await warning.getByRole('button', { name: 'Delete anyway', exact: true }).click();
-      await warning.waitFor({ state: 'hidden' });
+      await deleteButton(dialog).click();
+      await dialog.first().waitFor({ state: 'hidden' });
       await waitUnlisted(path);
 
       expect(existsSync(path)).toBe(false);
       expect(linesIn('td15.log')).toHaveLength(1);
+    });
+
+    test('COCKPIT-68 AC25 — a failing teardown on a worktree with the warning on screen: one "Delete anyway" removes the worktree with its changes (force sent) and does not run the teardown again', async () => {
+      const { page } = session;
+      writeConfig(repo, { teardown: ['echo ran >> "$COCKPIT_ROOT_PATH/td25.log"; exit 4'] });
+      const path = await addExternal('td-force');
+      writeFileSync(join(path, 'unsaved.txt'), 'uncommitted work\n');
+      await countIpcCalls(session, ['workspaces:remove']);
+      const removesBefore = (await removeOptions(session)).length;
+
+      const dialog = await openDeleteDialog(page, path, 'td-force');
+      expect(await dialog.innerText()).toContain('It has uncommitted changes. They will be lost.');
+      await deleteButton(dialog).click();
+      await dialog.getByText('Teardown failed with exit code 4').waitFor();
+      expect(existsSync(path)).toBe(true);
+      expect(linesIn('td25.log')).toHaveLength(1);
+
+      await deleteButton(dialog, 'Delete anyway').click();
+      await dialog.first().waitFor({ state: 'hidden' });
+      await waitUnlisted(path);
+
+      expect(existsSync(path)).toBe(false);
+      expect(linkedWorktrees(repo).map((worktree) => worktree.path)).not.toContain(path);
+      expect(linesIn('td25.log')).toHaveLength(1);
+      const sent = (await removeOptions(session)).slice(removesBefore);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.force, 'the warning was on screen').toBe(true);
     });
 
     test('AC15 — Escape on a running teardown ends its process and keeps the workspace', async () => {
@@ -235,7 +299,7 @@ describe('built app', () => {
       await dialog.getByText(/Teardown (failed with exit code \d+|ended before it finished\.)/).waitFor();
       expect(await collectedPtyData(page)).toMatch(/✗ Teardown failed: .*waitfor\.sh.* was killed by SIGINT/);
       await waiter.gone;
-      expect(await dialog.getByRole('button', { name: 'Delete anyway', exact: true }).count()).toBe(1);
+      expect(await deleteButton(dialog, 'Delete anyway').count()).toBe(1);
       expect(existsSync(path)).toBe(true);
       expect(linkedWorktrees(repo).map((worktree) => worktree.path)).toContain(path);
       expect(localBranches(repo)).toContain('td-signal');
@@ -251,12 +315,12 @@ describe('built app', () => {
 
       const dialog = await confirmDeletion(path);
       await dialog.getByText(refused.message!).first().waitFor();
-      expect(await dialog.getByRole('button', { name: 'Delete anyway', exact: true }).count()).toBe(1);
+      expect(await deleteButton(dialog, 'Delete anyway').count()).toBe(1);
       expect(existsSync(path)).toBe(true);
       expect(localBranches(repo)).toContain('td-bad');
       expect(await isListed(path)).toBe(true);
 
-      await dialog.getByRole('button', { name: 'Delete anyway', exact: true }).click();
+      await deleteButton(dialog, 'Delete anyway').click();
       await dialog.first().waitFor({ state: 'hidden' });
       await waitUnlisted(path);
 

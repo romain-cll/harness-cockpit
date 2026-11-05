@@ -6,7 +6,7 @@ import { type Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 import { agentSelect, baseSelect, createButton, detectAgain, itemTexts, openComposer, openPopup, promptBox, useAgent, waitForAgent, waitForMessage } from './composer';
 import { daemonSocketIn, gonePipe, heldProcess, isAlive, MAIN_PROCESS_ERROR, type Session, startClock, truthy, untilIn, untilRead, versionLabel } from './launch';
-import { addRepository, afterIpcAnswers, countIpcCalls, deleteDialog, destructiveColor, dispatchFocus, entryTitles, gitIn, holdWaiter, INVOKE_HANDLERS, ipcCallArgs, ipcCalls, isBelowProjectsHeader, linkedWorktrees, makeRepo, mutedColor, readRecords, removeThroughMenu, setupLabel, setupLinkCount, sidebarLines, startDeletion, stateSnapshot, type TempRepo, untilAnswered, untilFewerOverlays, waitForEntries, waitForEntry, waitForLine, waitForNoEntry, waitForSetupLabel, worktreePath, writeConfig, writeScripts } from './support/projects';
+import { addRepository, afterIpcAnswers, countIpcCalls, deleteButton, deleteDialog, destructiveColor, dispatchFocus, entryTitles, gitIn, holdWaiter, INVOKE_HANDLERS, ipcCallArgs, ipcCalls, isBelowProjectsHeader, linkedWorktrees, makeRepo, mutedColor, openDeleteDialog, readRecords, removeOptions, removeThroughMenu, setupLabel, setupLinkCount, sidebarLines, startDeletion, startProjectRemoval, stateSnapshot, type TempRepo, untilAnswered, untilFewerOverlays, waitForDialogLine, waitForEntries, waitForEntry, waitForLine, waitForNoEntry, waitForSetupLabel, worktreePath, writeConfig, writeScripts } from './support/projects';
 import { addOpenFixture, allSessionLinkIds, childPidsOf, closeMenus, controlTokenIn, createPlainWorkspace, createWorkspaceWithAgent, expectDot, expectNoErrors, expectSetupSpawnedWithDetectedPath, FIRST_MENU, hookCommandsOf, INHERITED_CONTROL_ENV, launchBuiltWith, makeSessionsFixture, moveMouseAway, OPEN_BUNDLES, type OpenFixture, openRuns, openSessionEntry, openSubmenu, openWorkspaceMenu, openWorkspaceStartMenu, pickInSubmenu, pickTopItem, postSessionEvent, readSessionLinks, readStub, readStubEnv, rememberedApps, REPOSITORY_CLI, sessionEntries, sessionFoldersIn, sessionIdOf, type SessionLinksArg, type SessionsFixture, sessionsInState, setOpenOutcome, singleQuoted, startApi, STARTED_PROMPT, startForeignSetup, startInWorkspace, startPlusLabel, startRuns, startSession, stubPids, stubRuns, submenuNamed, submenuTexts, trimmed, versionRuns, waitForOpenRuns, waitForSessionEntries, waitForWorkspaceTabs, workspacesApi, workspaceTabs } from './support/sessions';
 import { ensurePtyLog, exitCount, focusedPane, focusTerminal, goHome, killPtyHost, openShellTab, outputOf, ptyHostPid, ptyKill, ptyWrite, spawnShell, terminalOfSession, terminalRows, typeLine, untilPtyLog, visiblePanes, waitForExit, waitForOutput, waitForRow } from './support/terminal';
 
@@ -674,29 +674,42 @@ describe('sessions: built app', () => {
     expect(loginShellRuns()).toBe(before + 1);
   });
 
-  test('workspace sessions AC9 — deleting a workspace ends its running sessions once the removal succeeds (not at the uncommitted-changes step); the entries go, state.json keeps them', async () => {
+  test('workspace sessions AC9, COCKPIT-68 AC14, AC15 — Cancel and Escape on the Delete dialog end nothing; a file that appears after it opened makes the first Delete end nothing and show the warning; the click that follows removes the workspace and ends its running sessions (the entries go, state.json keeps them)', async () => {
     const { page } = session;
     expect(ws.fix.path, 'the AC5 test created the workspace').not.toBe('');
-    writeFileSync(join(ws.fix.path, 'notes.txt'), 'untracked\n');
     expect(isAlive(ws.fix.pid)).toBe(true);
     const sessionsBefore = sessionsInState(session.dataDir);
     await ensurePtyLog(page);
     const terminal = await terminalOfSession(page, ws.fix.id);
+    await countIpcCalls(session, ['workspaces:remove']);
+    const removesBefore = (await removeOptions(session)).length;
 
-    await startDeletion(page, ws.fix.path);
-    const dialog = deleteDialog(page, 'Delete fix-the-tests?');
-    await dialog.waitFor();
-    await dialog.getByRole('button', { name: 'Delete', exact: true }).click();
-    const warning = deleteDialog(page, 'fix-the-tests has uncommitted changes');
-    await warning.waitFor();
+    for (const dismiss of ['Cancel', 'Escape'] as const) {
+      const closing = await openDeleteDialog(page, ws.fix.path, 'fix-the-tests');
+      if (dismiss === 'Cancel') await closing.getByRole('button', { name: 'Cancel', exact: true }).click();
+      else await page.keyboard.press('Escape');
+      await closing.waitFor({ state: 'hidden' });
+      await afterIpcAnswers(page);
+      expect((await removeOptions(session)).length).toBe(removesBefore);
+      expect(await terminalOfSession(page, ws.fix.id), `the session is still listed after ${dismiss}`).toBe(terminal);
+      expect(isAlive(ws.fix.pid), `the harness runs after ${dismiss}`).toBe(true);
+      expect(existsSync(ws.fix.path)).toBe(true);
+    }
+
+    // The workspace was clean when the dialog read it; a file appears before Delete is clicked.
+    const dialog = await openDeleteDialog(page, ws.fix.path, 'fix-the-tests');
+    writeFileSync(join(ws.fix.path, 'notes.txt'), 'untracked\n');
+    await deleteButton(dialog).click();
+    await waitForDialogLine(dialog, /^It has uncommitted changes\. They will be lost\.$/);
     // The warning is the answer of the first removal. Ending a terminal takes it out of the page's list at once,
     // so the list tells whether the sessions were ended at this step.
     expect(await terminalOfSession(page, ws.fix.id), 'the session is still listed').toBe(terminal);
     expect(isAlive(ws.fix.pid), 'the harness runs while the warning is shown').toBe(true);
     expect(existsSync(ws.fix.path)).toBe(true);
+    expect(await dialog.isVisible()).toBe(true);
 
-    await warning.getByRole('button', { name: 'Delete anyway', exact: true }).click();
-    await warning.waitFor({ state: 'hidden' });
+    await deleteButton(dialog).click();
+    await dialog.waitFor({ state: 'hidden' });
     await waitForNoEntry(page, ws.fix.path);
 
     expect(existsSync(ws.fix.path)).toBe(false);
@@ -705,15 +718,31 @@ describe('sessions: built app', () => {
     expect(await allSessionLinkIds(page)).not.toContain(ws.fix.id);
     expect(sessionsInState(session.dataDir)).toEqual(sessionsBefore);
     expect(sessionsInState(session.dataDir).map((entry) => entry.id)).toContain(ws.fix.id);
+    const sent = (await removeOptions(session)).slice(removesBefore);
+    expect(sent.map((options) => options.force ?? false)).toEqual([false, true]);
   });
 
-  test('workspace sessions AC10 — removing the project ends its workspaces\' running sessions; adding it again shows its workspaces with no tab, and state.json held the sessions throughout', async () => {
+  test('workspace sessions AC10, COCKPIT-68 AC5, AC6 — removing the project ends its workspaces\' running sessions; adding it again shows its workspaces with no tab, and state.json held the sessions throughout', async () => {
     const { page } = session;
     const running = [ws.blank.pid, ...ws.plus.pids];
     for (const pid of running) expect(isAlive(pid)).toBe(true);
     const sessionsBefore = sessionsInState(session.dataDir);
     await ensurePtyLog(page);
     const terminals = await Promise.all([ws.blank.id, ...ws.plus.ids].map((id) => terminalOfSession(page, id)));
+
+    // COCKPIT-68 AC5: Cancel and Escape on the dialog end nothing.
+    await countIpcCalls(session, ['projects:remove']);
+    const removesBefore = await ipcCalls(session, 'projects:remove');
+    for (const dismiss of ['Cancel', 'Escape'] as const) {
+      const closing = await startProjectRemoval(page, repo.root);
+      if (dismiss === 'Cancel') await closing.getByRole('button', { name: 'Cancel', exact: true }).click();
+      else await page.keyboard.press('Escape');
+      await closing.waitFor({ state: 'hidden' });
+      await afterIpcAnswers(page);
+      expect(await ipcCalls(session, 'projects:remove'), dismiss).toBe(removesBefore);
+      for (const pid of running) expect(isAlive(pid), `${dismiss}: a session keeps running`).toBe(true);
+      expect(await entryTitles(page)).toContain(repo.root);
+    }
 
     await removeThroughMenu(page, repo.root);
     await waitForNoEntry(page, repo.root);

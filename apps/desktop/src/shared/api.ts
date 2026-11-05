@@ -101,6 +101,9 @@ export type BranchesResult =
 
 export type CreateWorkspaceResult = { status: 'created'; workspace: Workspace } | Refused;
 
+/** What deleting a workspace would lose: `uncommitted` changes, and whether its branch is `merged` (`null`: no branch). */
+export type RemovalResult = { status: 'read'; uncommitted: boolean; merged: boolean | null } | Refused;
+
 /** `dirty`: the workspace has uncommitted changes and was not removed. `branchKept`: its branch is not merged. */
 export type RemoveWorkspaceResult = { status: 'removed'; branchKept: boolean } | { status: 'dirty' } | Refused;
 
@@ -270,8 +273,18 @@ export interface Api {
      * worktree under `$COCKPIT_HOME/worktrees`.
      */
     create(project: string, task: string, base: string): Promise<CreateWorkspaceResult>;
-    /** Removes the worktree, and its branch when merged; `force` removes it with its uncommitted changes. */
-    remove(project: string, path: string, options?: { force?: boolean }): Promise<RemoveWorkspaceResult>;
+    /** Reads what removing the worktree would lose, without writing anything. */
+    removal(project: string, path: string): Promise<RemovalResult>;
+    /**
+     * Removes the worktree. `force` removes it with its uncommitted changes; `deleteBranch` also deletes its
+     * branch when merged; `forceBranch`, the name of the branch the caller showed, deletes it whatever its state
+     * if it is still the worktree's branch.
+     */
+    remove(
+      project: string,
+      path: string,
+      options: { force?: boolean; deleteBranch?: boolean; forceBranch?: string },
+    ): Promise<RemoveWorkspaceResult>;
     /** The detected editors and terminals, looked up at each call. */
     apps(): Promise<AppsResult>;
     /** Shows the worktree in the Finder. Refused when the path is not a linked worktree of the project. */
