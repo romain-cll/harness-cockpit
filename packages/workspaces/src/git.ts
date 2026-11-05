@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, type ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -50,13 +50,17 @@ export interface GitOptions {
  * executable included: with a `cwd`, ENOENT also means the folder is missing.
  */
 export async function git(args: string[], { cwd, env, maxBuffer, signal }: GitOptions = {}): Promise<string> {
-  const run = execFileAsync('git', args, { cwd, env, signal, maxBuffer: maxBuffer ?? DEFAULT_MAX_BUFFER });
+  let child: ChildProcess | undefined;
   try {
+    // Started inside the `try`: a `cwd` that is a file makes `spawn` throw at once.
+    const run = execFileAsync('git', args, { cwd, env, signal, maxBuffer: maxBuffer ?? DEFAULT_MAX_BUFFER });
+    child = run.child;
     return (await run).stdout;
   } catch (error) {
     // `execFile` rejects at the abort, before git has exited and finished what it was doing.
-    if (signal?.aborted && run.child.exitCode === null && run.child.signalCode === null) {
-      await new Promise((resolve) => run.child.once('exit', resolve));
+    const running = child;
+    if (running && signal?.aborted && running.exitCode === null && running.signalCode === null) {
+      await new Promise((resolve) => running.once('exit', resolve));
     }
     const failure = error as NodeJS.ErrnoException & { stderr?: string };
     throw new WorkspaceError(

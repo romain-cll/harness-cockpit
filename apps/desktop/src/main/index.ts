@@ -741,7 +741,7 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
   });
 
   const badName = (name: string): Refused | undefined => {
-    const message = nameProblem(name);
+    const message = name === '' ? 'A project name is required.' : nameProblem(name);
     return message ? { status: 'refused', message } : undefined;
   };
 

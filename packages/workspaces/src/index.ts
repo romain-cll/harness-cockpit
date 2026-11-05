@@ -51,7 +51,8 @@ export async function cloneRepository({
   try {
     await git(['clone', '--', url, path], { env: { ...env, GIT_TERMINAL_PROMPT: '0' }, signal });
   } catch (error) {
-    await rm(path, { recursive: true, force: true });
+    // A removal that fails (the location holds a file where a folder is needed) never replaces git's error.
+    await rm(path, { recursive: true, force: true }).catch(() => {});
     throw error;
   }
 }
@@ -59,12 +60,14 @@ export async function cloneRepository({
 /**
  * Makes `path` (an existing folder) a repository holding one empty commit, so that a worktree can start from
  * it; its files stay untracked. Without an identity git resolves in the new repository, `GIT_IDENTITY_MISSING`.
- * On any failure `.git` is removed again; a folder that already has one is refused (`GIT_DIR_EXISTS`) and left
- * untouched, so the rollback only removes what this call made.
+ * On any failure `.git` is removed again. A folder that already has one is left untouched, so the rollback only
+ * removes what this call made: it resolves if git reads the folder as a repository (a retry after a failed save),
+ * else `GIT_DIR_EXISTS`.
  */
 export async function initRepository({ path, env }: { path: string } & GitEnv): Promise<void> {
   await checkGit(env);
   if (await exists(join(path, '.git'))) {
+    if (await succeeds(['rev-parse', '--is-inside-work-tree'], { cwd: path, env })) return;
     throw new WorkspaceError('GIT_DIR_EXISTS', `${path} already has a .git that git cannot use. Nothing was changed.`);
   }
   await git(['init'], { cwd: path, env });
