@@ -68,7 +68,7 @@ describe('single instance: built app', () => {
     try {
       for (const other of [one, two]) {
         await other.page.getByText(versionLabel).waitFor();
-        await other.page.getByRole('heading', { name: 'New workspace', exact: true }).waitFor();
+        await other.page.getByText('No projects yet', { exact: true }).waitFor();
         expect(other.output()).not.toContain("Cockpit's background service could not start");
         expect(other.output()).not.toMatch(MAIN_PROCESS_ERROR);
       }

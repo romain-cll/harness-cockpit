@@ -102,15 +102,53 @@ export const pickerOpenedAfter = (session: Session, before: number) =>
     else picker.opened = resolve;
   })`);
 
-// Clicks "Add project" with the picker answering `pick`, and waits until the
-// app has opened the picker. What the app does with the answer is the caller's
-// to wait for.
+// Opens the Projects "+" ("Add project") menu and gives it: "Open project…" (⌘O), "Clone from Git…", "Create new…".
+export async function openAddMenu(page: Page) {
+  const trigger = page.getByRole('button', { name: 'Add project', exact: true });
+  const id = await trigger.getAttribute('id');
+  await trigger.click();
+  const menu = page.locator(`[role="menu"][aria-labelledby="${id}"]`);
+  await menu.waitFor();
+  return menu;
+}
+
+// Picks an item of the Projects "+" menu.
+export async function pickAddItem(page: Page, item: 'Open project…' | 'Clone from Git…' | 'Create new…') {
+  const menu = await openAddMenu(page);
+  await menu.getByRole('menuitem', { name: new RegExp(`^${item}`) }).click();
+}
+
+// Picks "Open project…" in the Projects "+" menu with the picker answering `pick`, and waits until the
+// app has opened the picker. What the app does with the answer is the caller's to wait for.
 export async function addProject(session: Session, pick: string | null) {
   await stubPicker(session, pick);
   const before = await pickerCalls(session);
-  await session.page.getByRole('button', { name: 'Add project', exact: true }).click();
+  await pickAddItem(session.page, 'Open project…');
   const after = await pickerOpenedAfter(session, before);
-  expect(after, 'clicking "Add project" opens the folder picker').toBeGreaterThan(before);
+  expect(after, 'picking "Open project…" opens the folder picker').toBeGreaterThan(before);
+}
+
+// --- Clone and Create dialogs (COCKPIT-72)
+
+export const cloneDialog = (page: Page) => openDialogs(page).filter({ has: page.getByRole('textbox', { name: 'Repository URL' }) });
+export const createDialog = (page: Page) =>
+  openDialogs(page)
+    .filter({ has: page.getByRole('textbox', { name: 'Project name' }) })
+    .filter({ hasNot: page.getByRole('textbox', { name: 'Repository URL' }) });
+export const urlBox = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('textbox', { name: 'Repository URL' });
+export const nameBox = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('textbox', { name: 'Project name' });
+export const cloneButton = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('button', { name: 'Clone', exact: true });
+export const submitCreate = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('button', { name: 'Create', exact: true });
+export const choose = (dialog: ReturnType<Page['locator']>) => dialog.getByRole('button', { name: 'Choose…', exact: true });
+
+// Picks the dialog's location through "Choose…" (the stubbed picker answers `folder`) and waits for its hint, which
+// shows the choice once the name is filled.
+export async function chooseLocation(session: Session, dialog: ReturnType<Page['locator']>, folder: string, hint: string) {
+  await stubPicker(session, folder);
+  const before = await pickerCalls(session);
+  await choose(dialog).click();
+  await pickerOpenedAfter(session, before);
+  await dialog.getByText(hint).first().waitFor();
 }
 
 export interface SidebarEntry {

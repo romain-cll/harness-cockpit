@@ -89,7 +89,7 @@ describe('packaged app state file', () => {
 
   async function expectHomePageWithoutError(session: Session) {
     await session.page.getByText(versionLabel).waitFor();
-    await session.page.getByRole('heading', { name: 'New workspace', exact: true }).waitFor();
+    await session.page.getByText('No projects yet', { exact: true }).waitFor();
     expect(await consoleErrorsOf(session.page)).toEqual([]);
     expect(await session.page.pageErrors()).toEqual([]);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);

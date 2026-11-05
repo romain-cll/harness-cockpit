@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -7,7 +7,8 @@ import { type Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 import { sendFromComposer } from '../composer';
 import { freePort, isAlive, launchEnv, MAIN_PROCESS_ERROR, packagedAppDir, type Session, versionLabel } from '../launch';
-import { addProject, addRepository, deleteDialog, entryTitles, linkedWorktrees, localBranches, makeRepo, projectsInState, removeThroughMenu, sidebarEntries, sidebarLines, snapshotRepo, startDeletion, stateSnapshot, type TempRepo, waitForEntries, worktreePath, writeConfig } from './projects';
+import { makeTestDir } from '../run-root';
+import { addProject, addRepository, chooseLocation, cloneButton, cloneDialog, deleteDialog, entryTitles, linkedWorktrees, localBranches, makeRepo, nameBox, pickAddItem, projectsInState, removeThroughMenu, sidebarEntries, sidebarLines, snapshotRepo, startDeletion, stateSnapshot, type TempRepo, urlBox, waitForEntries, worktreePath, writeConfig } from './projects';
 import { clearFocusCalls, FRONT_CALLS, frontCalls, runSecondLaunch, stubFocus } from './single-instance';
 import { allConsoleErrorsOf, allPageErrorsOf, applicationType, captureRow, dropTerminalWorkspace, getShellPath, LAUNCHD_ENV, LAUNCHD_PATH, launchLaunchd, normalizeFnm, openTerminal, pidOf, ptyKill, type PtyWindow, ptyWrite, spawnShell, typeLine, unexpectedConsoleErrors, waitForOutput, waitForRow, watchFrontmost } from './terminal';
 
@@ -51,7 +52,8 @@ export const describeMode = (mode: string, launch: () => Promise<Session>) => de
   test('shows the home page and the version from the main process', async () => {
     const { page } = session;
     await page.getByText(versionLabel).waitFor();
-    await page.getByRole('heading', { name: 'New workspace', exact: true }).waitFor();
+    // No project yet: the home page is the empty state (COCKPIT-72 AC1).
+    await page.getByText('No projects yet', { exact: true }).waitFor();
     expect(await page.title()).toBe('Cockpit');
     expect(await page.getByRole('link', { name: 'New workspace', exact: true }).getAttribute('aria-current')).toBe('page');
   });
@@ -225,6 +227,32 @@ export const describeMode = (mode: string, launch: () => Promise<Session>) => de
       expect(projectsInState(session.dataDir)).toEqual([]);
       expect(snapshotRepo(repo)).toEqual(onDisk);
       expect(onDisk.hasGit).toBe(true);
+    });
+
+    test('smoke path (c), COCKPIT-72 AC11 — clone: "Clone from Git…" clones a local repository through "Choose…" into <location>/<name>, parent folders created, lists and stores the project, then "Remove project…" leaves the clone on disk', async () => {
+      const { page } = session;
+      const source = makeRepo('smoke-clone-source');
+      const location = realpathSync(makeTestDir('p-'));
+      folders.push(source, { parent: location, root: location, name: 'location' });
+      const target = join(location, 'a', 'smoke-clone');
+      await page.getByText(versionLabel).waitFor();
+
+      await pickAddItem(page, 'Clone from Git…');
+      const dialog = cloneDialog(page);
+      await dialog.waitFor();
+      await urlBox(dialog).fill(source.root);
+      await nameBox(dialog).fill('smoke-clone');
+      await chooseLocation(session, dialog, join(location, 'a'), `Clones into ${join(location, 'a')}/smoke-clone`);
+      await cloneButton(dialog).click();
+      await dialog.waitFor({ state: 'hidden' });
+
+      await waitForEntries(page, [target]);
+      expect(projectsInState(session.dataDir)).toEqual([{ path: target }]);
+      expect(existsSync(join(target, 'README.md'))).toBe(true);
+      await removeThroughMenu(page, target);
+      await waitForEntries(page, []);
+      expect(projectsInState(session.dataDir)).toEqual([]);
+      expect(existsSync(join(target, 'README.md'))).toBe(true);
     });
 
     test('smoke path (b), workspace scripts AC19, setup through the CLI AC11 — workspaces: the composer with "Terminal" creates a worktree under COCKPIT_HOME from the base main and lists it, its page opens with a shell tab that runs the setup (no agent); "Delete workspace…" runs `cockpit teardown`, which writes the login-shell PATH and the worktree path, then removes the folder, the worktree, the branch and the row', async () => {

@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { type Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 import { type Session, untilRead, versionLabel } from './launch';
-import { addProject, addRepository, dispatchFocus, gitAlertOf, gitIn, makeLightRepo, makePlainFolder, makeRepo, projectsGit, sidebarLines, type TempRepo, tokenColor, waitForLine } from './support/projects';
+import { addRepository, dispatchFocus, gitAlertOf, gitIn, makeLightRepo, makeRepo, projectsGit, sidebarLines, type TempRepo, tokenColor } from './support/projects';
 import { promptBox } from './composer';
 import { daemonPidIn } from './support/panes';
 import {
@@ -168,7 +168,6 @@ describe('redesign foundation: built app', () => {
   let session: Session;
   let alpha: TempRepo;
   let bravo: TempRepo;
-  let plain: TempRepo;
   let alphaWorkspace = '';
   let bravoWorkspace = '';
   const ids = { top: '', workspace: '' };
@@ -178,7 +177,6 @@ describe('redesign foundation: built app', () => {
     fx = makeSessionsFixture(['claude'], { log: true, gitLog: true });
     alpha = makeRepo('alpha-redesign');
     bravo = makeLightRepo('bravo-redesign');
-    plain = makePlainFolder('not-a-repository-redesign');
     alphaWorkspace = join(alpha.parent, 'feat-a');
     bravoWorkspace = join(bravo.parent, 'feat-b');
     gitIn(alpha.root, 'worktree', 'add', '--quiet', '-b', 'feat-a', alphaWorkspace);
@@ -192,7 +190,7 @@ describe('redesign foundation: built app', () => {
   afterAll(async () => {
     await session?.close();
     if (fx) rmSync(fx.root, { recursive: true, force: true });
-    for (const repo of [alpha, bravo, plain]) if (repo) rmSync(repo.parent, { recursive: true, force: true });
+    for (const repo of [alpha, bravo]) if (repo) rmSync(repo.parent, { recursive: true, force: true });
   });
 
   afterEach(() => closeOverlays(session.page));
@@ -417,10 +415,18 @@ describe('redesign foundation: built app', () => {
     expect(await sessions.getAttribute('aria-expanded')).toBe('true');
     expect(await projects.locator('svg').count(), 'a caret').toBeGreaterThan(0);
 
-    // A message line under the Projects header.
-    const refusal = `${plain.root} is not in a git repository.`;
-    await addProject(session, plain.root);
-    await waitForLine(page, refusal);
+    // A message line under the Projects header. An add refusal opens a dialog since COCKPIT-72, so a refused start
+    // (the agent's binary is gone) puts it there.
+    await openWorkspaceStartMenu(page, bravoWorkspace, 'feat-b');
+    const binary = join(fx.bin, 'claude');
+    renameSync(binary, `${binary}.off`);
+    try {
+      await startItem(page).click();
+      await page.locator('aside [role="status"]').filter({ hasText: /^\s*Could not start Claude Code:/ }).first().waitFor();
+    } finally {
+      renameSync(`${binary}.off`, binary);
+    }
+    const refusal = (await page.locator('aside [role="status"]').first().innerText()).trim();
 
     await projects.click();
     expect(await projects.getAttribute('aria-expanded')).toBe('false');
