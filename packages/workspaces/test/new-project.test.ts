@@ -5,7 +5,7 @@ import { Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
-import { WorkspaceError } from '../src/git';
+import { git as runGit, WorkspaceError } from '../src/git';
 import { cloneRepository, findRepositoryRoot, initRepository, listBranches, listWorktrees, repairWorktrees } from '../src/index';
 
 // COCKPIT-72: clone, init (with its first empty commit) and worktree repair, on real git in temporary folders.
@@ -304,6 +304,18 @@ describe('cloneRepository', () => {
     expect(existsSync(path), 'the folder is gone').toBe(false);
   });
 
+  test('AC31 — a clone to a path under a regular file rejects with git\'s WorkspaceError, not a raw error from the rollback', async () => {
+    const source = await makeRepo();
+    const file = join(await tempDir(), 'a-file');
+    await writeFile(file, 'not a folder\n');
+
+    const error = await failure(cloneRepository({ url: source, path: join(file, 'copy'), env: testEnv }));
+
+    expect(error).toBeInstanceOf(WorkspaceError);
+    expect((error as WorkspaceError).code).toBe('GIT_FAILED');
+    expect(readFileSync(file, 'utf8')).toBe('not a folder\n');
+  });
+
   test('AC27 — with no identity at all the clone succeeds: it makes no commit', async () => {
     const source = await makeRepo();
     const path = join(await tempDir(), 'copy');
@@ -328,6 +340,17 @@ describe('initRepository', () => {
     expect(contentsOf(folder)).toEqual(before);
     const branch = git(folder, 'symbolic-ref', '--short', 'HEAD');
     expect((await listBranches(folder, { env: testEnv })).defaultBase).toBe(branch);
+  });
+
+  test('AC29 — a folder initialized already (a retry after a failed save) resolves and keeps its single empty commit', async () => {
+    const folder = await plainFolder();
+    await initRepository({ path: folder, env: testEnv });
+    const head = git(folder, 'rev-parse', 'HEAD');
+
+    await initRepository({ path: folder, env: testEnv });
+
+    expect(git(folder, 'rev-list', '--count', 'HEAD')).toBe('1');
+    expect(git(folder, 'rev-parse', 'HEAD')).toBe(head);
   });
 
   test.each([
@@ -420,6 +443,19 @@ describe('initRepository', () => {
     expect(error.message).toContain('refused by the hook');
     expect(existsSync(join(folder, '.git'))).toBe(false);
     expect(contentsOf(folder)).toEqual(before);
+  });
+});
+
+describe('git with a working directory that is a file', () => {
+  test('AC30 — rejects with a WorkspaceError, never a raw ENOTDIR, directly and through listWorktrees', async () => {
+    const file = join(await tempDir(), 'replaced-by-a-file');
+    await writeFile(file, 'now a file\n');
+
+    const direct = await failure(runGit(['status'], { cwd: file, env: testEnv }));
+    const listed = await failure(listWorktrees(file, { env: testEnv }));
+
+    expect(direct).toBeInstanceOf(WorkspaceError);
+    expect(listed).toBeInstanceOf(WorkspaceError);
   });
 });
 

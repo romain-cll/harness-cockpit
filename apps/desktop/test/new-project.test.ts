@@ -304,15 +304,21 @@ describe('new project: built app', () => {
     expect(await submitCreate(create).isDisabled()).toBe(false);
   });
 
-  test('AC20 — the main process refuses an invalid name for clone and create with AC20\'s text, runs no git and makes no folder', async () => {
+  test('AC20 — the main process refuses an invalid or empty name for clone and create with AC20\'s text, runs no git and makes no folder', async () => {
     const { page } = session;
     const location = join(base, 'invalid-names');
     const clones = cloneLines().length;
     const before = stateSnapshot(session.dataDir);
     type Refusal = { status: string; message?: string };
     const answers: Refusal[] = [];
+    const names: Array<[string, string]> = [
+      ['.', BAD_NAME],
+      ['..', BAD_NAME],
+      ['a/b', BAD_NAME],
+      ['', 'A project name is required.'],
+    ];
 
-    for (const name of ['.', '..', 'a/b']) {
+    for (const [name] of names) {
       answers.push(
         await page.evaluate(
           ([location, name]) =>
@@ -327,7 +333,7 @@ describe('new project: built app', () => {
       );
     }
 
-    expect(answers).toEqual(Array.from({ length: 6 }, () => ({ status: 'refused', message: BAD_NAME })));
+    expect(answers).toEqual(names.flatMap(([, message]) => [{ status: 'refused', message }, { status: 'refused', message }]));
     expect(cloneLines(), 'no git clone ran').toHaveLength(clones);
     expect(existsSync(location), 'no folder appeared').toBe(false);
     expect(stateSnapshot(session.dataDir)).toEqual(before);
@@ -491,6 +497,35 @@ describe('new project: built app', () => {
     expect(readdirSync(target).sort()).toEqual(content);
     expect(gitIn(target, 'rev-list', '--count', 'HEAD')).toBe('1');
     await expectProjects();
+  });
+
+  test('AC29 — Initialize after a failed save: once saving works a second click adds the project, the folder keeps its single empty commit and no message says git cannot use it', async () => {
+    const { page } = session;
+    setIdentity(true);
+    const plain = makePlainFolder('saved-late');
+    folders.push(plain.parent);
+    const blocker = join(session.dataDir, 'state.json.tmp');
+    mkdirSync(blocker);
+    await addProject(session, plain.root);
+    const dialog = openDialogs(page).filter({ hasText: 'This folder is not a git repository' });
+    await dialog.waitFor();
+    const initialize = dialog.getByRole('button', { name: 'Initialize git repository', exact: true });
+    try {
+      await initialize.click();
+      await dialog.getByText('Cockpit could not save its data: ').first().waitFor();
+      expect(await entryTitles(page)).toEqual(added);
+    } finally {
+      rmSync(blocker, { recursive: true, force: true });
+    }
+
+    await initialize.click();
+    await dialog.waitFor({ state: 'hidden' });
+
+    added.push(plain.root);
+    await waitForEntry(page, plain.root);
+    await expectProjects();
+    expect(gitIn(plain.root, 'rev-list', '--count', 'HEAD')).toBe('1');
+    expect(await dialog.getByText('cannot use').count()).toBe(0);
   });
 
   test('AC11 — Clone runs git clone with the login-shell environment into <location>/<name> (parents created), lists and stores the project, closes the dialog and leaves the page', async () => {
