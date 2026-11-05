@@ -10,7 +10,7 @@ import { expect } from 'vitest';
 import { sendFromComposer } from '../composer';
 import { appDir, daemonSocketIn, fifo, heldProcess, launchDev, launchPackaged, launchSpawned, MAIN_PROCESS_ERROR, packagedAppDir, type Session, startClock, untilRead } from '../launch';
 import { makeTestDir } from '../run-root';
-import { dispatchFocus, entryTitles, gitIn, openMenu, type TempRepo, untilFewerOverlays, waitForEntry, worktreePath } from './projects';
+import { countIpcCalls, dispatchFocus, entryTitles, gitIn, ipcAnswered, ipcCalls, openMenu, type TempRepo, untilFewerOverlays, waitForEntry, worktreePath } from './projects';
 import { allConsoleErrorsOf, allPageErrorsOf, escapeRegExp, focusTerminal, terminalRows, typeLine, waitForRow } from './terminal';
 
 // --- Sessions (COCKPIT-25) ---------------------------------------------------
@@ -259,11 +259,8 @@ export const storedSessions = (page: Page) =>
     () => (window as unknown as { api: { sessions: { list(): Promise<StoredSession[]> } } }).api.sessions.list(),
   );
 
-// Resolves once the router has nothing left to load. The sidebar's start flow (`started` in projects.tsx) adds the
-// tab, then `await router.invalidate()`, then navigates to the workspace page: the tab shows before the flow ends,
-// and a user action in between (a click on the Sessions "+") is overridden by that late navigation. The router
-// reports `onResolved` when a load ends; the navigation that follows is issued in the same microtask chain, so by
-// the time this answer reaches the test it is already pending again or done.
+// Resolves once the router has nothing left to load (`onResolved` when a load is under way). A test that holds the
+// sidebar's start flow in its `await router.invalidate()` (COCKPIT-86) waits for it before reading where the page is.
 export const routerSettled = (page: Page) =>
   page.evaluate(
     () =>
@@ -281,6 +278,61 @@ export const routerSettled = (page: Page) =>
       }),
   );
 
+type RouterInPage = {
+  state: { matches: Array<{ routeId: string; loaderData?: { sessions?: Array<{ id: string }> } }> };
+  history: { subscribe: (fn: (event: { location: { href: string } }) => void) => () => void };
+  subscribe: (type: 'onResolved', fn: () => void) => () => void;
+};
+
+// COCKPIT-86: the hrefs the page's history goes through from now on, read by `locationsSeen`. A late navigation
+// of a start flow shows there even if the user's own page is back by the time the test reads `location.href`.
+export const recordLocations = (page: Page) =>
+  page.evaluate(() => {
+    const router = (window as unknown as { __TSR_ROUTER__: RouterInPage }).__TSR_ROUTER__;
+    const seen: string[] = [];
+    (window as unknown as { __locationsSeen?: string[] }).__locationsSeen = seen;
+    router.history.subscribe(({ location }) => void seen.push(location.href));
+  });
+export const locationsSeen = (page: Page) => page.evaluate(() => (window as unknown as { __locationsSeen: string[] }).__locationsSeen);
+
+// Resolves once the root loader's data (the sidebar's) lists session `id`: the last load of a start flow has ended,
+// and what the flow does next (its navigation, if it may) is issued in the same microtask chain, so by the time this
+// answer reaches the test it is done.
+export const untilSessionListed = (page: Page, id: string) =>
+  page.evaluate(
+    (id) =>
+      new Promise<void>((resolve) => {
+        const router = (window as unknown as { __TSR_ROUTER__: RouterInPage }).__TSR_ROUTER__;
+        const listed = () => router.state.matches.find((match) => match.routeId === '__root__')?.loaderData?.sessions?.some((each) => each.id === id) === true;
+        if (listed()) {
+          resolve();
+          return;
+        }
+        const stop = router.subscribe('onResolved', () => {
+          if (!listed()) return;
+          stop();
+          resolve();
+        });
+      }),
+    id,
+  );
+
+// The number of `sessions:start` calls the main process has seen, counted from the first call of this on.
+export const watchStarts = async (session: Session) => {
+  await countIpcCalls(session, ['sessions:start']);
+  return ipcCalls(session, 'sessions:start');
+};
+
+// Waits for the end of a start (COCKPIT-86): the main process answered the `startsBefore + 1`th `sessions:start`
+// (the session is stored), then the sidebar's data lists it. Gives the new stored session (not in `known`).
+export async function untilStartListed(session: Session, known: Set<string>, startsBefore: number): Promise<StoredSession> {
+  await ipcAnswered(session, 'sessions:start', startsBefore + 1);
+  const stored = (await storedSessions(session.page)).find((each) => !known.has(each.id));
+  expect(stored, 'the start stored a session').toBeTruthy();
+  await untilSessionListed(session.page, stored!.id);
+  return stored!;
+}
+
 // Waits for the page of a new session called `pageName`. Outside any project that is its page
 // (`/sessions/<id>`, `previous` being the id of the session page that was open before, if any). In a workspace
 // (COCKPIT-70, `known` being the ids of the sessions stored before the start) it is the workspace page, the
@@ -294,7 +346,6 @@ export async function waitForSessionPage(page: Page, previous: string | undefine
     const fresh = (await storedSessions(page)).find((stored) => stored.name === pageName && stored.project !== undefined && !known.has(stored.id));
     expect(fresh, `${pageName} is stored for a workspace`).toBeTruthy();
     await page.waitForURL((url) => url.searchParams.get('path') === fresh!.directory);
-    await routerSettled(page);
     return fresh!.id;
   }
   await page.getByRole('heading', { name: pageName, exact: true }).waitFor();

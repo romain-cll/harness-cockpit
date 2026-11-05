@@ -5,6 +5,7 @@ import type { AppsResult, AvailableApp, OpenWorkspaceResult, Project, Session, S
 import { toggleProject, toggleProjects, useCollapsedProjects, useProjectsCollapsed } from '@/components/collapsed';
 import { DeleteWorkspaceDialog } from '@/components/delete-workspace-dialog';
 import { endSessions, getWorkspaceSetups, startSession, subscribe } from '@/components/live-terminals';
+import { claimNavigation } from '@/components/navigation-claim';
 import { ProjectBadge } from '@/components/project-badge';
 import { linkRowClass, rowClass, StatusIcon } from '@/components/sessions';
 import { StartSessionMenu } from '@/components/start-session-menu';
@@ -188,7 +189,7 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
   }
 
   // Shows what starting a session came to: its tab on the workspace's page, or why it was refused.
-  async function started(result: StartSessionResult) {
+  async function started(result: StartSessionResult, mayNavigate: () => boolean) {
     if (result.status === 'refused') {
       setMessage(result.message);
       return;
@@ -196,7 +197,7 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
     setMessage(undefined);
     addSessionTab(result.session);
     await router.invalidate();
-    await router.navigate({ to: '/workspace', search: { path: result.session.directory } });
+    if (mayNavigate()) await router.navigate({ to: '/workspace', search: { path: result.session.directory } });
   }
 
   // Shows why opening a worktree was refused or failed; a success clears the message.
@@ -290,9 +291,12 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
                             <StartSessionMenu
                               label={`Start session in ${workspace.name}`}
                               className="absolute top-1 right-7 opacity-0 group-hover/entry:opacity-100 focus-visible:opacity-100 aria-expanded:opacity-100"
-                              onStart={(harness) =>
-                                void startSession(harness, { workspace: { project: project.path, path: workspace.path } }).then(started)
-                              }
+                              onStart={(harness) => {
+                                const mayNavigate = claimNavigation(router.history);
+                                void startSession(harness, { workspace: { project: project.path, path: workspace.path } }).then((result) =>
+                                  started(result, mayNavigate),
+                                );
+                              }}
                             />
                           }
                         >
