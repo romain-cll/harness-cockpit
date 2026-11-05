@@ -197,7 +197,7 @@ const readDescription = (bar: HTMLElement) => {
 
 // A table of the Description: whether the tab panel or the bar scrolls sideways, whether the table sits in a box that
 // scrolls by itself, and whether its cell showing `last` can be brought into view by scrolling that box.
-// Self-contained: it runs in the page, and scrolls the box.
+// Self-contained: it runs in the page, scrolls the box to its end and back.
 const readTable = (bar: HTMLElement, { last }: { last: string }) => {
   const panel = [...bar.querySelectorAll<HTMLElement>('[role="tabpanel"]')].find((each) => !each.hasAttribute('hidden') && each.checkVisibility()) ?? bar;
   const overflow = { panel: panel.scrollWidth - panel.clientWidth, bar: bar.scrollWidth - bar.clientWidth };
@@ -213,6 +213,8 @@ const readTable = (bar: HTMLElement, { last }: { last: string }) => {
   box.scrollLeft = box.scrollWidth;
   const boxRect = box.getBoundingClientRect();
   const after = cell.getBoundingClientRect().right;
+  // Leave the box as it was found: a later read must not depend on a remount.
+  box.scrollLeft = 0;
   return {
     table: true as const,
     box: true as const,
