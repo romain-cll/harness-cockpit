@@ -85,8 +85,10 @@ describe('waitForGroupGone', () => {
       // It was still running: returning at once would have been a lie.
       expect(groupAlive(child.pid!)).toBe(true);
     } finally {
+      // The listener first: `exit` can fire while the release is awaited.
+      const exited = once(child, 'exit');
       await held.release();
-      await once(child, 'exit');
+      await exited;
     }
   });
 });

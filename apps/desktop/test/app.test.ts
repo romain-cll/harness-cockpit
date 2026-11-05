@@ -8841,7 +8841,8 @@ describe('single instance: built app', () => {
       const loaded = (contents) => {
         const done = () => setImmediate(() => resolve({ url: contents.getURL(), loading: contents.isLoading() }));
         if (contents.getURL() !== '' && !contents.isLoading()) done();
-        else contents.once('did-finish-load', done);
+        // Not did-finish-load: isLoading() is still true then, and false at did-stop-loading.
+        else contents.once('did-stop-loading', done);
       };
       const [existing] = BrowserWindow.getAllWindows();
       if (existing) loaded(existing.webContents);

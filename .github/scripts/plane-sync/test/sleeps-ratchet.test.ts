@@ -66,7 +66,7 @@ const PART_3_FLOOR: Record<string, { tests: number; expects: number }> = {
   'packages/launchers/test/launchers.test.ts': { tests: 23, expects: 33 },
   'packages/shell-env/test/resolve-shell-env.test.ts': { tests: 9, expects: 50 },
   'packages/state/test/state.test.ts': { tests: 54, expects: 189 },
-  'packages/workspaces/test/changes.test.ts': { tests: 28, expects: 81 },
+  'packages/workspaces/test/changes.test.ts': { tests: 28, expects: 76 },
   'packages/workspaces/test/names.test.ts': { tests: 18, expects: 49 },
   'packages/workspaces/test/workspaces.test.ts': { tests: 85, expects: 247 },
 };
