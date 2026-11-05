@@ -603,7 +603,7 @@ describe('watchWorktree on the git metadata', () => {
     return { changed, reached, close: () => watcher.close() };
   }
 
-  test('AC9 — a quiet worktree, git folder and remote refs watched too, gets no onChange after watchWorktree resolved', async () => {
+  test.each(Array.from({ length: 15 }, (_, index) => index))('AC9 — %i a quiet worktree, git folder and remote refs watched too, gets no onChange after watchWorktree resolved', async () => {
     const { worktree } = await makeShippableWorkspace();
     const { changed, close } = await watched(worktree);
     try {

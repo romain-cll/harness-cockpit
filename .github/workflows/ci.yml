@@ -20,6 +20,10 @@ jobs:
     # desktop session for the Electron tests.
     runs-on: macos-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        copy: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v7
 
@@ -44,3 +48,21 @@ jobs:
       # `test` launches the desktop app four ways: the dev script, the built app,
       # the packaged app and the packaged app with the environment of launchd.
       - run: bun turbo run build typecheck lint test
+
+  # Throwaway control: the old changes.ts against AC9, to show the repeated test catches the start-up call.
+  control:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: git show 5935684:packages/workspaces/src/changes.ts > packages/workspaces/src/changes.ts
+      - run: bunx vitest run test/changes.test.ts -t 'a quiet worktree, git folder'
+        working-directory: packages/workspaces
