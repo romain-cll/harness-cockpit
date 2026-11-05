@@ -401,6 +401,16 @@ describe('watchWorktree', () => {
     expect(isFolderTouch('change', basename(withFile), withFile)).toBe(false);
   });
 
+  test('AC8 — on a folder that cannot be read (chmod 000), the event is no touch and nothing throws, so it counts as a change', async () => {
+    const dir = await tempDir();
+    await chmod(dir, 0o000);
+    try {
+      expect(isFolderTouch('change', basename(dir), dir)).toBe(false);
+    } finally {
+      await chmod(dir, 0o700);
+    }
+  });
+
   test('AC12 — a burst of writes gives one onChange, and none comes after close()', async () => {
     const dir = await tempDir();
     const changed = counted();
