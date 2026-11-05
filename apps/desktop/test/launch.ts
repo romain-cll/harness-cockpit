@@ -12,7 +12,7 @@ import { afterEach, expect } from 'vitest';
 import { makeTestDir, runRoot } from './run-root';
 
 // Launching the app the ways it runs (the dev server, the built app, the packaged app) and
-// stopping it, shared by the test files of this folder. See `app.test.ts` for what each launch is for.
+// stopping it, shared by the test files of this folder. See `support/mode-checks.ts` for what each launch is for.
 
 export const UI_TIMEOUT = 10_000;
 
@@ -253,6 +253,16 @@ export async function waitForGroupGone(pid: number): Promise<void> {
   const closed = closedByPid.get(pid);
   if (!closed) throw new Error(`no launch started ${pid}: nothing tells when its group is gone`);
   await closed;
+}
+
+// Quits the app from its main process and waits for its process group to go.
+export async function quitApp(session: Session): Promise<void> {
+  // `require` only exists during the evaluation: `app` is taken before the next turn of the loop, which runs after
+  // the evaluation has answered (a quit during it would end the app before the inspector answered).
+  await session.evaluateInMain(`(() => { const { app } = require('electron'); setImmediate(() => app.quit()); })()`);
+  await session.disconnectInspector();
+  // The app's exit: its process group is gone once its `close` fires (the exit, and every holder of its stdio).
+  await waitForGroupGone(session.pid);
 }
 
 // Stops a process started with `detached: true` and everything in its process group, and waits
@@ -751,4 +761,3 @@ export function isAlive(pid: number): boolean {
     return (error as NodeJS.ErrnoException).code !== 'ESRCH';
   }
 }
-
