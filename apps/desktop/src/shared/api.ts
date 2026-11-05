@@ -87,7 +87,19 @@ export interface Project {
 export type AddProjectResult =
   | { status: 'added'; project: Project }
   | { status: 'cancelled' }
+  /** The picked folder is in no repository: the user may initialize one (`projects.init`). */
+  | { status: 'not-a-repository'; folder: string }
   | { status: 'refused'; message: string };
+
+/** `location/name` is where a clone or a new repository goes; `name` is a single folder name. */
+export interface CloneRequest {
+  url: string;
+  location: string;
+  name: string;
+}
+export type CreateRequest = Omit<CloneRequest, 'url'>;
+
+export type UpdatePathResult = { status: 'updated' } | { status: 'cancelled' } | Refused;
 
 /** A refusal carries the message to show the user. */
 export interface Refused {
@@ -259,6 +271,23 @@ export interface Api {
     git(): Promise<'ok' | 'missing'>;
     /** Opens the folder picker, then adds the repository that holds the folder. */
     add(): Promise<AddProjectResult>;
+    /** Makes `folder` a repository with one empty commit (its files stay untracked), then adds it. */
+    init(folder: string): Promise<AddProjectResult>;
+    /**
+     * Clones into `location/name` and adds it; a name that is not a single folder name is refused. Answers
+     * `cancelled` once `cancelClone` ended the clone, or the page navigated away from it.
+     */
+    clone(request: CloneRequest): Promise<AddProjectResult>;
+    /** Ends the running clone, which removes its partial folder. */
+    cancelClone(): Promise<void>;
+    /** Makes `location/name` a repository with one empty commit, then adds it; refused like `clone`. */
+    create(request: CreateRequest): Promise<AddProjectResult>;
+    /** Opens the folder picker; `null` when cancelled. */
+    pickFolder(): Promise<string | null>;
+    /** The user's home folder. */
+    home(): Promise<string>;
+    /** Opens the folder picker for the project whose folder moved and points the project at the repository picked. */
+    updatePath(from: string): Promise<UpdatePathResult>;
     /** Forgets the project; its files stay on disk. */
     remove(path: string): Promise<void>;
     /** Calls `listener` when the main process changed a project's workspaces (a workspace named from its agent's title). */

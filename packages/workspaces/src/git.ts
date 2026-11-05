@@ -19,6 +19,8 @@ export type WorkspaceErrorCode =
   | 'NO_BASE'
   | 'GIT_MISSING'
   | 'GIT_TOO_OLD'
+  | 'DESTINATION_EXISTS'
+  | 'GIT_IDENTITY_MISSING'
   | 'GIT_FAILED'
   | 'FS_FAILED';
 
@@ -38,15 +40,17 @@ export interface GitOptions {
   env?: NodeJS.ProcessEnv;
   /** Overrides the default stdout buffer of 256 MiB. */
   maxBuffer?: number;
+  /** Ends git (SIGTERM) when aborted. */
+  signal?: AbortSignal;
 }
 
 /**
  * Runs git without a shell and resolves to its stdout. Every failure is `GIT_FAILED`, a missing
  * executable included: with a `cwd`, ENOENT also means the folder is missing.
  */
-export async function git(args: string[], { cwd, env, maxBuffer }: GitOptions = {}): Promise<string> {
+export async function git(args: string[], { cwd, env, maxBuffer, signal }: GitOptions = {}): Promise<string> {
   try {
-    const { stdout } = await execFileAsync('git', args, { cwd, env, maxBuffer: maxBuffer ?? DEFAULT_MAX_BUFFER });
+    const { stdout } = await execFileAsync('git', args, { cwd, env, signal, maxBuffer: maxBuffer ?? DEFAULT_MAX_BUFFER });
     return stdout;
   } catch (error) {
     const failure = error as NodeJS.ErrnoException & { stderr?: string };

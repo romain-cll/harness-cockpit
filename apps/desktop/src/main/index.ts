@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { mkdir, rm, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -33,17 +33,20 @@ import {
   removeProject,
   saveState,
   sessionName,
+  updateProjectPath,
   type State,
 } from '@cockpit/state';
 import {
   availableBranch,
   branchStatus,
   checkGit,
+  cloneRepository,
   commitAll,
   createWorktree,
   fileDiff,
   findRepositoryRoot,
   headSubject,
+  initRepository,
   listBranches,
   listChanges,
   listWorktrees,
@@ -52,6 +55,7 @@ import {
   readWorkspaceConfig,
   removalState,
   removeWorktree,
+  repairWorktrees,
   watchWorktree,
   WorkspaceError,
   type Worktree,
@@ -76,8 +80,10 @@ import type {
   BranchStatusResult,
   ChangedFile,
   ChangesResult,
+  CloneRequest,
   CommitResult,
   CreatePullRequestResult,
+  CreateRequest,
   CreateWorkspaceResult,
   DaemonStatus,
   DiffResult,
@@ -95,9 +101,11 @@ import type {
   TeardownResult,
   StartSessionOptions,
   StartSessionResult,
+  UpdatePathResult,
 } from '../shared/api';
 import daemonPath from './daemon?modulePath';
 import { devFolderName } from './dev-folder';
+import { nameProblem } from '../renderer/components/project-form';
 import { shellEnv } from './shell-env';
 
 // The built renderer is served from a custom protocol rather than `file://`,
@@ -654,35 +662,143 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
     return gitCheck;
   });
 
-  ipcMain.handle('projects:add', async (event): Promise<AddProjectResult> => {
-    if (!isFromApp(event)) throw new Error('projects:add refused: unexpected origin');
+  // The folder the user picks in the system dialog, `undefined` when cancelled.
+  async function pickFolder(event: IpcMainInvokeEvent): Promise<string | undefined> {
     const window = BrowserWindow.fromWebContents(event.sender);
     const options = { properties: ['openDirectory' as const] };
     const picked = await (window ? dialog.showOpenDialog(window, options) : dialog.showOpenDialog(options));
-    const folder = picked.filePaths[0];
-    if (picked.canceled || folder === undefined) return { status: 'cancelled' };
+    return picked.canceled ? undefined : picked.filePaths[0];
+  }
 
+  // Saves `next` and makes it the state; a refusal when the save fails leaves the state as it was.
+  function commit(next: State): Refused | undefined {
     try {
-      const root = await findRepositoryRoot(folder, { env: await shellEnv });
-      const next = addProject(state, root);
-      try {
-        saveState(userData, next);
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        return { status: 'refused', message: `Cockpit could not save its data: ${reason}` };
-      }
-      state = next;
+      saveState(userData, next);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return { status: 'refused', message: `Cockpit could not save its data: ${reason}` };
+    }
+    state = next;
+    return undefined;
+  }
+
+  // The one way a repository becomes a project: add its root to the state, save, list it. A refusal
+  // changes nothing.
+  async function addRoot(root: string): Promise<AddProjectResult> {
+    try {
+      const refused = commit(addProject(state, root));
+      if (refused) return refused;
       return { status: 'added', project: await toProject({ path: root }) };
     } catch (error) {
       if (error instanceof ProjectExistsError) {
         return { status: 'refused', message: `${basename(error.path)} is already in Cockpit.` };
       }
-      if (error instanceof WorkspaceError) {
-        const message = error.code === 'NOT_A_REPOSITORY' ? `${folder} is not in a git repository.` : error.message;
-        return { status: 'refused', message };
-      }
       throw error;
     }
+  }
+
+  // Runs `action`, turning a git failure into a refusal that carries git's message.
+  async function refusing(action: () => Promise<AddProjectResult>): Promise<AddProjectResult> {
+    try {
+      return await action();
+    } catch (error) {
+      if (error instanceof WorkspaceError) return { status: 'refused', message: error.message };
+      throw error;
+    }
+  }
+
+  const addAt = async (folder: string) => addRoot(await findRepositoryRoot(folder, { env: await shellEnv }));
+
+  ipcMain.handle('projects:add', async (event): Promise<AddProjectResult> => {
+    if (!isFromApp(event)) throw new Error('projects:add refused: unexpected origin');
+    const folder = await pickFolder(event);
+    if (folder === undefined) return { status: 'cancelled' };
+    try {
+      return await addAt(folder);
+    } catch (error) {
+      if (error instanceof WorkspaceError && error.code === 'NOT_A_REPOSITORY') return { status: 'not-a-repository', folder };
+      if (error instanceof WorkspaceError) return { status: 'refused', message: error.message };
+      throw error;
+    }
+  });
+
+  ipcMain.handle('projects:init', (event, folder: string): Promise<AddProjectResult> => {
+    if (!isFromApp(event)) throw new Error('projects:init refused: unexpected origin');
+    return refusing(async () => {
+      await initRepository({ path: folder, env: await shellEnv });
+      return addAt(folder);
+    });
+  });
+
+  ipcMain.handle('projects:pick-folder', async (event): Promise<string | null> => {
+    if (!isFromApp(event)) throw new Error('projects:pick-folder refused: unexpected origin');
+    return (await pickFolder(event)) ?? null;
+  });
+
+  ipcMain.handle('projects:home', (event) => {
+    if (!isFromApp(event)) throw new Error('projects:home refused: unexpected origin');
+    return homedir();
+  });
+
+  const badName = (name: string): Refused | undefined => {
+    const message = name === '' ? 'A project name is required.' : nameProblem(name);
+    return message ? { status: 'refused', message } : undefined;
+  };
+
+  // The running clone: ended by the Cancel button, by the page that asked for it navigating away or closing.
+  let cloning: AbortController | undefined;
+
+  ipcMain.handle('projects:clone', async (event, request: CloneRequest): Promise<AddProjectResult> => {
+    if (!isFromApp(event)) throw new Error('projects:clone refused: unexpected origin');
+    const invalid = badName(request.name);
+    if (invalid) return invalid;
+    const path = join(request.location, request.name);
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    cloning = controller;
+    event.sender.once('did-navigate', abort);
+    event.sender.once('destroyed', abort);
+    try {
+      const env = await shellEnv;
+      await cloneRepository({ url: request.url, path, env, signal: controller.signal });
+      return await addAt(path);
+    } catch (error) {
+      if (controller.signal.aborted) return { status: 'cancelled' };
+      if (error instanceof WorkspaceError) return { status: 'refused', message: error.message };
+      throw error;
+    } finally {
+      if (cloning === controller) cloning = undefined;
+      event.sender.removeListener('did-navigate', abort);
+      event.sender.removeListener('destroyed', abort);
+    }
+  });
+
+  ipcMain.handle('projects:cancel-clone', (event) => {
+    if (!isFromApp(event)) throw new Error('projects:cancel-clone refused: unexpected origin');
+    cloning?.abort();
+  });
+
+  ipcMain.handle('projects:create', async (event, request: CreateRequest): Promise<AddProjectResult> => {
+    if (!isFromApp(event)) throw new Error('projects:create refused: unexpected origin');
+    const invalid = badName(request.name);
+    if (invalid) return invalid;
+    const path = join(request.location, request.name);
+    if (existsSync(path)) return { status: 'refused', message: `${path} already exists.` };
+    return refusing(async () => {
+      try {
+        await mkdir(request.location, { recursive: true });
+        await mkdir(path);
+      } catch (error) {
+        return { status: 'refused', message: `Cockpit could not create ${path}: ${(error as NodeJS.ErrnoException).code ?? error}` };
+      }
+      try {
+        await initRepository({ path, env: await shellEnv });
+        return await addAt(path);
+      } catch (error) {
+        await rm(path, { recursive: true, force: true });
+        throw error;
+      }
+    });
   });
 
   ipcMain.handle('projects:remove', (event, path: string) => {
@@ -691,6 +807,31 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
     if (next.projects.length === state.projects.length) return;
     saveState(userData, next);
     state = next;
+  });
+
+  // The project at `from` moved: the user picks its repository again. Its worktrees are reconnected after the
+  // state is saved, and a repair that fails (the workspaces then show git's error) does not undo the update.
+  ipcMain.handle('projects:update-path', async (event, from: string): Promise<UpdatePathResult> => {
+    if (!isFromApp(event)) throw new Error('projects:update-path refused: unexpected origin');
+    if (!state.projects.some((project) => project.path === from)) {
+      return { status: 'refused', message: `${from} is not a project in Cockpit.` };
+    }
+    const folder = await pickFolder(event);
+    if (folder === undefined) return { status: 'cancelled' };
+    try {
+      const env = await shellEnv;
+      const root = await findRepositoryRoot(folder, { env });
+      const refused = commit(updateProjectPath(state, from, root));
+      if (refused) return refused;
+      await repairWorktrees(root, { env }).catch(() => {});
+      return { status: 'updated' };
+    } catch (error) {
+      if (error instanceof ProjectExistsError) return { status: 'refused', message: `${basename(error.path)} is already in Cockpit.` };
+      if (error instanceof WorkspaceError) {
+        return { status: 'refused', message: error.code === 'NOT_A_REPOSITORY' ? `${folder} is not in a git repository.` : error.message };
+      }
+      throw error;
+    }
   });
 
   // Runs `action` for a project of the state, turning a git failure into a refusal (or into what

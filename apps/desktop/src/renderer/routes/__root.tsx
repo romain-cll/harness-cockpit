@@ -1,5 +1,6 @@
 import { createRootRoute, Outlet, useLocation, useNavigate, useRouter } from '@tanstack/react-router';
 import { useEffect } from 'react';
+import { AddProject } from '@/components/add-project';
 import { AppSidebar } from '@/components/app-sidebar';
 import { useSidebarCollapsed } from '@/components/collapsed';
 import { ChangesPanel, RightRail, useRightBar, workspaceOf } from '@/components/changes-panel';
@@ -64,6 +65,7 @@ function RootLayout() {
       <main className="flex min-w-0 flex-1 flex-col bg-background p-2">
         <Outlet />
       </main>
+      <AddProject />
       {workspace &&
         (rightBarOpen ? (
           <ChangesPanel key={workspace.workspace.path} project={workspace.project} workspace={workspace.workspace} />

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { access, mkdir, readFile, realpath } from 'node:fs/promises';
+import { access, mkdir, readFile, realpath, rm } from 'node:fs/promises';
 import { basename, isAbsolute, join } from 'node:path';
 import { checkGit, git, list, succeeds, WorkspaceError, type GitEnv, type Worktree } from './git';
 
@@ -28,6 +28,56 @@ async function linkedWorktree(worktrees: Worktree[], path: string): Promise<Work
   const worktree = await findLinked(worktrees, path);
   if (!worktree) throw new WorkspaceError('GIT_FAILED', `not a linked worktree: ${path}`);
   return worktree;
+}
+
+/**
+ * Clones `url` into `path`, which must not exist (`DESTINATION_EXISTS`); git creates the parent folders.
+ * `GIT_TERMINAL_PROMPT=0` so a credential prompt fails instead of waiting. Aborting `signal` ends git, which
+ * removes the partial folder itself.
+ */
+export async function cloneRepository({
+  url,
+  path,
+  env,
+  signal,
+}: {
+  url: string;
+  path: string;
+  signal?: AbortSignal;
+} & GitEnv): Promise<void> {
+  await checkGit(env);
+  if (await exists(path)) throw new WorkspaceError('DESTINATION_EXISTS', `${path} already exists.`);
+  await git(['clone', '--', url, path], { env: { ...env, GIT_TERMINAL_PROMPT: '0' }, signal });
+}
+
+/**
+ * Makes `path` (an existing folder) a repository holding one empty commit, so that a worktree can start from
+ * it; its files stay untracked. Without an identity git resolves in the new repository, `GIT_IDENTITY_MISSING`.
+ * On any failure `.git` is removed again.
+ */
+export async function initRepository({ path, env }: { path: string } & GitEnv): Promise<void> {
+  await checkGit(env);
+  await git(['init'], { cwd: path, env });
+  try {
+    for (const variable of ['GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT']) {
+      if (!(await succeeds(['var', variable], { cwd: path, env }))) {
+        throw new WorkspaceError(
+          'GIT_IDENTITY_MISSING',
+          'Git needs your name and email to commit. Set user.name and user.email, then try again.',
+        );
+      }
+    }
+    await git(['commit', '--allow-empty', '--no-gpg-sign', '-m', 'Initial commit'], { cwd: path, env });
+  } catch (error) {
+    await rm(join(path, '.git'), { recursive: true, force: true });
+    throw error;
+  }
+}
+
+/** Reconnects the linked worktrees of `repo` after it moved (`git worktree repair`). */
+export async function repairWorktrees(repo: string, { env }: GitEnv = {}): Promise<void> {
+  await checkGit(env);
+  await git(['worktree', 'repair'], { cwd: repo, env });
 }
 
 /** The main working tree of the repository containing `path`, which may be inside a linked worktree. */

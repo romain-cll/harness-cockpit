@@ -6,6 +6,8 @@ import {
   CodeXmlIcon,
   FolderMinusIcon,
   FolderOpenIcon,
+  FolderPlusIcon,
+  GitBranchIcon,
   MoreHorizontalIcon,
   PlusIcon,
   SquareTerminalIcon,
@@ -14,6 +16,7 @@ import {
 } from 'lucide-react';
 import { useState, useSyncExternalStore, type ReactNode } from 'react';
 import type { AppsResult, AvailableApp, OpenWorkspaceResult, Project, Session, StartSessionResult, Workspace } from '../../shared/api';
+import { showRefusal, useAddProject } from '@/components/add-project';
 import { toggleProject, toggleProjects, useCollapsedProjects, useProjectsCollapsed } from '@/components/collapsed';
 import { DeleteWorkspaceDialog } from '@/components/delete-workspace-dialog';
 import { endSessions, getWorkspaceSetups, startSession, subscribe } from '@/components/live-terminals';
@@ -28,6 +31,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
+  DropdownMenuShortcut,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
@@ -203,7 +207,7 @@ function WorkspaceName({ workspace }: { workspace: Workspace }) {
 export function Projects({ projects, sessions }: { projects: Project[]; sessions: Session[] }) {
   const router = useRouter();
   const navigate = useNavigate();
-  // Why the last add or start was refused, or that a deletion kept its branch; cleared by the next add, start or deletion that succeeds.
+  // Why the last start was refused, or that a deletion kept its branch; cleared by the next add, start or deletion that succeeds.
   const message = useProjectsMessage();
   const setMessage = setProjectsMessage;
   const deleting = useSyncExternalStore(subscribeDeleting, () => deletion);
@@ -215,11 +219,13 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
   // The project whose removal dialog is open.
   const [removing, setRemoving] = useState<Project>();
 
-  async function add() {
-    const result = await window.api.projects.add();
-    if (result.status === 'cancelled') return;
-    setMessage(result.status === 'refused' ? result.message : undefined);
-    if (result.status === 'added') await router.invalidate();
+  const adding = useAddProject();
+
+  // The moved project's repository, picked again: the project keeps its place under the new path.
+  async function updatePath(project: Project) {
+    const result = await window.api.projects.updatePath(project.path);
+    if (result.status === 'refused') showRefusal('Cannot update path', result.message);
+    else if (result.status === 'updated') await router.invalidate();
   }
 
   // The sessions of a workspace (a project's when `directory` is omitted), newest first like `sessions`.
@@ -259,9 +265,26 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
             {collapsed ? <ChevronRightIcon className="size-2.5 text-subtle" /> : <ChevronDownIcon className="size-2.5 text-subtle" />}
           </button>
         </h2>
-        <Button variant="ghost" size="icon-xs" aria-label="Add project" className="text-subtle" onClick={() => void add()}>
-          <PlusIcon className="size-3.5" />
-        </Button>
+        <DropdownMenu>
+          <DropdownMenuTrigger render={<Button variant="ghost" size="icon-xs" aria-label="Add project" className="text-subtle" />}>
+            <PlusIcon className="size-3.5" />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-50">
+            <DropdownMenuItem onClick={() => void adding.open()}>
+              <FolderOpenIcon className="text-muted-foreground" />
+              Open project…
+              <DropdownMenuShortcut className="text-[11px] tracking-normal text-subtle">⌘O</DropdownMenuShortcut>
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={adding.clone}>
+              <GitBranchIcon className="text-muted-foreground" />
+              Clone from Git…
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={adding.create}>
+              <FolderPlusIcon className="text-muted-foreground" />
+              Create new…
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       </header>
       {message && (
         <p role="status" className="shrink-0 px-2 py-1 text-xs break-words text-destructive">
@@ -309,8 +332,11 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
                   <div className="flex flex-col gap-1.5 pt-0.5 pr-2 pb-1.5 pl-[30px] text-[11px] break-words">
                     <p className="text-destructive">Folder not found</p>
                     <p className="text-muted-foreground">{project.path}</p>
-                    <Button variant="outline" className="h-auto w-full rounded-md px-2 py-[5px] text-xs" onClick={() => setRemoving(project)}>
+                    <Button variant="outline" className="h-auto w-full rounded-md border-foreground/10 px-2 py-[5px] text-xs" onClick={() => setRemoving(project)}>
                       Remove from Cockpit
+                    </Button>
+                    <Button variant="outline" className="h-auto w-full rounded-md border-foreground/10 px-2 py-[5px] text-xs" onClick={() => void updatePath(project)}>
+                      Update path…
                     </Button>
                   </div>
                 )}
