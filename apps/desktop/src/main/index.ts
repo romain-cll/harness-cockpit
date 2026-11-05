@@ -50,6 +50,7 @@ import {
   nameWorkspace,
   pushBranch,
   readWorkspaceConfig,
+  removalState,
   removeWorktree,
   watchWorktree,
   WorkspaceError,
@@ -88,6 +89,7 @@ import type {
   PullRequestResult,
   PushResult,
   Refused,
+  RemovalResult,
   RemoveWorkspaceResult,
   SessionStatus,
   TeardownResult,
@@ -744,15 +746,34 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
     );
   });
 
+  ipcMain.handle('workspaces:removal', (event, project: string, path: string): Promise<RemovalResult> =>
+    forProject<RemovalResult>(event, 'workspaces:removal', project, async () => {
+      const { uncommitted, merged } = await removalState({ repo: project, path, env: await shellEnv });
+      return { status: 'read', uncommitted, merged };
+    }),
+  );
+
   ipcMain.handle(
     'workspaces:remove',
-    (event, project: string, path: string, options?: { force?: boolean }): Promise<RemoveWorkspaceResult> =>
+    (
+      event,
+      project: string,
+      path: string,
+      options: { force: boolean; deleteBranch: boolean; forceBranch: boolean },
+    ): Promise<RemoveWorkspaceResult> =>
       forProject<RemoveWorkspaceResult>(
         event,
         'workspaces:remove',
         project,
         async () => {
-          await removeWorktree({ repo: project, path, deleteBranch: true, force: options?.force, env: await shellEnv });
+          await removeWorktree({
+            repo: project,
+            path,
+            force: options.force,
+            deleteBranch: options.deleteBranch,
+            forceBranch: options.forceBranch,
+            env: await shellEnv,
+          });
           return { status: 'removed', branchKept: false };
         },
         (error) => {

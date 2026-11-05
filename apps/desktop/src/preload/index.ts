@@ -33,6 +33,7 @@ const api: Api = {
   workspaces: {
     branches: (project) => ipcRenderer.invoke('workspaces:branches', project),
     create: (project, task, base) => ipcRenderer.invoke('workspaces:create', project, task, base),
+    removal: (project, path) => ipcRenderer.invoke('workspaces:removal', project, path),
     remove: (project, path, options) => ipcRenderer.invoke('workspaces:remove', project, path, options),
     apps: () => ipcRenderer.invoke('workspaces:apps'),
     reveal: (project, path) => ipcRenderer.invoke('workspaces:reveal', project, path),

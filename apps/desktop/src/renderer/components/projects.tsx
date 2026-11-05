@@ -1,5 +1,17 @@
 import { Link, useNavigate, useRouter } from '@tanstack/react-router';
-import { ChevronDownIcon, ChevronRightIcon, MoreHorizontalIcon, PlusIcon, TriangleAlertIcon } from 'lucide-react';
+import {
+  ChevronDownIcon,
+  ChevronRightIcon,
+  CheckIcon,
+  CodeXmlIcon,
+  FolderMinusIcon,
+  FolderOpenIcon,
+  MoreHorizontalIcon,
+  PlusIcon,
+  SquareTerminalIcon,
+  Trash2Icon,
+  TriangleAlertIcon,
+} from 'lucide-react';
 import { useState, useSyncExternalStore, type ReactNode } from 'react';
 import type { AppsResult, AvailableApp, OpenWorkspaceResult, Project, Session, StartSessionResult, Workspace } from '../../shared/api';
 import { toggleProject, toggleProjects, useCollapsedProjects, useProjectsCollapsed } from '@/components/collapsed';
@@ -7,6 +19,7 @@ import { DeleteWorkspaceDialog } from '@/components/delete-workspace-dialog';
 import { endSessions, getWorkspaceSetups, startSession, subscribe } from '@/components/live-terminals';
 import { claimNavigation } from '@/components/navigation-claim';
 import { ProjectBadge } from '@/components/project-badge';
+import { RemoveProjectDialog } from '@/components/remove-project-dialog';
 import { linkRowClass, rowClass, StatusIcon } from '@/components/sessions';
 import { StartSessionMenu } from '@/components/start-session-menu';
 import { Button } from '@/components/ui/button';
@@ -97,7 +110,7 @@ function Entry({
         >
           <MoreHorizontalIcon />
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-auto">
+        <DropdownMenuContent align="end" className="w-50">
           {children}
         </DropdownMenuContent>
       </DropdownMenu>
@@ -105,32 +118,62 @@ function Entry({
   );
 }
 
-// The items of a workspace's menu that open its worktree: the editor and the terminal shown first,
-// the Finder, and a submenu of each kind listing every detected app.
+// An app's placeholder badge in a submenu: its first letter on neutral tokens.
+const AppBadge = ({ name }: { name: string }) => (
+  <span className="flex size-4 shrink-0 items-center justify-center rounded-[4px] bg-muted text-[9px] leading-none text-muted-foreground">
+    {name.charAt(0).toUpperCase()}
+  </span>
+);
+
+const kindIcon = { editor: CodeXmlIcon, terminal: SquareTerminalIcon };
+
+// The items of a workspace's menu that open its worktree: the editor and the terminal shown first, a
+// submenu of each kind listing every detected app (the one shown first checked), and the Finder.
 function OpenItems({ apps, onOpen, onReveal }: { apps?: AppsResult; onOpen: (app: string) => void; onReveal: () => void }) {
   if (!apps) return null;
-  const submenu = (kind: 'editor' | 'terminal', list: AvailableApp[]) => (
-    <DropdownMenuSub>
-      <DropdownMenuSubTrigger>Open in {kind}</DropdownMenuSubTrigger>
-      <DropdownMenuSubContent>
-        {list.map((app) => (
-          <DropdownMenuItem key={app.id} onClick={() => onOpen(app.id)}>
-            {app.name}
-          </DropdownMenuItem>
-        ))}
-        {list.length === 0 && <DropdownMenuItem disabled>No {kind} found</DropdownMenuItem>}
-      </DropdownMenuSubContent>
-    </DropdownMenuSub>
-  );
+  const submenu = (kind: 'editor' | 'terminal', list: AvailableApp[]) => {
+    const Icon = kindIcon[kind];
+    return (
+      <DropdownMenuSub>
+        <DropdownMenuSubTrigger>
+          <Icon />
+          Open in {kind}
+        </DropdownMenuSubTrigger>
+        <DropdownMenuSubContent>
+          {list.map((app) => (
+            <DropdownMenuItem key={app.id} onClick={() => onOpen(app.id)}>
+              <AppBadge name={app.name} />
+              {app.name}
+              {app.id === apps[kind] && <CheckIcon className="ml-auto" />}
+            </DropdownMenuItem>
+          ))}
+          {list.length === 0 && <DropdownMenuItem disabled>No {kind} found</DropdownMenuItem>}
+        </DropdownMenuSubContent>
+      </DropdownMenuSub>
+    );
+  };
   const editor = apps.editors.find(({ id }) => id === apps.editor);
   const terminal = apps.terminals.find(({ id }) => id === apps.terminal);
   return (
     <>
-      {editor && <DropdownMenuItem onClick={() => onOpen(editor.id)}>Open in {editor.name}</DropdownMenuItem>}
-      {terminal && <DropdownMenuItem onClick={() => onOpen(terminal.id)}>Open in {terminal.name}</DropdownMenuItem>}
-      <DropdownMenuItem onClick={onReveal}>Reveal in Finder</DropdownMenuItem>
+      {editor && (
+        <DropdownMenuItem onClick={() => onOpen(editor.id)}>
+          <CodeXmlIcon />
+          Open in {editor.name}
+        </DropdownMenuItem>
+      )}
+      {terminal && (
+        <DropdownMenuItem onClick={() => onOpen(terminal.id)}>
+          <SquareTerminalIcon />
+          Open in {terminal.name}
+        </DropdownMenuItem>
+      )}
       {submenu('editor', apps.editors)}
       {submenu('terminal', apps.terminals)}
+      <DropdownMenuItem onClick={onReveal}>
+        <FolderOpenIcon />
+        Reveal in Finder
+      </DropdownMenuItem>
       <DropdownMenuSeparator />
     </>
   );
@@ -169,6 +212,8 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
   const collapsedProjects = useCollapsedProjects();
   // The editors and terminals found when a workspace's menu last opened.
   const [apps, setApps] = useState<AppsResult>();
+  // The project whose removal dialog is open.
+  const [removing, setRemoving] = useState<Project>();
 
   async function add() {
     const result = await window.api.projects.add();
@@ -250,17 +295,21 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
                   }
                   label={`Actions for ${project.name}`}
                 >
-                  <DropdownMenuItem onClick={() => void navigate({ to: '/', search: { project: project.path } })}>New workspace…</DropdownMenuItem>
-                  <DropdownMenuItem className="flex-col items-start gap-0" onClick={() => void remove(project)}>
-                    <span>Remove from Cockpit</span>
-                    <span className="text-muted-foreground!">Files stay on disk</span>
+                  <DropdownMenuItem onClick={() => void navigate({ to: '/', search: { project: project.path } })}>
+                    <PlusIcon />
+                    New workspace
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem variant="destructive" onClick={() => setRemoving(project)}>
+                    <FolderMinusIcon />
+                    Remove project…
                   </DropdownMenuItem>
                 </Entry>
                 {project.missing && (
                   <div className="flex flex-col gap-1.5 pt-0.5 pr-2 pb-1.5 pl-[30px] text-[11px] break-words">
                     <p className="text-destructive">Folder not found</p>
                     <p className="text-muted-foreground">{project.path}</p>
-                    <Button variant="outline" className="h-auto w-full rounded-md px-2 py-[5px] text-xs" onClick={() => void remove(project)}>
+                    <Button variant="outline" className="h-auto w-full rounded-md px-2 py-[5px] text-xs" onClick={() => setRemoving(project)}>
                       Remove from Cockpit
                     </Button>
                   </div>
@@ -305,7 +354,10 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
                             onOpen={(app) => void window.api.workspaces.open(project.path, workspace.path, app).then(opened)}
                             onReveal={() => void window.api.workspaces.reveal(project.path, workspace.path).then(opened)}
                           />
-                          <DropdownMenuItem onClick={() => setDeleting({ project, workspace })}>Delete workspace…</DropdownMenuItem>
+                          <DropdownMenuItem variant="destructive" onClick={() => setDeleting({ project, workspace })}>
+                            <Trash2Icon />
+                            Delete workspace…
+                          </DropdownMenuItem>
                         </Entry>
                       </li>
                     ))}
@@ -316,6 +368,7 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
           })}
         </ul>
       )}
+      {removing && <RemoveProjectDialog project={removing} onClose={() => setRemoving(undefined)} onRemove={() => remove(removing)} />}
       {deleting && (
         <DeleteWorkspaceDialog
           project={deleting.project}

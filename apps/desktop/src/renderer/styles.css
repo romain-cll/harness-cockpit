@@ -26,6 +26,11 @@
   --color-status-exited: var(--status-exited);
   --color-status-merged: var(--status-merged);
   --color-subtle: var(--subtle);
+  --color-menu: var(--menu);
+  --color-dialog: var(--dialog);
+  --color-scrim: var(--scrim);
+  --shadow-dialog: var(--dialog-shadow);
+  --color-destructive-foreground: var(--destructive-foreground);
   --color-hover: var(--hover);
   --color-brand: var(--brand);
   --color-brand-foreground: var(--brand-foreground);
@@ -97,7 +102,8 @@
   --muted-foreground: #6B6B73;
   --accent: oklch(0.97 0 0);
   --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
+  --destructive: #D64545;
+  --destructive-foreground: #FFFFFF;
   --border: #00000014;
   --input: #00000014;
   --ring: oklch(0.708 0 0);
@@ -124,6 +130,12 @@
   /* Text under the muted one, and the fill of a row under the pointer. */
   --subtle: #A1A1A8;
   --hover: #0000000A;
+  /* The fills of menus and confirmation dialogs (the page's own background in the light theme), the veil
+     behind a dialog and its shadow. */
+  --menu: var(--background);
+  --dialog: var(--background);
+  --scrim: #00000052;
+  --dialog-shadow: 0 8px 32px #00000029;
   /* The accent of the composer's send button and the icon on it, the same in both themes. */
   --brand: #5E6AD2;
   --brand-foreground: #FFFFFF;
@@ -177,7 +189,7 @@
     --muted-foreground: #8B8B92;
     --accent: oklch(0.269 0 0);
     --accent-foreground: oklch(0.985 0 0);
-    --destructive: oklch(0.704 0.191 22.216);
+    --destructive: #EB5757;
     --border: #FFFFFF12;
     --input: #FFFFFF12;
     --ring: oklch(0.556 0 0);
@@ -201,6 +213,10 @@
     --status-merged: #A371F7;
     --subtle: #5C5C63;
     --hover: #FFFFFF0A;
+    --menu: #1E1E21;
+    --dialog: #161618;
+    --scrim: #000000A3;
+    --dialog-shadow: 0 8px 32px #00000066;
     --diff-added: #4CB7821F;
     --diff-removed: #EB57571F;
     --diff-added-foreground: #4CB782;
