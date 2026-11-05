@@ -6,7 +6,7 @@ import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { type Locator, type Page } from 'playwright-core';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
-import { MAIN_PROCESS_ERROR, UI_TIMEOUT, launchSpawned, poll, versionLabel, type Session } from './launch';
+import { MAIN_PROCESS_ERROR, launchSpawned, startClock, untilRead, versionLabel, type Session } from './launch';
 import { makeTestDir } from './run-root';
 import {
   agentSelect,
@@ -288,10 +288,18 @@ const terminalRows = (page: Page) =>
     .locator('.xterm-rows:visible')
     .first()
     .evaluate((element) => [...element.children].map((row) => (row.textContent ?? '').replace(/ /g, ' ').trimEnd()));
-const waitForRow = (page: Page, text: string) =>
-  poll(() => terminalRows(page).catch(() => [] as string[]), (rows) => rows.includes(text), 15_000).then((rows) => {
-    expect(rows, `the terminal shows "${text}"`).toContain(text);
+// The same rows read in the page, at once and after each DOM mutation, until one is the text. Self-contained: it runs in `untilRead`.
+const readVisibleRows = () => {
+  const terminal = [...document.querySelectorAll('.xterm-rows')].find((element) => {
+    const { width, height } = element.getBoundingClientRect();
+    return width > 0 && height > 0 && getComputedStyle(element).visibility !== 'hidden';
   });
+  return terminal ? [...terminal.children].map((row) => (row.textContent ?? '').replace(/\u00a0/g, ' ').trimEnd()) : [];
+};
+const waitForRow = async (page: Page, text: string) => {
+  const rows = await untilRead(page, readVisibleRows, (found, wanted: string) => found.includes(wanted), text);
+  expect(rows, `the terminal shows "${text}"`).toContain(text);
+};
 
 const mainBox = async (locator: Locator) => (await locator.boundingBox())!;
 
@@ -751,11 +759,9 @@ describe('new workspace page: built app', () => {
     await promptBox(page).press('Enter');
 
     await waitForWorkspacePage(page, path);
-    const stored = await poll(
-      async () => sessionsInState(dataDir).find((each) => each.directory === path),
-      Boolean,
-      UI_TIMEOUT,
-    );
+    // The composer navigates to the workspace page after the session started: it is stored by now.
+    const stored = sessionsInState(dataDir).find((each) => each.directory === path);
+    expect(stored, 'the session is stored when its workspace page shows').toBeDefined();
     const id = stored!.id;
     // The page is the workspace's, with the session as its one tab, selected.
     await page.locator('[role="tab"][aria-selected="true"]').first().waitFor();
@@ -945,8 +951,14 @@ describe('new workspace page: built app', () => {
     await promptBox(page).press('Enter');
     await waitForWorkspacePage(page, path);
 
-    // The idle title `✳ Claude Code` is printed first and renames nothing.
-    await poll(() => localBranches(clone), (branches) => branches.includes(renamed), 15_000);
+    // The stub has printed its titles once it writes to the FIFO; the idle title `✳ Claude Code` came first and renames nothing.
+    // `nameWorkspace` writes `cockpitName` last, then the windows list again: the row showing the name is the event that
+    // the branch is renamed and named. AC21's bound: the name shows within 5 s of the stub's last title.
+    await signalled(done);
+    const within = startClock();
+    await entryOf(page, path).filter({ hasText: 'Fix the login redirect loop' }).waitFor();
+    within('the sidebar row shows the name', 5_000);
+    expect(localBranches(clone)).toContain(renamed);
     expect(localBranches(clone)).not.toContain(first);
     expect(gitOrNull(clone.root, 'config', '--get', `branch.${renamed}.cockpitName`)).toBe('Fix the login redirect loop');
     expect(gitOrNull(clone.root, 'config', '--get', `branch.${renamed}.cockpitBase`)).toBe('origin/main');
@@ -954,13 +966,10 @@ describe('new workspace page: built app', () => {
     expect(existsSync(path), 'the folder does not move').toBe(true);
     expect(git(path, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe(renamed);
     // The sidebar row shows the name without a window focus; its title attribute stays the path.
-    // AC21's bound: the name shows within 5 s.
-    await entryOf(page, path).filter({ hasText: 'Fix the login redirect loop' }).waitFor({ timeout: 5_000 });
     expect(await entryOf(page, path).innerText()).toContain('Fix the login redirect loop');
     expect(await entryOf(page, path).getAttribute('title')).toBe(path);
 
-    // A second prompt-derived title changes nothing.
-    await signalled(done);
+    // A second prompt-derived title changes nothing: the main process has read every title the stub printed.
     await settleMain(page);
     expect(localBranches(clone)).toContain(renamed);
     expect(localBranches(clone)).not.toContain('something-else-entirely');
@@ -1021,7 +1030,8 @@ describe('new workspace page: built app', () => {
       await promptBox(page).press('Enter');
       await waitForWorkspacePage(page, worktreeOf(refuse, placeholder));
       await waitForRow(page, 'title-printed');
-      await poll(() => localBranches(refuse), (branches) => branches.includes(renamed), 15_000);
+      // The row shows the name once `nameWorkspace` has renamed the branch and stored the name.
+      await entryOf(page, worktreeOf(refuse, placeholder)).filter({ hasText: 'Fix the login redirect loop' }).waitFor();
     } finally {
       rmSync(config, { recursive: true, force: true });
     }

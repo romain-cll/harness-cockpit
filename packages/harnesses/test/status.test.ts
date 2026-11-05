@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { chmodSync, existsSync } from 'node:fs';
+import { execFile, execFileSync } from 'node:child_process';
+import { chmodSync, closeSync, constants, existsSync, openSync, writeSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -28,7 +29,9 @@ const quoted = (path: string) => `'${path.replaceAll("'", "'\\''")}'`;
 const command = (event: Event) => `${quoted(CLI)} status ${event}`;
 
 const created: string[] = [];
+const closers: Array<() => void> = [];
 afterEach(async () => {
+  for (const close of closers.splice(0)) close();
   await Promise.all(created.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -69,7 +72,8 @@ describe('Claude Code (AC2)', () => {
       expect(groups[0]!.matcher, `${name} has no matcher`).toBeUndefined();
       expect(groups[0]!.hooks, name).toHaveLength(1);
       const hook = groups[0]!.hooks[0]!;
-      expect(hook, name).toMatchObject({ type: 'command', command: command(event), timeout: 5 });
+      expect(hook, name).toMatchObject({ type: 'command', command: command(event) });
+      expect(hook.timeout).toBe(5);
       expect(hook.async ?? false, `${name} is synchronous`).toBe(false);
     }
     // Nothing is written anywhere for Claude Code.
@@ -234,7 +238,14 @@ function parseToml(text: string): unknown {
 function expectedHash(eventName: string, hookCommand: string, matcher?: string): string {
   const identity: Record<string, unknown> = {
     event_name: eventName,
-    hooks: [{ async: false, command: hookCommand, timeout: 3, type: 'command' }],
+    hooks: [
+      Object.fromEntries([
+        ['async', false],
+        ['command', hookCommand],
+        ['timeout', 3],
+        ['type', 'command'],
+      ]),
+    ],
   };
   if (matcher !== undefined) identity.matcher = matcher;
   return `sha256:${createHash('sha256').update(JSON.stringify(identity)).digest('hex')}`;
@@ -286,7 +297,8 @@ describe('Codex (AC3)', () => {
       expect(groups[0]!.matcher, `${name} matcher`).toBe(matcher);
       expect(groups[0]!.hooks, name).toHaveLength(1);
       const hook = groups[0]!.hooks[0]!;
-      expect(hook, name).toMatchObject({ type: 'command', command: command(event), timeout: 3 });
+      expect(hook, name).toMatchObject({ type: 'command', command: command(event) });
+      expect(hook.timeout).toBe(3);
       expect(hook.async ?? false, `${name} is synchronous`).toBe(false);
       state[`/<session-flags>/config.toml:${snake}:0:0`] = { trusted_hash: expectedHash(snake, command(event), matcher) };
     }
@@ -389,25 +401,85 @@ describe('OpenCode plugin (AC6)', () => {
     setup(ctx: unknown): unknown;
   }
 
-  // The plugin file `statusLaunch` writes in `<dir>/<name>`, for a stub CLI that appends
-  // `<arguments>` to `<dir>/log`; `working` is slow, so a plugin that ran commands side by side
-  // would log them out of order. The stub sits in a folder whose name holds a space and `$(…)`, so
-  // a plugin that went through `/bin/sh` would not find it.
-  async function plugin(dir?: string, name = 'plugins') {
-    dir ??= await tempDir();
-    const log = join(dir, 'log');
-    const folder = join(dir, `cli ${name} $(touch pwned)`);
-    const cli = join(folder, 'cockpit');
+  // The two FIFOs the test holds between itself and the stub CLI of a folder, each opened for reading and
+  // writing so that neither side waits for the other to open: `events` carries a line per stage of each
+  // command the stub runs, `go` is the test's go-ahead for a held command.
+  function channel(dir: string) {
+    const make = (name: string) => {
+      const path = join(dir, name);
+      execFileSync('mkfifo', [path]);
+      return { path, fd: openSync(path, constants.O_RDWR) };
+    };
+    const events = make('events');
+    const go = make('go');
+    const reader = new Socket({ fd: events.fd, readable: true, writable: false });
+    const arrived: string[] = [];
+    const waiting: Array<(line: string) => void> = [];
+    let text = '';
+    reader.on('data', (chunk) => {
+      text += chunk;
+      for (let end = text.indexOf('\n'); end >= 0; end = text.indexOf('\n')) {
+        const line = text.slice(0, end);
+        text = text.slice(end + 1);
+        const next = waiting.shift();
+        if (next) next(line);
+        else arrived.push(line);
+      }
+    });
+    closers.push(() => {
+      reader.destroy();
+      closeSync(go.fd);
+    });
+    return {
+      eventsPath: events.path,
+      goPath: go.path,
+      /** The next line the stub wrote to `events`. */
+      next: () => (arrived.length > 0 ? Promise.resolve(arrived.shift()!) : new Promise<string>((resolve) => waiting.push(resolve))),
+      /** Lets the held command go on. */
+      release: () => void writeSync(go.fd, 'go\n'),
+    };
+  }
+
+  // The folder of a stub CLI: it appends its arguments to `<dir>/log`, one line per command, and tells the
+  // test where it is through the channel: `start <name> <event>`, then, for `working` only, it waits for the
+  // test's go-ahead (a slow command: a plugin that ran commands side by side would log them out of order),
+  // then logs, then `end <name> <event>`.
+  async function stubFolder() {
+    const dir = await tempDir();
+    return { dir, log: join(dir, 'log'), channel: channel(dir) };
+  }
+
+  // The plugin file `statusLaunch` writes in `<dir>/<name>`. The stub sits in a folder whose name holds a
+  // space and `$(…)`, so a plugin that went through `/bin/sh` would not find it.
+  async function plugin(folder?: Awaited<ReturnType<typeof stubFolder>>, name = 'plugins') {
+    const { dir, log, channel: pipes } = (folder ??= await stubFolder());
+    const stubDir = join(dir, `cli ${name} $(touch pwned)`);
+    const cli = join(stubDir, 'cockpit');
     if (!existsSync(cli)) {
-      await mkdir(folder, { recursive: true });
-      await writeFile(cli, `#!/bin/sh\n[ "$2" = working ] && sleep 0.2\necho "$@" >> '${log}'\n`);
+      await mkdir(stubDir, { recursive: true });
+      await writeFile(
+        cli,
+        `#!/bin/sh\necho "start ${name} $2" > '${pipes.eventsPath}'\n[ "$2" = working ] && read _ < '${pipes.goPath}'\necho "$@" >> '${log}'\necho "end ${name} $2" > '${pipes.eventsPath}'\n`,
+      );
       chmodSync(cli, 0o755);
     }
     const pluginsDir = join(dir, name);
     await statusLaunch('opencode', { cli, pluginsDir, env: {} });
     const module = (await import(/* @vite-ignore */ pathToFileURL(join(pluginsDir, 'opencode-status', 'server.js')).href)) as { default: Plugin };
     const lines = async () => (existsSync(log) ? (await readFile(log, 'utf8')).split('\n').filter(Boolean) : []);
-    return { plugin: module.default, lines, dir };
+    /**
+     * Follows the commands the plugin runs for these events, one after the other: the stub's lines come in
+     * pairs, `start` then `end` of the same command, never two `start` in a row; a `working` is held until the
+     * test lets it go. A plugin that ran its commands side by side would start the next one while this one is held.
+     */
+    const follow = async (events: string[]) => {
+      for (const [index, event] of events.entries()) {
+        expect(await pipes.next(), `command ${index + 1} starts`).toBe(`start ${name} ${event}`);
+        if (event === 'working') pipes.release();
+        expect(await pipes.next(), `command ${index + 1} ends before the next one starts`).toBe(`end ${name} ${event}`);
+      }
+    };
+    return { ...folder, plugin: module.default, lines, follow };
   }
 
   // A context whose event stream yields `events`, then ends.
@@ -423,14 +495,14 @@ describe('OpenCode plugin (AC6)', () => {
   async function run(events: unknown[], { socket = '/unused.sock', session = 'cockpit-session' }: { socket?: string; session?: string } = {}) {
     process.env.COCKPIT_SOCKET = socket;
     process.env.COCKPIT_SESSION_ID = session;
-    const { plugin: loaded, lines } = await plugin();
+    const { plugin: loaded, lines, follow } = await plugin();
     expect(loaded.id).toBe('cockpit.session-status');
     await Promise.resolve(loaded.setup(contextOf(events)));
-    return lines;
+    return { lines, follow };
   }
 
   test('AC6 — spawns the CLI directly with `status <event>` for each state the events lead to, in order and one at a time, only when the state changes', async () => {
-    const lines = await run([
+    const { lines, follow } = await run([
       started('s1'), // working (slow command)
       started('s1'), // no change
       asked('s1', 'p1'), // waiting
@@ -444,23 +516,23 @@ describe('OpenCode plugin (AC6)', () => {
       succeeded('s1'), // finished
     ]);
 
-    const expected = ['working', 'waiting', 'working', 'waiting', 'working', 'waiting', 'working', 'finished'].map(reported);
-    await vi.waitFor(async () => expect((await lines()).length).toBeGreaterThanOrEqual(expected.length), { timeout: 15_000, interval: 50 });
-    expect(await lines()).toEqual(expected);
+    const sent = ['working', 'waiting', 'working', 'waiting', 'working', 'waiting', 'working', 'finished'];
+    await follow(sent);
+    expect(await lines()).toEqual(sent.map(reported));
   });
 
   test('AC6 — an execution that ends drops its pending permissions, whichever way it ends: the next start is working, not waiting', async () => {
     for (const ending of [succeeded, failed, interrupted]) {
-      const lines = await run([started('s1'), asked('s1', 'p1'), ending('s1'), started('s1')]);
+      const { lines, follow } = await run([started('s1'), asked('s1', 'p1'), ending('s1'), started('s1')]);
 
-      const expected = ['working', 'waiting', 'finished', 'working'].map(reported);
-      await vi.waitFor(async () => expect((await lines()).length).toBeGreaterThanOrEqual(expected.length), { timeout: 15_000, interval: 50 });
-      expect(await lines(), ending.name).toEqual(expected);
+      const sent = ['working', 'waiting', 'finished', 'working'];
+      await follow(sent);
+      expect(await lines(), ending.name).toEqual(sent.map(reported));
     }
   });
 
   test('AC6 — the state covers every session of the server: it stays waiting while another session has a pending permission, and finishes when the last execution ends', async () => {
-    const lines = await run([
+    const { lines, follow } = await run([
       started('s1'), // working
       started('s2'), // no change
       asked('s1', 'p1'), // waiting
@@ -469,9 +541,9 @@ describe('OpenCode plugin (AC6)', () => {
       failed('s1'), // finished
     ]);
 
-    const expected = ['working', 'waiting', 'working', 'finished'].map(reported);
-    await vi.waitFor(async () => expect((await lines()).length).toBeGreaterThanOrEqual(expected.length), { timeout: 15_000, interval: 50 });
-    expect(await lines()).toEqual(expected);
+    const sent = ['working', 'waiting', 'working', 'finished'];
+    await follow(sent);
+    expect(await lines()).toEqual(sent.map(reported));
   });
 
   test.each([
@@ -480,17 +552,18 @@ describe('OpenCode plugin (AC6)', () => {
   ])('AC6 — with %s unset it runs nothing', async (unset, kept) => {
     delete process.env[unset];
     process.env[kept] = 'value';
-    const { plugin: silent, lines, dir } = await plugin();
+    const { plugin: silent, lines, ...folder } = await plugin();
     await Promise.resolve(silent.setup(contextOf([started('s1'), asked('s1', 'p1'), succeeded('s1')])));
 
-    // A copy of the plugin loaded with both variables set reports its one event, which proves the
-    // earlier events had every chance to run a command by then (the commands of one log line are fast).
+    // A copy of the plugin loaded with both variables set, on the same stub and log, reports its one event: the
+    // first command the stub starts is the probe's (the stub names the plugin that ran it), so the earlier
+    // events, which came first, ran none; and the log holds the probe's line alone.
     process.env.COCKPIT_SOCKET = '/unused.sock';
     process.env.COCKPIT_SESSION_ID = 'cockpit-session';
-    const { plugin: probe } = await plugin(dir, 'probe');
+    const { plugin: probe, follow } = await plugin(folder, 'probe');
     await Promise.resolve(probe.setup(contextOf([started('probe')])));
 
-    await vi.waitFor(async () => expect((await lines()).length).toBeGreaterThanOrEqual(1), { timeout: 15_000, interval: 50 });
+    await follow(['working']);
     expect(await lines()).toEqual([reported('working')]);
   });
 });

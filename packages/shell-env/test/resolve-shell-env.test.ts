@@ -1,9 +1,8 @@
-import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { execFile, execFileSync } from 'node:child_process';
+import { chmodSync, close, constants, mkdtempSync, open, read, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import * as os from 'node:os';
 import { homedir, tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
-import { setTimeout as sleep } from 'node:timers/promises';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
 import { resolveShellEnv } from '../src/index';
 
@@ -55,18 +54,59 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   warn.mockRestore();
   vi.mocked(userInfo).mockImplementation(real.userInfo);
   vi.mocked(os.homedir).mockImplementation(real.homedir);
 });
 
-function isAlive(pid: number): boolean {
+/** Resolves once the process has exited (macOS's `caffeinate -w <pid>` returns then; it may return before the process is reaped). */
+function exited(pid: number): Promise<void> {
+  return new Promise((resolve) => execFile('/usr/bin/caffeinate', ['-w', String(pid)], () => resolve()));
+}
+
+/** Whether a process has ended: no longer listed, or a zombie (killed, not reaped yet: `kill(pid, 0)` still sees it). */
+function hasEnded(pid: number): boolean {
   try {
-    process.kill(pid, 0);
-    return true;
+    const state = execFileSync('ps', ['-p', String(pid), '-o', 'stat='], { encoding: 'utf8' }).trim();
+    return state === '' || state.startsWith('Z');
   } catch {
-    return false;
+    // `ps` exits 1 when no process matches.
+    return true;
   }
+}
+
+/**
+ * A pipe the test holds: `snippet` makes the running shell hold its write end on descriptor 9, which its
+ * children inherit. `started` resolves with the first line a process writes to it, `gone` once no process
+ * holds the write end any more (end of file). `hold` is a FIFO nobody writes to: a process reading it
+ * lives until it is killed.
+ */
+function heldPipe(): { snippet: string; hold: string; started: Promise<void>; gone: Promise<void> } {
+  const path = join(dir, `pipe-${counter++}`);
+  const hold = join(dir, `hold-${counter++}`);
+  execFileSync('mkfifo', [path]);
+  execFileSync('mkfifo', [hold]);
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => (markStarted = resolve));
+  const gone = new Promise<void>((resolve, reject) => {
+    // The open returns once the first writer has opened the FIFO, so no end of file comes before it. The
+    // read blocks a thread of libuv's pool until a byte or the end of file: kqueue does not report a
+    // FIFO's end of file on macOS, so a stream over the descriptor would never end.
+    open(path, constants.O_RDONLY, (error, fd) => {
+      if (error) return reject(error);
+      const next = () =>
+        read(fd, Buffer.alloc(16), 0, 16, null, (failure, bytes) => {
+          if (failure) reject(failure);
+          else if (bytes > 0) {
+            markStarted();
+            next();
+          } else close(fd, () => resolve());
+        });
+      next();
+    });
+  });
+  return { snippet: `exec 9> '${path}'`, hold, started, gone };
 }
 
 describe('resolveShellEnv', () => {
@@ -93,13 +133,23 @@ describe('resolveShellEnv', () => {
 
   test('AC5 — gives up on a shell that never exits, in time, and kills the shell and its child', async () => {
     const pidFile = join(dir, 'hanging-pids');
+    const { snippet, hold, started, gone } = heldPipe();
+    // The shell reports on the pipe once its first lines ran, so the product's clock is advanced only then:
+    // under load a shell can take longer than the timeout to run its first line. Its background child
+    // inherits the shell's stdout, so the shell's output stays open, and the pipe of the test (descriptor 9) too.
     const shell = fakeShell(
-      [`echo $$ > "${pidFile}"`, 'sleep 60 &', `echo $! >> "${pidFile}"`, 'wait'].join('\n'),
+      [snippet, `echo $$ > "${pidFile}"`, `read _ < "${hold}" &`, `echo $! >> "${pidFile}"`, 'echo up >&9', 'wait'].join('\n'),
     );
 
-    const started = Date.now();
-    const env = await resolveShellEnv({ shell, baseEnv, timeoutMs: 200 });
-    const elapsed = Date.now() - started;
+    // Only the product's timer is the test's clock: files, pipes and processes stay real.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const resolving = resolveShellEnv({ shell, baseEnv, timeoutMs: 200 });
+    await started;
+
+    const advancedAt = Date.now();
+    vi.advanceTimersByTime(200);
+    const env = await resolving;
+    const elapsed = Date.now() - advancedAt;
 
     expect(elapsed).toBeLessThan(2000);
     expect(env).toEqual(baseEnv);
@@ -107,10 +157,11 @@ describe('resolveShellEnv', () => {
 
     const pids = readFileSync(pidFile, 'utf8').trim().split('\n').map(Number);
     expect(pids).toHaveLength(2);
-    // The kernel may need a moment to reap the killed processes.
-    const deadline = Date.now() + 2000;
-    while (pids.some(isAlive) && Date.now() < deadline) await sleep(25);
-    expect(pids.map(isAlive)).toEqual([false, false]);
+    // Every holder of the pipe, the shell and its child, is gone.
+    await gone;
+    // And so are the two processes: `caffeinate -w` returns at a process's exit (at once if it is gone).
+    await Promise.all(pids.map(exited));
+    expect(pids.map(hasEnded)).toEqual([true, true]);
   });
 
   test('AC6 — resolves to the base environment and warns once, with the spawn error, when the shell does not exist', async () => {
@@ -206,7 +257,7 @@ describe('resolveShellEnv', () => {
     const pidFiles: string[] = [];
 
     afterEach(() => {
-      // The startup leaves `sleep 30` running on purpose; the test cleans up.
+      // The startup leaves its background process running on purpose; the test cleans up.
       for (const file of pidFiles.splice(0)) {
         try {
           process.kill(Number(readFileSync(file, 'utf8').trim()), 'SIGKILL');
@@ -219,22 +270,21 @@ describe('resolveShellEnv', () => {
     test('resolves to the shell environment, in time, without a warning', async () => {
       const pidFile = join(dir, `background-pid-${counter++}`);
       pidFiles.push(pidFile);
+      const hold = join(dir, `hold-${counter++}`);
+      execFileSync('mkfifo', [hold]);
       const shell = fakeShell(
-        // `sleep` inherits the shell's stdout and is not redirected.
-        ['sleep 30 &', `echo $! > "${pidFile}"`, `FROM_SHELL=yes /bin/sh -c "$2"`].join('\n'),
+        // The background process inherits the shell's stdout and is not redirected; nobody writes to its FIFO.
+        [`read _ < "${hold}" &`, `echo $! > "${pidFile}"`, `FROM_SHELL=yes /bin/sh -c "$2"`].join('\n'),
       );
 
       const started = Date.now();
-      // Gives up waiting after 2.5 s, so a regression fails here instead of after 30 s.
-      const env = await Promise.race([
-        resolveShellEnv({ shell, baseEnv, timeoutMs: 5000 }),
-        sleep(2500).then(() => undefined),
-      ]);
+      // A regression (waiting for the background process) ends at the 5 s timeout with the base environment.
+      const env = await resolveShellEnv({ shell, baseEnv, timeoutMs: 5000 });
       const elapsed = Date.now() - started;
 
-      expect(env).toBeDefined();
       expect(elapsed).toBeLessThan(2000);
-      expect(env!.FROM_SHELL).toBe('yes');
+      expect(env.FROM_SHELL).toBe('yes');
+      expect(env.BASE_ONLY).toBe('from-base');
       expect(warn).not.toHaveBeenCalled();
     });
   });

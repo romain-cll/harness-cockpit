@@ -158,8 +158,14 @@ describe('AC15 — listeners of a live terminal', () => {
 });
 
 describe('exit of a live terminal', () => {
-  const pending = (promise: Promise<unknown>) =>
-    Promise.race([promise.then(() => 'settled'), new Promise((resolve) => setTimeout(() => resolve('pending'), 0))]);
+  // A promise already resolved has run its reactions by the next turn of the event loop (`setImmediate`), which
+  // follows every queued microtask: no timer, nothing to wait for.
+  const pending = async (promise: Promise<unknown>) => {
+    let state = 'pending';
+    void promise.then(() => (state = 'settled'));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    return state;
+  };
 
   test('AC2, AC4–AC9, AC13, AC14 — exit resolves with the exit of its own pty only, a pty host death (exitCode null) included', async () => {
     const { createLiveTerminal } = await loadStore();

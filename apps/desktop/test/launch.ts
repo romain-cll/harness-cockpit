@@ -1,11 +1,14 @@
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
-import { readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { close, constants, open, openSync, read, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { createServer, type AddressInfo } from 'node:net';
+import { Socket, createConnection, createServer, type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { setTimeout as sleep } from 'node:timers/promises';
-import { chromium, type Browser, type Page } from 'playwright-core';
+import type { DaemonClient } from '@cockpit/daemon';
+import { chromium, type Browser, type ElementHandle, type Frame, type Page } from 'playwright-core';
+import { afterEach, expect } from 'vitest';
 import { makeTestDir, runRoot } from './run-root';
 
 // Launching the app the ways it runs (the dev server, the built app, the packaged app) and
@@ -35,6 +38,8 @@ export interface Session {
   cockpitHome: string;
   /** Everything the app wrote to stdout and stderr. */
   output(): string;
+  /** Resolves with the match once the app's output holds `pattern` (at once if it already does); rejects if the app exits first. */
+  outputMatch(pattern: RegExp): Promise<RegExpExecArray>;
   /**
    * Evaluates an expression in the app's main process, through the Node
    * inspector, and returns its value. `require` is available in it (the
@@ -128,14 +133,30 @@ export function daemonPidFilesIn(home: string): string[] {
   }
 }
 
+// Connects to a daemon's socket; the kernel closes the connection when the daemon process ends,
+// whoever its parent is, so the returned promise resolves once the daemon is gone. A daemon with no
+// socket to connect to is taken as gone.
+function connectToDaemon(socketPath: string): Promise<{ gone: Promise<void> }> {
+  return new Promise((resolve) => {
+    const socket = createConnection(socketPath);
+    const gone = new Promise<void>((done) => socket.once('close', () => done()));
+    socket.on('error', () => {});
+    socket.once('connect', () => {
+      socket.resume();
+      resolve({ gone });
+    });
+    socket.once('error', () => resolve({ gone: Promise.resolve() }));
+  });
+}
+
 export async function killDaemonsIn(...homes: Array<string | undefined>): Promise<void> {
-  const pids: number[] = [];
+  const gone: Promise<void>[] = [];
   for (const home of homes) {
     if (!home) continue;
     for (const file of daemonPidFilesIn(home)) {
       const pid = Number(readFileSync(file, 'utf8').trim());
       if (!Number.isInteger(pid) || pid <= 1) continue;
-      pids.push(pid);
+      gone.push((await connectToDaemon(file.replace(/\.pid$/, '.sock'))).gone);
       for (const signal of ['SIGCONT', 'SIGKILL'] as const) {
         try {
           process.kill(pid, signal);
@@ -145,7 +166,7 @@ export async function killDaemonsIn(...homes: Array<string | undefined>): Promis
       }
     }
   }
-  for (const pid of pids) await poll(() => isAlive(pid), (alive) => !alive, 5_000);
+  await Promise.all(gone);
 }
 
 // The folders a launch's daemons live in: its COCKPIT_HOME, or, when that is unset or empty, the
@@ -184,8 +205,10 @@ export async function attach(endpoint: string): Promise<{ browser: Browser; page
   // The window's target starts as `about:blank` while its first navigation to the
   // app is pending: a reload racing that navigation waits for a load that never
   // comes. Wait until the page is on the app's URL and loaded.
-  await page.waitForURL((url) => url.protocol !== 'about:', { timeout: 30_000 });
+  await page.waitForURL((url) => url.protocol !== 'about:');
   await page.reload();
+  // The one action timeout of the tests: no call passes its own.
+  context.setDefaultTimeout(UI_TIMEOUT);
   return { browser, page };
 }
 
@@ -208,32 +231,313 @@ export function groupAlive(pid: number): boolean {
   }
 }
 
-// Waits until no process of the group `pid` is alive: the helpers of a child can
-// outlive it and still write in the data folder. The group gets SIGKILL 10 s after
-// `started` if anything is left, and an error names it after 20 s.
-export async function waitForGroupGone(pid: number, started = Date.now()): Promise<void> {
-  const killer = setTimeout(() => signalGroup(pid, 'SIGKILL'), Math.max(0, 10_000 - (Date.now() - started)));
+// The `close` of each child a launch started, by pid: it fires once the child has ended and every
+// process holding its stdio has too, which for the app and the dev server is its whole process group
+// (the helpers inherit the pipes). `waitForGroupGone` has no event for a pid launched elsewhere.
+const closedByPid = new Map<number, Promise<void>>();
+
+function closedPromise(child: ChildProcess): Promise<void> {
+  const ended = child.exitCode !== null || child.signalCode !== null;
+  if (ended && [child.stdin, child.stdout, child.stderr].every((stream) => !stream || stream.destroyed)) return Promise.resolve();
+  return new Promise((resolve) => child.once('close', () => resolve()));
+}
+
+function track(child: ChildProcess): void {
+  closedByPid.set(child.pid!, closedPromise(child));
+}
+
+// Waits until the group of a child that a launch started is gone: the helpers of a child can outlive
+// it and still write in the data folder. Rejects for a pid no launch started: nothing tells when its group is
+// gone, and returning at once would claim it was.
+export async function waitForGroupGone(pid: number): Promise<void> {
+  const closed = closedByPid.get(pid);
+  if (!closed) throw new Error(`no launch started ${pid}: nothing tells when its group is gone`);
+  await closed;
+}
+
+// Stops a process started with `detached: true` and everything in its process group, and waits
+// until the group is gone: SIGKILL to the group, then the child's `close` (every process holding its
+// stdio has ended). Not SIGTERM first: an app with no window does not quit on it, and without a timer
+// there is no moment to give up on it and escalate.
+export async function stopGroup(child: ChildProcess): Promise<void> {
+  const pid = child.pid!;
+  const closed = closedByPid.get(pid) ?? closedPromise(child);
+  signalGroup(pid, 'SIGKILL');
+  await closed;
+}
+
+// A FIFO in a folder of the run: a line written to it is an event the test awaits. Opened for
+// reading and writing at once, so a writer never blocks on a missing reader and no line is lost.
+function makeFifo(): string {
+  const path = join(makeTestDir('f-'), 'p');
+  execFileSync('mkfifo', [path]);
+  return path;
+}
+
+/** A FIFO at `path`; `line()` resolves with the first line a process writes to it, `close()` closes its reader (a line that never came). */
+export function fifo(): { path: string; line(): Promise<string>; close(): void } {
+  const path = makeFifo();
+  const reader = new Socket({ fd: openSync(path, constants.O_RDWR), readable: true, writable: false });
+  reader.unref();
+  const first = new Promise<string>((resolve, reject) => {
+    let text = '';
+    reader.on('error', reject);
+    reader.on('data', (chunk) => {
+      text += chunk;
+      const end = text.indexOf('\n');
+      if (end < 0) return;
+      reader.destroy();
+      resolve(text.slice(0, end));
+    });
+  });
+  return { path, line: () => first, close: () => reader.destroy() };
+}
+
+/**
+ * A process the test holds: `snippet` is shell text that blocks until `release()` writes to its FIFO,
+ * then ends with status 0. For a stub or a `sh -c`, instead of a `sleep` or a wait on a file.
+ */
+export function heldProcess(): { snippet: string; release(): Promise<void> } {
+  const path = makeFifo();
+  return { snippet: `read _ < '${path}'`, release: () => writeFile(path, 'go\n') };
+}
+
+/**
+ * Tells when a process, and every process it passed the descriptor to, is gone: `snippet` is shell
+ * text that makes the running shell hold the write end of a FIFO on descriptor 9, which its children
+ * inherit; `gone` resolves once no process holds it any more (the read end's end of file).
+ */
+export function gonePipe(): { snippet: string; gone: Promise<void> } {
+  const path = makeFifo();
+  const gone = new Promise<void>((resolve, reject) => {
+    // The open returns once the first writer has opened the FIFO, so no end of file comes before it.
+    // The read blocks a thread of libuv's pool until a byte or the end of file: kqueue does not report
+    // a FIFO's end of file on macOS, so a stream over the descriptor would never end.
+    open(path, constants.O_RDONLY, (error, fd) => {
+      if (error) return reject(error);
+      const next = () =>
+        read(fd, Buffer.alloc(1), 0, 1, null, (failure, bytes) => {
+          if (failure) reject(failure);
+          else if (bytes > 0) next();
+          else close(fd, () => resolve());
+        });
+      next();
+    });
+  });
+  return { snippet: `exec 9> '${path}'`, gone };
+}
+
+const exitTables = new WeakMap<DaemonClient, Map<number, { ended: Promise<void>; end(): void }>>();
+
+// The exit of terminal `id` as the client has heard it: the daemon sends it to a client that attached the terminal.
+function exitOf(daemon: DaemonClient, id: number) {
+  let table = exitTables.get(daemon);
+  if (!table) {
+    const mine = new Map<number, { ended: Promise<void>; end(): void }>();
+    table = mine;
+    exitTables.set(daemon, mine);
+    daemon.onExit((event) => exitOf(daemon, event.id).end());
+  }
+  let each = table.get(id);
+  if (!each) {
+    let end!: () => void;
+    each = { ended: new Promise<void>((resolve) => (end = resolve)), end: () => end() };
+    table.set(id, each);
+  }
+  return each;
+}
+
+/**
+ * Finds the terminal of the daemon whose screen shows the pid a program printed (`pid<marker>-<pid>` or
+ * `pid:<pid>`, with `<marker>` letters and digits) and attaches it, so `ended` resolves when the daemon says that
+ * terminal ended: its process is reaped. `daemon` is the test's own connection.
+ */
+export async function watchTerminalEnd(daemon: DaemonClient, pid: number): Promise<{ ended: Promise<void> }> {
+  const printed = new RegExp(`pid[0-9a-z]*[-:]${pid}(?![0-9])`);
+  for (const { id } of await daemon.list()) {
+    const { ended } = exitOf(daemon, id);
+    // A terminal that ended meanwhile is none of those listed.
+    const attached = await daemon.attach(id).catch(() => undefined);
+    if (attached && printed.test(attached.screen)) return { ended };
+  }
+  throw new Error(`no terminal of the daemon shows the pid ${pid}`);
+}
+
+/** Resolves once the daemon says terminal `id` ended: at once if it already has (the daemon refuses to attach it). */
+export async function terminalEnd(daemon: DaemonClient, id: number): Promise<void> {
+  const { ended } = exitOf(daemon, id);
+  if (await daemon.attach(id).then(() => true, () => false)) await ended;
+}
+
+/**
+ * Resolves once `predicate(arg)` holds in the page, checked at once and after each DOM mutation
+ * (a `MutationObserver`), for a condition no locator state expresses. `predicate` must be
+ * self-contained: it runs in the page, from its source text.
+ */
+export async function untilDom<A>(page: Page, predicate: (arg: A) => boolean, arg?: A): Promise<void> {
+  await page.evaluate(`new Promise((resolve, reject) => {
+    const predicate = ${predicate.toString()};
+    const arg = ${JSON.stringify(arg)};
+    const check = () => {
+      try {
+        if (!predicate(arg)) return;
+      } catch (error) {
+        observer.disconnect();
+        reject(error);
+        return;
+      }
+      observer.disconnect();
+      resolve();
+    };
+    const observer = new MutationObserver(check);
+    observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+    check();
+  })`);
+}
+
+// COCKPIT-81: the waits of the tests are on the event that marks the step done. `untilRead` and `untilIn` are
+// `untilDom` (launch.ts) with a value: `read` runs in the page (or on `element`) from its source text, at once
+// and after each DOM mutation, and the promise resolves with the first value `done(value, arg)` accepts.
+// `read` and `done` must be self-contained, and `read` synchronous.
+export const truthy = (value: unknown) => Boolean(value);
+
+// A criterion's time bound ("within 5 s") stays a check, as a measure: the test waits for the event with no
+// timeout of its own, and `within` then fails when more than `boundMs` passed since `startClock()` ran, which is
+// at the action the criterion starts its clock from.
+export const startClock = () => {
+  const start = performance.now();
+  return (what: string, boundMs: number) => expect(performance.now() - start, `${what} took longer than ${boundMs} ms`).toBeLessThan(boundMs);
+};
+
+// The script both run: `call` reads the value, `root` is what the observer watches. It reads again on DOM
+// mutations and on what changes geometry or style with none: a transition or animation ending, a resize of the
+// window or of the root. `id` names its last read in the page (`__waitLast`) for `pendingWaits`.
+export const untilScript = (read: object, done: object, arg: unknown, call: string, root: string, id: string, uses: Record<string, object> = {}) => `new Promise((resolve, reject) => {
+    ${Object.entries(uses).map(([name, each]) => `const ${name} = ${each.toString()};`).join('\n    ')}
+    const read = ${read.toString()};
+    const done = ${done.toString()};
+    const arg = ${JSON.stringify(arg)};
+    const events = ['transitionend', 'transitioncancel', 'animationend'];
+    const stop = () => {
+      observer.disconnect();
+      resize.disconnect();
+      for (const name of events) document.removeEventListener(name, check, true);
+      window.removeEventListener('resize', check);
+      delete window.__waitLast?.[${JSON.stringify(id)}];
+    };
+    const check = () => {
+      let value;
+      try {
+        value = ${call};
+        (window.__waitLast ??= {})[${JSON.stringify(id)}] = String(JSON.stringify(value)).slice(0, 2000);
+        if (!done(value, arg)) return;
+      } catch (error) {
+        stop();
+        reject(error);
+        return;
+      }
+      stop();
+      resolve(value);
+    };
+    const observer = new MutationObserver(check);
+    const resize = new ResizeObserver(check);
+    observer.observe(${root}, { subtree: true, childList: true, attributes: true, characterData: true });
+    resize.observe(${root} === document ? document.documentElement : ${root});
+    for (const name of events) document.addEventListener(name, check, true);
+    window.addEventListener('resize', check);
+    check();
+  })`;
+
+// The waits running in a page, for the diagnostic below: a wait that never ends is ended by the test's own guard
+// and says nothing, so the page keeps the last value each one read.
+type PendingWait = { frame: Frame; id: string; label: string };
+const pendingWaits = new Set<PendingWait>();
+
+export async function evaluateUntil<R>(frame: Frame, read: object, arg: unknown, script: (id: string) => string): Promise<R> {
+  const label = `${read.toString().replace(/\s+/g, ' ').slice(0, 100)} waiting for ${JSON.stringify(arg)?.slice(0, 200)}`;
+  const pending: PendingWait = { frame, id: randomUUID(), label };
+  pendingWaits.add(pending);
   try {
-    while (groupAlive(pid)) {
-      if (Date.now() - started > 20_000) throw new Error(`the process group ${pid} is still alive after 20 s`);
-      await sleep(100);
-    }
+    return (await frame.evaluate(script(pending.id))) as R;
   } finally {
-    clearTimeout(killer);
+    pendingWaits.delete(pending);
   }
 }
 
-// Stops a process started with `detached: true` and everything in its process
-// group, and waits until no process of the group is alive.
-export async function stopGroup(child: ChildProcess): Promise<void> {
-  const pid = child.pid!;
-  const started = Date.now();
-  const exited =
-    child.exitCode !== null || child.signalCode !== null
-      ? Promise.resolve()
-      : new Promise((resolve) => child.once('exit', resolve));
-  signalGroup(pid, 'SIGTERM');
-  await Promise.all([exited, waitForGroupGone(pid, started)]);
+// A test the guard ended while a wait ran names what that wait last read, in the test's error.
+afterEach(async ({ task }) => {
+  const waiting = [...pendingWaits];
+  pendingWaits.clear();
+  const error = task.result?.errors?.[0];
+  if (task.result?.state !== 'fail' || !error || waiting.length === 0) return;
+  const lines = await Promise.all(
+    waiting.map(async ({ frame, id, label }) => {
+      const last = await frame.evaluate((id) => (window as unknown as { __waitLast?: Record<string, string> }).__waitLast?.[id], id).catch(() => '(the page is gone)');
+      return `  ${label}\n    last read: ${last}`;
+    }),
+  );
+  error.message += `\nWaits still running when the test ended:\n${lines.join('\n')}`;
+});
+
+export async function untilRead<A, R>(page: Page, read: (arg: A) => R, done: (value: R, arg: A) => boolean, arg?: A): Promise<R> {
+  return evaluateUntil<R>(page.mainFrame(), read, arg, (id) => untilScript(read, done, arg, 'read(arg)', 'document', id));
+}
+
+// The script finds the element by a mark it carries meanwhile: a string handed to a handle's `evaluate` is an
+// expression, not a function that gets the element.
+export async function untilIn<A, R>(element: ElementHandle<HTMLElement>, read: (element: HTMLElement, arg: A) => R, done: (value: R, arg: A) => boolean, arg?: A): Promise<R> {
+  const mark = randomUUID();
+  const frame = (await element.ownerFrame())!;
+  await element.evaluate((target, mark) => target.setAttribute('data-waiting', mark), mark);
+  try {
+    return await evaluateUntil<R>(
+      frame,
+      read,
+      arg,
+      (id) => `(() => { const element = document.querySelector('[data-waiting="${mark}"]'); return ${untilScript(read, done, arg, 'read(element, arg)', 'element', id)}; })()`,
+    );
+  } finally {
+    await element.evaluate((target) => target.removeAttribute('data-waiting')).catch(() => {});
+  }
+}
+
+// What a spawned app (or dev server) writes to stdout and stderr, and the lines tests wait for in it.
+interface OutputWatch {
+  output(): string;
+  /** Resolves with the match once the output holds `pattern`; rejects if the process exits first. */
+  match(pattern: RegExp): Promise<RegExpExecArray>;
+}
+
+function watchOutput(child: ChildProcess, label: string): OutputWatch {
+  let output = '';
+  let exit: Error | undefined;
+  const waiting = new Set<{ pattern: RegExp; resolve(match: RegExpExecArray): void; reject(error: Error): void }>();
+  const feed = (chunk: Buffer | string) => {
+    output += chunk;
+    for (const each of waiting) {
+      const found = each.pattern.exec(output);
+      if (!found) continue;
+      waiting.delete(each);
+      each.resolve(found);
+    }
+  };
+  child.stdout!.on('data', feed);
+  child.stderr!.on('data', feed);
+  child.once('exit', (code, signal) => {
+    exit = new Error(`${label} exited with code ${code ?? signal}:\n${output}`);
+    for (const each of waiting) each.reject(exit);
+    waiting.clear();
+  });
+  return {
+    output: () => output,
+    match: (pattern) =>
+      new Promise((resolve, reject) => {
+        const found = pattern.exec(output);
+        if (found) resolve(found);
+        else if (exit) reject(exit);
+        else waiting.add({ pattern, resolve, reject });
+      }),
+  };
 }
 
 // Connects to the main process's Node inspector (`--inspect=0` prints
@@ -241,15 +545,14 @@ export async function stopGroup(child: ChildProcess): Promise<void> {
 // evaluates expressions in it. The connection opens on the first evaluation.
 // `Runtime.evaluate` with `includeCommandLineAPI` exposes `require`, which is
 // what `electronApp.evaluate` of Playwright's Electron launcher does too.
-export function mainInspector(output: () => string) {
+export function mainInspector(watch: OutputWatch) {
   let socket: Promise<WebSocket> | undefined;
   let lastId = 0;
   const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();
 
   const connect = async () => {
-    const url = await poll(() => /Debugger listening on (ws:\/\/\S+)/.exec(output())?.[1], Boolean, 15_000);
-    if (!url) throw new Error(`the app did not open an inspector:\n${output()}`);
-    const ws = new WebSocket(url);
+    const [, url] = await watch.match(/Debugger listening on (ws:\/\/\S+)/);
+    const ws = new WebSocket(url!);
     await new Promise<void>((resolve, reject) => {
       ws.addEventListener('open', () => resolve(), { once: true });
       ws.addEventListener('error', () => reject(new Error(`cannot connect to the inspector at ${url}`)), { once: true });
@@ -312,29 +615,23 @@ export async function launchSpawned(
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  let output = '';
-  child.stdout.on('data', (chunk) => (output += chunk));
-  child.stderr.on('data', (chunk) => (output += chunk));
+  track(child);
+  const watch = watchOutput(child, 'the app');
   const removeDataDir = () => {
     if (!givenDataDir) rmSync(dataDir, { recursive: true, force: true });
   };
 
   try {
-    const deadline = Date.now() + 30_000;
-    let port: string | undefined;
-    while (!(port = /DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)/.exec(output)?.[1])) {
-      if (child.exitCode !== null) throw new Error(`the app exited with code ${child.exitCode}:\n${output}`);
-      if (Date.now() > deadline) throw new Error(`the app did not open a debugging port:\n${output}`);
-      await sleep(50);
-    }
+    const [, port] = await watch.match(/DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)/);
     const { browser, page } = await attach(`http://127.0.0.1:${port}`);
-    const inspector = mainInspector(() => output);
+    const inspector = mainInspector(watch);
     return {
       page,
       pid: child.pid!,
       dataDir,
       cockpitHome,
-      output: () => output,
+      output: watch.output,
+      outputMatch: watch.match,
       evaluateInMain: inspector.evaluate,
       disconnectInspector: inspector.close,
       isRunning: () => child.exitCode === null,
@@ -406,31 +703,26 @@ export async function launchDev(
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  let output = '';
-  dev.stdout.on('data', (chunk) => (output += chunk));
-  dev.stderr.on('data', (chunk) => (output += chunk));
+  track(dev);
+  const watch = watchOutput(dev, 'dev');
   const stop = () => stopGroup(dev);
   const removeDataDir = () => rmSync(dataDir, { recursive: true, force: true });
 
   try {
-    const endpoint = `http://127.0.0.1:${port}`;
-    const deadline = Date.now() + 90_000;
-    while (!(await fetch(`${endpoint}/json/version`).then((r) => r.ok, () => false))) {
-      if (dev.exitCode !== null) throw new Error(`dev exited with code ${dev.exitCode}:\n${output}`);
-      if (Date.now() > deadline) throw new Error(`dev did not open a window:\n${output}`);
-      await sleep(250);
-    }
-    const { browser, page } = await attach(endpoint);
+    await watch.match(new RegExp(`DevTools listening on ws://127\\.0\\.0\\.1:${port}`));
+    const { browser, page } = await attach(`http://127.0.0.1:${port}`);
     // The dev script runs Electron in the process group of `dev`; the helpers
     // are named `Electron Helper ...`, so `-x` matches the main process only.
     const pid = Number(execFileSync('pgrep', ['-g', String(dev.pid), '-x', 'Electron'], { encoding: 'utf8' }).split('\n')[0]);
-    const inspector = mainInspector(() => output);
+    closedByPid.set(pid, closedByPid.get(dev.pid!)!);
+    const inspector = mainInspector(watch);
     return {
       page,
       pid,
       dataDir,
       cockpitHome,
-      output: () => output,
+      output: watch.output,
+      outputMatch: watch.match,
       evaluateInMain: inspector.evaluate,
       disconnectInspector: inspector.close,
       isRunning: () => dev.exitCode === null,
@@ -447,16 +739,6 @@ export async function launchDev(
     await killDaemonsIn(...daemonHomesOf(env, cockpitHome));
     removeDataDir();
     throw error;
-  }
-}
-
-// Reads until `done` accepts the value or `timeout` ms pass, and returns the last value.
-export async function poll<T>(read: () => T | Promise<T>, done: (value: T) => boolean, timeout: number): Promise<T> {
-  const deadline = Date.now() + timeout;
-  for (;;) {
-    const value = await read();
-    if (done(value) || Date.now() > deadline) return value;
-    await sleep(100);
   }
 }
 

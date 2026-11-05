@@ -12,8 +12,8 @@ import {
   send,
   shellOptions,
   startDaemon,
+  heldProcess,
   stripAnsi,
-  until,
   waitForOutput,
 } from './helpers';
 
@@ -30,7 +30,7 @@ async function start() {
 // Prints the pid of the terminal's shell, to check later whether the process is alive.
 async function pidOf(connection: Awaited<ReturnType<typeof connectTo>>, id: unknown): Promise<number> {
   connection.client.write(id, 'echo pid-$$-end\n');
-  await until(() => /pid-\d+-end/.test(connection.output(id)), `the pid of terminal ${String(id)}`);
+  await connection.when(() => /pid-\d+-end/.test(connection.output(id)));
   return Number(/pid-(\d+)-end/.exec(connection.output(id))![1]);
 }
 
@@ -97,7 +97,7 @@ describe('attach and sequence numbers (AC14, AC5)', () => {
     expect(typeof attached.seq).toBe('number');
     const before = connection.data.length;
     client.write(id, 'echo after-$((1+1))\n');
-    await until(() => connection.data.slice(before).some((chunk) => chunk.data.includes('after-2')), 'the later output');
+    await connection.when(() => connection.data.slice(before).some((chunk) => chunk.data.includes('after-2')));
     for (const chunk of connection.data.slice(before)) expect(chunk.seq).toBeGreaterThan(attached.seq);
   });
 
@@ -124,16 +124,24 @@ describe('attach and sequence numbers (AC14, AC5)', () => {
   test('AC14 — a client attaching during a burst of output gets every line exactly once: the screen it receives plus the data events after its sequence number', async () => {
     const { client, connection, files } = await start();
     const id = await client.spawn(shellOptions);
-    // 150 lines, a few milliseconds apart: the attach lands in the middle.
-    client.write(id, 'i=0; while [ $i -lt 150 ]; do echo line-$i; i=$((i+1)); sleep 0.02; done; echo burst-$((1+1))-done\n');
-    await waitForOutput(connection, id, 'line-10\r');
-
     const other = await connectTo(files.socket);
-    const attached = await other.client.attach(id);
+    // 150 lines, each typed once the previous one printed (a chunk of output each): the attach lands in the middle.
+    let attaching!: ReturnType<typeof other.client.attach>;
+    for (let line = 0; line < 150; line++) {
+      // The typed line holds `$((n+0))`: only the output holds the number.
+      client.write(id, `echo line-$((${line}+0))\n`);
+      await waitForOutput(connection, id, `line-${line}\r`);
+      if (line === 10) attaching = other.client.attach(id);
+      // The attach is answered before the burst is over.
+      if (line === 100) await attaching;
+    }
+    client.write(id, 'echo burst-$((1+1))-done\n');
+    const attached = await attaching;
     await waitForOutput(other, id, 'burst-2-done');
 
     const later = other.data.filter((chunk) => chunk.id === id);
-    expect(later.length, 'some output came after the attach').toBeGreaterThan(0);
+    // The burst arrives in many chunks, not one.
+    expect(later.length, 'several chunks of output came after the attach').toBeGreaterThan(1);
     const seqs = later.map((chunk) => chunk.seq);
     expect(seqs.every((seq) => seq > attached.seq)).toBe(true);
     expect([...seqs].sort((a, b) => a - b)).toEqual(seqs);
@@ -162,8 +170,8 @@ describe('the headless terminal (AC5)', () => {
   });
 });
 
-// Ignores SIGHUP (inherited by the `sleep` it execs), prints its pid, then waits.
-const HUP_IGNORER = "trap '' HUP; echo ready-$$-end; exec sleep 60";
+// Ignores SIGHUP (inherited by the process it execs, which holds the test's FIFO), prints its pid, then waits.
+const hupIgnorer = () => `trap '' HUP; echo ready-$$-end; ${heldProcess().snippet}`;
 
 describe('kill and exit (AC6)', () => {
   test('AC6 — kill ends the process and the daemon no longer lists the terminal; a shell that exits by itself leaves the list too', async () => {
@@ -175,28 +183,31 @@ describe('kill and exit (AC6)', () => {
     client.kill(killed);
     client.write(exiting, 'exit 3\n');
 
-    await until(() => connection.exits.length === 2, 'both exits');
+    await connection.when(() => connection.exits.length === 2);
     expect(connection.exits.find((exit) => exit.id === exiting)?.exitCode).toBe(3);
     // AC2 — a shell that ends on SIGHUP reports it: no SIGKILL was needed.
     expect(connection.exits.find((exit) => exit.id === killed)?.signal).toBe(1);
     expect(await client.list()).toEqual([]);
-    await until(() => !isAlive(killedPid), 'the killed shell to be gone');
+    // The exit is reported once node-pty has reaped the process.
+    expect(isAlive(killedPid), 'the killed shell is gone').toBe(false);
   });
 
   test('AC1 — a process that ignores SIGHUP gets SIGKILL 1 s after the hang-up: the client receives signal 9 within 3 s, the terminal leaves the list and the process is gone', async () => {
     const { client, connection } = await start();
-    const id = await client.spawn({ ...shellOptions, command: '/bin/sh', args: ['-c', HUP_IGNORER] });
-    await until(() => /ready-\d+-end/.test(connection.output(id)), 'the process to ignore SIGHUP');
+    const id = await client.spawn({ ...shellOptions, command: '/bin/sh', args: ['-c', hupIgnorer()] });
+    await connection.when(() => /ready-\d+-end/.test(connection.output(id)));
     const pid = Number(/ready-(\d+)-end/.exec(connection.output(id))![1]);
 
     const killedAt = Date.now();
     client.kill(id);
 
-    await until(() => connection.exits.some((exit) => exit.id === id), 'the exit of the SIGHUP-ignoring process', 3000);
-    expect(Date.now() - killedAt).toBeGreaterThanOrEqual(900);
+    await connection.when(() => connection.exits.some((exit) => exit.id === id));
+    const elapsed = Date.now() - killedAt;
+    expect(elapsed).toBeGreaterThanOrEqual(900);
+    expect(elapsed).toBeLessThan(3000);
     expect(connection.exits.find((exit) => exit.id === id)?.signal).toBe(9);
     expect(await client.list()).toEqual([]);
-    await until(() => !isAlive(pid), 'the process to be gone');
+    expect(isAlive(pid), 'the process is gone').toBe(false);
   });
 });
 
@@ -208,13 +219,15 @@ describe('commands bound to a connection (AC7)', () => {
     const session = await client.spawn({ ...shellOptions, kind: 'session', sessionId: 'session-1' });
     const commands = await client.spawn({ ...shellOptions, kind: 'commands' });
     const pids = { shell: await pidOf(connection, shell), session: await pidOf(connection, session), commands: await pidOf(connection, commands) };
+    // Attached, the other client hears the commands terminal's exit.
+    const other = await connectTo(files.socket);
+    await other.client.attach(commands);
 
     client.close();
 
-    const other = await connectTo(files.socket);
-    await until(async () => (await other.client.list()).length === 2, 'the commands terminal to end');
+    await other.when(() => other.exits.some((exit) => exit.id === commands));
     expect((await other.client.list()).map((entry) => entry.id).sort()).toEqual([shell, session].sort());
-    await until(() => !isAlive(pids.commands), 'the commands process to be gone');
+    expect(isAlive(pids.commands), 'the commands process is gone').toBe(false);
     expect(isAlive(pids.shell)).toBe(true);
     expect(isAlive(pids.session)).toBe(true);
     other.client.kill(shell);
@@ -226,23 +239,28 @@ describe('commands that ignore SIGHUP (AC3)', () => {
   test('AC3 — closing the connection that spawned a commands terminal running a SIGHUP-ignoring process ends it within 3 s, and another client no longer lists it', async () => {
     const { connection, files } = await start();
     const { client } = connection;
-    const id = await client.spawn({ ...shellOptions, kind: 'commands', command: '/bin/sh', args: ['-c', HUP_IGNORER] });
-    await until(() => /ready-\d+-end/.test(connection.output(id)), 'the process to ignore SIGHUP');
+    const id = await client.spawn({ ...shellOptions, kind: 'commands', command: '/bin/sh', args: ['-c', hupIgnorer()] });
+    await connection.when(() => /ready-\d+-end/.test(connection.output(id)));
     const pid = Number(/ready-(\d+)-end/.exec(connection.output(id))![1]);
     const other = await connectTo(files.socket);
     expect((await other.client.list()).map((entry) => entry.id)).toEqual([id]);
+    // Attached, the other client hears the terminal's exit.
+    await other.client.attach(id);
     expect(isAlive(pid)).toBe(true);
 
+    const closedAt = Date.now();
     client.close();
 
-    await until(() => !isAlive(pid), 'the commands process to be gone', 3000);
-    await until(async () => (await other.client.list()).length === 0, 'the commands terminal to leave the list');
+    await other.when(() => other.exits.some((exit) => exit.id === id));
+    expect(Date.now() - closedAt).toBeLessThan(3000);
+    expect(isAlive(pid), 'the commands process is gone').toBe(false);
+    expect(await other.client.list()).toEqual([]);
   });
 });
 
 describe('another build (AC8, AC9)', () => {
   test('AC8 — a hello of another build supersedes the daemon: it keeps its terminals, then exits when the last one ends, removing .sock, .token and .pid but not .log', async () => {
-    const { client, connection, files } = await start();
+    const { client, connection, files, daemon } = await start();
     writeFileSync(files.log, 'daemon output\n');
     const id = await client.spawn(shellOptions);
     const pid = await pidOf(connection, id);
@@ -258,16 +276,18 @@ describe('another build (AC8, AC9)', () => {
     await waitForOutput(newer, id, 'from-newer-42');
     client.kill(id);
 
-    await until(() => ![files.socket, files.token, files.pid].some(exists), 'the superseded daemon to remove its files');
+    await daemon.closed;
+    expect([files.socket, files.token, files.pid].some(exists), 'the superseded daemon removed its files').toBe(false);
     expect(exists(files.log)).toBe(true);
   });
 
   test('AC8 — a daemon holding no terminal exits as soon as a client of another build connects', async () => {
-    const { files } = await start();
+    const { files, daemon } = await start();
 
     await connectTo(files.socket, OTHER_BUILD);
 
-    await until(() => ![files.socket, files.token, files.pid].some(exists), 'the idle daemon to exit');
+    await daemon.closed;
+    expect([files.socket, files.token, files.pid].some(exists), 'the idle daemon removed its files').toBe(false);
   });
 
   test('AC9 — a client of another build asking to spawn is refused with the build message and nothing is spawned', async () => {
