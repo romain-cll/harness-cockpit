@@ -32,8 +32,9 @@ async function linkedWorktree(worktrees: Worktree[], path: string): Promise<Work
 
 /**
  * Clones `url` into `path`, which must not exist (`DESTINATION_EXISTS`); git creates the parent folders.
- * `GIT_TERMINAL_PROMPT=0` so a credential prompt fails instead of waiting. Aborting `signal` ends git, which
- * removes the partial folder itself.
+ * `GIT_TERMINAL_PROMPT=0` so a credential prompt fails instead of waiting. Aborting `signal` ends git. Past the
+ * existence check, a clone that fails or is aborted leaves no `path`: git keeps its folder when it dies or fails
+ * during the checkout, so it is removed once git has exited.
  */
 export async function cloneRepository({
   url,
@@ -47,16 +48,25 @@ export async function cloneRepository({
 } & GitEnv): Promise<void> {
   await checkGit(env);
   if (await exists(path)) throw new WorkspaceError('DESTINATION_EXISTS', `${path} already exists.`);
-  await git(['clone', '--', url, path], { env: { ...env, GIT_TERMINAL_PROMPT: '0' }, signal });
+  try {
+    await git(['clone', '--', url, path], { env: { ...env, GIT_TERMINAL_PROMPT: '0' }, signal });
+  } catch (error) {
+    await rm(path, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 /**
  * Makes `path` (an existing folder) a repository holding one empty commit, so that a worktree can start from
  * it; its files stay untracked. Without an identity git resolves in the new repository, `GIT_IDENTITY_MISSING`.
- * On any failure `.git` is removed again.
+ * On any failure `.git` is removed again; a folder that already has one is refused (`GIT_DIR_EXISTS`) and left
+ * untouched, so the rollback only removes what this call made.
  */
 export async function initRepository({ path, env }: { path: string } & GitEnv): Promise<void> {
   await checkGit(env);
+  if (await exists(join(path, '.git'))) {
+    throw new WorkspaceError('GIT_DIR_EXISTS', `${path} already has a .git that git cannot use. Nothing was changed.`);
+  }
   await git(['init'], { cwd: path, env });
   try {
     for (const variable of ['GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT']) {

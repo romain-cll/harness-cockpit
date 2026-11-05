@@ -741,7 +741,7 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
   });
 
   const badName = (name: string): Refused | undefined => {
-    const message = name === '' ? 'A project name is required.' : nameProblem(name);
+    const message = nameProblem(name);
     return message ? { status: 'refused', message } : undefined;
   };
 
@@ -813,6 +813,7 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
   // state is saved, and a repair that fails (the workspaces then show git's error) does not undo the update.
   ipcMain.handle('projects:update-path', async (event, from: string): Promise<UpdatePathResult> => {
     if (!isFromApp(event)) throw new Error('projects:update-path refused: unexpected origin');
+    // The sidebar's list can be stale (the project was removed from another window).
     if (!state.projects.some((project) => project.path === from)) {
       return { status: 'refused', message: `${from} is not a project in Cockpit.` };
     }

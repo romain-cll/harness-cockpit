@@ -168,8 +168,8 @@ function Field({ label, htmlFor, error, children }: { label: string; htmlFor?: s
   );
 }
 
-// Aria-invalid keeps the destructive border in the dark theme too; no transition, so a read right after an error sees the final color.
-const fieldClass = 'h-8 bg-background px-2.5 text-xs transition-none dark:bg-background dark:aria-invalid:border-destructive';
+// `!` wins over the Input's own dark-theme background and invalid border; no transition, so a read right after an error sees the final color.
+const fieldClass = 'h-8 bg-background! px-2.5 text-xs transition-none aria-invalid:border-destructive!';
 
 function LocationField({ shownPath, hint, disabled, onChoose }: { shownPath?: string; hint?: string; disabled: boolean; onChoose: () => void }) {
   return (
@@ -246,7 +246,7 @@ function CloneDialog({ onClose }: { onClose: () => void }) {
   }
 
   return (
-    <Dialog open onOpenChange={(open) => !open && cancel()}>
+    <Dialog open disablePointerDismissal={cloning} onOpenChange={(open) => !open && cancel()}>
       <DialogContent showCloseButton={false} initialFocus={first} className={dialogClass}>
         <DialogHeader>
           <DialogTitle className={titleClass}>Clone from Git</DialogTitle>
