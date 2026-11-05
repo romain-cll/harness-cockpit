@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { type Page } from 'playwright-core';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
@@ -26,6 +26,7 @@ import {
   selectTab,
   startFakeDaemon,
   stoppedBanner,
+  stubPicker,
   tabNames,
   tabNamed,
   typeLine,
@@ -36,6 +37,7 @@ import {
   daemonFile,
 } from './support/daemon';
 import { waitForRowStatus } from './support/panes';
+import { deleteButton, openDeleteDialog, removeThroughMenu, waitForNoEntry } from './support/projects';
 
 // COCKPIT-69: each way the background service can fail, stop, vanish after a reboot or become unreachable has its
 // own screen. The built app runs every case (the dev server and the packaged app run one smoke path each, in
@@ -48,6 +50,7 @@ const failureView = (page: Page) => page.getByText(FAILURE_TITLE, { exact: true 
 const endedView = (page: Page) => page.getByText('This terminal ended', { exact: true });
 const noTab = (page: Page) => page.getByText('No tab open', { exact: true });
 const state = (dataDir: string, content: unknown) => writeFileSync(join(dataDir, 'state.json'), JSON.stringify(content));
+const storedSessions = (dataDir: string) => (JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')) as { sessions?: Array<{ id: string; open?: boolean }> }).sessions ?? [];
 
 // The look of the banner: its fill and border against the `--status-working` token (10% and 25%), and whether it sits
 // under the tab bar. Self-contained: it runs in the page.
@@ -587,5 +590,169 @@ describe('background service: a daemon of another protocol with no terminal', ()
 
     expect(await restartDialog(page).count()).toBe(0);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+  });
+});
+
+describe('background service: the open mark when a workspace or a project goes', () => {
+  let fx: Fixture;
+  let dataDir: string;
+  let home: string;
+  let build: string;
+  let repo: { parent: string; root: string };
+  let session: Session | undefined;
+
+  beforeAll(() => {
+    fx = makeFixture();
+    dataDir = makeDataDir();
+    home = join(dataDir, 'h');
+    build = uniqueBuild();
+    // No teardown command: a workspace deletes at once.
+    repo = makeRepoWithSetup({});
+  });
+
+  afterAll(async () => {
+    await session?.close().catch(() => {});
+    await killDaemonsIn(home);
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(fx.root, { recursive: true, force: true });
+    rmSync(repo.parent, { recursive: true, force: true });
+  });
+
+  const launch = async () => {
+    if (session?.isRunning()) await session.close().catch(() => {});
+    session = await launchBuiltOn(fx.env({ COCKPIT_TEST_DAEMON_BUILD: build }), dataDir, home);
+    await session.page.getByText(versionLabel).waitFor();
+    return session;
+  };
+
+  // A workspace with a running session in its tab, marked open in state.json.
+  const workspaceWithSession = async (current: Session, name: string) => {
+    const made = await makeWorkspace(current, name, repo.root);
+    await goToWorkspacePage(current.page, made.path);
+    await newAgentTab(current.page);
+    await expectTabCount(current.page, 1);
+    await expectScreen(current.page, /^ready$/m);
+    expect(storedSessions(dataDir).at(-1)?.open, 'the session is marked open while it runs').toBe(true);
+    await watchEvents(current.page);
+    return made;
+  };
+
+  test('AC22 — deleting the workspace keeps the session stored with its mark cleared; a new workspace on the same branch after a relaunch shows no ended tab', async () => {
+    const first = await launch();
+    const { page } = first;
+    const made = await workspaceWithSession(first, 'del-ws');
+
+    const dialog = await openDeleteDialog(page, made.path, 'del-ws');
+    await deleteButton(dialog).click();
+    await dialog.waitFor({ state: 'hidden' });
+    await waitForNoEntry(page, made.path);
+    // The agent's terminal ended: the daemon holds nothing of it any more.
+    await untilEvents(page, 'exits', 1);
+
+    const stored = storedSessions(dataDir);
+    expect(stored).toHaveLength(1);
+    expect(stored[0]!.open, 'the mark is cleared').not.toBe(true);
+
+    await quitApp(first);
+    const second = await launch();
+    const again = await makeWorkspace(second, 'del-ws', repo.root);
+    expect(again.path).toBe(made.path);
+    await goToWorkspacePage(second.page, again.path);
+    await noTab(second.page).waitFor();
+    expect(await endedView(second.page).count()).toBe(0);
+  });
+
+  test('AC23 — removing the project keeps the session stored with its mark cleared; adding the project again after a relaunch shows its workspaces with no tab', async () => {
+    const first = session!;
+    const { page } = first;
+    const made = await workspaceWithSession(first, 'rm-ws');
+
+    await removeThroughMenu(page, repo.root);
+    await waitForNoEntry(page, repo.root);
+    await untilEvents(page, 'exits', 1);
+
+    const stored = storedSessions(dataDir);
+    expect(stored).toHaveLength(2);
+    expect(stored.at(-1)!.open, 'the mark is cleared').not.toBe(true);
+
+    await quitApp(first);
+    const second = await launch();
+    await stubPicker(second, repo.root);
+    await second.page.evaluate(() => (window as unknown as { api: { projects: { add(): Promise<unknown> } } }).api.projects.add());
+    await second.page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await goToWorkspacePage(second.page, made.path);
+    await noTab(second.page).waitFor();
+    expect(await endedView(second.page).count()).toBe(0);
+  });
+});
+
+describe('background service: the daemon of a superseded build dies', () => {
+  let fx: Fixture;
+  let dataDir: string;
+  let home: string;
+  let repo: { parent: string; root: string };
+  let session: Session | undefined;
+
+  beforeAll(() => {
+    fx = makeFixture();
+    dataDir = makeDataDir();
+    home = join(dataDir, 'h');
+    // No teardown command: a workspace deletes at once.
+    repo = makeRepoWithSetup({});
+  });
+
+  afterAll(async () => {
+    await session?.close().catch(() => {});
+    await killDaemonsIn(home);
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(fx.root, { recursive: true, force: true });
+    rmSync(repo.parent, { recursive: true, force: true });
+  });
+
+  const launch = async (build: string) => {
+    if (session?.isRunning()) await session.close().catch(() => {});
+    session = await launchBuiltOn(fx.env({ COCKPIT_TEST_DAEMON_BUILD: build }), dataDir, home);
+    await session.page.getByText(versionLabel).waitFor();
+    return session;
+  };
+
+  test('AC24 — builds A and B each hold a shell and the app runs build C: after A dies, "Restart" clears the banner; after B dies, a terminal from the "+" menu does; C keeps its pid', async () => {
+    const [a, b, c] = [uniqueBuild(), uniqueBuild(), uniqueBuild()] as const;
+    const first = await launch(a);
+    const made = await makeWorkspace(first, 'sup-ws', repo.root);
+    await goToWorkspacePage(first.page, made.path);
+    await newShellTab(first.page);
+    await typeLine(first.page, 'echo from-a-$((6*7))');
+    await expectScreen(first.page, /^from-a-42$/m);
+    await quitApp(first);
+
+    const second = await launch(b);
+    await goToWorkspacePage(second.page, made.path);
+    await expectTabCount(second.page, 1);
+    await newShellTab(second.page);
+    await expectTabCount(second.page, 2);
+    await typeLine(second.page, 'echo from-b-$((6*7))');
+    await expectScreen(second.page, /^from-b-42$/m);
+    await quitApp(second);
+
+    const third = await launch(c);
+    const { page } = third;
+    await goToWorkspacePage(page, made.path);
+    await expectTabCount(page, 2);
+    const own = must(daemonPid(home, c), 'the own daemon pid');
+
+    await killDaemon(home, a);
+    await stoppedBanner(page, 1).waitFor();
+    await restartButton(page).click();
+    await stoppedBanner(page).waitFor({ state: 'detached' });
+    expect(daemonPid(home, c), 'the own daemon keeps its pid').toBe(own);
+
+    await killDaemon(home, b);
+    await stoppedBanner(page, 1).waitFor();
+    await newShellTab(page);
+    await typeLine(page, 'echo from-c-$((6*7))');
+    await expectScreen(page, /^from-c-42$/m);
+    await stoppedBanner(page).waitFor({ state: 'detached' });
+    expect(daemonPid(home, c), 'the own daemon keeps its pid').toBe(own);
   });
 });

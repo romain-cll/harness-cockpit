@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { once } from 'node:events';
 import { describe, expect, test } from 'vitest';
 import { daemonFiles, runDaemonEntry } from '../src/index';
-import { BUILD, type Connection, connectTo, exists, makeHome, OTHER_BUILD, registerCleanup, send, shellOptions, startDaemon } from './helpers';
+import { BUILD, type Connection, connectTo, exists, heldProcess, isAlive, makeHome, OTHER_BUILD, registerCleanup, send, shellOptions, startDaemon } from './helpers';
 
 // COCKPIT-69 AC15: two routes of the daemon's HTTP side that a later app uses to list and end a daemon
 // it cannot talk to (another protocol). They are frozen across protocols: `GET /terminals` answers a JSON
@@ -104,5 +104,31 @@ describe('POST /shutdown', () => {
     expect(exits).toEqual([0]);
     expect([exists(files.socket), exists(files.token), exists(files.pid)]).toEqual([false, false, false]);
     for (const pid of pids) await processEnded(pid);
+  });
+
+  test('AC15 — a terminal that ignores SIGHUP is ended before the daemon removes its files and exits: the process is gone at the exit', async () => {
+    const home = makeHome();
+    const files = daemonFiles(home, 1, BUILD);
+    const exits: number[] = [];
+    let exited!: () => void;
+    const exitedOnce = new Promise<void>((resolve) => (exited = resolve));
+    await runDaemonEntry(['/usr/bin/electron', '/app/daemon.js', '--cockpit-daemon', BUILD], { COCKPIT_HOME: home }, {
+      stderr: { write: () => {} },
+      exit: (code) => void (exits.push(code), exited()),
+      ready: () => {},
+    });
+    const connection = await connectTo(files.socket);
+    // It ignores SIGHUP (inherited by the process it execs), prints a marker with its pid, then waits.
+    const id = await connection.client.spawn({ ...shellOptions, command: '/bin/sh', args: ['-c', `trap '' HUP; echo ready-$$-end; ${heldProcess().snippet}`] });
+    await connection.when(() => /ready-\d+-end/.test(connection.output(id)));
+    const pid = Number(/ready-(\d+)-end/.exec(connection.output(id))![1]);
+    expect(isAlive(pid)).toBe(true);
+
+    expect((await shutdown(files.socket, `Bearer ${tokenOf(files)}`)).status).toBe(202);
+    await exitedOnce;
+
+    expect(exits).toEqual([0]);
+    expect(isAlive(pid), 'the process is gone when the daemon exits').toBe(false);
+    expect([exists(files.socket), exists(files.token), exists(files.pid)]).toEqual([false, false, false]);
   });
 });
