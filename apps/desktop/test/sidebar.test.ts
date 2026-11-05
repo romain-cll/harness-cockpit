@@ -4,7 +4,28 @@ import { type Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 import { type Session, untilRead, versionLabel } from './launch';
 import { addProject, addRepository, dispatchFocus, gitAlertOf, gitIn, makeLightRepo, makePlainFolder, makeRepo, projectsGit, sidebarLines, type TempRepo, tokenColor, waitForLine } from './support/projects';
-import { closeOverlays, dotTarget, launchBuiltWith, makeSessionsFixture, openSessionEntry, readStub, reportStatus, type SessionsFixture, startInWorkspace, startSession, stubNotifications } from './support/sessions';
+import { promptBox } from './composer';
+import { daemonPidIn } from './support/panes';
+import {
+  closeOverlays,
+  dotTarget,
+  launchBuiltWith,
+  locationsSeen,
+  makeSessionsFixture,
+  openSessionEntry,
+  openWorkspaceStartMenu,
+  readStub,
+  recordLocations,
+  reportStatus,
+  routerSettled,
+  type SessionsFixture,
+  startInWorkspace,
+  startSession,
+  storedSessionIds,
+  stubNotifications,
+  untilStartListed,
+  watchStarts,
+} from './support/sessions';
 import { focusTerminal, goHome, typeLine, waitForRow } from './support/terminal';
 
 // --- Redesign foundation (COCKPIT-65) ----------------------------------------
@@ -460,5 +481,80 @@ describe('redesign foundation: built app', () => {
     await typeLine(page, 'quit');
     await waitForRow(page, '[Process exited with code 0]');
     await expectStatusIcon(page, ids.workspace, 'feat-a', { kind: 'circle-dashed', token: '--muted-foreground', label: 'Ended' });
+  });
+
+  // --- A session's start never overrides a later navigation (COCKPIT-86) ----------------------------------
+
+  // Where the page is, as the router has it.
+  const hereNow = (page: Page) => page.evaluate(() => location.pathname + location.search);
+  const startItem = (page: Page) => page.getByRole('menuitem', { name: 'Claude Code', exact: true });
+  const sessionsPlus = (page: Page) => page.getByRole('button', { name: 'Start session', exact: true });
+
+  test('COCKPIT-86 AC1 — a session started from a workspace row\'s menu, its tab added and the flow\'s router.invalidate() still loading, does not pull the page back to the workspace when the user clicks the Sessions "+" and the load ends', async () => {
+    const { page } = session;
+    await goHome(page);
+    const answer = await projectsGit(page);
+    // The first `projects:git` call from now on is held: the root loader the flow's `router.invalidate()` runs. Later
+    // calls (the user's own navigation) answer at once.
+    await session.evaluateInMain(`(() => {
+      const { ipcMain } = require('electron');
+      globalThis.__gitHeld = new Promise((resolve) => { globalThis.__gitHolding = resolve; });
+      const gate = new Promise((resolve) => { globalThis.__gitRelease = resolve; });
+      let held = false;
+      ipcMain.removeHandler('projects:git');
+      ipcMain.handle('projects:git', async () => {
+        if (!held) {
+          held = true;
+          globalThis.__gitHolding();
+          await gate;
+        }
+        return ${JSON.stringify(answer)};
+      });
+    })()`);
+    let released = false;
+    const release = async () => {
+      released = true;
+      await session.evaluateInMain('globalThis.__gitRelease()');
+    };
+    try {
+      await openWorkspaceStartMenu(page, bravoWorkspace, 'feat-b');
+      await startItem(page).click();
+      await session.evaluateInMain('globalThis.__gitHeld');
+      await recordLocations(page);
+      await sessionsPlus(page).click();
+      await promptBox(page).waitFor();
+      await release();
+    } finally {
+      if (!released) await release();
+    }
+    await routerSettled(page);
+    expect(await hereNow(page), 'the composer is still open').toBe('/?project=none');
+    expect((await locationsSeen(page)).filter((href) => href.startsWith('/workspace')), 'the page never went back to the workspace').toEqual([]);
+  });
+
+  test('COCKPIT-86 AC2 — a session started from a workspace row\'s menu whose start has not answered (daemon stopped) does not pull the page back when the user clicks the Sessions "+" and the daemon resumes: the composer stays, the session is stored and the workspace shows its tab', async () => {
+    const { page } = session;
+    await goHome(page);
+    const known = await storedSessionIds(page);
+    const starts = await watchStarts(session);
+    const daemon = daemonPidIn(session.cockpitHome);
+    await openWorkspaceStartMenu(page, bravoWorkspace, 'feat-b');
+    process.kill(daemon, 'SIGSTOP');
+    try {
+      await startItem(page).click();
+      await recordLocations(page);
+      await sessionsPlus(page).click();
+      await promptBox(page).waitFor();
+    } finally {
+      process.kill(daemon, 'SIGCONT');
+    }
+    const stored = await untilStartListed(session, known, starts);
+    await routerSettled(page);
+    expect(await hereNow(page), 'the composer is still open').toBe('/?project=none');
+    expect((await locationsSeen(page)).filter((href) => href.startsWith('/workspace')), 'the page never went to the workspace').toEqual([]);
+    expect(stored.directory).toBe(bravoWorkspace);
+
+    await page.getByTitle(bravoWorkspace, { exact: true }).first().click();
+    await page.getByRole('tab', { name: stored.name, exact: true }).waitFor();
   });
 });
