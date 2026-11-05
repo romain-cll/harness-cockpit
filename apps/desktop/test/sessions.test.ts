@@ -424,6 +424,7 @@ describe('sessions: built app', () => {
       directory: path,
       project: repo.root,
       createdAt: expect.any(String),
+      open: true,
     });
     expect(sessionFoldersIn(session.cockpitHome)).toEqual(foldersBefore);
   });
@@ -513,6 +514,7 @@ describe('sessions: built app', () => {
       directory: ws.plus.path,
       project: repo.root,
       createdAt: expect.any(String),
+      open: true,
     });
     expect(sessionFoldersIn(session.cockpitHome)).toEqual(foldersBefore);
   });
@@ -1132,7 +1134,7 @@ describe('sessions: built app', () => {
       expect(hookCommandsOf(fx, 'claude', stub.pid).UserPromptSubmit).toBe(`${singleQuoted(REPOSITORY_CLI)} status working`);
       expect(await waitForSetupLabel(page, path, null)).toBeNull();
       expect(await setupLinkCount(page)).toBe(0);
-      expect(storedIn(path)).toEqual([{ id, name: 'Claude Code 1', harness: 'claude-code', directory: path, project: repo.root, createdAt: expect.any(String) }]);
+      expect(storedIn(path)).toEqual([{ id, name: 'Claude Code 1', harness: 'claude-code', directory: path, project: repo.root, createdAt: expect.any(String), open: true }]);
     }, 60_000);
 
     test('AC3, AC4, AC6, AC10 — a failing command stops the setup (the later ones do not run) with the failure line, the hint and the login shell prompt, no agent, and "Setup failed" (destructive) on the row, which a reload keeps; after fixing the config, "cockpit setup" typed in that shell runs it again ("Setting up", then no label) and returns to the same shell; "--then claude" starts the agent', async () => {
