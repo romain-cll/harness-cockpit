@@ -795,12 +795,21 @@ export async function openSubmenu(page: Page, trigger: 'Open in editor' | 'Open 
   return submenu.getByRole('menuitem');
 }
 
+// An app's item of a submenu holds a letter badge (COCKPIT-68) before its name; tests of the apps read the name,
+// the last text of the item, whatever the layout puts between the two.
 export const submenuTexts = async (page: Page, trigger: 'Open in editor' | 'Open in terminal') =>
-  trimmed(await (await openSubmenu(page, trigger)).allInnerTexts());
+  (await openSubmenu(page, trigger)).evaluateAll((items) =>
+    items.map((item) => {
+      const walker = document.createTreeWalker(item, NodeFilter.SHOW_TEXT);
+      let last = '';
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) last = (node.textContent ?? '').trim() || last;
+      return last;
+    }),
+  );
 
 export async function pickInSubmenu(page: Page, trigger: 'Open in editor' | 'Open in terminal', app: string) {
   const items = await openSubmenu(page, trigger);
-  await items.filter({ hasText: new RegExp(`^\\s*${escapeRegExp(app)}\\s*$`) }).first().click();
+  await items.filter({ hasText: new RegExp(`^\\s*(?:\\S\\s*)?${escapeRegExp(app)}\\s*$`) }).first().click();
 }
 
 // Escape until no menu is open (a submenu takes one Escape of its own).

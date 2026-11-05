@@ -1120,7 +1120,7 @@ describe('workspace panes: built app', () => {
 
   // --- Deleting and removing ---
 
-  test('AC25 — deleting a workspace (not at the uncommitted-changes step) ends every one of its processes and drops its tabs; removing its project does the same for the others', async () => {
+  test('AC25 — deleting a workspace ends every one of its processes and drops its tabs; removing its project does the same for the others', async () => {
     const { page } = session;
     await openWorkspace(page, 'gamma', ws.gamma);
     await newTab(page, 'Terminal');
@@ -1134,13 +1134,8 @@ describe('workspace panes: built app', () => {
     await page.getByRole('button', { name: 'Actions for gamma', exact: true }).click();
     await page.getByRole('menuitem', { name: 'Delete workspace…' }).click();
     const confirm = page.getByRole('alertdialog').or(page.getByRole('dialog')).filter({ hasText: 'Delete gamma?' });
+    // The dialog read the uncommitted changes at opening: one click removes the workspace (COCKPIT-68 AC9).
     await confirm.getByRole('button', { name: 'Delete', exact: true }).click();
-    // At the dirty step the dialog's title turns into "gamma has uncommitted changes".
-    const dirty = page.getByRole('alertdialog').or(page.getByRole('dialog')).filter({ hasText: 'has uncommitted changes' });
-    await dirty.waitFor();
-    // The uncommitted-changes step ends nothing.
-    expect(isAlive(shellId) && isAlive(agent)).toBe(true);
-    await dirty.getByRole('button', { name: 'Delete anyway', exact: true }).click();
     await workspaceRow(page, 'gamma').waitFor({ state: 'detached' });
     expect(await hasEnded(shellId), 'the shell is gone').toBe(true);
     expect(await hasEnded(agent), 'the agent is gone').toBe(true);
@@ -1155,7 +1150,8 @@ describe('workspace panes: built app', () => {
     const omegaAgent = await agentPid(page, await terminalOf(page, 0));
     await page.getByRole('button', { name: `Actions for ${repoTwo.name}`, exact: true }).hover();
     await page.getByRole('button', { name: `Actions for ${repoTwo.name}`, exact: true }).click();
-    await page.getByRole('menuitem', { name: /Remove from Cockpit/ }).click();
+    await page.getByRole('menuitem', { name: 'Remove project…', exact: true }).click();
+    await page.getByRole('alertdialog').filter({ hasText: `Remove ${repoTwo.name}?` }).getByRole('button', { name: 'Remove', exact: true }).click();
     expect(await hasEnded(omegaShell)).toBe(true);
     expect(await hasEnded(omegaAgent)).toBe(true);
     await addRepository(session, repoTwo);

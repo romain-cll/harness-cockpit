@@ -5,7 +5,7 @@ import { basename, join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 import { launchBuilt, launchSpawned, type Session, untilRead, versionLabel } from './launch';
 import { makeTestDir } from './run-root';
-import { addProject, afterIpcAnswers, entryTitles, isBelowProjectsHeader, makePlainFolder, makeRepo, projectsGit, projectsInState, readGitAlert, refusalsShown, removeThroughMenu, sidebarEntries, sidebarLines, snapshotRepo, stateSnapshot, type TempRepo, waitForEntries, waitForLine } from './support/projects';
+import { addProject, afterIpcAnswers, countIpcCalls, entryTitles, ipcCalls, isBelowProjectsHeader, makePlainFolder, makeRepo, projectsGit, projectsInState, readGitAlert, refusalsShown, removeThroughMenu, sidebarEntries, sidebarLines, snapshotRepo, startProjectRemoval, stateSnapshot, type TempRepo, untilFewerOverlays, waitForEntries, waitForLine } from './support/projects';
 import { expectNoErrors } from './support/sessions';
 import { dropTerminalWorkspace, watchFrontmost } from './support/terminal';
 
@@ -54,6 +54,18 @@ describe('built app', () => {
 
     afterAll(() => {
       for (const folder of folders) rmSync(folder.parent, { recursive: true, force: true });
+    });
+
+    // A failing test must not leave a menu or a dialog that blocks the tests after it.
+    afterEach(async () => {
+      const { page } = session;
+      const overlays = page.locator('[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]');
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const open = await overlays.count();
+        if (open === 0) break;
+        await page.keyboard.press('Escape');
+        await untilFewerOverlays(page, open);
+      }
     });
 
     test('AC1 — adding a subfolder of a repository lists the repository by name, titled with its root, and stores its root', async () => {
@@ -132,23 +144,59 @@ describe('built app', () => {
       expect(stateSnapshot(session.dataDir)).toEqual(before);
     });
 
-    test('AC6 — the "…" menu offers "Remove from Cockpit" (Files stay on disk); picking it removes the entry at once and leaves the repository on disk', async () => {
+    test('COCKPIT-68 AC4 — "Remove project…" opens "Remove <name>?" saying what is removed and what stays, with Cancel and Remove; the project is still listed and in state.json', async () => {
+      const { page } = session;
+      const before = stateSnapshot(session.dataDir);
+
+      const dialog = await startProjectRemoval(page, bravo.root);
+
+      const text = await dialog.innerText();
+      expect(text).toContain(`Remove ${bravo.name}?`);
+      expect(text).toContain('This removes the project from Cockpit. The repository stays on disk, and the sessions running in its workspaces end.');
+      expect(await dialog.getByRole('button', { name: 'Cancel', exact: true }).count()).toBe(1);
+      expect(await dialog.getByRole('button', { name: 'Remove', exact: true }).count()).toBe(1);
+      expect(await entryTitles(page)).toEqual([alpha.root, bravo.root]);
+      expect(stateSnapshot(session.dataDir)).toEqual(before);
+      expect(projectsInState(session.dataDir)).toEqual([{ path: alpha.root }, { path: bravo.root }]);
+
+      await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await dialog.waitFor({ state: 'hidden' });
+    });
+
+    test('COCKPIT-68 AC5 — Cancel and Escape close the dialog: the project stays listed and in state.json, and no removal reaches the main process', async () => {
+      const { page } = session;
+      const before = stateSnapshot(session.dataDir);
+      await countIpcCalls(session, ['projects:remove']);
+      const removesBefore = await ipcCalls(session, 'projects:remove');
+      const onDisk = snapshotRepo(bravo);
+
+      const first = await startProjectRemoval(page, bravo.root);
+      await first.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await first.waitFor({ state: 'hidden' });
+      const second = await startProjectRemoval(page, bravo.root);
+      await page.keyboard.press('Escape');
+      await second.waitFor({ state: 'hidden' });
+      await afterIpcAnswers(page);
+
+      expect(await ipcCalls(session, 'projects:remove')).toBe(removesBefore);
+      expect(await entryTitles(page)).toEqual([alpha.root, bravo.root]);
+      expect(stateSnapshot(session.dataDir)).toEqual(before);
+      expect(snapshotRepo(bravo)).toEqual(onDisk);
+    });
+
+    test('COCKPIT-68 AC6 — Remove takes the project out of the sidebar and state.json at once and leaves the repository on disk', async () => {
       const { page } = session;
       const alphaOnDisk = snapshotRepo(alpha);
       const bravoOnDisk = snapshotRepo(bravo);
 
       await removeThroughMenu(page, bravo.root);
       await waitForEntries(page, [alpha.root]);
-      // No confirmation to answer.
-      expect(await page.getByRole('dialog').count()).toBe(0);
       expect(await page.getByRole('alertdialog').count()).toBe(0);
       expect(projectsInState(session.dataDir)).toEqual([{ path: alpha.root }]);
       expect(snapshotRepo(bravo)).toEqual(bravoOnDisk);
 
       await removeThroughMenu(page, alpha.root);
       await waitForEntries(page, []);
-      expect(await page.getByRole('dialog').count()).toBe(0);
-      expect(await page.getByRole('alertdialog').count()).toBe(0);
       expect(projectsInState(session.dataDir)).toEqual([]);
       expect(snapshotRepo(alpha)).toEqual(alphaOnDisk);
       expect(alphaOnDisk.hasGit).toBe(true);

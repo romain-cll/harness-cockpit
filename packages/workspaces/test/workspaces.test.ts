@@ -12,6 +12,7 @@ import {
   listBranches,
   listWorktrees,
   readWorkspaceConfig,
+  removalState,
   removeWorktree,
   shellInvocation,
 } from '../src/index';
@@ -520,6 +521,118 @@ describe('removeWorktree', () => {
     expect(existsSync(path)).toBe(false);
     expect(branchExists(repo, 'unmerged')).toBe(true);
     expect(git(repo, 'rev-parse', 'unmerged')).toBe(branchHead);
+  });
+});
+
+/** Every file under the repository's git folder with its size and modification time: what a read must leave alone. */
+function gitdirListing(repo: string): string[] {
+  const root = join(repo, '.git');
+  return readdirSync(root, { recursive: true })
+    .map(String)
+    .sort()
+    .map((entry) => {
+      const stat = statSync(join(root, entry));
+      return stat.isFile() ? `${entry} ${stat.size} ${stat.mtimeMs}` : entry;
+    });
+}
+
+describe('removalState', () => {
+  test('COCKPIT-68 AC19 — a clean worktree on a merged branch is neither uncommitted nor unmerged', async () => {
+    const repo = await makeRepo();
+    const path = await addWorktree(repo, 'clean', 'clean');
+
+    expect(await removalState({ repo, path, env: testEnv })).toEqual({ uncommitted: false, merged: true });
+  });
+
+  test('COCKPIT-68 AC19 — a modified tracked file, an untracked file and an untracked file under status.showUntrackedFiles=no each make it uncommitted, as removeWorktree\'s check does', async () => {
+    const repo = await makeRepo();
+    git(repo, 'config', 'status.showUntrackedFiles', 'no');
+    const tracked = await addWorktree(repo, 'tracked', 'tracked');
+    await writeFile(join(tracked, 'README.md'), 'changed\n');
+    const untracked = await addWorktree(repo, 'untracked', 'untracked');
+    await writeFile(join(untracked, 'notes.txt'), 'keep me\n');
+
+    for (const path of [tracked, untracked]) {
+      const state = await removalState({ repo, path, env: testEnv });
+      expect(state.uncommitted, path).toBe(true);
+      // removeWorktree agrees.
+      expect((await rejection(removeWorktree({ repo, path, env: testEnv }))).code, path).toBe('DIRTY_WORKTREE');
+    }
+  });
+
+  test('COCKPIT-68 AC19 — with no upstream a branch is merged when the main working tree\'s HEAD holds it, and not when it holds a commit HEAD lacks', async () => {
+    const repo = await makeRepo();
+    const behind = await addWorktree(repo, 'behind', 'behind');
+    commit(repo, 'main moved on');
+    const ahead = await addWorktree(repo, 'ahead', 'ahead');
+    commit(ahead, 'not on main');
+
+    expect((await removalState({ repo, path: behind, env: testEnv })).merged).toBe(true);
+    expect((await removalState({ repo, path: ahead, env: testEnv })).merged).toBe(false);
+  });
+
+  test('COCKPIT-68 AC19 — with an upstream the upstream decides: merged when pushed even if HEAD lacks the commit, not merged when HEAD holds it but the upstream does not', async () => {
+    const { clone } = await makeClone();
+    const pushed = await addWorktree(clone, 'pushed', 'pushed');
+    commit(pushed, 'pushed work');
+    git(pushed, 'push', '--quiet', '--set-upstream', 'origin', 'pushed');
+    commit(clone, 'local only');
+    const tracking = await addWorktree(clone, 'tracking', 'tracking');
+    git(clone, 'branch', '--set-upstream-to=origin/main', 'tracking');
+
+    // The same answers as `git branch -d`.
+    expect((await removalState({ repo: clone, path: pushed, env: testEnv })).merged).toBe(true);
+    expect((await removalState({ repo: clone, path: tracking, env: testEnv })).merged).toBe(false);
+    await removeWorktree({ repo: clone, path: pushed, deleteBranch: true, env: testEnv });
+    expect(branchExists(clone, 'pushed')).toBe(false);
+    expect((await rejection(removeWorktree({ repo: clone, path: tracking, deleteBranch: true, env: testEnv }))).code).toBe('BRANCH_NOT_MERGED');
+  });
+
+  test('COCKPIT-68 AC19 — merged is null when the worktree has no branch', async () => {
+    const repo = await makeRepo();
+    const path = await addWorktree(repo, 'detached', 'detached');
+    git(path, 'checkout', '--detach');
+
+    expect(await removalState({ repo, path, env: testEnv })).toEqual({ uncommitted: false, merged: null });
+  });
+
+  test('COCKPIT-68 AC19 — it writes nothing under the git folder', async () => {
+    const repo = await makeRepo();
+    const path = await addWorktree(repo, 'quiet-read', 'quiet-read');
+    await writeFile(join(path, 'README.md'), 'changed\n');
+    await writeFile(join(path, 'notes.txt'), 'untracked\n');
+    commit(path, 'ahead of main');
+    const before = gitdirListing(repo);
+
+    const state = await removalState({ repo, path, env: testEnv });
+
+    expect(state).toEqual({ uncommitted: true, merged: false });
+    expect(gitdirListing(repo)).toEqual(before);
+  });
+});
+
+describe('removeWorktree forceBranch', () => {
+  test('COCKPIT-68 AC20 — deleteBranch with forceBranch deletes an unmerged branch (git branch -D) after removing the worktree', async () => {
+    const repo = await makeRepo();
+    const path = await addWorktree(repo, 'unmerged-forced', 'unmerged-forced');
+    commit(path, 'not on main');
+
+    await removeWorktree({ repo, path, deleteBranch: true, forceBranch: true, env: testEnv });
+
+    expect(existsSync(path)).toBe(false);
+    expect((await listWorktrees(repo, { env: testEnv })).some((w) => w.path === path)).toBe(false);
+    expect(branchExists(repo, 'unmerged-forced')).toBe(false);
+  });
+
+  test('COCKPIT-68 AC20 — forceBranch without deleteBranch keeps the branch', async () => {
+    const repo = await makeRepo();
+    const path = await addWorktree(repo, 'kept-forced', 'kept-forced');
+    const head = commit(path, 'not on main');
+
+    await removeWorktree({ repo, path, forceBranch: true, env: testEnv });
+
+    expect(existsSync(path)).toBe(false);
+    expect(git(repo, 'rev-parse', 'kept-forced')).toBe(head);
   });
 });
 

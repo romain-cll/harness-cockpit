@@ -4,7 +4,7 @@ import { basename, dirname, join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 import { baseSelect, chooseBase, createButton, openComposer, projectSelect, promptBox, sendFromComposer, textOf, useAgent, waitForBase, waitForMessage } from './composer';
 import { launchBuilt, type Session, untilRead, versionLabel } from './launch';
-import { addProject, addRepository, afterIpcAnswers, countIpcCalls, deleteDialog, dismissDialogs, dispatchFocus, entryTitles, errorMark, expectNoNewErrors, gitIn, gitState, INVOKE_HANDLERS, ipcCalls, isBelowProjectsHeader, linesOf, linkedWorktrees, localBranches, makeClone, makeLightRepo, missingFolderBlock, mutedColor, openDialogs, openMenu, projectsInState, readBaseOptions, readSidebarLines, removeThroughMenu, sha8, sidebarEntries, sidebarLines, startDeletion, stateSnapshot, stubPicker, type TempClone, type TempRepo, tokenColor, untilFewerOverlays, waitForDialogLine, waitForEntries, waitForEntry, waitForLine, waitForNoEntry, worktreePath } from './support/projects';
+import { addProject, addRepository, afterIpcAnswers, branchBox, countIpcCalls, deleteButton, deleteDialog, dismissDialogs, dispatchFocus, entryTitles, errorMark, expectNoNewErrors, gitIn, gitState, INVOKE_HANDLERS, ipcCalls, isBelowProjectsHeader, linesOf, linkedWorktrees, localBranches, makeClone, makeLightRepo, missingFolderBlock, mutedColor, openDeleteDialog, openDialogs, openMenu, projectsInState, readBaseOptions, readSidebarLines, removeOptions, removeProjectDialog, removeThroughMenu, sha8, sidebarEntries, sidebarLines, stateSnapshot, stubPicker, type TempClone, type TempRepo, tokenColor, untilFewerOverlays, waitForDialogLine, waitForEntries, waitForEntry, waitForLine, waitForNoEntry, worktreePath } from './support/projects';
 import { expectNoErrors, workspacesApi } from './support/sessions';
 import { dropTerminalWorkspace, goHome, type PtyWindow, watchFrontmost } from './support/terminal';
 
@@ -82,17 +82,15 @@ describe('built app', () => {
     const waitListed = (path: string) => waitForEntry(session.page, path);
     const waitUnlisted = (path: string) => waitForNoEntry(session.page, path);
 
-    test('AC1, COCKPIT-66 AC3 — the project menu holds "New workspace…" above "Remove from Cockpit", and "New workspace…" goes to the composer for that project, with no dialog', async () => {
+    test('AC1, COCKPIT-66 AC3, COCKPIT-68 AC3 — the project menu holds "New workspace" above "Remove project…", and "New workspace" goes to the composer for that project, with no dialog', async () => {
       const { page } = session;
       await page.getByText(versionLabel).waitFor();
       await addRepository(session, clone);
 
       await openMenu(page, clone.root);
       const items = await page.getByRole('menuitem').allInnerTexts();
-      expect(items).toHaveLength(2);
-      expect(items[0]!.trim()).toBe('New workspace…');
-      expect(items[1]!.split('\n')[0]!.trim()).toBe('Remove from Cockpit');
-      await page.getByRole('menuitem', { name: 'New workspace…' }).click();
+      expect(items.map((item) => item.trim())).toEqual(['New workspace', 'Remove project…']);
+      await page.getByRole('menuitem', { name: 'New workspace', exact: true }).click();
 
       await page.waitForURL((url) => url.searchParams.get('project') === clone.root);
       expect(await textOf(projectSelect(page))).toContain(clone.name);
@@ -357,7 +355,13 @@ describe('built app', () => {
       await waitForEntries(page, []);
     }
 
-    test('AC14, AC15 — the workspace menu holds "Delete workspace…", which opens "Delete <name>?" naming the folder; Cancel and Escape change nothing', async () => {
+    // The dialog's lines, and what it says of the workspace it read.
+    const WARNING = 'It has uncommitted changes. They will be lost.';
+    const HINT = 'Not merged: its commits will be lost.';
+    const KEPT = (branch: string) => `Branch ${branch} was kept: it is not merged.`;
+    const keptLines = async () => (await sidebarLines(session.page)).filter((line) => line.startsWith('Branch '));
+
+    test('COCKPIT-68 AC14 — the workspace menu holds "Delete workspace…", which opens "Delete <name>?" with the folder; Cancel and Escape change nothing and send no removal', async () => {
       const { page } = session;
       const path = await addExternalWorkspace('review-ws');
       const before = { git: gitState(clone), listing: worktreeListing(clone) };
@@ -371,15 +375,10 @@ describe('built app', () => {
       await page.getByRole('menuitem').first().waitFor({ state: 'hidden' });
 
       for (const dismiss of ['Cancel', 'Escape'] as const) {
-        await startDeletion(page, path);
-        const dialog = deleteDialog(page, 'Delete review-ws?');
-        await dialog.waitFor();
-        const text = await dialog.innerText();
-        expect(text).toContain(path);
-        expect(text).toMatch(/deleted/);
-        expect(text).toMatch(/merged/);
+        const dialog = await openDeleteDialog(page, path, 'review-ws');
+        expect(await dialog.innerText()).toContain(path);
         expect(await dialog.getByRole('button', { name: 'Cancel', exact: true }).count()).toBe(1);
-        expect(await dialog.getByRole('button', { name: 'Delete', exact: true }).count()).toBe(1);
+        expect(await deleteButton(dialog).count()).toBe(1);
 
         if (dismiss === 'Cancel') await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
         else await page.keyboard.press('Escape');
@@ -395,107 +394,208 @@ describe('built app', () => {
       }
     });
 
-    test('AC16 — confirming the deletion of a clean workspace with no new commit removes the folder, the worktree, the branch and the row', async () => {
+    test('COCKPIT-68 AC8 — a clean workspace on a merged branch: the dialog says what is deleted with the folder in a box, the branch box is checked, no warning and no hint; Delete removes the worktree and the branch and shows no "was kept" line', async () => {
       const { page } = session;
       const path = worktreePath(session, clone, loginBranch);
+      await countIpcCalls(session, ['workspaces:remove']);
+      const removesBefore = (await removeOptions(session)).length;
 
-      await startDeletion(page, path);
-      const dialog = deleteDialog(page, `Delete ${loginBranch}?`);
-      await dialog.waitFor();
-      await dialog.getByRole('button', { name: 'Delete', exact: true }).click();
+      const dialog = await openDeleteDialog(page, path, loginBranch);
+      const text = await dialog.innerText();
+      expect(text).toContain("This deletes the worktree, the workspace's folder on this Mac, and ends its running sessions.");
+      expect(await dialog.getByText(path, { exact: true }).count(), 'the path in a box of its own').toBe(1);
+      expect(await branchBox(dialog, loginBranch).count()).toBe(1);
+      expect(await branchBox(dialog, loginBranch).isChecked()).toBe(true);
+      expect(text).not.toContain('uncommitted');
+      expect(text).not.toContain('Not merged');
+
+      await deleteButton(dialog).click();
       await dialog.waitFor({ state: 'hidden' });
       await waitUnlisted(path);
 
       expect(existsSync(path)).toBe(false);
       expect(linkedWorktrees(clone).map((worktree) => worktree.path)).not.toContain(path);
       expect(localBranches(clone)).not.toContain(loginBranch);
-      expect((await sidebarLines(page)).filter((line) => line.startsWith('Branch '))).toEqual([]);
+      expect(await keptLines()).toEqual([]);
+      // Nothing is forced that the dialog did not show.
+      const sent = (await removeOptions(session)).slice(removesBefore);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.deleteBranch).toBe(true);
+      expect(sent[0]!.force ?? false).toBe(false);
+      expect(sent[0]!.forceBranch ?? false).toBe(false);
     });
 
-    test('AC17 — an unmerged branch is kept: the worktree is removed and "Branch <branch> was kept: it is not merged." shows under the Projects header', async () => {
-      const { page } = session;
-      const path = await addExternalWorkspace('unmerged-ws');
-      gitIn(path, 'commit', '--allow-empty', '-m', 'work in progress');
-      const commit = gitIn(path, 'rev-parse', 'HEAD');
-
-      await startDeletion(page, path);
-      const dialog = deleteDialog(page, 'Delete unmerged-ws?');
-      await dialog.waitFor();
-      await dialog.getByRole('button', { name: 'Delete', exact: true }).click();
-      await dialog.waitFor({ state: 'hidden' });
-      const message = 'Branch unmerged-ws was kept: it is not merged.';
-      await waitForLine(page, message);
-      await waitUnlisted(path);
-
-      expect(await isBelowProjectsHeader(page, { text: message })).toBe(true);
-      expect(existsSync(path)).toBe(false);
-      expect(linkedWorktrees(clone).map((worktree) => worktree.path)).not.toContain(path);
-      expect(localBranches(clone)).toContain('unmerged-ws');
-      expect(gitIn(clone.root, 'rev-parse', 'unmerged-ws')).toBe(commit);
-    });
-
-    test('AC18 — a workspace with uncommitted changes shows a warning first; Cancel keeps everything; "Delete anyway" removes it, changes included, and applies the branch rule', async () => {
+    test('COCKPIT-68 AC9 — a workspace with uncommitted changes shows the warning at opening and a "Delete" button; one click removes the worktree with its changes, with no second step', async () => {
       const { page } = session;
       const path = await addExternalWorkspace('dirty-ws');
       writeFileSync(join(path, 'README.md'), 'changed\n');
       writeFileSync(join(path, 'notes.txt'), 'untracked\n');
-      const before = gitState(clone);
+      await countIpcCalls(session, ['workspaces:remove']);
+      const removesBefore = (await removeOptions(session)).length;
 
-      await startDeletion(page, path);
-      const dialog = deleteDialog(page, 'Delete dirty-ws?');
-      await dialog.waitFor();
-      await dialog.getByRole('button', { name: 'Delete', exact: true }).click();
-      const warning = deleteDialog(page, 'dirty-ws has uncommitted changes');
-      await warning.waitFor();
-      expect(await warning.innerText()).toMatch(/lost/i);
-      expect(await warning.getByRole('button', { name: 'Cancel', exact: true }).count()).toBe(1);
-      expect(await warning.getByRole('button', { name: 'Delete anyway', exact: true }).count()).toBe(1);
-      // The warning is the answer of the removal the first Delete asked for: nothing is deleted yet.
+      const dialog = await openDeleteDialog(page, path, 'dirty-ws');
+      expect(await dialog.innerText()).toContain(WARNING);
+      expect(await deleteButton(dialog, 'Delete anyway').count()).toBe(0);
       expect(existsSync(path)).toBe(true);
-      expect(gitState(clone)).toEqual(before);
 
-      await warning.getByRole('button', { name: 'Cancel', exact: true }).click();
-      await warning.waitFor({ state: 'hidden' });
-      expect(readFileSync(join(path, 'README.md'), 'utf8')).toBe('changed\n');
-      expect(readFileSync(join(path, 'notes.txt'), 'utf8')).toBe('untracked\n');
-      expect(gitState(clone)).toEqual(before);
-      expect(await isListed(path)).toBe(true);
+      await deleteButton(dialog).click();
+      await dialog.waitFor({ state: 'hidden' });
+      await waitUnlisted(path);
 
-      await startDeletion(page, path);
-      await deleteDialog(page, 'Delete dirty-ws?').getByRole('button', { name: 'Delete', exact: true }).click();
-      const again = deleteDialog(page, 'dirty-ws has uncommitted changes');
-      await again.waitFor();
-      await again.getByRole('button', { name: 'Delete anyway', exact: true }).click();
-      await again.waitFor({ state: 'hidden' });
+      expect(await deleteDialog(page, 'has uncommitted changes').count(), 'no second step').toBe(0);
+      expect(existsSync(path)).toBe(false);
+      expect(linkedWorktrees(clone).map((worktree) => worktree.path)).not.toContain(path);
+      // The branch was merged and its box checked: it goes too.
+      expect(localBranches(clone)).not.toContain('dirty-ws');
+      const sent = (await removeOptions(session)).slice(removesBefore);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.force).toBe(true);
+    });
+
+    test('COCKPIT-68 AC10 — an unmerged branch: the box is unchecked with the hint "Not merged: its commits will be lost."; Delete removes the worktree, keeps the branch and shows no "was kept" line', async () => {
+      const { page } = session;
+      const path = await addExternalWorkspace('unmerged-ws');
+      gitIn(path, 'commit', '--allow-empty', '-m', 'work in progress');
+      const commit = gitIn(path, 'rev-parse', 'HEAD');
+      await countIpcCalls(session, ['workspaces:remove']);
+      const removesBefore = (await removeOptions(session)).length;
+
+      const dialog = await openDeleteDialog(page, path, 'unmerged-ws');
+      expect(await branchBox(dialog, 'unmerged-ws').isChecked()).toBe(false);
+      const text = await dialog.innerText();
+      expect(text).toContain(HINT);
+      expect(text).not.toContain('uncommitted');
+
+      await deleteButton(dialog).click();
+      await dialog.waitFor({ state: 'hidden' });
       await waitUnlisted(path);
 
       expect(existsSync(path)).toBe(false);
       expect(linkedWorktrees(clone).map((worktree) => worktree.path)).not.toContain(path);
-      // No commit outside its base: the branch goes too (AC16).
-      expect(localBranches(clone)).not.toContain('dirty-ws');
+      expect(localBranches(clone)).toContain('unmerged-ws');
+      expect(gitIn(clone.root, 'rev-parse', 'unmerged-ws')).toBe(commit);
+      expect(await keptLines()).toEqual([]);
+      const sent = (await removeOptions(session)).slice(removesBefore);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.forceBranch ?? false).toBe(false);
     });
 
-    test('AC18 — "Delete anyway" on a workspace whose branch has unmerged commits removes the worktree, keeps the branch and says so (AC17)', async () => {
+    test('COCKPIT-68 AC11 — the same workspace with the box checked: Delete removes the worktree and the branch, its commits included', async () => {
       const { page } = session;
-      const path = await addExternalWorkspace('dirty-kept');
-      gitIn(path, 'commit', '--allow-empty', '-m', 'unmerged work');
-      writeFileSync(join(path, 'notes.txt'), 'untracked\n');
-      const commit = gitIn(path, 'rev-parse', 'HEAD');
+      const path = await addExternalWorkspace('unmerged-forced');
+      gitIn(path, 'commit', '--allow-empty', '-m', 'work to throw away');
+      await countIpcCalls(session, ['workspaces:remove']);
+      const removesBefore = (await removeOptions(session)).length;
 
-      await startDeletion(page, path);
-      await deleteDialog(page, 'Delete dirty-kept?').getByRole('button', { name: 'Delete', exact: true }).click();
-      const warning = deleteDialog(page, 'dirty-kept has uncommitted changes');
-      await warning.waitFor();
-      await warning.getByRole('button', { name: 'Delete anyway', exact: true }).click();
-      await warning.waitFor({ state: 'hidden' });
-      const message = 'Branch dirty-kept was kept: it is not merged.';
+      const dialog = await openDeleteDialog(page, path, 'unmerged-forced');
+      expect(await branchBox(dialog, 'unmerged-forced').isChecked()).toBe(false);
+      await branchBox(dialog, 'unmerged-forced').click();
+      expect(await branchBox(dialog, 'unmerged-forced').isChecked()).toBe(true);
+      await deleteButton(dialog).click();
+      await dialog.waitFor({ state: 'hidden' });
+      await waitUnlisted(path);
+
+      expect(existsSync(path)).toBe(false);
+      expect(linkedWorktrees(clone).map((worktree) => worktree.path)).not.toContain(path);
+      expect(localBranches(clone)).not.toContain('unmerged-forced');
+      expect(await keptLines()).toEqual([]);
+      const sent = (await removeOptions(session)).slice(removesBefore);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.deleteBranch).toBe(true);
+      expect(sent[0]!.forceBranch).toBe(true);
+    });
+
+    test('COCKPIT-68 AC12 — a merged branch with the box unchecked by the user: Delete removes the worktree and the branch stays', async () => {
+      const { page } = session;
+      const path = await addExternalWorkspace('merged-kept');
+
+      const dialog = await openDeleteDialog(page, path, 'merged-kept');
+      expect(await branchBox(dialog, 'merged-kept').isChecked()).toBe(true);
+      await branchBox(dialog, 'merged-kept').click();
+      expect(await branchBox(dialog, 'merged-kept').isChecked()).toBe(false);
+      await deleteButton(dialog).click();
+      await dialog.waitFor({ state: 'hidden' });
+      await waitUnlisted(path);
+
+      expect(existsSync(path)).toBe(false);
+      expect(linkedWorktrees(clone).map((worktree) => worktree.path)).not.toContain(path);
+      expect(localBranches(clone)).toContain('merged-kept');
+      expect(await keptLines()).toEqual([]);
+    });
+
+    test('COCKPIT-68 AC13 — a worktree with no branch (detached HEAD): the dialog shows no checkbox and Delete removes the worktree', async () => {
+      const { page } = session;
+      const path = join(clone.parent, 'detached-ws');
+      gitIn(clone.root, 'worktree', 'add', '--quiet', '--detach', path, 'origin/main');
+      await page.reload();
+      await page.getByText(versionLabel).waitFor();
+      await waitListed(path);
+      const branchesBefore = localBranches(clone);
+
+      const dialog = await openDeleteDialog(page, path, 'detached-ws');
+      expect(await dialog.getByRole('checkbox').count()).toBe(0);
+      await deleteButton(dialog).click();
+      await dialog.waitFor({ state: 'hidden' });
+      await waitUnlisted(path);
+
+      expect(existsSync(path)).toBe(false);
+      expect(linkedWorktrees(clone).map((worktree) => worktree.path)).not.toContain(path);
+      expect(localBranches(clone)).toEqual(branchesBefore);
+    });
+
+    test('COCKPIT-68 AC15 — a file that appears in a clean worktree after the dialog opened: the first Delete removes nothing, the dialog stays open with the warning, and a further click removes the worktree', async () => {
+      const { page } = session;
+      const path = await addExternalWorkspace('late-dirty');
+      await countIpcCalls(session, ['workspaces:remove']);
+      const removesBefore = (await removeOptions(session)).length;
+
+      const dialog = await openDeleteDialog(page, path, 'late-dirty');
+      expect(await dialog.innerText()).not.toContain(WARNING);
+      writeFileSync(join(path, 'late.txt'), 'appeared after the dialog opened\n');
+      await deleteButton(dialog).click();
+      await waitForDialogLine(dialog, /^It has uncommitted changes\. They will be lost\.$/);
+
+      expect(await dialog.isVisible()).toBe(true);
+      expect(existsSync(path)).toBe(true);
+      expect(await isListed(path)).toBe(true);
+      expect(readFileSync(join(path, 'late.txt'), 'utf8')).toBe('appeared after the dialog opened\n');
+      let sent = (await removeOptions(session)).slice(removesBefore);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.force ?? false, 'nothing is forced before the warning is shown').toBe(false);
+
+      await deleteButton(dialog).click();
+      await dialog.waitFor({ state: 'hidden' });
+      await waitUnlisted(path);
+
+      expect(existsSync(path)).toBe(false);
+      sent = (await removeOptions(session)).slice(removesBefore);
+      expect(sent).toHaveLength(2);
+      expect(sent[1]!.force).toBe(true);
+    });
+
+    test('COCKPIT-68 AC16 — a commit that lands on a merged branch after the dialog opened (box checked): the worktree goes, the branch stays and "Branch <branch> was kept: it is not merged." shows under the Projects header', async () => {
+      const { page } = session;
+      const path = await addExternalWorkspace('raced-ws');
+      await countIpcCalls(session, ['workspaces:remove']);
+      const removesBefore = (await removeOptions(session)).length;
+
+      const dialog = await openDeleteDialog(page, path, 'raced-ws');
+      expect(await branchBox(dialog, 'raced-ws').isChecked()).toBe(true);
+      gitIn(path, 'commit', '--allow-empty', '-m', 'landed after the dialog opened');
+      const commit = gitIn(path, 'rev-parse', 'HEAD');
+      await deleteButton(dialog).click();
+      await dialog.waitFor({ state: 'hidden' });
+      const message = KEPT('raced-ws');
       await waitForLine(page, message);
       await waitUnlisted(path);
 
       expect(await isBelowProjectsHeader(page, { text: message })).toBe(true);
       expect(existsSync(path)).toBe(false);
-      expect(localBranches(clone)).toContain('dirty-kept');
-      expect(gitIn(clone.root, 'rev-parse', 'dirty-kept')).toBe(commit);
+      expect(localBranches(clone)).toContain('raced-ws');
+      expect(gitIn(clone.root, 'rev-parse', 'raced-ws')).toBe(commit);
+      const sent = (await removeOptions(session)).slice(removesBefore);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.forceBranch ?? false, 'the hint was not on screen').toBe(false);
     });
 
     test('AC19 — a deletion git refuses (locked worktree) keeps the dialog open with the error message and the workspace listed', async () => {
@@ -505,11 +605,9 @@ describe('built app', () => {
       const before = gitState(clone);
 
       try {
-        await startDeletion(page, path);
-        const dialog = deleteDialog(page, 'Delete locked-ws?');
-        await dialog.waitFor();
+        const dialog = await openDeleteDialog(page, path, 'locked-ws');
         const linesBefore = await linesOf(dialog);
-        await dialog.getByRole('button', { name: 'Delete', exact: true }).click();
+        await deleteButton(dialog).click();
         const message = await waitForDialogLine(dialog, /lock/i, linesBefore);
         expect(message.length).toBeGreaterThan(0);
 
@@ -575,7 +673,7 @@ describe('built app', () => {
       expect(existsSync(lateReload), 'removing a project deletes no worktree').toBe(true);
     });
 
-    test('AC12, AC8, COCKPIT-65 AC11 — a project whose folder is gone stays listed with a red alert icon after its name, a red "Folder not found" line, its path in muted text and no workspace, logs no error, offers an unusable composer and is removed by its "Remove from Cockpit" button', async () => {
+    test('AC12, AC8, COCKPIT-65 AC11, COCKPIT-68 AC7 — a project whose folder is gone stays listed with a red alert icon after its name, a red "Folder not found" line, its path in muted text and no workspace, logs no error, offers an unusable composer and is removed, after the dialog, by its "Remove from Cockpit" button', async () => {
       const { page } = session;
       await clearProjects();
       const vanishing = makeLightRepo('ws-vanishing');
@@ -608,8 +706,14 @@ describe('built app', () => {
       expect(await createButton(page).isDisabled()).toBe(true);
       await goHome(page);
 
-      // The button removes it as the "…" menu does: the entry and the state's entry go, the disk is untouched.
+      // COCKPIT-68 AC7: the button opens the same dialog as the "…" menu; Remove takes the entry and the state's
+      // entry away, the disk is untouched.
       await page.locator('aside').getByRole('button', { name: 'Remove from Cockpit', exact: true }).click();
+      const removal = removeProjectDialog(page, vanishing.name);
+      await removal.waitFor();
+      expect(await removal.innerText()).toContain('This removes the project from Cockpit. The repository stays on disk, and the sessions running in its workspaces end.');
+      expect(projectsInState(session.dataDir)).toContainEqual({ path: vanishing.root });
+      await removal.getByRole('button', { name: 'Remove', exact: true }).click();
       await waitForEntries(page, []);
       expect(projectsInState(session.dataDir)).toEqual([]);
       expect(existsSync(vanishing.parent)).toBe(false);

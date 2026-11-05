@@ -432,12 +432,12 @@ describe('new workspace page: built app', () => {
     expect(await textOf(projectSelect(page))).toContain(nodef.name);
   });
 
-  test('AC3 — "New workspace…" in a project\'s menu goes to /?project=<path>, the project select shows that project and no dialog opens', async () => {
+  test('AC3 — "New workspace" (the label is checked by the menus tests) in a project\'s menu goes to /?project=<path>, the project select shows that project and no dialog opens', async () => {
     const { page } = session;
     await openComposer(page);
     await page.getByTitle(refuse.root, { exact: true }).first().hover();
     await page.getByRole('button', { name: `Actions for ${refuse.name}`, exact: true }).click();
-    await page.getByRole('menuitem', { name: 'New workspace…' }).click();
+    await page.getByRole('menuitem', { name: /^New workspace…?$/ }).click();
 
     await page.waitForURL((url) => url.searchParams.get('project') === refuse.root);
     expect(new URL(page.url()).pathname).toBe('/');

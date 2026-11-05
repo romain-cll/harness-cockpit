@@ -61,7 +61,7 @@ export async function openComposer(page: Page, project?: string) {
 }
 
 // Goes to the composer through the sidebar, as a user does and without reloading the page (the Sessions
-// "+", or "New workspace…" in the project's menu). A project the app does not list has no row to use, so the
+// "+", or "New workspace" (formerly "New workspace…") in the project's menu). A project the app does not list has no row to use, so the
 // URL is the way; one it lists has its row rendered sooner or later, and the click waits for it.
 export async function openComposerFromSidebar(page: Page, project: string) {
   if (project === 'none') {
@@ -69,7 +69,7 @@ export async function openComposerFromSidebar(page: Page, project: string) {
   } else if (await isListed(page, project)) {
     await page.getByTitle(project, { exact: true }).first().hover();
     await page.getByRole('button', { name: `Actions for ${basename(project)}`, exact: true }).click();
-    await page.getByRole('menuitem', { name: 'New workspace…' }).click();
+    await page.getByRole('menuitem', { name: /^New workspace…?$/ }).click();
   } else {
     await openComposer(page, project);
     return;

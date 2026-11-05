@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { type ElementHandle, type Page } from 'playwright-core';
 import { expect } from 'vitest';
 import { basePopup, baseSelect, searchBranches } from '../composer';
@@ -212,25 +212,24 @@ export async function openMenu(page: Page, title: string) {
   await page.getByRole('menuitem').first().waitFor();
 }
 
-// Opens the "…" menu of the project entry titled `root`, checks the removal
-// item, and picks "Remove from Cockpit".
-export async function removeThroughMenu(page: Page, root: string) {
+// --- Remove project dialog (COCKPIT-68)
+
+export const removeProjectDialog = (page: Page, name: string) => openDialogs(page).filter({ hasText: `Remove ${name}?` });
+
+// Opens the "…" menu of the project entry titled `root`, picks "Remove project…" and waits for its dialog.
+export async function startProjectRemoval(page: Page, root: string) {
   await openMenu(page, root);
+  await page.getByRole('menuitem', { name: 'Remove project…', exact: true }).click();
+  const dialog = removeProjectDialog(page, basename(root));
+  await dialog.waitFor();
+  return dialog;
+}
 
-  const items = page.getByRole('menuitem');
-  const remove = items.filter({ hasText: 'Remove from Cockpit' });
-  expect(await remove.count()).toBe(1);
-  const lines = (await remove.first().innerText()).split('\n').map((line) => line.trim()).filter(Boolean);
-  expect(lines).toEqual(['Remove from Cockpit', 'Files stay on disk']);
-  // The second line is muted: not painted like the item itself.
-  const colors = await remove.first().evaluate((item) => {
-    const note = [...item.querySelectorAll('*')].find((element) => element.textContent?.trim() === 'Files stay on disk');
-    return { item: getComputedStyle(item).color, note: note ? getComputedStyle(note).color : 'no element of its own' };
-  });
-  expect(colors.note).not.toBe('no element of its own');
-  expect(colors.note).not.toBe(colors.item);
-
-  await remove.first().click();
+// Removes the project entry titled `root` through its "…" menu and confirms in the dialog.
+export async function removeThroughMenu(page: Page, root: string) {
+  const dialog = await startProjectRemoval(page, root);
+  await dialog.getByRole('button', { name: 'Remove', exact: true }).click();
+  await dialog.waitFor({ state: 'hidden' });
 }
 
 // --- Workspaces helpers ------------------------------------------------------
@@ -462,6 +461,40 @@ export async function startDeletion(page: Page, path: string) {
   await openMenu(page, path);
   await page.getByRole('menuitem', { name: 'Delete workspace…' }).click();
 }
+
+// The dialog's button labelled `label`, found by its text: it may hold a spinner, which would change its name.
+export const deleteButton = (dialog: ReturnType<Page['locator']>, label: 'Delete' | 'Delete anyway' = 'Delete') =>
+  dialog.locator('button').filter({ hasText: new RegExp(`^\\s*${label}\\s*$`) });
+
+// The "Also delete the local branch <branch>" checkbox.
+export const branchBox = (dialog: ReturnType<Page['locator']>, branch?: string) =>
+  dialog.getByRole('checkbox', { name: `Also delete the local branch${branch === undefined ? '' : ` ${branch}`}` });
+
+// Waits until the dialog's Delete button is enabled: the read it makes at opening (`workspaces:removal`) is answered and shown.
+// The wait is on the page, not on the IPC call: a dialog that never reads is a failed assertion, not a hang.
+export async function untilDeleteReady(dialog: ReturnType<Page['locator']>) {
+  await untilIn(
+    (await dialog.elementHandle()) as ElementHandle<HTMLElement>,
+    (element): boolean =>
+      [...element.querySelectorAll('button')].some(
+        (button) => /^\s*Delete\s*$/.test(button.textContent ?? '') && !button.disabled && button.getAttribute('aria-disabled') !== 'true',
+      ),
+    (ready) => ready,
+  );
+}
+
+// Opens the Delete dialog of the workspace `name` at `path` and waits until it has read what the workspace holds.
+export async function openDeleteDialog(page: Page, path: string, name: string) {
+  await startDeletion(page, path);
+  const dialog = deleteDialog(page, `Delete ${name}?`);
+  await dialog.waitFor();
+  await untilDeleteReady(dialog);
+  return dialog;
+}
+
+// The options of the calls of `workspaces:remove` counted so far (`countIpcCalls`), the third argument of each.
+export const removeOptions = async (session: Session) =>
+  (await ipcCallArgs(session, 'workspaces:remove')).map((args) => (args[2] ?? {}) as { force?: boolean; deleteBranch?: boolean; forceBranch?: boolean });
 
 // The color the `muted-foreground` token resolves to, for "muted" lines.
 export const mutedColor = (page: Page) =>
