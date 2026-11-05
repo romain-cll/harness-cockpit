@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { access, mkdir, readFile, realpath, rm } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, rm } from 'node:fs/promises';
 import { basename, isAbsolute, join } from 'node:path';
 import { checkGit, git, list, succeeds, WorkspaceError, type GitEnv, type Worktree } from './git';
 
@@ -67,11 +67,11 @@ export async function cloneRepository({
 export async function initRepository({ path, env }: { path: string } & GitEnv): Promise<void> {
   await checkGit(env);
   if (await exists(join(path, '.git'))) {
-    if (await succeeds(['rev-parse', '--is-inside-work-tree'], { cwd: path, env })) return;
+    if (await succeeds(['rev-parse', '--show-toplevel'], { cwd: path, env })) return;
     throw new WorkspaceError('GIT_DIR_EXISTS', `${path} already has a .git that git cannot use. Nothing was changed.`);
   }
-  await git(['init'], { cwd: path, env });
   try {
+    await git(['init'], { cwd: path, env });
     for (const variable of ['GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT']) {
       if (!(await succeeds(['var', variable], { cwd: path, env }))) {
         throw new WorkspaceError(
@@ -82,7 +82,7 @@ export async function initRepository({ path, env }: { path: string } & GitEnv): 
     }
     await git(['commit', '--allow-empty', '--no-gpg-sign', '-m', 'Initial commit'], { cwd: path, env });
   } catch (error) {
-    await rm(join(path, '.git'), { recursive: true, force: true });
+    await rm(join(path, '.git'), { recursive: true, force: true }).catch(() => {});
     throw error;
   }
 }
@@ -133,7 +133,8 @@ export async function listWorktrees(repo: string, { env }: GitEnv = {}): Promise
 /** The folder of a project's worktrees under the root: its name and a hash of its path. */
 const projectFolder = (main: string) => `${basename(main)}-${createHash('sha256').update(main).digest('hex').slice(0, 8)}`;
 
-const exists = (path: string) => access(path).then(() => true, () => false);
+// `lstat`, so a dangling symbolic link exists too.
+const exists = (path: string) => lstat(path).then(() => true, () => false);
 
 const MAX_SLUG = 40;
 

@@ -623,9 +623,10 @@ function describeFailure(error: WorkspaceError, path: string): string {
 // A project with its workspaces, which git tells: the linked worktrees, the main one being the project.
 async function toProject({ path }: { path: string }): Promise<Project> {
   const project = { path, name: basename(path) };
-  // Only an absent folder is "not found"; any other failure (EACCES, EIO…) goes on to git, as before.
+  // An absent folder, or a path that is not a folder (a file took its place), is "not found"; any other failure
+  // (EACCES, EIO…) goes on to git, as before.
   const gone = await stat(path).then(
-    () => false,
+    (found) => !found.isDirectory(),
     (error: NodeJS.ErrnoException) => error.code === 'ENOENT' || error.code === 'ENOTDIR',
   );
   if (gone) return { ...project, workspaces: [], missing: true };
@@ -795,7 +796,7 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
         await initRepository({ path, env: await shellEnv });
         return await addAt(path);
       } catch (error) {
-        await rm(path, { recursive: true, force: true });
+        await rm(path, { recursive: true, force: true }).catch(() => {});
         throw error;
       }
     });

@@ -229,8 +229,8 @@ function CloneDialog({ onClose }: { onClose: () => void }) {
     if (!canClone || location === undefined) return;
     setCloning(true);
     setFailure(undefined);
-    const result = await window.api.projects.clone({ url: url.trim(), location, name });
-    setCloning(false);
+    // Whatever the call comes to, the dialog is usable again.
+    const result = await window.api.projects.clone({ url: url.trim(), location, name }).finally(() => setCloning(false));
     if (result.status === 'added') {
       onClose();
       await listed();
@@ -328,8 +328,8 @@ function CreateDialog({ onClose }: { onClose: () => void }) {
     if (!canCreate || location === undefined) return;
     setCreating(true);
     setFailure(undefined);
-    const result = await window.api.projects.create({ location, name });
-    setCreating(false);
+    // Whatever the call comes to, the dialog is usable again.
+    const result = await window.api.projects.create({ location, name }).finally(() => setCreating(false));
     if (result.status === 'added') {
       onClose();
       await listed();
@@ -388,8 +388,8 @@ function InitDialog({ folder, onClose }: { folder: string; onClose: () => void }
   async function initialize() {
     setBusy(true);
     setFailure(undefined);
-    const result = await window.api.projects.init(folder);
-    setBusy(false);
+    // Whatever the call comes to, the dialog is usable again.
+    const result = await window.api.projects.init(folder).finally(() => setBusy(false));
     if (result.status === 'added') {
       onClose();
       await listed();
