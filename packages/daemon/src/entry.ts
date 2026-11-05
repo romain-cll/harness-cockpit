@@ -1,8 +1,29 @@
+import { closeSync, writeSync } from 'node:fs';
+import { READY_FD } from './protocol';
 import { runDaemon } from './server';
 
 export interface EntryIo {
   stderr: { write(text: string): unknown };
   exit(code: number): unknown;
+  /** Tells whoever started the daemon that it is up: called once, after `.token` and `.pid` are on disk. */
+  ready(): unknown;
+}
+
+/**
+ * Writes the ready line on the pipe the starter gave the daemon, then closes it. A starter that is
+ * gone, or that gave no pipe, fails the write: the daemon runs on all the same.
+ */
+export function reportReady(fd: number = READY_FD): void {
+  try {
+    writeSync(fd, 'ready\n');
+  } catch {
+    // Nobody to tell.
+  }
+  try {
+    closeSync(fd);
+  } catch {
+    // Already closed.
+  }
 }
 
 /**
@@ -11,7 +32,7 @@ export interface EntryIo {
  * the marker and a build after it, writes the usage, exits with code 2 and creates nothing. The
  * output goes to `daemon-<protocol>-<build>.log`, whose last line is the reason a failed start shows.
  */
-export async function runDaemonEntry(argv: readonly string[], env: NodeJS.ProcessEnv, { stderr, exit }: EntryIo): Promise<void> {
+export async function runDaemonEntry(argv: readonly string[], env: NodeJS.ProcessEnv, { stderr, exit, ready }: EntryIo): Promise<void> {
   const marker = argv.indexOf('--cockpit-daemon');
   const build = marker === -1 ? undefined : argv[marker + 1];
   const home = env.COCKPIT_HOME;
@@ -32,6 +53,7 @@ export async function runDaemonEntry(argv: readonly string[], env: NodeJS.Proces
     // Superseded and out of terminals: the daemon closes itself.
     void daemon.closed.then(() => exit(0));
     for (const signal of ['SIGTERM', 'SIGINT'] as const) process.on(signal, () => void daemon.close());
+    ready();
   } catch (error) {
     stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     exit(1);

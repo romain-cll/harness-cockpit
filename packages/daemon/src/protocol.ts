@@ -11,6 +11,9 @@ export { SCROLLBACK } from './scrollback';
 export const AGENT_MARKER_OSC = 6973;
 export const agentMarker = (what: 'started' | 'exited') => `\u001b]${AGENT_MARKER_OSC};agent-${what}\u0007`;
 
+/** The file descriptor a daemon's starter gives it to say it is ready: the `stdio` pipe at index 3. */
+export const READY_FD = 3;
+
 /** Upgrade token of the stream: `cockpit-<protocol>`. */
 export const UPGRADE = `cockpit-${PROTOCOL_VERSION}`;
 

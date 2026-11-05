@@ -1,7 +1,7 @@
-import { existsSync, watch, type FSWatcher } from 'node:fs';
+import { existsSync, lstatSync, watch, type FSWatcher } from 'node:fs';
 import { copyFile, mkdtemp, readFile, rm, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { checkGit, git, listBranches, succeeds, WorkspaceError, type GitEnv } from './git';
 
@@ -29,11 +29,27 @@ const MAX_DIFF_BYTES = 1024 * 1024;
 
 const DEBOUNCE_MS = 200;
 
-// Watcher start-up: how often the folder is touched, how long to wait for the first event, and the
-// quiet time after it.
+// Watcher start-up: how often the folder is touched, and how long to wait for the first event.
 const PROBE_MS = 10;
 const PROBE_TIMEOUT_MS = 2000;
-const SETTLE_MS = 50;
+
+/**
+ * Whether a watcher's event is the touch of the watched folder itself (the start-up probe's `utimes`,
+ * reported late): FSEvents, through `fs.watch`, gives it as `change` with the folder's own basename.
+ * A file of that name in the folder is a real change (libuv also reports `change` for an older file).
+ * The format is libuv's, not documented.
+ */
+export function isFolderTouch(event: string, filename: string | null, dir: string): boolean {
+  if (event !== 'change' || filename === null || filename !== basename(dir)) return false;
+  try {
+    const entry = lstatSync(join(dir, filename), { throwIfNoEntry: false });
+    return entry === undefined || entry.isDirectory();
+  } catch {
+    // This runs in the `fs.watch` callback, where a throw is uncaught (a `chmod 000` of the folder
+    // reports itself): no answer means no touch, so the event counts as a change.
+    return false;
+  }
+}
 
 /** Git's output trimmed, or `null` when git exits with a non-zero code. */
 const output = (args: string[], cwd: string, env?: NodeJS.ProcessEnv) =>
@@ -287,8 +303,9 @@ export async function watchWorktree(
   const firsts = targets.map(({ dir, recursive, name }) => {
     let reported!: () => void;
     const first = new Promise<void>((resolve) => (reported = resolve));
-    const watcher = watch(dir, { recursive }, (_event, filename) => {
-      if (!live) return reported();
+    const watcher = watch(dir, { recursive }, (event, filename) => {
+      reported();
+      if (!live || isFolderTouch(event, filename, dir)) return;
       if (name !== undefined && filename !== name) return;
       clearTimeout(timer);
       timer = setTimeout(onChange, DEBOUNCE_MS);
@@ -302,14 +319,14 @@ export async function watchWorktree(
   });
 
   // FSEvents starts its stream after `watch` returns, and a change made before is never reported:
-  // touch the folders until every stream reports it, and let the events of the touches die down.
+  // touch the folders until every stream reports it. A touch still in flight reports later: it is
+  // told from a change by what it is (`isFolderTouch`), not by waiting.
   const probe = setInterval(() => {
     const now = new Date();
     for (const { dir } of firsts) void utimes(dir, now, now).catch(() => {});
   }, PROBE_MS);
   await Promise.race([Promise.all(firsts.map(({ first }) => first)), sleep(PROBE_TIMEOUT_MS)]);
   clearInterval(probe);
-  await sleep(SETTLE_MS);
   live = true;
   return { close };
 }

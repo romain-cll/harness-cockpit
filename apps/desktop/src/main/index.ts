@@ -416,7 +416,7 @@ function spawnDaemon(): ChildProcess {
   try {
     const child = spawn(process.execPath, [daemonPath, '--cockpit-daemon', daemonBuild], {
       detached: true,
-      stdio: ['ignore', log, log],
+      stdio: ['ignore', log, log, 'pipe'],
       env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', COCKPIT_HOME: cockpitHome },
     });
     child.on('error', (error) => {

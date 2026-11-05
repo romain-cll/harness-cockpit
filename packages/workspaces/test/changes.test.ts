@@ -2,8 +2,9 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, readdirSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { afterEach, describe, expect, test, vi } from 'vitest';
+import { isFolderTouch } from '../src/changes';
 import { WorkspaceError } from '../src/git';
 import { branchStatus, commitAll, createWorktree, fileDiff, listChanges, pushBranch, removeWorktree, watchWorktree } from '../src/index';
 
@@ -350,7 +351,66 @@ function counted() {
   return { spy, reached, calls: () => count };
 }
 
+/**
+ * Starts a witness watcher on another folder, writes a file there and waits for its `onChange`. A watcher that
+ * was live before it and calls `onChange` on its own armed its debounce before the witness's, so by the time
+ * the witness has fired that call has been made: what the caller checks after it is settled, with no pause.
+ */
+async function witnessFires(): Promise<void> {
+  const dir = await tempDir();
+  const witness = counted();
+  const watcher = await watchWorktree(dir, witness.spy);
+  try {
+    await writeFile(join(dir, 'witness.txt'), 'x\n');
+    await witness.reached(1);
+  } finally {
+    watcher.close();
+  }
+}
+
 describe('watchWorktree', () => {
+  test('AC7 — a folder\'s own touch arms nothing: A\'s onChange has not been called once B\'s has fired', async () => {
+    const [a, b] = [await tempDir(), await tempDir()];
+    const [touched, written] = [counted(), counted()];
+    const watcherA = await watchWorktree(a, touched.spy);
+    const watcherB = await watchWorktree(b, written.spy);
+    try {
+      const now = new Date();
+      await utimes(a, now, now);
+      await writeFile(join(b, 'file.txt'), 'x\n');
+      await written.reached(1);
+      expect(touched.spy).not.toHaveBeenCalled();
+    } finally {
+      watcherA.close();
+      watcherB.close();
+    }
+  });
+
+  test('AC8 — an event with the folder\'s own name is a touch only when it is a change and no file has that name', async () => {
+    const dir = await tempDir();
+    const name = basename(dir);
+    expect(isFolderTouch('change', name, dir)).toBe(true);
+    expect(isFolderTouch('rename', name, dir)).toBe(false);
+    expect(isFolderTouch('change', 'other.txt', dir)).toBe(false);
+
+    await mkdir(join(dir, name));
+    expect(isFolderTouch('change', name, dir)).toBe(true);
+
+    const withFile = await tempDir();
+    await writeFile(join(withFile, basename(withFile)), 'x\n');
+    expect(isFolderTouch('change', basename(withFile), withFile)).toBe(false);
+  });
+
+  test('AC8 — on a folder that cannot be read (chmod 000), the event is no touch and nothing throws, so it counts as a change', async () => {
+    const dir = await tempDir();
+    await chmod(dir, 0o000);
+    try {
+      expect(isFolderTouch('change', basename(dir), dir)).toBe(false);
+    } finally {
+      await chmod(dir, 0o700);
+    }
+  });
+
   test('AC12 — a burst of writes gives one onChange, and none comes after close()', async () => {
     const dir = await tempDir();
     const changed = counted();
@@ -553,28 +613,24 @@ describe('watchWorktree on the git metadata', () => {
     return { changed, reached, close: () => watcher.close() };
   }
 
-  /**
-   * Runs two changes of the kind under test and waits for the watcher's second call. The watcher's own start
-   * can call `onChange` once on its own (a probe's late event, about 200 ms after `watchWorktree` resolved),
-   * and that call alone would satisfy the wait for the first change: the kind is seen once a second call has
-   * come for the second change.
-   */
-  async function reportsBoth(reached: (n: number) => Promise<void>, [first, second]: [() => unknown, () => unknown]) {
-    await first();
-    await reached(1);
-    await second();
-    await reached(2);
-  }
+  test('AC9 — a quiet worktree, git folder and remote refs watched too, gets no onChange after watchWorktree resolved', async () => {
+    const { worktree } = await makeShippableWorkspace();
+    const { changed, close } = await watched(worktree);
+    try {
+      await witnessFires();
+      expect(changed).not.toHaveBeenCalled();
+    } finally {
+      close();
+    }
+  });
 
   test('AC13 — a git commit made in the worktree calls onChange', async () => {
     const { worktree } = await makeShippableWorkspace();
     await writeFile(join(worktree, 'a.txt'), 'edited\n');
     const { reached, close } = await watched(worktree);
     try {
-      await reportsBoth(reached, [
-        () => git(worktree, 'commit', '-q', '-am', 'edit a'),
-        () => git(worktree, 'commit', '-q', '--allow-empty', '-m', 'an empty commit'),
-      ]);
+      git(worktree, 'commit', '-q', '-am', 'edit a');
+      await reached(1);
     } finally {
       close();
     }
@@ -585,13 +641,8 @@ describe('watchWorktree on the git metadata', () => {
     await commitFile(worktree, 'one.txt', 'one');
     const { reached, close } = await watched(worktree);
     try {
-      await reportsBoth(reached, [
-        () => git(worktree, 'push', '-q', '-u', 'origin', 'feat'),
-        async () => {
-          await commitFile(worktree, 'two.txt', 'two');
-          git(worktree, 'push', '-q', 'origin', 'feat');
-        },
-      ]);
+      git(worktree, 'push', '-q', '-u', 'origin', 'feat');
+      await reached(1);
     } finally {
       close();
     }
@@ -605,14 +656,8 @@ describe('watchWorktree on the git metadata', () => {
     git(other, 'push', '--quiet', 'origin', 'main');
     const { reached, close } = await watched(worktree);
     try {
-      await reportsBoth(reached, [
-        () => git(repo, 'fetch', '--quiet', 'origin'),
-        async () => {
-          await commitFile(other, 'theirs-again.txt', 'theirs again');
-          git(other, 'push', '--quiet', 'origin', 'main');
-          git(repo, 'fetch', '--quiet', 'origin');
-        },
-      ]);
+      git(repo, 'fetch', '--quiet', 'origin');
+      await reached(1);
     } finally {
       close();
     }
@@ -626,13 +671,8 @@ describe('watchWorktree on the git metadata', () => {
     git(repo, 'branch', 'extra');
     const { reached, close } = await watched(worktree);
     try {
-      await reportsBoth(reached, [
-        () => git(repo, 'pack-refs', '--all'),
-        () => {
-          git(repo, 'branch', 'extra-again');
-          git(repo, 'pack-refs', '--all');
-        },
-      ]);
+      git(repo, 'pack-refs', '--all');
+      await reached(1);
     } finally {
       close();
     }
@@ -646,7 +686,7 @@ describe('watchWorktree on the git metadata', () => {
     const stale = join(worktree, 'a.txt');
     await writeFile(stale, await readFile(stale));
     await utimes(stale, new Date(1_600_000_000_000), new Date(1_600_000_000_000));
-    const { reached, close } = await watched(worktree);
+    const { changed, reached, close } = await watched(worktree);
     try {
       // What the watcher watches besides the worktree itself: the worktree's git folder, the remote refs and packed-refs.
       const [gitDir, commonDir] = git(worktree, 'rev-parse', '--path-format=absolute', '--git-dir', '--git-common-dir').split('\n');
@@ -662,17 +702,16 @@ describe('watchWorktree on the git metadata', () => {
         await listChanges(worktree, { env: testEnv });
       }
 
-      // The cause: the reads wrote nothing in the places the watcher watches (the events of a write would
-      // reach it, a debounce later), and the index is still stale: a plain `git status` would have refreshed
-      // it. A quiet period cannot show it (the watcher's own start calls `onChange` once, late), so the
-      // places are compared.
+      // The reads called nothing: a witness watcher fires after any call they would have armed.
+      await witnessFires();
+      expect(changed).not.toHaveBeenCalled();
+      // The cause: the reads wrote nothing in the places the watcher watches, and the index is still stale:
+      // a plain `git status` would have refreshed it.
       expect(watchedPlaces.map(snapshot)).toEqual(before);
       expect(git(worktree, 'diff-files', '--name-only')).toBe('a.txt');
 
-      await reportsBoth(reached, [
-        () => git(worktree, 'commit', '-q', '--allow-empty', '-m', 'an empty commit'),
-        () => git(worktree, 'commit', '-q', '--allow-empty', '-m', 'another empty commit'),
-      ]);
+      git(worktree, 'commit', '-q', '--allow-empty', '-m', 'an empty commit');
+      await reached(1);
     } finally {
       close();
     }

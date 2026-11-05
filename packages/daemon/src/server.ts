@@ -161,7 +161,9 @@ export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon>
     });
   });
   chmodSync(files.socket, 0o600);
-  // A client that connects before this reads the token of an earlier daemon, or none, and tries again.
+  // Between `listen` and this rename a client would read the token of an earlier daemon, or none: the
+  // starter connects only after the daemon's ready line (`reportReady`, written once these files are
+  // on disk), and no other client reaches a daemon it did not start.
   const temporaryPath = `${files.token}.tmp`;
   writeFileSync(temporaryPath, token, { mode: 0o600 });
   renameSync(temporaryPath, files.token);
