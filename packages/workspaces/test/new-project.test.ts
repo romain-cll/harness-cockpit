@@ -1,17 +1,15 @@
 import { execFileSync } from 'node:child_process';
-import { close, constants, existsSync, open, openSync, read, readdirSync, readFileSync } from 'node:fs';
+import { close, constants, existsSync, open, openSync, read, readdirSync, readFileSync, writeSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, test, vi } from 'vitest';
+import { afterEach, describe, expect, test } from 'vitest';
 import { WorkspaceError } from '../src/git';
-import { cloneRepository, initRepository, listBranches, listWorktrees, repairWorktrees } from '../src/index';
+import { cloneRepository, findRepositoryRoot, initRepository, listBranches, listWorktrees, repairWorktrees } from '../src/index';
 
 // COCKPIT-72: clone, init (with its first empty commit) and worktree repair, on real git in temporary folders.
 // A split of `workspaces.test.ts`, which is past the size a test file should keep.
-
-vi.setConfig({ testTimeout: 30_000 });
 
 // The variables that give git an identity without a config file.
 const IDENTITY_VARIABLES = ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'EMAIL'];
@@ -138,6 +136,49 @@ async function silentServer(): Promise<{ command: string; ready: Promise<void>; 
   return { command: script, ready, gone };
 }
 
+/**
+ * A smudge filter that holds the checkout of a clone. Config for `GIT_CONFIG_COUNT` in `env`: git runs `script` for
+ * every file it writes, with `.gitattributes` of the source naming the filter. The script reports on a FIFO once
+ * git has reached the checkout, then waits for a line on a second FIFO; `release()` writes it (the cleanup does too,
+ * so no script outlives the test).
+ */
+async function heldCheckout(): Promise<{ env: NodeJS.ProcessEnv; ready: Promise<void>; release(): void }> {
+  const dir = await tempDir();
+  const readyFifo = join(dir, 'ready');
+  const holdFifo = join(dir, 'hold');
+  execFileSync('mkfifo', [readyFifo, holdFifo]);
+  const reader = new Socket({ fd: openSync(readyFifo, constants.O_RDWR), readable: true, writable: false });
+  reader.unref();
+  closers.push(() => reader.destroy());
+  const ready = new Promise<void>((resolve, reject) => {
+    reader.on('error', reject);
+    reader.once('data', () => resolve());
+  });
+  // Both ends open, so the script's wait is for the line and never for a reader.
+  const holdFd = openSync(holdFifo, constants.O_RDWR);
+  const release = () => {
+    try {
+      writeSync(holdFd, 'go\n');
+    } catch {
+      // Already released.
+    }
+  };
+  closers.push(release);
+  const script = join(dir, 'smudge');
+  await writeFile(script, `#!/bin/sh\ncat > "$0.content"\necho ready > '${readyFifo}'\nread _ < '${holdFifo}'\ncat "$0.content"\n`);
+  await chmod(script, 0o755);
+  return { env: { ...testEnv, GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'filter.hold.smudge', GIT_CONFIG_VALUE_0: script }, ready, release };
+}
+
+/** A repository whose files all go through the `hold` filter on checkout. */
+async function filteredRepo(): Promise<string> {
+  const repo = await makeRepo();
+  await writeFile(join(repo, '.gitattributes'), '* filter=hold\n');
+  git(repo, 'add', '.gitattributes');
+  git(repo, 'commit', '-q', '-m', 'filter');
+  return repo;
+}
+
 /** The outcome of a promise: its error, or `undefined` if it resolved. */
 const failure = (promise: Promise<unknown>) => promise.then(() => undefined, (error: unknown) => error ?? new Error('rejected with nothing'));
 
@@ -225,6 +266,44 @@ describe('cloneRepository', () => {
     expect(existsSync(join(parent, 'a')), 'the parents git created stay').toBe(true);
   });
 
+  test('AC15, AC16 — aborting during the checkout, after the fetch, ends git and leaves no folder once the clone settles', async () => {
+    const source = await filteredRepo();
+    const path = join(await tempDir(), 'held-checkout');
+    const hold = await heldCheckout();
+    const controller = new AbortController();
+    const outcome = failure(cloneRepository({ url: source, path, env: hold.env, signal: controller.signal }));
+
+    await hold.ready;
+    expect(existsSync(join(path, '.git')), 'the fetch is done: git is checking out').toBe(true);
+    controller.abort();
+    const error = await outcome;
+
+    expect(error, 'the clone rejected').toBeDefined();
+    expect(existsSync(path), 'the folder is gone').toBe(false);
+  });
+
+  test('AC12 — a clone whose checkout fails (a required smudge filter fails) rejects and leaves no folder', async () => {
+    const source = await filteredRepo();
+    const dir = await tempDir();
+    const path = join(dir, 'failed-checkout');
+    const script = join(dir, 'smudge');
+    await writeFile(script, '#!/bin/sh\nexit 1\n');
+    await chmod(script, 0o755);
+    const env = {
+      ...testEnv,
+      GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'filter.hold.smudge',
+      GIT_CONFIG_VALUE_0: script,
+      GIT_CONFIG_KEY_1: 'filter.hold.required',
+      GIT_CONFIG_VALUE_1: 'true',
+    };
+
+    const error = await failure(cloneRepository({ url: source, path, env }));
+
+    expect(error).toBeInstanceOf(WorkspaceError);
+    expect(existsSync(path), 'the folder is gone').toBe(false);
+  });
+
   test('AC27 — with no identity at all the clone succeeds: it makes no commit', async () => {
     const source = await makeRepo();
     const path = join(await tempDir(), 'copy');
@@ -304,6 +383,25 @@ describe('initRepository', () => {
     await initRepository({ path: folder, env });
 
     expect(git(folder, 'log', '-1', '--format=%an <%ae> %cn <%ce>')).toBe('Env Author <author@example.com> Env Committer <committer@example.com>');
+  });
+
+  test('AC28 — a .git git refuses to read (dubious ownership): findRepositoryRoot says NOT_A_REPOSITORY, initRepository rejects with GIT_DIR_EXISTS, and .git and its history stay intact', async () => {
+    const repo = await makeRepo();
+    git(repo, 'commit', '-q', '--allow-empty', '-m', 'second');
+    const head = git(repo, 'rev-parse', 'HEAD');
+    const entries = readdirSync(join(repo, '.git')).sort();
+    const env = { ...testEnv, GIT_TEST_ASSUME_DIFFERENT_OWNER: '1' };
+
+    const notFound = (await failure(findRepositoryRoot(repo, { env }))) as WorkspaceError;
+    const refused = (await failure(initRepository({ path: repo, env }))) as WorkspaceError;
+
+    expect(notFound.code).toBe('NOT_A_REPOSITORY');
+    expect(refused).toBeInstanceOf(WorkspaceError);
+    expect(refused.code).toBe('GIT_DIR_EXISTS');
+    expect(readdirSync(join(repo, '.git')).sort()).toEqual(entries);
+    expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
+    expect(git(repo, 'rev-list', '--count', 'HEAD')).toBe('2');
+    expect(readFileSync(join(repo, 'README.md'), 'utf8')).toBe('hello\n');
   });
 
   test('AC26 — an identity but a commit that fails anyway (a global pre-commit hook refuses): rejects with git\'s message, removes .git and leaves the files', async () => {

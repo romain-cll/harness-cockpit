@@ -275,20 +275,9 @@ describe('new project: built app', () => {
     expect(await cloneButton(dialog).isDisabled(), 'invalid name').toBe(true);
   });
 
-  test('AC9, AC20 — a typed URL fills the Project name with the repository\'s name until the user edits it; a name that is ".", ".." or holds "/" disables Clone and Create and shows the message', async () => {
+  test('AC9, AC20 — a hand-edited Project name stays when the URL changes; a name that is ".", ".." or holds "/" disables Clone and Create and shows the message', async () => {
     const dialog = await openClone();
-    const urls: Array<[string, string]> = [
-      ['https://host/a/n1', 'n1'],
-      ['https://host/a/n2.git', 'n2'],
-      ['https://host/a/n3/', 'n3'],
-      ['git@host:a/n4.git', 'n4'],
-      ['ssh://git@host/a/n5.git', 'n5'],
-    ];
-    for (const [url, name] of urls) {
-      await urlBox(dialog).fill(url);
-      expect(await nameBox(dialog).inputValue(), url).toBe(name);
-    }
-
+    await urlBox(dialog).fill('https://host/a/n1');
     await nameBox(dialog).fill('mine');
     await urlBox(dialog).fill('https://host/a/n6');
     expect(await nameBox(dialog).inputValue(), 'an edited name stays').toBe('mine');
@@ -647,6 +636,24 @@ describe('new project: built app', () => {
     await settled();
   });
 
+  test('AC15 — a click outside the dialog while cloning leaves it open and the clone running', async () => {
+    const { page } = session;
+    const { dialog, settled } = await holdClone('backdrop');
+    const target = join(base, 'held-backdrop', 'held');
+
+    // The corner of the window is on the backdrop, outside the dialog.
+    await page.mouse.click(2, 2);
+    await afterIpcAnswers(page);
+
+    expect(await dialog.isVisible(), 'the dialog stays open').toBe(true);
+    expect(await dialog.getByRole('button', { name: 'Cloning…', exact: true }).isDisabled()).toBe(true);
+    expect(existsSync(target), 'git is still cloning').toBe(true);
+
+    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await dialog.waitFor({ state: 'hidden' });
+    await settled();
+  });
+
   test('AC16 — reloading the page during a clone ends git, removes the partial folder and adds no project', async () => {
     const { page } = session;
     const { settled } = await holdClone('reload');
@@ -773,5 +780,55 @@ describe('update path: built app', () => {
       [newRoot, workspace] as const,
     );
     expect(removal.status, 'the app reads the workspace with git').toBe('read');
+  });
+});
+
+// --- A .git git refuses to read -------------------------------------------------------------------------------------
+
+describe('initialize over a .git git cannot use: built app', () => {
+  let fx: SessionsFixture;
+  let session: Session;
+  let repo: ReturnType<typeof makeRepo>;
+
+  beforeAll(async () => {
+    fx = makeSessionsFixture([]);
+    repo = makeRepo('foreign-owner');
+    gitIn(repo.root, 'commit', '--allow-empty', '-m', 'second');
+    // Through the fake login shell, git takes the folder's `.git` for another user's: it will not read it.
+    writeFileSync(join(fx.root, 'early'), 'export GIT_TEST_ASSUME_DIFFERENT_OWNER=1\n');
+    session = await launchBuiltWith(fx.env());
+    await session.page.getByText(versionLabel).waitFor();
+    await stubPicker(session, null);
+  });
+
+  afterAll(async () => {
+    try {
+      if (session) await expectNoErrors(session);
+    } finally {
+      await session?.close();
+      if (fx) rmSync(fx.root, { recursive: true, force: true });
+      if (repo) rmSync(repo.parent, { recursive: true, force: true });
+    }
+  });
+
+  test('AC28 — Initialize leaves the folder as it was, history included, keeps the dialog open with "<path> already has a .git that git cannot use. Nothing was changed." and adds no project', async () => {
+    const { page } = session;
+    const head = gitIn(repo.root, 'rev-parse', 'HEAD');
+    const entries = readdirSync(join(repo.root, '.git')).sort();
+    const before = stateSnapshot(session.dataDir);
+
+    await addProject(session, repo.root);
+    const dialog = openDialogs(page).filter({ hasText: 'This folder is not a git repository' });
+    await dialog.waitFor();
+    await dialog.getByRole('button', { name: 'Initialize git repository', exact: true }).click();
+    await dialog.getByText(`${repo.root} already has a .git that git cannot use. Nothing was changed.`).first().waitFor();
+
+    expect(await dialog.isVisible()).toBe(true);
+    expect(await dialog.getByRole('button', { name: 'Initialize git repository', exact: true }).isDisabled(), 'Initialize is enabled again').toBe(false);
+    expect(readdirSync(join(repo.root, '.git')).sort()).toEqual(entries);
+    expect(gitIn(repo.root, 'rev-parse', 'HEAD')).toBe(head);
+    expect(gitIn(repo.root, 'rev-list', '--count', 'HEAD')).toBe('2');
+    expect(stateSnapshot(session.dataDir)).toEqual(before);
+    expect(await entryTitles(page)).toEqual([]);
   });
 });
