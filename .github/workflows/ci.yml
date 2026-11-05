@@ -20,6 +20,10 @@ jobs:
     # desktop session for the Electron tests.
     runs-on: macos-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        copy: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v7
 
