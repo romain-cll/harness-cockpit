@@ -99,6 +99,12 @@ export async function findRepositoryRoot(path: string, { env }: GitEnv = {}): Pr
   return repositoryRoot(path, env);
 }
 
+/** Whether the repository containing `path` has a git remote: without one, no `gh` call can resolve it. */
+export async function hasRemote(path: string, { env }: GitEnv = {}): Promise<boolean> {
+  await checkGit(env);
+  return (await git(['remote'], { cwd: path, env })).trim() !== '';
+}
+
 /** The readable names kept in git config, by branch: one `git config` call for the repository. */
 async function cockpitNames(repo: string, env?: NodeJS.ProcessEnv): Promise<Map<string, string>> {
   const names = new Map<string, string>();

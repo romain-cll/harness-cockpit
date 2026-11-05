@@ -15,13 +15,41 @@ export class GitHubError extends Error {
 
 export type ChecksSummary = 'none' | 'pending' | 'passing' | 'failing' | 'unknown';
 
+export type Check = Exclude<ChecksSummary, 'none'>;
+
+export interface CheckRun {
+  /** `<workflow> / <name>`, `<name>` without a workflow, the context for a status context. */
+  name: string;
+  check: Check;
+  /** gh's raw strings (a zero date included), `null` when absent. */
+  startedAt: string | null;
+  completedAt: string | null;
+}
+
+export type ReviewState = 'changes_requested' | 'approved' | 'commented' | 'dismissed' | 'unknown';
+
+export interface Review {
+  login: string;
+  state: ReviewState;
+}
+
 export interface PullRequest {
   number: number;
   title: string;
   url: string;
   state: 'open' | 'closed' | 'merged';
   checks: ChecksSummary;
+  /** `ghost` when GitHub has no author (a deleted account). */
+  author: string;
+  body: string;
+  headOid: string;
+  /** gh's raw `reviewDecision`, `''` when the repository requires no review. */
+  reviewDecision: string;
+  checkRuns: CheckRun[];
+  reviews: Review[];
 }
+
+export type MergeMethod = 'squash' | 'merge' | 'rebase';
 
 /** `gh help exit-codes`: 4 is "authentication required". */
 const EXIT_AUTH_REQUIRED = 4;
@@ -49,8 +77,6 @@ const CONTEXT_PENDING = ['PENDING', 'EXPECTED'];
 const CONTEXT_PASSING = ['SUCCESS'];
 const CONTEXT_FAILING = ['FAILURE', 'ERROR'];
 
-type Check = Exclude<ChecksSummary, 'none'>;
-
 function checkOf(entry: Record<string, unknown>): Check {
   if (entry.__typename === 'CheckRun') {
     if (RUN_PENDING.includes(entry.status as string)) return 'pending';
@@ -75,6 +101,40 @@ export function checksSummary(rollup: readonly Record<string, unknown>[]): Check
 
 const STATES: Record<string, PullRequest['state']> = { OPEN: 'open', CLOSED: 'closed', MERGED: 'merged' };
 
+const REVIEW_STATES: Record<string, ReviewState> = {
+  CHANGES_REQUESTED: 'changes_requested',
+  APPROVED: 'approved',
+  COMMENTED: 'commented',
+  DISMISSED: 'dismissed',
+};
+
+interface ListedPullRequest {
+  number: number;
+  title: string;
+  url: string;
+  state: string;
+  body?: string;
+  headRefOid?: string;
+  reviewDecision?: string;
+  author?: { login?: string } | null;
+  statusCheckRollup?: Record<string, unknown>[] | null;
+  latestReviews?: { author?: { login?: string } | null; state?: string }[] | null;
+}
+
+const text = (value: unknown): string | null => (typeof value === 'string' && value !== '' ? value : null);
+
+function checkRunOf(entry: Record<string, unknown>): CheckRun {
+  const isContext = entry.__typename === 'StatusContext';
+  const name = (isContext ? text(entry.context) : text(entry.name)) ?? '';
+  const workflow = isContext ? null : text(entry.workflowName);
+  return {
+    name: workflow ? `${workflow} / ${name}` : name,
+    check: checkOf(entry),
+    startedAt: text(entry.startedAt),
+    completedAt: text(entry.completedAt),
+  };
+}
+
 /** The newest pull request of `branch`, whatever its state, or `null` when it has none. */
 export async function findPullRequest(
   cwd: string,
@@ -82,11 +142,22 @@ export async function findPullRequest(
   { env }: { env?: NodeJS.ProcessEnv } = {},
 ): Promise<PullRequest | null> {
   const stdout = await gh(
-    ['pr', 'list', '--head', branch, '--state', 'all', '--limit', '1', '--json', 'number,title,url,state,statusCheckRollup'],
+    [
+      'pr',
+      'list',
+      '--head',
+      branch,
+      '--state',
+      'all',
+      '--limit',
+      '1',
+      '--json',
+      'number,title,url,state,author,body,headRefOid,latestReviews,reviewDecision,statusCheckRollup',
+    ],
     cwd,
     env,
   );
-  let found: { number: number; title: string; url: string; state: string; statusCheckRollup: Record<string, unknown>[] }[];
+  let found: ListedPullRequest[];
   try {
     found = JSON.parse(stdout);
   } catch (error) {
@@ -94,12 +165,21 @@ export async function findPullRequest(
   }
   const [newest] = found;
   if (!newest) return null;
+  const rollup = newest.statusCheckRollup ?? [];
   return {
     number: newest.number,
     title: newest.title,
     url: newest.url,
     state: STATES[newest.state] ?? 'open',
-    checks: checksSummary(newest.statusCheckRollup ?? []),
+    checks: checksSummary(rollup),
+    author: newest.author?.login ?? 'ghost',
+    body: newest.body ?? '',
+    headOid: newest.headRefOid ?? '',
+    reviewDecision: newest.reviewDecision ?? '',
+    checkRuns: rollup.map(checkRunOf),
+    reviews: (newest.latestReviews ?? [])
+      .filter((review) => review.state !== 'PENDING')
+      .map((review) => ({ login: review.author?.login ?? 'ghost', state: REVIEW_STATES[review.state ?? ''] ?? 'unknown' })),
   };
 }
 
@@ -113,4 +193,70 @@ export async function createPullRequest(
   const created = await findPullRequest(cwd, head, { env });
   if (!created) throw new GitHubError('GH_FAILED', `no pull request found for ${head} after creating it`);
   return created;
+}
+
+const MERGE_FLAGS: Record<MergeMethod, string> = { squash: '--squash', merge: '--merge', rebase: '--rebase' };
+
+/**
+ * Merges pull request `number` with `gh pr merge`. `--match-head-commit` makes gh refuse when the head moved since
+ * `headOid` was read. Never `--admin`, `--auto` or `--delete-branch`.
+ */
+export async function mergePullRequest(
+  cwd: string,
+  { number, method, headOid }: { number: number; method: MergeMethod; headOid: string },
+  { env }: { env?: NodeJS.ProcessEnv } = {},
+): Promise<void> {
+  await gh(['pr', 'merge', String(number), MERGE_FLAGS[method], '--match-head-commit', headOid], cwd, env);
+}
+
+/** `{owner}` and `{repo}` are gh's placeholders, resolved from the cwd's remote; branches travel as `-f` variables. */
+const STATES_QUERY = (count: number) => {
+  const indexes = Array.from({ length: count }, (_, index) => index);
+  const variables = indexes.map((index) => `$b${index}:String!`).join(',');
+  const aliases = indexes
+    .map(
+      (index) =>
+        `b${index}:pullRequests(headRefName:$b${index},first:1,orderBy:{field:CREATED_AT,direction:DESC}){nodes{state}}`,
+    )
+    .join(' ');
+  return `query($owner:String!,$repo:String!,${variables}){repository(owner:$owner,name:$repo){${aliases}}}`;
+};
+
+/** The state of the newest pull request of each branch in one `gh` run; a branch with none has no key. */
+export async function pullRequestStates(
+  cwd: string,
+  branches: readonly string[],
+  { env }: { env?: NodeJS.ProcessEnv } = {},
+): Promise<Record<string, PullRequest['state']>> {
+  if (branches.length === 0) return {};
+  const stdout = await gh(
+    [
+      'api',
+      'graphql',
+      '-F',
+      'owner={owner}',
+      '-F',
+      'repo={repo}',
+      ...branches.flatMap((branch, index) => ['-f', `b${index}=${branch}`]),
+      '-f',
+      `query=${STATES_QUERY(branches.length)}`,
+    ],
+    cwd,
+    env,
+  );
+  const unreadable = (cause?: unknown) =>
+    new GitHubError('GH_FAILED', `unreadable answer from gh: ${stdout.trim()}`, { cause });
+  let repository: Record<string, { nodes?: { state?: string }[] }> | null | undefined;
+  try {
+    repository = JSON.parse(stdout)?.data?.repository;
+  } catch (error) {
+    throw unreadable(error);
+  }
+  if (!repository || typeof repository !== 'object') throw unreadable();
+  const states: Record<string, PullRequest['state']> = {};
+  branches.forEach((branch, index) => {
+    const state = STATES[repository[`b${index}`]?.nodes?.[0]?.state ?? ''];
+    if (state) states[branch] = state;
+  });
+  return states;
 }

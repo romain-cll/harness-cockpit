@@ -22,6 +22,7 @@ import { DeleteWorkspaceDialog } from '@/components/delete-workspace-dialog';
 import { endSessions, getWorkspaceSetups, startSession, subscribe } from '@/components/live-terminals';
 import { claimNavigation } from '@/components/navigation-claim';
 import { ProjectBadge } from '@/components/project-badge';
+import { usePullRequestState, usePullRequestStates } from '@/components/pull-request-states';
 import { RemoveProjectDialog } from '@/components/remove-project-dialog';
 import { linkRowClass, rowClass, StatusIcon } from '@/components/sessions';
 import { StartSessionMenu } from '@/components/start-session-menu';
@@ -197,13 +198,14 @@ function SetupLabel({ state }: { state?: 'running' | 'failed' }) {
   );
 }
 
-// A workspace's row: a link to its page, with the icon of its most urgent session. A workspace being set up is
-// no entry of the list yet: its link has no title, the path is on its name.
-function WorkspaceName({ workspace }: { workspace: Workspace }) {
+// A workspace's row: a link to its page, with the icon of its most urgent session, else of its branch's pull request.
+// A workspace being set up is no entry of the list yet: its link has no title, the path is on its name.
+function WorkspaceName({ project, workspace }: { project: string; workspace: Workspace }) {
   const status = useWorkspaceStatus(workspace.path);
+  const pullRequest = usePullRequestState(project, workspace.branch);
   return (
     <>
-      <StatusIcon label={status} />
+      <StatusIcon label={status ?? (pullRequest === 'open' || pullRequest === 'merged' ? `Pull request ${pullRequest}` : undefined)} />
       <span title={workspace.settingUp ? workspace.path : undefined} className={cn('truncate', !status && 'text-muted-foreground')}>
         {workspace.name}
       </span>
@@ -221,6 +223,15 @@ export function Projects({ projects, sessions, failedSetups }: { projects: Proje
   const setups = useSyncExternalStore(subscribe, getWorkspaceSetups);
   const collapsed = useProjectsCollapsed();
   const collapsedProjects = useCollapsedProjects();
+  // The expanded projects and their branches: their pull request states are read while the sidebar shows them.
+  usePullRequestStates(
+    collapsed
+      ? []
+      : projects.flatMap(({ path, workspaces }) => {
+          const branches = workspaces.flatMap(({ branch }) => (branch === null ? [] : [branch]));
+          return collapsedProjects.has(path) || branches.length === 0 ? [] : [{ project: path, branches }];
+        }),
+  );
   // The editors and terminals found when a workspace's menu last opened.
   const [apps, setApps] = useState<AppsResult>();
   // The project whose removal dialog is open.
@@ -356,7 +367,7 @@ export function Projects({ projects, sessions, failedSetups }: { projects: Proje
                         <Entry
                           title={workspace.path}
                           icon={null}
-                          name={<WorkspaceName workspace={workspace} />}
+                          name={<WorkspaceName project={project.path} workspace={workspace} />}
                           label={`Actions for ${workspace.name}`}
                           trailing={<SetupLabel state={workspace.settingUp ? 'running' : setups.get(workspace.path)} />}
                           row={({ className, children }) => (

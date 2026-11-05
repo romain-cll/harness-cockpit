@@ -1,20 +1,16 @@
-import { ArrowUpIcon, ExternalLinkIcon, GitMergeIcon, GitPullRequestClosedIcon, GitPullRequestIcon } from 'lucide-react';
+import { ArrowUpIcon, ChevronRightIcon, ExternalLinkIcon, FileDiffIcon, GitMergeIcon, GitPullRequestClosedIcon, GitPullRequestIcon } from 'lucide-react';
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import type { BranchStatusResult, ChangesResult, Project, PullRequestResult, Workspace } from '../../shared/api';
+import type { BranchStatusResult, ChangedFile, ChangesResult, Project, PullRequestResult, Workspace } from '../../shared/api';
+import { openRightBar } from '@/components/changes-panel';
+import { ChecksSection, DescriptionSection, MergeRow, ReviewsSection } from '@/components/pull-request-details';
 import { readPullRequests } from '@/components/pull-request-reads';
+import { refreshPullRequestStates } from '@/components/pull-request-states';
 import { requestDeleteWorkspace } from '@/components/projects';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
-
-const CHECKS = {
-  pending: 'Checks pending',
-  passing: 'Checks passing',
-  failing: 'Checks failing',
-  unknown: 'Checks unknown',
-} as const;
 
 const STATES = {
   open: { label: 'Open', Icon: GitPullRequestIcon, color: 'bg-status-ready/14 text-status-ready' },
@@ -96,9 +92,32 @@ function CreatePullRequestDialog({
   );
 }
 
+// The files changed against the base with the Diff tab's totals, which it leads to.
+function DiffRow({ files }: { files: ChangedFile[] }) {
+  const additions = files.reduce((sum, file) => sum + (file.additions ?? 0), 0);
+  const deletions = files.reduce((sum, file) => sum + (file.deletions ?? 0), 0);
+  return (
+    <button
+      type="button"
+      className="flex h-8 w-full items-center gap-2 rounded-lg border px-2.5 py-2 text-left hover:bg-hover"
+      onClick={() => openRightBar('diff')}
+    >
+      <FileDiffIcon className="size-3.5 shrink-0 text-muted-foreground" />
+      <span className="text-xs text-foreground">{`${files.length} ${files.length === 1 ? 'file' : 'files'} changed`}</span>
+      {additions > 0 && <span className="text-[11px] text-diff-added-foreground">+{additions}</span>}
+      {deletions > 0 && <span className="text-[11px] text-diff-removed-foreground">−{deletions}</span>}
+      <span className="ml-auto flex items-center gap-0.5 text-[11px] text-muted-foreground">
+        View diff
+        <ChevronRightIcon className="size-3.5" />
+      </span>
+    </button>
+  );
+}
+
 /**
- * The content of the right bar's "Pull request" tab: the workspace's pull request, the button that
- * creates one, and the commit and push section. It reads the pull request through `gh` (see
+ * The content of the right bar's "Pull request" tab: the workspace's pull request with its merge row, the
+ * button that creates one, the files changed, the commit and push section, then the checks, reviews and
+ * description of the pull request. It reads the pull request through `gh` (see
  * `readPullRequests`) while mounted; `status` is the git state the bar read, and `onShipped` asks
  * the bar to read it again after a commit or a push.
  */
@@ -116,6 +135,8 @@ export function ShipSection({
   onShipped: () => void;
 }) {
   const [pullRequest, setPullRequest] = useState<PullRequestResult>();
+  // When the pull request was read: a running check counts from it.
+  const [readAt, setReadAt] = useState(0);
   const reads = useRef<ReturnType<typeof readPullRequests>>(undefined);
   const [message, setMessage] = useState('');
   // Why the last commit or push failed.
@@ -125,7 +146,10 @@ export function ShipSection({
 
   // The sidebar is keyed by workspace, so one workspace is read for the section's lifetime.
   useEffect(() => {
-    reads.current = readPullRequests(project.path, workspace.path, setPullRequest);
+    reads.current = readPullRequests(project.path, workspace.path, (result) => {
+      setPullRequest(result);
+      setReadAt(Date.now());
+    });
     return () => reads.current?.stop();
   }, [project.path, workspace.path]);
 
@@ -159,6 +183,13 @@ export function ShipSection({
     if (await ship(() => window.api.workspaces.commit(project.path, workspace.path, message))) setMessage('');
   }
 
+  // The bar's pull request and the sidebar's icons are read again, with no window focus.
+  function pullRequestChanged() {
+    reads.current?.refresh();
+    refreshPullRequestStates(project.path);
+  }
+
+  const files = changes?.status === 'listed' ? changes.files : [];
   const base = changes?.status === 'listed' ? changes.base.replace(/^origin\//, '') : undefined;
   const unpushed = git?.unpushed ?? 0;
   const pushed = git !== undefined && git.upstream !== null && unpushed === 0;
@@ -177,9 +208,7 @@ export function ShipSection({
                 <state.Icon className="size-3" />
                 {state.label}
               </span>
-              <span className="text-[11px] text-muted-foreground">
-                {found.state === 'open' && found.checks !== 'none' ? `#${found.number} · ${CHECKS[found.checks]}` : `#${found.number}`}
-              </span>
+              <span className="text-[11px] text-muted-foreground">{`#${found.number} · ${found.author}`}</span>
               <a
                 href={found.url}
                 target="_blank"
@@ -194,6 +223,16 @@ export function ShipSection({
             <p className="text-[13px] leading-[18px] break-words text-foreground">{found.title}</p>
             {git?.branch && base !== undefined && (
               <p className="font-mono text-[11px] break-all text-muted-foreground">{`${git.branch} → ${base}`}</p>
+            )}
+            {found.state === 'open' && (
+              <MergeRow
+                project={project}
+                workspace={workspace}
+                pullRequest={found}
+                base={base}
+                unpushed={unpushed}
+                onMerged={pullRequestChanged}
+              />
             )}
             {found.state === 'merged' && (
               <div>
@@ -212,6 +251,7 @@ export function ShipSection({
             {!pushed && <span className="text-[11px] text-muted-foreground">Push the branch first.</span>}
           </div>
         )}
+        {files.length > 0 && <DiffRow files={files} />}
       </div>
       <section className="flex flex-col gap-2 border-t p-3">
         <h3 className="text-[11px] text-subtle">{'Commit & push'}</h3>
@@ -242,6 +282,13 @@ export function ShipSection({
           </p>
         )}
       </section>
+      {found && (
+        <>
+          <ChecksSection checkRuns={found.checkRuns} now={readAt} />
+          <ReviewsSection reviewDecision={found.reviewDecision} reviews={found.reviews} />
+          <DescriptionSection body={found.body} />
+        </>
+      )}
       {creating && base !== undefined && git && (
         <CreatePullRequestDialog
           project={project}
@@ -251,7 +298,7 @@ export function ShipSection({
           onClose={() => setCreating(false)}
           onCreated={() => {
             setCreating(false);
-            reads.current?.refresh();
+            pullRequestChanged();
           }}
         />
       )}

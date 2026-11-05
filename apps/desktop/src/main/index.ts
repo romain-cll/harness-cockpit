@@ -22,7 +22,7 @@ import {
   type TerminalInfo,
   type TerminalKind,
 } from '@cockpit/daemon';
-import { createPullRequest, findPullRequest, GitHubError } from '@cockpit/github';
+import { createPullRequest, findPullRequest, GitHubError, mergePullRequest, pullRequestStates } from '@cockpit/github';
 import { detectHarnesses, harnesses, statusLaunch, type DetectedHarness, type Harness } from '@cockpit/harnesses';
 import { apps, defaultApplicationDirs, detectApps, LaunchError, openIn, reveal, type App } from '@cockpit/launchers';
 import {
@@ -49,6 +49,7 @@ import {
   createWorktree,
   fileDiff,
   findRepositoryRoot,
+  hasRemote,
   headSubject,
   initRepository,
   listBranches,
@@ -96,12 +97,15 @@ import type {
   EndedSession,
   FailedSetup,
   ListedTerminal,
+  MergeMethod,
+  MergePullRequestResult,
   Project,
   OpenWorkspaceResult,
   OutdatedTerminal,
   PtySpawnOptions,
   PtySpawnRequest,
   PullRequestResult,
+  PullRequestStatesResult,
   PushResult,
   Refused,
   RemovalResult,
@@ -1297,6 +1301,44 @@ function startProjects(
           return { status: 'refused', message: `Could not create the pull request: ${error.message}` };
         }
       }),
+  );
+
+  const MERGE_METHODS = ['squash', 'merge', 'rebase'];
+
+  ipcMain.handle(
+    'workspaces:merge-pull-request',
+    (event, project: string, path: string, number: number, method: string, headOid: string): Promise<MergePullRequestResult> =>
+      forProject<MergePullRequestResult>(event, 'workspaces:merge-pull-request', project, async () => {
+        if (!MERGE_METHODS.includes(method)) return { status: 'refused', message: `${String(method)} is not a merge method.` };
+        if (!Number.isInteger(number) || number < 1 || !/^[0-9a-f]{7,64}$/i.test(String(headOid))) {
+          return { status: 'refused', message: 'The pull request to merge is unknown.' };
+        }
+        const workspace = await findWorkspace({ project, path });
+        if ('status' in workspace) return workspace;
+        if (workspace.branch === null) return { status: 'refused', message: `${workspaceName(workspace)} has no branch.` };
+        try {
+          await mergePullRequest(path, { number, method: method as MergeMethod, headOid }, { env: await shellEnv });
+          return { status: 'merged' };
+        } catch (error) {
+          if (!(error instanceof GitHubError)) throw error;
+          return { status: 'refused', message: `Could not merge the pull request: ${error.message}` };
+        }
+      }),
+  );
+
+  // One `gh` run for the project's workspaces; none when no workspace has a branch or the repository has no remote.
+  ipcMain.handle('workspaces:pull-request-states', (event, project: string): Promise<PullRequestStatesResult> =>
+    forProject<PullRequestStatesResult>(event, 'workspaces:pull-request-states', project, async () => {
+      const env = await shellEnv;
+      const branches = (await listWorktrees(project, { env })).flatMap((worktree) => (worktree.main || worktree.branch === null ? [] : [worktree.branch]));
+      if (branches.length === 0 || !(await hasRemote(project, { env }))) return { status: 'read', states: {} };
+      try {
+        return { status: 'read', states: await pullRequestStates(project, branches, { env }) };
+      } catch (error) {
+        if (!(error instanceof GitHubError)) throw error;
+        return { status: 'refused', message: describeReadFailure(error) };
+      }
+    }),
   );
 
   // The worktree each window's page watches, at most one per window. A request is checked against
