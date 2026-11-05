@@ -1,4 +1,4 @@
-import { readFileSync, rmSync } from 'node:fs';
+import { readFileSync, renameSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { type Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
@@ -25,6 +25,7 @@ import {
   stubNotifications,
   untilStartListed,
   watchStarts,
+  workspaceTabs,
 } from './support/sessions';
 import { focusTerminal, goHome, typeLine, waitForRow } from './support/terminal';
 
@@ -556,5 +557,32 @@ describe('redesign foundation: built app', () => {
 
     await page.getByTitle(bravoWorkspace, { exact: true }).first().click();
     await page.getByRole('tab', { name: stored.name, exact: true }).waitFor();
+  });
+
+  test('COCKPIT-86 AC5 — a start refused from a workspace row\'s menu navigates nowhere, adds no tab and shows "Could not start Claude Code: …" in the sidebar\'s message slot', async () => {
+    const { page } = session;
+    await page.getByTitle(bravoWorkspace, { exact: true }).first().click();
+    await page.getByRole('tab').first().waitFor();
+    const tabsBefore = await workspaceTabs(page);
+    await goHome(page);
+    const known = await storedSessionIds(page);
+    await recordLocations(page);
+    const binary = join(fx.bin, 'claude');
+    await openWorkspaceStartMenu(page, bravoWorkspace, 'feat-b');
+    renameSync(binary, `${binary}.off`);
+    try {
+      await startItem(page).click();
+      await page.locator('aside [role="status"]').filter({ hasText: /^\s*Could not start Claude Code:/ }).first().waitFor();
+    } finally {
+      renameSync(`${binary}.off`, binary);
+    }
+    await routerSettled(page);
+    expect(await hereNow(page), 'the page did not move').toBe('/');
+    expect(await locationsSeen(page), 'the history went nowhere').toEqual([]);
+    expect(await storedSessionIds(page), 'no session stored').toEqual(known);
+
+    await page.getByTitle(bravoWorkspace, { exact: true }).first().click();
+    await page.getByRole('tab').first().waitFor();
+    expect(await workspaceTabs(page), 'no tab added').toEqual(tabsBefore);
   });
 });
