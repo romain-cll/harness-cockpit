@@ -151,6 +151,25 @@ describe('availableBranch', () => {
     expect(await availableBranch(repo, 'Another task', options)).toBe('another-task');
   });
 
+  // COCKPIT-89: a workspace being set up has no branch and no folder yet, but its name is taken. `reserved` is an
+  // array of branch names (the main process passes the names of its pending setups for the repository).
+  test('COCKPIT-89 AC9 — a reserved name counts as taken even though no branch or folder has it: -2, then -3 with both reserved, and other tasks are unaffected', async () => {
+    const repo = await makeRepo();
+    const root = await tempDir();
+
+    expect(await availableBranch(repo, 'Fix bug', { env: testEnv, root, reserved: ['fix-bug'] })).toBe('fix-bug-2');
+    expect(await availableBranch(repo, 'Fix bug', { env: testEnv, root, reserved: ['fix-bug', 'fix-bug-2'] })).toBe('fix-bug-3');
+    expect(await availableBranch(repo, 'Something else', { env: testEnv, root, reserved: ['fix-bug'] })).toBe('something-else');
+    expect(branches(repo)).toEqual(['main']);
+  });
+
+  test('COCKPIT-89 AC9 — a reserved name counts as taken without a root too, next to a real branch', async () => {
+    const repo = await makeRepo();
+    git(repo, 'branch', 'fix-bug');
+
+    expect(await availableBranch(repo, 'Fix bug', { env: testEnv, reserved: ['fix-bug-2'] })).toBe('fix-bug-3');
+  });
+
   test('AC18 — a text with nothing left becomes "workspace", then "workspace-2"', async () => {
     const repo = await makeRepo();
     expect(await availableBranch(repo, '???', { env: testEnv })).toBe('workspace');

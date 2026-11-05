@@ -168,13 +168,16 @@ export const tabsOf = (page: Page) =>
     return { labels: tabs.map(label), selected: tabs.filter((tab) => tab.getAttribute('aria-selected') === 'true').map(label) };
   });
 
-// Gives the new stored session of the workspace at `path` (not one of `known`) and waits for a selected tab. The
-// composer navigates to the workspace page after `startSession` answered (the session stored), so one read of the
-// stored sessions is enough once the page is there.
+// Waits for the selected tab of the workspace page (COCKPIT-89: the page opens while the worktree is still being
+// made, and the session's terminal joins it as a tab once the session is stored).
+export const waitForSelectedTab = (page: Page) => page.locator('[role="tab"][aria-selected="true"]').first().waitFor();
+
+// Gives the new stored session of the workspace at `path` (not one of `known`) once its tab is selected: the
+// tab shows after the session was stored, so one read of the stored sessions is enough then.
 export async function waitForWorkspaceSession(page: Page, path: string, known: Set<string>) {
+  await waitForSelectedTab(page);
   const stored = (await storedSessions(page)).find((each) => each.directory === path && !known.has(each.id));
   expect(stored, `a session stored for ${path}`).toBeTruthy();
-  await page.locator('[role="tab"][aria-selected="true"]').first().waitFor();
   return stored!;
 }
 
@@ -194,7 +197,8 @@ export interface Sent {
 // Fills the composer for `project` (`none` for no project) and sends it with Enter or the button: picks
 // `agent` ("Terminal" by default, so a real CLI of the developer's machine never starts), waits for the
 // base to be known and, with `base`, picks it. With "No project" the session's page opens (`id`); with a
-// project the workspace page opens (`path`), and with an agent its new session is the selected tab (`id`).
+// project the workspace page opens (`path`) while its worktree is still being made, and once its tab is selected
+// (the shell of "Terminal", or the agent's new session, `id`) the send is done.
 export async function sendFromComposer(
   page: Page,
   project: { root: string } | 'none',
@@ -213,6 +217,9 @@ export async function sendFromComposer(
   else await createButton(page).click();
   if (project === 'none') return { id: await waitForNewSession(page, previous) };
   const path = await waitForWorkspacePage(page);
-  if (agent === 'Terminal') return { path };
+  if (agent === 'Terminal') {
+    await waitForSelectedTab(page);
+    return { path };
+  }
   return { path, id: (await waitForWorkspaceSession(page, path, known)).id };
 }
