@@ -809,9 +809,11 @@ function startProjects(
     let message: string | undefined;
     try {
       if (harness === 'terminal') {
-        await ensureOwnDaemon();
+        // As the agent's start does: no shell for a project that is gone.
+        const found = await findWorkspace({ project, path });
+        if ('status' in found) message = found.message;
         // The repository's setup, then the login shell.
-        await spawnFor(undefined, { ...SETUP_SIZE, cwd: path, command: cliPath, args: ['setup', '--shell'] }, { kind: 'shell', workspace: path });
+        else await spawnFor(undefined, { ...SETUP_SIZE, cwd: path, command: cliPath, args: ['setup', '--shell'] }, { kind: 'shell', workspace: path });
       } else {
         const started = await startSession(undefined, harness, SETUP_SIZE, {
           workspace: { project, path },

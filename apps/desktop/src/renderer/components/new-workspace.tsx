@@ -273,7 +273,9 @@ function Composer() {
         // The workspace exists as a row from the reservation on; the main process makes it and starts the agent.
         const reserved = await window.api.workspaces.compose(project.path, task, base, agent);
         if (reserved.status === 'refused') {
-          setMessage(reserved.message);
+          // A refusal the user left the page before hearing goes under Projects.
+          if (mayNavigate()) setMessage(reserved.message);
+          else setProjectsMessage(reserved.message);
           return;
         }
         await router.invalidate();
