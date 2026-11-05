@@ -195,6 +195,35 @@ const readDescription = (bar: HTMLElement) => {
   };
 };
 
+// A table of the Description: whether the tab panel or the bar scrolls sideways, whether the table sits in a box that
+// scrolls by itself, and whether its cell showing `last` can be brought into view by scrolling that box.
+// Self-contained: it runs in the page, and scrolls the box.
+const readTable = (bar: HTMLElement, { last }: { last: string }) => {
+  const panel = [...bar.querySelectorAll<HTMLElement>('[role="tabpanel"]')].find((each) => !each.hasAttribute('hidden') && each.checkVisibility()) ?? bar;
+  const overflow = { panel: panel.scrollWidth - panel.clientWidth, bar: bar.scrollWidth - bar.clientWidth };
+  const table = panel.querySelector('table');
+  if (!table) return { table: false as const, overflow };
+  let box: HTMLElement | null = table;
+  while (box && box !== panel && !['auto', 'scroll'].includes(getComputedStyle(box).overflowX)) box = box.parentElement;
+  if (!box || box === panel) return { table: true as const, box: false as const, overflow };
+  const cell = [...table.querySelectorAll('td')].find((each) => (each.textContent ?? '').includes(last))!;
+  const barRight = bar.getBoundingClientRect().right;
+  const before = cell.getBoundingClientRect().right;
+  const scrollable = box.scrollWidth > box.clientWidth;
+  box.scrollLeft = box.scrollWidth;
+  const boxRect = box.getBoundingClientRect();
+  const after = cell.getBoundingClientRect().right;
+  return {
+    table: true as const,
+    box: true as const,
+    overflow,
+    scrollable,
+    boxRightInBar: boxRect.right <= barRight + 1,
+    lastCellOutBeforeScroll: before > boxRect.right + 1,
+    lastCellReached: after <= boxRect.right + 1 && after >= boxRect.left,
+  };
+};
+
 describe('right bar pull request tab: built app', () => {
   let fx: SessionsFixture;
   let gh: GhFixture;
@@ -379,7 +408,8 @@ describe('right bar pull request tab: built app', () => {
       const row = workspaceRow(page, path);
       await row.waitFor();
       await row.click();
-      await page.waitForURL((url) => url.pathname === '/workspace' && url.searchParams.get('path') === path);
+      // The workspace page is a region named after the workspace: until it renders, the bar on screen is the previous page's.
+      await page.getByRole('region', { name: 'pr-no-base', exact: true }).waitFor();
       await setChangesOpen(page, true, 'Pull request');
       expect(await changesApi(page, 'changes', nobase.root, path), 'the changes read is refused').toEqual({
         status: 'refused',
@@ -791,6 +821,42 @@ describe('right bar pull request tab: built app', () => {
   });
 
   const heightOf = (clip: { found: boolean; height?: number | null } | null) => (clip?.found ? (clip.height ?? null) : undefined);
+
+  test('AC14 — a table wider than the bar scrolls inside its own box: neither the tab panel nor the bar scrolls sideways, folded or not, and its last cell can be reached', async () => {
+    const { page } = session;
+    const url = 'https://github.com/romain-cll/cockpit/actions/runs/1234567890/job/9876543210';
+    const body = [
+      '| Job | Link |',
+      '| --- | ---- |',
+      `| CI | ${url} |`,
+      '| Lint | short |',
+      '',
+      ...Array.from({ length: 6 }, (_, index) => `Paragraph ${index + 1}`).flatMap((line) => [line, '']),
+    ].join('\n');
+    await show(D, { list: prJson({ body }) });
+    await waitForText((shown) => shown.includes('Paragraph 6'));
+    // Folded: the body is taller than 96 px and cut, and nothing sticks out sideways.
+    await shipButton(page, 'Show more').waitFor();
+    const folded = (await panelEval(page, readTable, { last: 'github.com' }))!;
+    expect(folded.table).toBe(true);
+    expect(folded.overflow.panel, 'folded: the tab panel does not scroll sideways').toBeLessThanOrEqual(0);
+    expect(folded.overflow.bar, 'folded: the bar does not scroll sideways').toBeLessThanOrEqual(0);
+
+    try {
+      await shipButton(page, 'Show more').click();
+      await shipButton(page, 'Show less').waitFor();
+      const open = (await panelEval(page, readTable, { last: 'github.com' }))!;
+      expect(open, 'the table sits in a box that scrolls by itself').toMatchObject({ table: true, box: true, scrollable: true });
+      expect(open).toMatchObject({ boxRightInBar: true, lastCellOutBeforeScroll: true, lastCellReached: true });
+      expect(open.overflow.panel, 'the tab panel does not scroll sideways').toBeLessThanOrEqual(0);
+      expect(open.overflow.bar, 'the bar does not scroll sideways').toBeLessThanOrEqual(0);
+    } finally {
+      if ((await shipButton(page, 'Show less').count()) > 0) {
+        await shipButton(page, 'Show less').click();
+        await shipButton(page, 'Show more').waitFor();
+      }
+    }
+  });
 
   test('AC15 — a body taller than 96 px is cut with "Show more", which shows it whole with "Show less" and stays so when the pull request is read again; a shorter body has neither', async () => {
     const { page } = session;
