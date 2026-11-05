@@ -8,6 +8,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest';
 import { WorkspaceError } from '../src/git';
 import {
   createWorktree,
+  commitsAfter,
   findRepositoryRoot,
   hasRemote,
   listBranches,
@@ -1554,5 +1555,33 @@ describe('hasRemote', () => {
     const linkedClone = await addWorktree(clone, 'linked', 'linked-clone-branch');
     expect(await hasRemote(clone, { env: testEnv })).toBe(true);
     expect(await hasRemote(linkedClone, { env: testEnv })).toBe(true);
+  });
+});
+
+describe('commitsAfter', () => {
+  test('COCKPIT-75 AC5 — counts the commits of HEAD after the oid, none for HEAD itself, from the main working tree and from a linked worktree', async () => {
+    const repo = await makeRepo();
+    const first = git(repo, 'rev-parse', 'HEAD');
+    commit(repo, 'second');
+    const second = git(repo, 'rev-parse', 'HEAD');
+    commit(repo, 'third');
+    const third = git(repo, 'rev-parse', 'HEAD');
+    const linked = await addWorktree(repo, 'linked', 'linked-branch');
+    commit(linked, 'on the branch');
+
+    expect(await commitsAfter(repo, first, { env: testEnv })).toBe(2);
+    expect(await commitsAfter(repo, second, { env: testEnv })).toBe(1);
+    expect(await commitsAfter(repo, third, { env: testEnv })).toBe(0);
+    expect(await commitsAfter(linked, third, { env: testEnv }), 'the worktree counts its own HEAD').toBe(1);
+    expect(await commitsAfter(linked, first, { env: testEnv })).toBe(3);
+  });
+
+  test('COCKPIT-75 AC5 — an oid unknown locally gives null, counting nothing and changing nothing', async () => {
+    const repo = await makeRepo();
+    const head = git(repo, 'rev-parse', 'HEAD');
+
+    expect(await commitsAfter(repo, 'f'.repeat(40), { env: testEnv })).toBeNull();
+    expect(git(repo, 'rev-parse', 'HEAD')).toBe(head);
+    expect(git(repo, 'status', '--porcelain')).toBe('');
   });
 });

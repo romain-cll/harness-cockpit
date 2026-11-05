@@ -8,7 +8,7 @@ import { checksHeader, checkTime, overallReview, sortChecks } from '../src/rende
 //   being the ISO strings gh printed (`null` or absent when it printed none, gh's zero date included);
 // - `sortChecks(checks)` gives a new array: failing, unknown, pending, passing, the given order within a group;
 // - `checksHeader(checks)` gives the Checks header summary;
-// - `checkTime(check, now)` gives the right text of a row, `now` in milliseconds since the epoch, `''` for none;
+// - `checkTime(check, now)` gives the right text of a row, `now` (the time of the last read) in milliseconds since the epoch, `''` for none;
 // - `overallReview(reviewDecision, reviews)` gives `'changes_requested' | 'approved' | 'review_required' | null`,
 //   `reviews` being `{ state: 'changes_requested' | 'approved' | 'commented' | 'dismissed' | 'unknown' }`.
 
@@ -74,11 +74,11 @@ describe('checkTime', () => {
     ['11:57:55', 'Running · 2m'],
     ['11:57:00', 'Running · 3m'],
     ['11:59:48', 'Running · 12s'],
-  ])('AC10 — a running check started at %s reads "%s" at the time of the render', (started, expected) => {
+  ])('AC10 — a running check started at %s reads "%s" at the time of the last read', (started, expected) => {
     expect(checkTime(check('pending', { startedAt: `2026-11-05T${started}Z` }), NOW)).toBe(expected);
   });
 
-  test('AC10 — a running check counts from the time of the render: it advances with it', () => {
+  test('AC10 — a running check counts up to the time of the last read: a later read gives a later time', () => {
     const running = check('pending', { startedAt: '2026-11-05T11:59:48Z' });
 
     expect(checkTime(running, NOW)).toBe('Running · 12s');

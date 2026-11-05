@@ -80,7 +80,7 @@ cat '${bin}/list.json'
 
 /** The fields of the `--json` argument of a run, sorted: the order gh is asked in does not matter. */
 const jsonFields = (args: string[]) => args[args.indexOf('--json') + 1]!.split(',').sort();
-const LIST_FIELDS = ['author', 'body', 'headRefOid', 'latestReviews', 'number', 'reviewDecision', 'state', 'statusCheckRollup', 'title', 'url'];
+const LIST_FIELDS = ['author', 'baseRefName', 'body', 'headRefOid', 'latestReviews', 'number', 'reviewDecision', 'state', 'statusCheckRollup', 'title', 'url'];
 
 const failWith = (stub: Stub, { code, stderr }: { code: number; stderr: string }) =>
   Promise.all([writeFile(join(stub.bin, 'code'), String(code)), writeFile(join(stub.bin, 'stderr'), stderr)]);
@@ -321,6 +321,10 @@ describe('findPullRequest: the fields of the Pull request tab', () => {
     const found = await read({ author: { login: 'romain-cll', id: 'x' }, body: 'The **body**', headRefOid: 'abc123def456' });
 
     expect(found).toMatchObject({ author: 'romain-cll', body: 'The **body**', headOid: 'abc123def456' });
+  });
+
+  test('AC1 — gives the base the pull request is into, as baseRefName', async () => {
+    expect(await read({ baseRefName: 'develop' })).toMatchObject({ base: 'develop' });
   });
 
   test('AC1 — a missing or null author reads ghost, and absent arrays read empty', async () => {

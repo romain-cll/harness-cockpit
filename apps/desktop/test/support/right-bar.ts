@@ -610,6 +610,7 @@ export const prJson = ({
   author = 'romain-cll',
   body = '',
   head = PR_HEAD,
+  base = 'main',
   rollup,
   reviews = [],
   decision = '',
@@ -620,6 +621,8 @@ export const prJson = ({
   author?: string;
   body?: string;
   head?: string;
+  /** `baseRefName`: the branch the pull request is into. */
+  base?: string;
   /** The checks themselves, instead of the one `checks` stands for. */
   rollup?: object[];
   /** `latestReviews`: a login and a GitHub review state each. */
@@ -637,6 +640,7 @@ export const prJson = ({
       author: { login: author },
       body,
       headRefOid: head,
+      baseRefName: base,
       latestReviews: reviews.map(({ login, state }) => ({ author: { login }, state })),
       reviewDecision: decision,
     },
@@ -798,8 +802,8 @@ export const mergeDialog = (page: Page, title: string) => openDialogs(page).filt
 export const workspaceRow = (page: Page, path: string) => page.locator('aside').locator(`[title="${path}"]`).first();
 // The named status icon of that row ("Pull request open", "Pull request merged", "Working"…).
 export const rowIcon = (page: Page, path: string, name: string) => workspaceRow(page, path).getByRole('img', { name, exact: true });
-// The `gh pr merge` arguments of a merge of #7 with `method`, as PR_HEAD read.
-export const mergeArgs = (method: MergeMethod) => ['pr', 'merge', '7', MERGE_FLAGS[method], '--match-head-commit', PR_HEAD];
+// The `gh pr merge` arguments of a merge of #7 with `method`, `head` being the head the bar read.
+export const mergeArgs = (method: MergeMethod, head = PR_HEAD) => ['pr', 'merge', '7', MERGE_FLAGS[method], '--match-head-commit', head];
 
 // Picks `method` in the "Merge method" menu of the bar.
 export async function pickMergeMethod(page: Page, method: MergeMethod) {

@@ -11,25 +11,30 @@ import {
   gitIn,
   INVOKE_HANDLERS,
   ipcAnswered,
+  ipcCallArgs,
   ipcCalls,
   makeRepo,
   mutedColor,
   openDialogs,
+  removeThroughMenu,
   sidebarLines,
   type TempRepo,
   tokenColor,
   untilAnswered,
   untilFewerOverlays,
+  waitForNoEntry,
   worktreePath,
 } from './support/projects';
 import {
   addGhFixture,
   addOrigin,
   branchesOfRun,
+  changesApi,
   type GhAnswers,
   type GhFixture,
   GIT_APP_ENV,
   type GhRun,
+  ghRuns,
   graphqlRuns,
   heaviestWeight,
   iconIn,
@@ -68,6 +73,7 @@ import { createWorkspaceWithAgent, expectNoErrors, launchBuiltWith, makeSessions
 
 const STATES_CHANNEL = 'workspaces:pull-request-states';
 const MERGE_CHANNEL = 'workspaces:merge-pull-request';
+const COMMITS_CHANNEL = 'workspaces:commits-after';
 
 interface Workspace {
   /** The name and the branch: the prompt's slug. */
@@ -169,6 +175,19 @@ const readDescription = (bar: HTMLElement) => {
     emphasis: texts('em, i'),
     code: texts('code'),
     link: link ? { href: link.getAttribute('href'), text: (link.textContent ?? '').trim() } : null,
+    bareLink: [...panel.querySelectorAll('a')].filter((anchor) => anchor.getAttribute('href') === 'https://example.com/bare').map((anchor) => (anchor.textContent ?? '').trim()),
+    tables: panel.querySelectorAll('table').length,
+    cells: texts('th, td'),
+    struck: texts('del, s'),
+    checkboxes: [...panel.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].map((box) => ({ checked: box.checked, disabled: box.disabled })),
+    pre: [...panel.querySelectorAll<HTMLElement>('pre')].map((block) => {
+      const style = getComputedStyle(block);
+      return { whiteSpace: style.whiteSpace, height: block.getBoundingClientRect().height, lineHeight: parseFloat(style.lineHeight), right: block.getBoundingClientRect().right };
+    }),
+    // Nothing sticks out sideways: neither the tab panel nor the bar scrolls horizontally.
+    panelOverflow: panel.scrollWidth - panel.clientWidth,
+    barOverflow: bar.scrollWidth - bar.clientWidth,
+    barRight: bar.getBoundingClientRect().right,
     images: panel.querySelectorAll('img').length,
     rawHtml: panel.querySelectorAll('#raw-html, script').length,
     pwned: (window as unknown as { __pwned?: boolean }).__pwned === true,
@@ -196,7 +215,7 @@ describe('right bar pull request tab: built app', () => {
     gh = addGhFixture(fx);
     session = await launchBuiltWith({ ...fx.env(), ...GIT_APP_ENV });
     await session.page.getByText(versionLabel).waitFor();
-    await countIpcCalls(session, [STATES_CHANNEL, MERGE_CHANNEL, 'workspaces:pull-request']);
+    await countIpcCalls(session, [STATES_CHANNEL, MERGE_CHANNEL, COMMITS_CHANNEL, 'workspaces:pull-request']);
 
     main = makeChangesRepo('pr-tab');
     addOrigin(main);
@@ -248,8 +267,9 @@ describe('right bar pull request tab: built app', () => {
   }
 
   const sortedBranches = (run: GhRun) => branchesOfRun(run).sort();
-  const openAnswers = (workspace: Workspace): GhAnswers => ({
-    list: prJson(),
+  // An open pull request of `workspace`'s branch into `base` at `head`, which merges into a merged one.
+  const openAnswers = (workspace: Workspace, base = 'main', head = PR_HEAD): GhAnswers => ({
+    list: prJson({ base, head }),
     states: { [workspace.name]: 'OPEN' },
     afterMerge: { list: prJson({ state: 'MERGED', checks: 'passing' }), states: { [workspace.name]: 'MERGED' } },
   });
@@ -268,6 +288,12 @@ describe('right bar pull request tab: built app', () => {
     expect(await shipButton(page, 'Delete workspace…').count()).toBe(0);
     // No check, review or description: none of their sections.
     for (const section of ['Checks', 'Reviews', 'Description']) expect(text, section).not.toMatch(new RegExp(`\\b${section}\\b`));
+    // The line under the title names the pull request's base, not the workspace's recorded one (main).
+    await waitForText((shown) => shown.includes('pr-meta → main'));
+    setGh(gh, { list: prJson({ base: 'develop' }) });
+    await dispatchFocus(page);
+    const developLine = await waitForText((shown) => shown.includes('pr-meta → develop'));
+    expect(developLine).not.toContain('pr-meta → main');
 
     for (const [state, pill] of [['MERGED', 'Merged'], ['CLOSED', 'Closed']] as const) {
       setGh(gh, { list: prJson({ state }) });
@@ -323,43 +349,108 @@ describe('right bar pull request tab: built app', () => {
     expect(mergeRuns(gh), 'nothing merged').toEqual([]);
   });
 
-  test('AC4, AC5, AC6 — the merge button asks "Squash and merge #7 into main?" and runs nothing until confirmed; unpushed commits are counted; confirming runs gh pr merge with the head read for each method, reads the pull request again with no focus, and turns the pill, the merge row and the sidebar icon', async () => {
+  test('AC4 — the merge button asks "Squash and merge #7 into develop?" (the pull request\'s base, the workspace being recorded on main) with "Cancel" and the method\'s label, and runs nothing', async () => {
     const { page } = session;
-    await show(G, openAnswers(G));
+    await show(G, openAnswers(G, 'develop'));
     const merge = shipButton(page, 'Squash and merge');
     await merge.waitFor();
 
-    // AC4, AC5 — nothing to push: no line about it. Cancel closes the dialog and runs nothing.
     await merge.click();
-    let dialog = mergeDialog(page, 'Squash and merge #7 into main?');
+    const dialog = mergeDialog(page, 'Squash and merge #7 into develop?');
     await dialog.waitFor();
     expect((await dialog.getByRole('button').allInnerTexts()).map((label) => label.trim()).sort()).toEqual(['Cancel', 'Squash and merge']);
-    expect(await dialog.innerText()).not.toContain('not pushed');
+    expect(await dialog.innerText()).not.toContain('into main');
     expect(mergeRuns(gh), 'the dialog ran nothing').toEqual([]);
     await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
     await dialog.waitFor({ state: 'hidden' });
     expect(mergeRuns(gh), 'Cancel ran nothing').toEqual([]);
+  });
 
-    // AC5 — one local commit, then two.
+  test('AC4 — the merge row does not wait for the changes read: with it refused, the button is enabled and the dialog names the pull request\'s base', async () => {
+    const { page } = session;
+    // A workspace with no recorded base in a repository with no default base: the changes read is refused for real.
+    const nobase = makeRepo('pr-no-base');
+    try {
+      const path = join(nobase.parent, 'wt-no-base');
+      gitIn(nobase.root, 'worktree', 'add', '--quiet', '-b', 'pr-no-base', path, 'main');
+      gitIn(nobase.root, 'checkout', '--quiet', '--detach');
+      await addRepository(session, nobase);
+      setGh(gh, { list: prJson({ base: 'develop' }) });
+      const row = workspaceRow(page, path);
+      await row.waitFor();
+      await row.click();
+      await page.waitForURL((url) => url.pathname === '/workspace' && url.searchParams.get('path') === path);
+      await setChangesOpen(page, true, 'Pull request');
+      expect(await changesApi(page, 'changes', nobase.root, path), 'the changes read is refused').toEqual({
+        status: 'refused',
+        message: 'No base branch to compare pr-no-base with.',
+      });
+
+      const merge = shipButton(page, 'Squash and merge');
+      await merge.waitFor();
+      expect(await merge.isEnabled()).toBe(true);
+      await merge.click();
+      const dialog = mergeDialog(page, 'Squash and merge #7 into develop?');
+      await dialog.waitFor();
+      await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await dialog.waitFor({ state: 'hidden' });
+      expect(mergeRuns(gh)).toEqual([]);
+      await removeThroughMenu(page, nobase.root);
+      await waitForNoEntry(page, nobase.root);
+    } finally {
+      setGh(gh);
+      rmSync(nobase.parent, { recursive: true, force: true });
+    }
+  });
+
+  test('AC5 — the dialog counts the local commits after the pull request\'s head, read when the button is clicked; none, a head unknown locally, or a branch with no upstream whose head is the pull request\'s show no line', async () => {
+    const { page } = session;
+    const head0 = gitIn(G.path, 'rev-parse', 'HEAD');
     gitIn(G.path, 'commit', '--allow-empty', '-m', 'local one');
-    await waitForText((shown) => /(^|\s)1 commit to push(\s|$)/.test(shown));
-    await merge.click();
-    dialog = mergeDialog(page, 'Squash and merge #7 into main?');
-    await dialog.waitFor();
-    expect(await dialog.innerText()).toContain('1 local commit is not pushed and will not be merged.');
-    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
-    await dialog.waitFor({ state: 'hidden' });
     gitIn(G.path, 'commit', '--allow-empty', '-m', 'local two');
-    await waitForText((shown) => /(^|\s)2 commits to push(\s|$)/.test(shown));
-    await merge.click();
-    await dialog.waitFor();
-    expect(await dialog.innerText()).toContain('2 local commits are not pushed and will not be merged.');
-    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
-    await dialog.waitFor({ state: 'hidden' });
-    expect(mergeRuns(gh)).toEqual([]);
+    const headNow = gitIn(G.path, 'rev-parse', 'HEAD');
+    const headOne = gitIn(G.path, 'rev-parse', 'HEAD~1');
+    // From the base the branch is 2 commits ahead and has no upstream: a count from there would say 2 in the cases of no line.
+    expect(Number(gitIn(G.path, 'rev-list', '--count', 'origin/main..HEAD'))).toBe(2);
+    await show(G, openAnswers(G, 'develop'));
+    const merge = shipButton(page, 'Squash and merge');
+    await merge.waitFor();
 
-    // AC6 — confirming merges with the head the bar read, with no window focus afterwards.
+    const cases: Array<[string, string, string | null]> = [
+      ['2 commits after the head', head0, '2 local commits are not pushed and will not be merged.'],
+      ['1 commit after the head', headOne, '1 local commit is not pushed and will not be merged.'],
+      ['no commit after the head (no upstream)', headNow, null],
+      ['a head unknown locally', 'f'.repeat(40), null],
+    ];
+    for (const [label, head, line] of cases) {
+      // The bar read the head: the page has shown the answer before the button is clicked.
+      setGh(gh, openAnswers(G, 'develop', head));
+      await untilAnswered(session, 'workspaces:pull-request', () => dispatchFocus(page));
+      await afterIpcAnswers(page);
+      const before = await ipcCalls(session, COMMITS_CHANNEL);
+      await merge.click();
+      const dialog = mergeDialog(page, 'Squash and merge #7 into develop?');
+      await dialog.waitFor();
+      await ipcAnswered(session, COMMITS_CHANNEL, before + 1);
+      await afterIpcAnswers(page);
+      expect((await ipcCallArgs(session, COMMITS_CHANNEL)).at(-1), `${label}: counted from the head read, when the button was clicked`).toEqual([main.root, G.path, head]);
+      const text = await dialog.innerText();
+      if (line) expect(text, label).toContain(line);
+      else expect(text, label).not.toMatch(/not pushed/);
+      await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await dialog.waitFor({ state: 'hidden' });
+    }
+    expect(mergeRuns(gh)).toEqual([]);
+  });
+
+  test('AC6 — confirming runs gh pr merge with the head read for each method, reads the pull request again with no focus, and turns the pill, the merge row and the sidebar icon', async () => {
+    const { page } = session;
+    await show(G, openAnswers(G, 'develop'));
+    const merge = shipButton(page, 'Squash and merge');
+    await merge.waitFor();
+
     await merge.click();
+    const dialog = mergeDialog(page, 'Squash and merge #7 into develop?');
     await dialog.waitFor();
     await dialog.getByRole('button', { name: 'Squash and merge', exact: true }).click();
     await dialog.waitFor({ state: 'hidden' });
@@ -372,12 +463,12 @@ describe('right bar pull request tab: built app', () => {
     expect(PR_HEAD).not.toBe(gitIn(G.path, 'rev-parse', 'HEAD'));
 
     for (const method of ['merge', 'rebase'] as const) {
-      setGh(gh, openAnswers(G));
+      setGh(gh, openAnswers(G, 'develop'));
       await dispatchFocus(page);
       await mergeMethodButton(page).waitFor();
       await pickMergeMethod(page, method);
       await shipButton(page, MERGE_LABELS[method]).click();
-      const methodDialog = mergeDialog(page, `${MERGE_LABELS[method]} #7 into main?`);
+      const methodDialog = mergeDialog(page, `${MERGE_LABELS[method]} #7 into develop?`);
       await methodDialog.waitFor();
       await methodDialog.getByRole('button', { name: MERGE_LABELS[method], exact: true }).click();
       await methodDialog.waitFor({ state: 'hidden' });
@@ -587,7 +678,7 @@ describe('right bar pull request tab: built app', () => {
     }
   });
 
-  test('AC14 — the description renders headings, lists, emphasis, inline code and links, shows raw HTML as nothing executable and an image as its alt text, and a link opens in the system browser', async () => {
+  test('AC14 — the description renders headings, lists, emphasis, inline code, links, a table, a task list, strikethrough, a bare URL and a wrapping pre, shows raw HTML as nothing executable and an image as its alt text, and a link, a bare URL included, opens in the system browser', async () => {
     const { page } = session;
     await session.evaluateInMain(`(() => {
       const { shell } = require('electron');
@@ -612,32 +703,91 @@ describe('right bar pull request tab: built app', () => {
       '<b id="raw-html">raw bold</b> <script>window.__pwned = true</script>',
       '',
       '![alt text here](https://evil.example/pixel.png)',
+      '',
+      '| Name | Value |',
+      '| ---- | ----- |',
+      '| alpha | 1 |',
+      '',
+      '- [x] done task',
+      '- [ ] open task',
+      '',
+      '~~struck~~ words and a bare URL https://example.com/bare end.',
+      '',
+      '```',
+      Array.from({ length: 40 }, (_, index) => `word${index}`).join(' '),
+      '```',
     ].join('\n');
     await show(D, { list: prJson({ body }) });
     await waitForText((shown) => shown.includes('Release notes'));
+    try {
+      // The body is taller than 96 px: unfold it, so the links can be clicked and the layout measured whole.
+      await shipButton(page, 'Show more').click();
+      await shipButton(page, 'Show less').waitFor();
 
-    const rendered = (await panelEval(page, readDescription, null))!;
-    expect(rendered.headings).toEqual(['Release notes', 'What changed']);
-    expect(rendered.items).toEqual(['first item', 'second item']);
-    expect(rendered.emphasis).toEqual(['emphasis']);
-    expect(rendered.code).toEqual(['inline code']);
-    expect(rendered.link).toEqual({ href: 'https://example.com/docs', text: 'docs link' });
-    expect(rendered.rawHtml, 'raw HTML is not rendered as HTML').toBe(0);
-    expect(rendered.pwned).toBe(false);
-    expect(rendered.images, 'an image loads nothing').toBe(0);
-    expect(rendered.text).toContain('alt text here');
-    await expectNoErrors(session);
+      const rendered = (await panelEval(page, readDescription, null))!;
+      expect(rendered.headings).toEqual(['Release notes', 'What changed']);
+      expect(rendered.items).toEqual(['first item', 'second item', 'done task', 'open task']);
+      expect(rendered.emphasis).toEqual(['emphasis']);
+      expect(rendered.code).toContain('inline code');
+      expect(rendered.link).toEqual({ href: 'https://example.com/docs', text: 'docs link' });
+      expect(rendered.rawHtml, 'raw HTML is not rendered as HTML').toBe(0);
+      expect(rendered.pwned).toBe(false);
+      expect(rendered.images, 'an image loads nothing').toBe(0);
+      expect(rendered.text).toContain('alt text here');
 
-    const url = page.url();
-    await page.locator(PANEL).getByRole('link', { name: 'docs link', exact: true }).click();
-    const opened = await session.evaluateInMain<string[]>(`new Promise((resolve) => {
-      const done = () => resolve(globalThis.__openedExternally.slice());
-      if (globalThis.__openedExternally.length > 0) done();
-      else globalThis.__onOpenedExternally = done;
-    })`);
-    expect(opened).toEqual(['https://example.com/docs']);
-    expect(page.url(), 'the window stays on its page').toBe(url);
-    await expectNoErrors(session);
+      // remark-gfm: a table, a task list, strikethrough and a bare URL.
+      expect(rendered.tables).toBe(1);
+      expect(rendered.cells).toEqual(['Name', 'Value', 'alpha', '1']);
+      expect(rendered.struck).toEqual(['struck']);
+      expect(rendered.bareLink, 'a bare https URL is a link').toEqual(['https://example.com/bare']);
+      expect(rendered.checkboxes, 'task list checkboxes are read-only').toEqual([
+        { checked: true, disabled: true },
+        { checked: false, disabled: true },
+      ]);
+      // A long `pre` line wraps and does not widen the bar.
+      expect(rendered.pre).toHaveLength(1);
+      expect(['pre', 'nowrap']).not.toContain(rendered.pre[0]!.whiteSpace);
+      expect(rendered.pre[0]!.height, 'the long line wrapped').toBeGreaterThan(rendered.pre[0]!.lineHeight * 1.5);
+      expect(rendered.pre[0]!.right).toBeLessThanOrEqual(rendered.barRight);
+      expect(rendered.panelOverflow, 'the tab panel does not scroll sideways').toBeLessThanOrEqual(0);
+      expect(rendered.barOverflow, 'the bar does not scroll sideways').toBeLessThanOrEqual(0);
+      await expectNoErrors(session);
+
+      // Clicking a read-only checkbox changes nothing.
+      const runs = ghRuns(gh).length;
+      await page.locator(PANEL).locator('input[type="checkbox"]').last().click({ force: true });
+      await page.locator(PANEL).locator('input[type="checkbox"]').first().click({ force: true });
+      await afterIpcAnswers(page);
+      expect((await panelEval(page, readDescription, null))!.checkboxes).toEqual(rendered.checkboxes);
+      expect(ghRuns(gh), 'no gh run').toHaveLength(runs);
+
+      const url = page.url();
+      await page.locator(PANEL).getByRole('link', { name: 'docs link', exact: true }).click();
+      // Resolves once `count` links have been handed to the system browser.
+      const openedAfter = (count: number) =>
+        session.evaluateInMain<string[]>(`new Promise((resolve) => {
+          const check = () => {
+            if (globalThis.__openedExternally.length < ${count}) return;
+            globalThis.__onOpenedExternally = undefined;
+            resolve(globalThis.__openedExternally.slice());
+          };
+          globalThis.__onOpenedExternally = check;
+          check();
+        })`);
+      expect(await openedAfter(1)).toEqual(['https://example.com/docs']);
+      expect(page.url(), 'the window stays on its page').toBe(url);
+
+      await page.locator(PANEL).locator('a[href="https://example.com/bare"]').click();
+      expect(await openedAfter(2), 'the bare URL opens in the system browser too').toEqual(['https://example.com/docs', 'https://example.com/bare']);
+      expect(page.url(), 'the window stays on its page').toBe(url);
+      await expectNoErrors(session);
+    } finally {
+      // Folded again, as the next test expects it (a failure above included).
+      if ((await shipButton(page, 'Show less').count()) > 0) {
+        await shipButton(page, 'Show less').click();
+        await shipButton(page, 'Show more').waitFor();
+      }
+    }
   });
 
   const heightOf = (clip: { found: boolean; height?: number | null } | null) => (clip?.found ? (clip.height ?? null) : undefined);
@@ -660,6 +810,16 @@ describe('right bar pull request tab: built app', () => {
     const unfolded = await panelEval(page, readClip, { text: 'LAST-PARAGRAPH' });
     expect(unfolded).toMatchObject({ found: true, cut: false });
     expect(heightOf(unfolded) === null || heightOf(unfolded)! > 96).toBe(true);
+
+    // "Show less" cuts it at 96 px again.
+    await shipButton(page, 'Show less').click();
+    await shipButton(page, 'Show more').waitFor();
+    expect(await shipButton(page, 'Show less').count()).toBe(0);
+    const refolded = await panelEval(page, readClip, { text: 'LAST-PARAGRAPH' });
+    expect(Math.round(heightOf(refolded) ?? 0), 'cut at 96 px again').toBe(96);
+    expect(refolded).toMatchObject({ found: true, cut: true });
+    await shipButton(page, 'Show more').click();
+    await shipButton(page, 'Show less').waitFor();
 
     // A re-read with a changed body keeps it unfolded.
     setGh(gh, { list: prJson({ body: paragraphs('LAST-PARAGRAPH-EDITED') }) });
@@ -858,7 +1018,7 @@ describe('right bar pull request tab: built app', () => {
     setGh(gh);
   });
 
-  test('AC20 — the merge call refuses another origin, an unknown project, a path that is no linked worktree, a detached HEAD and a method outside the three, running no gh; the states call refuses an unknown project and another origin', async () => {
+  test('AC20 — the merge call and commitsAfter refuse another origin, an unknown project, a path that is no linked worktree, a detached HEAD and a method outside the three, running no gh; the states call refuses an unknown project and another origin', async () => {
     const { page } = session;
     await setChangesOpen(page, false);
     setGh(gh);
@@ -878,6 +1038,9 @@ describe('right bar pull request tab: built app', () => {
     await settle();
     const mergesBefore = mergeRuns(gh).length;
     const graphqlBefore = graphqlRuns(gh).length;
+    const head40 = gitIn(linked, 'rev-parse', 'HEAD');
+    const revLists = () => readFileSync(fx.gitLog, 'utf8').split('\n').filter((line) => / rev-list( |$)/.test(line)).length;
+    const revListsBefore = revLists();
 
     const refusals = [
       ['an unknown project', ['/no/such/project', linked, 7, 'squash', PR_HEAD]],
@@ -891,8 +1054,22 @@ describe('right bar pull request tab: built app', () => {
       expect(await api('mergePullRequest', [...args]), label).toMatchObject({ status: 'refused', message: expect.any(String) });
     }
     expect(await api('pullRequestStates', ['/no/such/project']), 'states: unknown project').toMatchObject({ status: 'refused', message: expect.any(String) });
+    const commitRefusals = [
+      ['an unknown project', ['/no/such/project', linked, head40]],
+      ['a path that is no worktree', [main.root, elsewhere, head40]],
+      ['the main working tree', [main.root, main.root, head40]],
+      ['an oid that is too short', [main.root, linked, head40.slice(0, 39)]],
+      ['an oid that is too long', [main.root, linked, `${head40}0`]],
+      ['an oid that is not hexadecimal', [main.root, linked, 'g'.repeat(40)]],
+      ['a revision, not an oid', [main.root, linked, 'HEAD']],
+      ['an option', [main.root, linked, '--all']],
+    ] as const;
+    for (const [label, args] of commitRefusals) {
+      expect(await api('commitsAfter', [...args]), `commitsAfter: ${label}`).toMatchObject({ status: 'refused', message: expect.any(String) });
+    }
     expect(mergeRuns(gh), 'no gh pr merge ran').toHaveLength(mergesBefore);
     expect(graphqlRuns(gh), 'no gh api graphql ran').toHaveLength(graphqlBefore);
+    expect(revLists(), 'no git rev-list ran for a refused commitsAfter').toBe(revListsBefore);
 
     // From another origin the handlers reject.
     const origins = await session.evaluateInMain<Record<string, string>>(`(async () => {
@@ -900,6 +1077,7 @@ describe('right bar pull request tab: built app', () => {
       const calls = {
         '${MERGE_CHANNEL}': [${JSON.stringify(main.root)}, ${JSON.stringify(linked)}, 7, 'squash', ${JSON.stringify(PR_HEAD)}],
         '${STATES_CHANNEL}': [${JSON.stringify(main.root)}],
+        '${COMMITS_CHANNEL}': [${JSON.stringify(main.root)}, ${JSON.stringify(linked)}, ${JSON.stringify(head40)}],
       };
       const results = {};
       for (const [channel, args] of Object.entries(calls)) {
@@ -914,8 +1092,13 @@ describe('right bar pull request tab: built app', () => {
       }
       return results;
     })()`);
-    expect(origins).toEqual({ [MERGE_CHANNEL]: 'rejected', [STATES_CHANNEL]: 'rejected' });
+    expect(origins).toEqual({ [MERGE_CHANNEL]: 'rejected', [STATES_CHANNEL]: 'rejected', [COMMITS_CHANNEL]: 'rejected' });
     expect(mergeRuns(gh)).toHaveLength(mergesBefore);
     expect(graphqlRuns(gh)).toHaveLength(graphqlBefore);
+    expect(revLists(), 'no git rev-list ran for another origin').toBe(revListsBefore);
+
+    // A valid call does count: nothing after the worktree's own HEAD, and null for an oid git does not know.
+    expect(await api('commitsAfter', [main.root, linked, head40])).toEqual({ status: 'read', count: 0 });
+    expect(await api('commitsAfter', [main.root, linked, 'f'.repeat(40)])).toEqual({ status: 'read', count: null });
   });
 });
