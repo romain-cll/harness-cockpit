@@ -246,7 +246,7 @@ export function DescriptionSection({ body }: { body: string }) {
       <h3 className="text-[11px] text-subtle">Description</h3>
       <div
         ref={box}
-        className={`text-xs/[18px] break-words text-foreground [&_:is(h1,h2,h3,h4,h5,h6)]:text-muted-foreground [&_a]:text-brand [&_a]:underline [&_code]:font-mono [&_code]:text-[11px] [&_.contains-task-list]:list-none [&_.contains-task-list]:pl-0 [&_input]:mr-1.5 [&_ol]:list-decimal [&_ol]:pl-4 [&_p:not(:first-child)]:mt-2 [&_pre]:whitespace-pre-wrap [&_strong]:font-normal [&_td]:pr-3 [&_th]:pr-3 [&_th]:text-left [&_th]:font-normal [&_ul]:list-disc [&_ul]:pl-4 ${expanded ? '' : 'max-h-24 overflow-hidden'}`}
+        className={`text-xs/[18px] break-words text-foreground [&_:is(h1,h2,h3,h4,h5,h6)]:text-muted-foreground [&_a]:text-brand [&_a]:underline [&_code]:font-mono [&_code]:text-[11px] [&_.contains-task-list]:list-none [&_.contains-task-list]:pl-0 [&_input]:mr-1.5 [&_ol]:list-decimal [&_ol]:pl-4 [&_p:not(:first-child)]:mt-2 [&_pre]:whitespace-pre-wrap [&_strong]:font-normal [&_table]:block [&_table]:overflow-x-auto [&_td]:pr-3 [&_th]:pr-3 [&_th]:text-left [&_th]:font-normal [&_ul]:list-disc [&_ul]:pl-4 ${expanded ? '' : 'max-h-24 overflow-hidden'}`}
       >
         <Markdown
           remarkPlugins={[remarkGfm]}
