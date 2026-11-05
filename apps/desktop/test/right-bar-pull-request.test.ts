@@ -36,7 +36,6 @@ import {
   lookOf,
   makeChangesRepo,
   MERGE_LABELS,
-  type MergeMethod,
   mergeArgs,
   mergeDialog,
   mergeMethodButton,
@@ -182,7 +181,6 @@ describe('right bar pull request tab: built app', () => {
   let gh: GhFixture;
   let session: Session;
   let main: TempRepo;
-  let origin: string;
   let local: TempRepo;
   let bare: TempRepo;
   // Merge, merge row and diff row; merge flow; details; no pull request; a workspace of `main` whose branch is not
@@ -201,7 +199,7 @@ describe('right bar pull request tab: built app', () => {
     await countIpcCalls(session, [STATES_CHANNEL, MERGE_CHANNEL, 'workspaces:pull-request']);
 
     main = makeChangesRepo('pr-tab');
-    origin = addOrigin(main);
+    addOrigin(main);
     local = makeChangesRepo('pr-no-remote');
     bare = makeRepo('pr-bare');
     for (const repo of [main, local, bare]) await addRepository(session, repo);
@@ -300,6 +298,7 @@ describe('right bar pull request tab: built app', () => {
       );
 
     await mergeMethodButton(page).click();
+    await items.first().waitFor();
     expect((await items.allInnerTexts()).map((label) => label.trim()).sort()).toEqual(Object.values(MERGE_LABELS).sort());
     expect(await checkedOf()).toEqual({ 'Squash and merge': 'true', 'Create a merge commit': 'false', 'Rebase and merge': 'false' });
     await page.keyboard.press('Escape');
@@ -308,12 +307,14 @@ describe('right bar pull request tab: built app', () => {
     await pickMergeMethod(page, 'merge');
     expect(await shipButton(page, 'Squash and merge').count()).toBe(0);
     await mergeMethodButton(page).click();
+    await items.first().waitFor();
     expect(await checkedOf()).toEqual({ 'Squash and merge': 'false', 'Create a merge commit': 'true', 'Rebase and merge': 'false' });
     await page.keyboard.press('Escape');
     await untilFewerOverlays(page, 1);
 
     await pickMergeMethod(page, 'rebase');
     await mergeMethodButton(page).click();
+    await items.first().waitFor();
     expect(await checkedOf()).toEqual({ 'Squash and merge': 'false', 'Create a merge commit': 'false', 'Rebase and merge': 'true' });
     await page.keyboard.press('Escape');
     await untilFewerOverlays(page, 1);
@@ -508,7 +509,7 @@ describe('right bar pull request tab: built app', () => {
       const rows = await Promise.all(names.map((label) => panelEval(page, readRow, { label, byTitle: true })));
       expect(rows.every((row) => row !== null), 'every check is listed, its full name as title').toBe(true);
       const found = rows as RowFacts[];
-      expect(found.map((row) => row.top), 'failing, unknown, pending, passing, gh\'s order within a group').toEqual([...found.map((row) => row.top)].sort((x, y) => x - y));
+      expect(found.map((row) => row.top), 'failing, unknown, pending, passing, gh\'s order within a group').toEqual(found.map((row) => row.top).sort((x, y) => x - y));
       const expectedIcons = [
         [/lucide-circle-x(\s|$)/, '--status-exited'],
         [/lucide-circle-(help|question-mark)(\s|$)/, '--muted-foreground'],
@@ -558,7 +559,7 @@ describe('right bar pull request tab: built app', () => {
         expect(row.avatar!.color).toBe(await tokenColor(page, '--project-foreground'));
         expect(row.avatar!.weight, 'no weight above 400, the letter included').toBeLessThanOrEqual(400);
       }
-      expect(reviewerRows.map((row) => row.top), 'gh\'s order').toEqual([...reviewerRows.map((row) => row.top)].sort((x, y) => x - y));
+      expect(reviewerRows.map((row) => row.top), 'gh\'s order').toEqual(reviewerRows.map((row) => row.top).sort((x, y) => x - y));
       expect(await panelEval(page, readRow, { label: 'erin', byTitle: false }), 'a PENDING review is not listed').toBeNull();
       expect(reviewerRows[4]!.iconClass, 'an unknown state is never approved').not.toMatch(/circle-check/);
       expect(await heaviestWeight(rightBar(page)), 'no font weight above 400 in the bar').toBeLessThanOrEqual(400);
@@ -647,6 +648,8 @@ describe('right bar pull request tab: built app', () => {
     await show(D, { list: prJson({ body: paragraphs('LAST-PARAGRAPH') }) });
     const more = shipButton(page, 'Show more');
     await more.waitFor();
+    // The "Show more" of the previous test may still be on screen: wait for this body.
+    await page.locator(PANEL).getByText('LAST-PARAGRAPH', { exact: true }).waitFor();
     const folded = await panelEval(page, readClip, { text: 'LAST-PARAGRAPH' });
     expect(Math.round(heightOf(folded) ?? 0), 'folded to 96 px').toBe(96);
     expect(folded).toMatchObject({ found: true, cut: true });

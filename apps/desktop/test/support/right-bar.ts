@@ -804,6 +804,8 @@ export const mergeArgs = (method: MergeMethod) => ['pr', 'merge', '7', MERGE_FLA
 // Picks `method` in the "Merge method" menu of the bar.
 export async function pickMergeMethod(page: Page, method: MergeMethod) {
   await mergeMethodButton(page).click();
+  // The menu mounts after the click: count its overlay only once it is there.
+  await page.locator('[role^="menuitem"]').first().waitFor();
   const open = await overlayCount(page);
   await page.locator('[role^="menuitem"]').filter({ hasText: MERGE_LABELS[method] }).first().click();
   await untilFewerOverlays(page, open);
