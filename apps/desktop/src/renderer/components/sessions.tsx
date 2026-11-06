@@ -1,5 +1,5 @@
 import { Link, useNavigate } from '@tanstack/react-router';
-import { CircleCheckIcon, CircleDashedIcon, CircleDotIcon, CircleXIcon, ChevronDownIcon, ChevronRightIcon, ContrastIcon, PlusIcon } from 'lucide-react';
+import { CircleCheckIcon, CircleDashedIcon, CircleDotIcon, CircleXIcon, ChevronDownIcon, ChevronRightIcon, ContrastIcon, GitMergeIcon, GitPullRequestIcon, PlusIcon } from 'lucide-react';
 import { useSyncExternalStore } from 'react';
 import type { DaemonStatus, Session } from '../../shared/api';
 import { toggleSessions, useSessionsCollapsed } from '@/components/collapsed';
@@ -16,7 +16,7 @@ export const rowClass =
 export const linkRowClass = `${rowClass} cursor-default aria-[current=page]:bg-sidebar-accent`;
 
 // The icon and color of a status icon by its accessible name; "Ended" is any session the store does not
-// hold (an earlier launch).
+// hold (an earlier launch). The two pull request names stand in a workspace row with no session status.
 function statusIcon(label: string) {
   switch (label) {
     case 'Working':
@@ -25,6 +25,10 @@ function statusIcon(label: string) {
       return { Icon: CircleDotIcon, color: 'text-status-waiting' };
     case 'Ready':
       return { Icon: CircleCheckIcon, color: 'text-status-ready' };
+    case 'Pull request open':
+      return { Icon: GitPullRequestIcon, color: 'text-status-ready' };
+    case 'Pull request merged':
+      return { Icon: GitMergeIcon, color: 'text-status-merged' };
     case 'Ended':
       return { Icon: CircleDashedIcon, color: 'text-muted-foreground' };
     default:

@@ -3,18 +3,24 @@ import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 import { baseSelect, chooseBase, createButton, norm, openComposer, projectSelect, promptBox, sendFromComposer, textOf, useAgent, waitForBase, waitForMessage } from './composer';
-import { launchBuilt, type Session, versionLabel } from './launch';
+import { type Session, versionLabel } from './launch';
 import { addProject, addRepository, afterIpcAnswers, branchBox, countIpcCalls, deleteButton, deleteDialog, dismissDialogs, dispatchFocus, entryTitles, errorMark, expectNoNewErrors, gitIn, gitState, INVOKE_HANDLERS, ipcCalls, isBelowProjectsHeader, linesOf, linkedWorktrees, localBranches, makeClone, makeLightRepo, missingFolderBlock, mutedColor, openDeleteDialog, openDialogs, openMenu, projectsInState, readBaseOptions, removeOptions, removeProjectDialog, removeThroughMenu, sha8, sidebarEntries, sidebarLines, stateSnapshot, stubPicker, type TempClone, type TempRepo, tokenColor, untilAnswered, untilFewerOverlays, waitForDialogLine, waitForEntries, waitForEntry, waitForLine, waitForNoEntry, worktreePath } from './support/projects';
-import { expectNoErrors, workspacesApi } from './support/sessions';
+import { addGhFixture } from './support/right-bar';
+import { expectNoErrors, launchBuiltWith, makeSessionsFixture, type SessionsFixture, workspacesApi } from './support/sessions';
 import { dropTerminalWorkspace, goHome, type PtyWindow, watchFrontmost } from './support/terminal';
 
 describe('built app', () => {
   let session: Session;
   let front: Awaited<ReturnType<typeof watchFrontmost>>;
+  let fx: SessionsFixture;
 
   beforeAll(async () => {
     front = await watchFrontmost();
-    session = await launchBuilt();
+    // The projects here are clones with a remote and workspaces: the sidebar reads their pull requests (COCKPIT-75). A
+    // stub `gh` on the fake login shell's `PATH` keeps that read away from the real one.
+    fx = makeSessionsFixture([]);
+    addGhFixture(fx);
+    session = await launchBuiltWith(fx.env());
     await session.page.getByText(versionLabel).waitFor();
   });
 
@@ -26,6 +32,7 @@ describe('built app', () => {
     } finally {
       await front?.stop();
       await session?.close();
+      if (fx) rmSync(fx.root, { recursive: true, force: true });
     }
     if (session) expect(existsSync(session.dataDir)).toBe(false);
   });

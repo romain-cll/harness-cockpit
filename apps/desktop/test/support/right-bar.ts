@@ -1,10 +1,10 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { type ElementHandle, type Page } from 'playwright-core';
 import { expect } from 'vitest';
 import { evaluateUntil, type Session, startClock, untilRead, untilScript } from '../launch';
-import { afterIpcAnswers, dispatchFocus, gitIn, makeRepo, type TempRepo } from './projects';
+import { afterIpcAnswers, dispatchFocus, gitIn, makeRepo, openDialogs, overlayCount, type TempRepo, untilFewerOverlays } from './projects';
 import { type SessionsFixture, storedSessions } from './sessions';
 
 // --- Changes sidebar (COCKPIT-34), the right bar since COCKPIT-67 --------------
@@ -590,17 +590,61 @@ export const GIT_APP_ENV = {
 export const PR_URL = 'https://github.test/acme/app/pull/7';
 
 export type PrChecks = 'none' | 'pending' | 'passing' | 'failing' | 'unknown';
+// One check run per state, named after it ("CI / check-failing"), so a test tells the answer it set from the one before.
+const run = (name: string, status: string, conclusion: string) => ({ __typename: 'CheckRun', name, workflowName: 'CI', status, conclusion });
 export const ROLLUPS: Record<PrChecks, object[]> = {
   none: [],
-  pending: [{ __typename: 'CheckRun', status: 'IN_PROGRESS', conclusion: '' }],
-  passing: [{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'SUCCESS' }],
-  failing: [{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'FAILURE' }],
-  unknown: [{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'STALE' }],
+  pending: [run('check-pending', 'IN_PROGRESS', '')],
+  passing: [run('check-passing', 'COMPLETED', 'SUCCESS')],
+  failing: [run('check-failing', 'COMPLETED', 'FAILURE')],
+  unknown: [run('check-unknown', 'COMPLETED', 'STALE')],
 };
 
-// What `gh pr list --json …` prints for one pull request.
-export const prJson = ({ state = 'OPEN', checks = 'none', title = 'Fix the bug' }: { state?: string; checks?: PrChecks; title?: string } = {}) =>
-  JSON.stringify([{ number: 7, title, url: PR_URL, state, statusCheckRollup: ROLLUPS[checks] }]);
+export const PR_HEAD = '0123456789abcdef0123456789abcdef01234567';
+
+// What `gh pr list --json …` prints for one pull request (COCKPIT-75: author, body, head, reviews and checks too).
+export const prJson = ({
+  state = 'OPEN',
+  checks = 'none',
+  title = 'Fix the bug',
+  author = 'romain-cll',
+  body = '',
+  head = PR_HEAD,
+  base = 'main',
+  rollup,
+  reviews = [],
+  decision = '',
+}: {
+  state?: string;
+  checks?: PrChecks;
+  title?: string;
+  author?: string;
+  body?: string;
+  head?: string;
+  /** `baseRefName`: the branch the pull request is into. */
+  base?: string;
+  /** The checks themselves, instead of the one `checks` stands for. */
+  rollup?: object[];
+  /** `latestReviews`: a login and a GitHub review state each. */
+  reviews?: Array<{ login: string; state: string }>;
+  /** `reviewDecision` as gh prints it, '' when the repository requires no review. */
+  decision?: string;
+} = {}) =>
+  JSON.stringify([
+    {
+      number: 7,
+      title,
+      url: PR_URL,
+      state,
+      statusCheckRollup: rollup ?? ROLLUPS[checks],
+      author: { login: author },
+      body,
+      headRefOid: head,
+      baseRefName: base,
+      latestReviews: reviews.map(({ login, state }) => ({ author: { login }, state })),
+      reviewDecision: decision,
+    },
+  ]);
 
 export interface GhFixture {
   /** The folder whose files set how the stub `gh` answers. */
@@ -613,7 +657,9 @@ export interface GhFixture {
 // (fields separated by US, runs by RS, so a multi-line argument survives): the working directory,
 // GH_PROMPT_DISABLED, then the arguments. `pr list` prints `pr-list` (`[]` without it) after failing as
 // `code` and `stderr` say; `pr create` fails with `create-stderr`, else copies `after-create` over
-// `pr-list` and prints a URL.
+// `pr-list` and prints a URL. `pr merge` fails with `merge-stderr` (exit 1), else succeeds unless `code` is set (COCKPIT-75), then copies `after-merge`
+// over `pr-list` and each `after-merge-state-<branch>` over `state-<branch>`. `api graphql` answers, for each
+// `-f b<i>=<branch>` it is given, the state in `state-<branch>` (no pull request without the file).
 export function addGhFixture(fx: SessionsFixture): GhFixture {
   const control = join(fx.root, 'gh-control');
   mkdirSync(control);
@@ -630,8 +676,32 @@ if [ "$1 $2" = "pr create" ]; then
   echo '${PR_URL}'
   exit 0
 fi
+if [ "$1 $2" = "pr merge" ] && [ -s '${control}/merge-stderr' ]; then cat '${control}/merge-stderr' >&2; exit 1; fi
+if [ "$1 $2" = "pr merge" ] && [ ! -e '${control}/code' ]; then
+  [ -e '${control}/after-merge' ] && cp '${control}/after-merge' '${control}/pr-list'
+  for f in '${control}'/after-merge-state-*; do
+    [ -e "$f" ] && cp "$f" '${control}/state-'"\${f##*/after-merge-state-}"
+  done
+  exit 0
+fi
 [ -s '${control}/stderr' ] && cat '${control}/stderr' >&2
 [ -e '${control}/code' ] && exit "$(cat '${control}/code')"
+if [ "$1" = api ]; then
+  out=''
+  for a in "$@"; do
+    case "$a" in
+      b[0-9]*=*)
+        key="\${a%%=*}"
+        branch="\${a#*=}"
+        nodes='[]'
+        [ -s '${control}/state-'"$branch" ] && nodes="[{\\"state\\":\\"$(cat '${control}/state-'"$branch")\\"}]"
+        out="$out\\"$key\\":{\\"nodes\\":$nodes},"
+        ;;
+    esac
+  done
+  printf '{"data":{"repository":{%s}}}' "\${out%,}"
+  exit 0
+fi
 if [ -e '${control}/pr-list' ]; then cat '${control}/pr-list'; else echo '[]'; fi
 `,
   );
@@ -642,13 +712,35 @@ if [ -e '${control}/pr-list' ]; then cat '${control}/pr-list'; else echo '[]'; f
   return { control, log };
 }
 
-// How the stub answers from now on: everything not given is back to the default (`[]`, exit 0).
-export function setGh(
-  gh: GhFixture,
-  { list, code, stderr, createStderr, afterCreate }: { list?: string; code?: number; stderr?: string; createStderr?: string; afterCreate?: string } = {},
-) {
-  for (const name of ['pr-list', 'code', 'stderr', 'create-stderr', 'after-create']) rmSync(join(gh.control, name), { force: true });
-  const files = { 'pr-list': list, code: code?.toString(), stderr, 'create-stderr': createStderr, 'after-create': afterCreate };
+export interface GhAnswers {
+  /** What `pr list` prints. */
+  list?: string;
+  code?: number;
+  stderr?: string;
+  createStderr?: string;
+  afterCreate?: string;
+  /** Makes `pr merge` (and only it) exit 1 with this message. */
+  mergeStderr?: string;
+  /** The state of the newest pull request of each branch for `api graphql` (`OPEN`, `MERGED`, `CLOSED`); a branch not named has none. */
+  states?: Record<string, string>;
+  /** What `pr list` prints and the states `api graphql` answers once `pr merge` succeeded. */
+  afterMerge?: { list?: string; states?: Record<string, string> };
+}
+
+// How the stub answers from now on: everything not given is back to the default (`[]`, exit 0, no pull request).
+export function setGh(gh: GhFixture, { list, code, stderr, createStderr, afterCreate, mergeStderr, states = {}, afterMerge }: GhAnswers = {}) {
+  for (const name of readdirSync(gh.control)) rmSync(join(gh.control, name), { force: true });
+  const files: Record<string, string | undefined> = {
+    'pr-list': list,
+    code: code?.toString(),
+    stderr,
+    'create-stderr': createStderr,
+    'after-create': afterCreate,
+    'merge-stderr': mergeStderr,
+    'after-merge': afterMerge?.list,
+  };
+  for (const [branch, state] of Object.entries(states)) files[`state-${branch}`] = state;
+  for (const [branch, state] of Object.entries(afterMerge?.states ?? {})) files[`after-merge-state-${branch}`] = state;
   for (const [name, content] of Object.entries(files)) if (content !== undefined) writeFileSync(join(gh.control, name), content);
 }
 
@@ -666,6 +758,13 @@ export const ghRuns = (gh: GhFixture): GhRun[] =>
       const [cwd, prompt, ...args] = run.split('\x1f').slice(0, -1);
       return { cwd: cwd!, prompt: prompt!, args };
     });
+
+// The runs of the bar's own read, of the sidebar's (one `api graphql` for a whole project) and of merges.
+export const prListRuns = (gh: GhFixture) => ghRuns(gh).filter((run) => run.args[0] === 'pr' && run.args[1] === 'list');
+export const graphqlRuns = (gh: GhFixture) => ghRuns(gh).filter((run) => run.args[0] === 'api' && run.args[1] === 'graphql');
+export const mergeRuns = (gh: GhFixture) => ghRuns(gh).filter((run) => run.args[0] === 'pr' && run.args[1] === 'merge');
+// The branches an `api graphql` run was given, in order.
+export const branchesOfRun = (run: GhRun) => run.args.filter((arg) => /^b\d+=/.test(arg)).map((arg) => arg.slice(arg.indexOf('=') + 1));
 
 // `origin`: a bare repository next to `repo`, holding `main`. Returns its path.
 export function addOrigin(repo: TempRepo): string {
@@ -690,6 +789,32 @@ export const shipButton = (page: Page, name: string) => page.locator(PANEL).getB
 export const prLink = (page: Page) => page.locator(PANEL).getByRole('link', { name: 'Open on GitHub', exact: true });
 export const commitField = (page: Page) => page.locator(PANEL).getByRole('textbox', { name: 'Commit message', exact: true });
 export const prDialog = (page: Page) => page.getByRole('dialog', { name: 'Create pull request' });
+
+// --- Merge, checks, reviews, description and the sidebar's icons (COCKPIT-75) ---
+
+export type MergeMethod = 'squash' | 'merge' | 'rebase';
+export const MERGE_LABELS: Record<MergeMethod, string> = { squash: 'Squash and merge', merge: 'Create a merge commit', rebase: 'Rebase and merge' };
+export const MERGE_FLAGS: Record<MergeMethod, string> = { squash: '--squash', merge: '--merge', rebase: '--rebase' };
+export const mergeMethodButton = (page: Page) => shipButton(page, 'Merge method');
+// The confirmation of a merge: a dialog (or alert dialog) that reads `title`.
+export const mergeDialog = (page: Page, title: string) => openDialogs(page).filter({ hasText: title });
+// The workspace's row in the left sidebar, by its folder (the link's title).
+export const workspaceRow = (page: Page, path: string) => page.locator('aside').locator(`[title="${path}"]`).first();
+// The named status icon of that row ("Pull request open", "Pull request merged", "Working"…).
+export const rowIcon = (page: Page, path: string, name: string) => workspaceRow(page, path).getByRole('img', { name, exact: true });
+// The `gh pr merge` arguments of a merge of #7 with `method`, `head` being the head the bar read.
+export const mergeArgs = (method: MergeMethod, head = PR_HEAD) => ['pr', 'merge', '7', MERGE_FLAGS[method], '--match-head-commit', head];
+
+// Picks `method` in the "Merge method" menu of the bar.
+export async function pickMergeMethod(page: Page, method: MergeMethod) {
+  await mergeMethodButton(page).click();
+  // The menu mounts after the click: count its overlay only once it is there.
+  await page.locator('[role^="menuitem"]').first().waitFor();
+  const open = await overlayCount(page);
+  await page.locator('[role^="menuitem"]').filter({ hasText: MERGE_LABELS[method] }).first().click();
+  await untilFewerOverlays(page, open);
+  await shipButton(page, MERGE_LABELS[method]).waitFor();
+}
 
 // Waits until the sidebar's text (its whitespace folded) satisfies `matches(text, arg)`, which runs in the page,
 // and checks it took less than 5 s from the call ("within 5 s").
@@ -724,13 +849,17 @@ export async function commitThroughPanel(page: Page, message: string) {
 
 // The smoke path of the dev server and the packaged app, on a workspace page whose Changes sidebar is
 // open with an uncommitted file, in a repository with a local bare `origin`: a pull request the stub
-// answers shows in the sidebar, then a commit and a push reach `origin`.
+// answers shows in the sidebar, then a commit and a push reach `origin`, then the pull request merges through its dialog.
 export async function expectShipSmoke(page: Page, gh: GhFixture, worktree: string, origin: string, branch: string) {
-  setGh(gh, { list: prJson({ checks: 'pending' }) });
+  setGh(gh, {
+    list: prJson({ checks: 'pending' }),
+    states: { [branch]: 'OPEN' },
+    afterMerge: { list: prJson({ state: 'MERGED', checks: 'passing' }), states: { [branch]: 'MERGED' } },
+  });
   await setChangesOpen(page, true, 'Pull request');
   await dispatchFocus(page);
   await prLink(page).waitFor();
-  await waitForShipText(page, (text) => text.includes('#7 · Checks pending'));
+  await waitForShipText(page, (text) => text.includes('#7 · romain-cll'));
 
   await commitThroughPanel(page, 'Smoke commit');
   // The section shows the commit to push once the commit succeeded.
@@ -748,4 +877,16 @@ export async function expectShipSmoke(page: Page, gh: GhFixture, worktree: strin
   expect(gitIn(worktree, 'rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`), 'the tracking ref').toBe(head);
   expect(gitIn(worktree, 'config', '--get', `branch.${branch}.remote`), 'the upstream remote').toBe('origin');
   expect(gitIn(worktree, 'config', '--get', `branch.${branch}.merge`), 'the upstream branch').toBe(`refs/heads/${branch}`);
+
+  // COCKPIT-75: the merge goes through its confirmation dialog, reads the pull request again with no window focus
+  // and turns the pill and the sidebar's icon to "Merged".
+  await shipButton(page, 'Squash and merge').click();
+  const dialog = mergeDialog(page, 'Squash and merge #7 into main?');
+  await dialog.waitFor();
+  await dialog.getByRole('button', { name: 'Squash and merge', exact: true }).click();
+  await dialog.waitFor({ state: 'hidden' });
+  await waitForShipText(page, (text) => /\bMerged\b/.test(text));
+  expect(await shipButton(page, 'Squash and merge').count(), 'no merge row once merged').toBe(0);
+  await rowIcon(page, worktree, 'Pull request merged').waitFor();
+  expect(mergeRuns(gh)).toEqual([{ cwd: worktree, prompt: '1', args: mergeArgs('squash') }]);
 }

@@ -2,7 +2,7 @@ import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promi
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
-import { checksSummary, createPullRequest, findPullRequest, GitHubError } from '../src/index';
+import { checksSummary, createPullRequest, findPullRequest, GitHubError, mergePullRequest, pullRequestStates } from '../src/index';
 
 // COCKPIT-38: the pull request of a branch, read and created through `gh`. The `gh` is a `#!/bin/sh` stub
 // on a temporary `PATH` that logs what it was run with and answers from files; the real `gh` never runs.
@@ -28,6 +28,8 @@ interface Stub {
   env: NodeJS.ProcessEnv;
   /** What `pr list` prints, set before the call. */
   list(json: string): Promise<void>;
+  /** What `api graphql` prints, set before the call. */
+  graphql(json: string): Promise<void>;
   /** `[cwd, GH_PROMPT_DISABLED, MARKER, ...arguments]` of every run, in order. */
   runs(): Promise<string[][]>;
 }
@@ -42,6 +44,7 @@ async function makeStub(): Promise<Stub> {
   const cwd = await tempDir();
   const log = join(bin, 'runs.log');
   await writeFile(join(bin, 'list.json'), '[]');
+  await writeFile(join(bin, 'graphql.json'), '{}');
   await writeFile(
     join(bin, 'gh'),
     `#!/bin/sh
@@ -54,6 +57,7 @@ if [ "$1 $2" = "pr create" ]; then
 fi
 [ -s '${bin}/stderr' ] && cat '${bin}/stderr' >&2
 [ -e '${bin}/code' ] && exit "$(cat '${bin}/code')"
+if [ "$1" = api ]; then cat '${bin}/graphql.json'; exit 0; fi
 cat '${bin}/list.json'
 `,
   );
@@ -63,6 +67,7 @@ cat '${bin}/list.json'
     cwd,
     env: { PATH: `${bin}:/usr/bin:/bin`, MARKER: 'passed-env' },
     list: (json) => writeFile(join(bin, 'list.json'), json),
+    graphql: (json) => writeFile(join(bin, 'graphql.json'), json),
     runs: async () => {
       const text = await readFile(log, 'utf8').catch(() => '');
       return text
@@ -72,6 +77,10 @@ cat '${bin}/list.json'
     },
   };
 }
+
+/** The fields of the `--json` argument of a run, sorted: the order gh is asked in does not matter. */
+const jsonFields = (args: string[]) => args[args.indexOf('--json') + 1]!.split(',').sort();
+const LIST_FIELDS = ['author', 'baseRefName', 'body', 'headRefOid', 'latestReviews', 'number', 'reviewDecision', 'state', 'statusCheckRollup', 'title', 'url'];
 
 const failWith = (stub: Stub, { code, stderr }: { code: number; stderr: string }) =>
   Promise.all([writeFile(join(stub.bin, 'code'), String(code)), writeFile(join(stub.bin, 'stderr'), stderr)]);
@@ -97,28 +106,17 @@ async function failure(promise: Promise<unknown>): Promise<GitHubError> {
 }
 
 describe('findPullRequest', () => {
-  test('AC1 — runs gh pr list for the branch, all states, the newest one, in the given folder with GH_PROMPT_DISABLED=1 and the env passed', async () => {
+  test('AC1 — runs gh pr list for the branch, all states, the newest one, in the given folder with GH_PROMPT_DISABLED=1 and the env passed, asking for the author, body, head, reviews and checks', async () => {
     const stub = await makeStub();
 
     await findPullRequest(stub.cwd, 'feature/login', { env: stub.env });
 
-    expect(await stub.runs()).toEqual([
-      [
-        stub.cwd,
-        '1',
-        'passed-env',
-        'pr',
-        'list',
-        '--head',
-        'feature/login',
-        '--state',
-        'all',
-        '--limit',
-        '1',
-        '--json',
-        'number,title,url,state,statusCheckRollup',
-      ],
-    ]);
+    const [run] = await stub.runs();
+    expect(await stub.runs()).toHaveLength(1);
+    expect(run!.slice(0, 11)).toEqual([stub.cwd, '1', 'passed-env', 'pr', 'list', '--head', 'feature/login', '--state', 'all', '--limit', '1']);
+    expect(run![11]).toBe('--json');
+    expect(jsonFields(run!)).toEqual(LIST_FIELDS);
+    expect(run).toHaveLength(13);
   });
 
   test('AC1 — gives null when the branch has no pull request', async () => {
@@ -136,7 +134,7 @@ describe('findPullRequest', () => {
     const stub = await makeStub();
     await stub.list(listJson(pr({ state })));
 
-    expect(await findPullRequest(stub.cwd, 'feat', { env: stub.env })).toEqual({
+    expect(await findPullRequest(stub.cwd, 'feat', { env: stub.env })).toMatchObject({
       number: 7,
       title: 'Fix the bug',
       url: 'https://github.test/acme/app/pull/7',
@@ -258,7 +256,10 @@ describe('createPullRequest', () => {
 
     const result = await createPullRequest(stub.cwd, input, { env: stub.env });
 
-    expect(await stub.runs()).toEqual([
+    const runs = await stub.runs();
+    expect(runs).toHaveLength(2);
+    const [createRun, listRun] = runs;
+    expect([createRun]).toEqual([
       [
         stub.cwd,
         '1',
@@ -274,23 +275,10 @@ describe('createPullRequest', () => {
         '--body',
         'Line one\nLine two $(not run)',
       ],
-      [
-        stub.cwd,
-        '1',
-        'passed-env',
-        'pr',
-        'list',
-        '--head',
-        'feature/login',
-        '--state',
-        'all',
-        '--limit',
-        '1',
-        '--json',
-        'number,title,url,state,statusCheckRollup',
-      ],
     ]);
-    expect(result).toEqual({
+    expect(listRun!.slice(0, 11)).toEqual([stub.cwd, '1', 'passed-env', 'pr', 'list', '--head', 'feature/login', '--state', 'all', '--limit', '1']);
+    expect(jsonFields(listRun!)).toEqual(LIST_FIELDS);
+    expect(result).toMatchObject({
       number: 7,
       title: 'Add the login',
       url: 'https://github.test/acme/app/pull/7',
@@ -317,5 +305,180 @@ describe('createPullRequest', () => {
 
     expect(error.code).toBe('GH_FAILED');
     expect(error.message).toBe('a pull request for branch "feature/login" already exists');
+  });
+});
+
+// COCKPIT-75: what the Pull request tab shows, read with the same `gh pr list`.
+describe('findPullRequest: the fields of the Pull request tab', () => {
+  const run = (over: object) => ({ __typename: 'CheckRun', name: 'check', workflowName: 'CI', status: 'COMPLETED', conclusion: 'SUCCESS', ...over });
+  const read = async (over: object) => {
+    const stub = await makeStub();
+    await stub.list(listJson(pr(over)));
+    return findPullRequest(stub.cwd, 'feat', { env: stub.env });
+  };
+
+  test('AC1 — gives the login of the author, the body and the head commit', async () => {
+    const found = await read({ author: { login: 'romain-cll', id: 'x' }, body: 'The **body**', headRefOid: 'abc123def456' });
+
+    expect(found).toMatchObject({ author: 'romain-cll', body: 'The **body**', headOid: 'abc123def456' });
+  });
+
+  test('AC1 — gives the base the pull request is into, as baseRefName', async () => {
+    expect(await read({ baseRefName: 'develop' })).toMatchObject({ base: 'develop' });
+  });
+
+  test('AC1 — a missing or null author reads ghost, and absent arrays read empty', async () => {
+    expect(await read({})).toMatchObject({ author: 'ghost', checkRuns: [], reviews: [] });
+    expect(await read({ author: null })).toMatchObject({ author: 'ghost' });
+    expect(await read({ statusCheckRollup: undefined, latestReviews: undefined })).toMatchObject({ checks: 'none', checkRuns: [], reviews: [] });
+  });
+
+  test('AC9 — checkRuns lists each check in gh\'s order, named "<workflow> / <name>", "<name>" without a workflow, the context for a status context', async () => {
+    const found = await read({
+      statusCheckRollup: [
+        run({ name: 'test', conclusion: 'FAILURE' }),
+        run({ name: 'lint', workflowName: '' }),
+        run({ name: 'build', workflowName: undefined, status: 'IN_PROGRESS', conclusion: '' }),
+        { __typename: 'StatusContext', context: 'ci/legacy', state: 'PENDING' },
+        run({ name: 'odd', conclusion: 'STALE' }),
+      ],
+    });
+
+    expect(found!.checkRuns.map(({ name, check }) => [name, check])).toEqual([
+      ['CI / test', 'failing'],
+      ['lint', 'passing'],
+      ['build', 'pending'],
+      ['ci/legacy', 'pending'],
+      ['CI / odd', 'unknown'],
+    ]);
+    expect(found!.checks).toBe('failing');
+  });
+
+  test('AC10 — a check run keeps its start and completion times as gh gave them, a missing one is null', async () => {
+    const found = await read({
+      statusCheckRollup: [
+        run({ startedAt: '2026-11-05T10:00:00Z', completedAt: '2026-11-05T10:06:41Z' }),
+        run({ name: 'running', status: 'IN_PROGRESS', conclusion: '', startedAt: '2026-11-05T10:00:00Z' }),
+        run({ name: 'bare' }),
+      ],
+    });
+
+    expect(found!.checkRuns[0]).toMatchObject({ startedAt: '2026-11-05T10:00:00Z', completedAt: '2026-11-05T10:06:41Z' });
+    expect(found!.checkRuns[1]).toMatchObject({ startedAt: '2026-11-05T10:00:00Z' });
+    expect(found!.checkRuns[1]!.completedAt ?? null).toBeNull();
+    expect(found!.checkRuns[2]!.startedAt ?? null).toBeNull();
+    expect(found!.checkRuns[2]!.completedAt ?? null).toBeNull();
+  });
+
+  test('AC12 — reviews lists each reviewer of latestReviews in gh\'s order with a normalised state; a PENDING review is not listed and any other state is unknown', async () => {
+    const found = await read({
+      latestReviews: [
+        { author: { login: 'alice' }, state: 'CHANGES_REQUESTED' },
+        { author: { login: 'bob' }, state: 'APPROVED' },
+        { author: { login: 'carol' }, state: 'COMMENTED' },
+        { author: { login: 'dave' }, state: 'DISMISSED' },
+        { author: { login: 'erin' }, state: 'PENDING' },
+        { author: { login: 'frank' }, state: 'SOMETHING_NEW' },
+        { author: null, state: 'APPROVED' },
+      ],
+    });
+
+    expect(found!.reviews).toEqual([
+      { login: 'alice', state: 'changes_requested' },
+      { login: 'bob', state: 'approved' },
+      { login: 'carol', state: 'commented' },
+      { login: 'dave', state: 'dismissed' },
+      { login: 'frank', state: 'unknown' },
+      { login: 'ghost', state: 'approved' },
+    ]);
+  });
+
+  test.each(['CHANGES_REQUESTED', 'APPROVED', 'REVIEW_REQUIRED', ''])('AC13 — reviewDecision %j is given as gh printed it', async (decision) => {
+    expect(await read({ reviewDecision: decision })).toMatchObject({ reviewDecision: decision });
+  });
+});
+
+describe('mergePullRequest', () => {
+  test.each([
+    ['squash', '--squash'],
+    ['merge', '--merge'],
+    ['rebase', '--rebase'],
+  ] as const)('AC6 — the %s method runs gh pr merge <number> %s --match-head-commit <head> in the folder, and nothing else', async (method, flag) => {
+    const stub = await makeStub();
+
+    await mergePullRequest(stub.cwd, { number: 7, method, headOid: 'abc123def456' }, { env: stub.env });
+
+    expect(await stub.runs()).toEqual([[stub.cwd, '1', 'passed-env', 'pr', 'merge', '7', flag, '--match-head-commit', 'abc123def456']]);
+  });
+
+  test('AC7 — a refusal of gh is GH_FAILED with its trimmed message', async () => {
+    const stub = await makeStub();
+    await failWith(stub, { code: 1, stderr: '\n  X Pull request #7 is not mergeable: the head branch is not up to date\n\n' });
+
+    const error = await failure(mergePullRequest(stub.cwd, { number: 7, method: 'squash', headOid: 'abc' }, { env: stub.env }));
+
+    expect(error.code).toBe('GH_FAILED');
+    expect(error.message).toBe('X Pull request #7 is not mergeable: the head branch is not up to date');
+  });
+});
+
+describe('pullRequestStates', () => {
+  const answer = (aliases: Record<string, string | null>) =>
+    JSON.stringify({
+      data: { repository: Object.fromEntries(Object.entries(aliases).map(([alias, state]) => [alias, { nodes: state === null ? [] : [{ state }] }])) },
+    });
+
+  test('AC17 — one gh api graphql run for all the branches, each branch a -f variable and never part of the query', async () => {
+    const stub = await makeStub();
+    await stub.graphql(answer({ b0: 'OPEN', b1: 'MERGED', b2: null }));
+    const branches = ['feat-a', 'feat/b', 'weird"} {x'];
+
+    await pullRequestStates(stub.cwd, branches, { env: stub.env });
+
+    const runs = await stub.runs();
+    expect(runs).toHaveLength(1);
+    const [cwd, prompt, marker, ...args] = runs[0]!;
+    expect([cwd, prompt, marker]).toEqual([stub.cwd, '1', 'passed-env']);
+    expect(args.slice(0, 2)).toEqual(['api', 'graphql']);
+    const flagged = (flag: string) => args.flatMap((arg, index) => (arg === flag ? [args[index + 1]!] : []));
+    expect(flagged('-f').filter((value) => /^b\d+=/.test(value))).toEqual(['b0=feat-a', 'b1=feat/b', 'b2=weird"} {x']);
+    const query = flagged('-f').find((value) => value.startsWith('query='))!;
+    expect(query).toBeDefined();
+    for (const branch of branches) expect(query).not.toContain(branch);
+    for (const variable of ['$b0', '$b1', '$b2']) expect(query).toContain(variable);
+    expect([...flagged('-F'), ...flagged('-f')].join(' ')).toContain('owner={owner}');
+    expect([...flagged('-F'), ...flagged('-f')].join(' ')).toContain('repo={repo}');
+  });
+
+  test('AC16 — gives the state of the newest pull request of each branch, in lower case, a branch with none has no state', async () => {
+    const stub = await makeStub();
+    await stub.graphql(answer({ b0: 'OPEN', b1: 'MERGED', b2: 'CLOSED', b3: null }));
+
+    const states = await pullRequestStates(stub.cwd, ['a', 'b', 'c', 'd'], { env: stub.env });
+
+    expect(states.a).toBe('open');
+    expect(states.b).toBe('merged');
+    expect(states.c).toBe('closed');
+    expect(states.d ?? null).toBeNull();
+  });
+
+  test('AC18 — no branch runs no gh and gives no state', async () => {
+    const stub = await makeStub();
+
+    const states = await pullRequestStates(stub.cwd, [], { env: stub.env });
+
+    expect(await stub.runs()).toEqual([]);
+    expect(Object.keys(states)).toEqual([]);
+  });
+
+  test.each([
+    ['not JSON', 'oops'],
+    ['no data', '{}'],
+    ['a repository that is null', '{"data":{"repository":null}}'],
+  ])('AC19 — an unreadable answer (%s) is GH_FAILED', async (_label, text) => {
+    const stub = await makeStub();
+    await stub.graphql(text);
+
+    expect((await failure(pullRequestStates(stub.cwd, ['a'], { env: stub.env }))).code).toBe('GH_FAILED');
   });
 });

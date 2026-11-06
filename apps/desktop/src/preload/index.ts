@@ -68,6 +68,10 @@ const api: Api = {
     pullRequest: (project, path) => ipcRenderer.invoke('workspaces:pull-request', project, path),
     createPullRequest: (project, path, title, body) =>
       ipcRenderer.invoke('workspaces:create-pull-request', project, path, title, body),
+    mergePullRequest: (project, path, number, method, headOid) =>
+      ipcRenderer.invoke('workspaces:merge-pull-request', project, path, number, method, headOid),
+    commitsAfter: (project, path, headOid) => ipcRenderer.invoke('workspaces:commits-after', project, path, headOid),
+    pullRequestStates: (project) => ipcRenderer.invoke('workspaces:pull-request-states', project),
   },
   sessions: {
     harnesses: (options) => ipcRenderer.invoke('sessions:harnesses', options),

@@ -6,7 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 import { type Session, startClock, versionLabel } from './launch';
 import { makeTestDir } from './run-root';
 import { addRepository, afterIpcAnswers, afterRender, countIpcCalls, deleteDialog, dispatchFocus, gitIn, INVOKE_HANDLERS, ipcAnswered, ipcCalls, localBranches, mutedColor, sidebarLines, type TempRepo, tokenColor, untilAnswered, untilFewerOverlays, waitForDialogLine, waitForNoEntry, worktreePath } from './support/projects';
-import { addGhFixture, addOrigin, type ChangesWindow, commitField, commitThroughPanel, commonAncestor, expectListed, fillIsTokenAt14, fsEventWatchersOf, type GhFixture, ghRuns, GIT_APP_ENV, gitRunsIn, iconIn, type Locator, lookOf, lookOfHandle, makeChangesRepo, markChangesPanel, near, openShip, PANEL, panelText, PR_URL, prDialog, prJson, prLink, remoteRef, rightBar, selectBarTab, setChangesOpen, setGh, shipButton, showRightBar, untilUnwatches, unwatchesSeen, waitForShipText, watchUnwatches } from './support/right-bar';
+import { addGhFixture, addOrigin, type ChangesWindow, commitField, commitThroughPanel, commonAncestor, expectListed, fillIsTokenAt14, fsEventWatchersOf, type GhFixture, ghRuns, GIT_APP_ENV, gitRunsIn, iconIn, type Locator, lookOf, lookOfHandle, makeChangesRepo, markChangesPanel, near, openShip, PANEL, panelText, PR_URL, prDialog, prJson, prLink, prListRuns, remoteRef, rightBar, selectBarTab, setChangesOpen, setGh, shipButton, showRightBar, untilUnwatches, unwatchesSeen, waitForShipText, watchUnwatches } from './support/right-bar';
 import { allSessionLinkIds, createWorkspaceWithAgent, expectNoErrors, launchBuiltWith, makeSessionsFixture, type SessionsFixture } from './support/sessions';
 import { goHome } from './support/terminal';
 
@@ -77,7 +77,7 @@ describe('changes sidebar: built app', () => {
 
     const waitForText = <A = undefined>(matches: (text: string, arg: A) => boolean, arg?: A) => waitForShipText(session.page, matches, arg);
 
-    test('ship AC1, right bar AC11 — a pull request opened outside Cockpit shows "#7 · Checks pending", its state and an "Open on GitHub" link to its URL, and no "Create pull request" button; each summary follows the answer; the meta row (24 px) holds the state pill (20 px, radius 10, 12 px icon, 11 px text, its token at 14 %), "#7" and the link; the title (13 px on 18 px, not a link) and "<branch> → <base>" follow; only a merged pull request offers "Delete workspace…"', async () => {
+    test('ship AC1, right bar AC11 — a pull request opened outside Cockpit shows "#7 · romain-cll" (no summary of its checks), its state and an "Open on GitHub" link to its URL, and no "Create pull request" button; each summary follows the answer; the meta row (24 px) holds the state pill (20 px, radius 10, 12 px icon, 11 px text, its token at 14 %), "#7" and the link; the title (13 px on 18 px, not a link) and "<branch> → <base>" follow; only a merged pull request offers "Delete workspace…"', async () => {
       const { page } = session;
       setGh(gh, { list: prJson({ checks: 'pending' }) });
       await openShip(page, W1.id);
@@ -85,21 +85,22 @@ describe('changes sidebar: built app', () => {
       const link = prLink(page);
       await link.waitFor();
       expect(await link.getAttribute('href')).toBe(PR_URL);
-      const text = await waitForText((shown) => shown.includes('#7 · Checks pending'));
+      const text = await waitForText((shown) => shown.includes('#7 · romain-cll') && shown.includes('CI / check-pending'));
       expect(await page.locator(PANEL).getByText('Open', { exact: true }).count(), 'the state pill').toBe(1);
       expect(text).toContain('Fix the bug');
+      expect(text, 'the former summary of the checks is gone').not.toContain('Checks pending');
       // Nothing to commit and nothing to push in a fresh workspace.
       expect(await shipButton(page, 'Push').count()).toBe(0);
 
-      for (const [checks, label] of [['unknown', '#7 · Checks unknown'], ['failing', '#7 · Checks failing'], ['passing', '#7 · Checks passing']] as const) {
+      for (const [checks, label] of [['unknown', 'CI / check-unknown'], ['failing', 'CI / check-failing'], ['passing', 'CI / check-passing']] as const) {
         setGh(gh, { list: prJson({ checks }) });
         await dispatchFocus(page);
         await waitForText((shown, wanted) => shown.includes(wanted), label);
       }
-      // No check: no summary at all.
+      // No check: no Checks section at all.
       setGh(gh, { list: prJson({ checks: 'none' }) });
       await dispatchFocus(page);
-      await waitForText((shown) => !shown.includes('Checks '));
+      await waitForText((shown) => !shown.includes('CI / check') && !/\bChecks\b/.test(shown));
       expect(await page.locator(PANEL).getByText('Open', { exact: true }).count()).toBe(1);
 
       const states = [
@@ -114,7 +115,7 @@ describe('changes sidebar: built app', () => {
         const pillText = bar.getByText(label, { exact: true });
         await pillText.waitFor();
         // The previous answer was an open pull request with no check: wait for the one just set.
-        if (state === 'OPEN') await waitForText((shown) => shown.includes('#7 · Checks passing'));
+        if (state === 'OPEN') await waitForText((shown) => shown.includes('CI / check-passing'));
         // The pill is the smallest element around the label that also holds its icon.
         const pillElement = await pillText.evaluateHandle((text) => {
           for (let node: Element | null = text; node; node = node.parentElement) if (node.querySelector('svg')) return node;
@@ -133,8 +134,10 @@ describe('changes sidebar: built app', () => {
         const numberLook = await lookOf(number);
         expect([numberLook.fontSize, numberLook.color], '#7: 11 px muted').toEqual(['11px', await mutedColor(page)]);
         const shown = (await panelText(page)).replace(/\s+/g, ' ');
-        if (state === 'OPEN') expect(shown).toContain('#7 · Checks passing');
-        else expect(shown, 'no checks once merged or closed').not.toContain('Checks ');
+        expect(shown).toContain('#7 · romain-cll');
+        expect(shown).not.toContain('#7 · Checks');
+        if (state === 'OPEN') expect(shown).toContain('CI / check-passing');
+        else expect(shown, 'no check in the answer, no Checks section').not.toContain('CI / check');
         const linkLook = await lookOf(prLink(page));
         expect([near(linkLook.width, 24), near(linkLook.height, 24)], '"Open on GitHub": 24 px').toEqual([true, true]);
         expect((await iconIn(prLink(page))).className).toMatch(/lucide-external-link(\s|$)/);
@@ -192,7 +195,7 @@ describe('changes sidebar: built app', () => {
       const { page } = session;
       const leftovers = ['tick.txt', 'closed.txt', 'reloaded.txt'];
       try {
-        // The previous test left "Checks passing" on screen, so each wait below is for an answer the
+        // The previous test left "check-passing" on screen, so each wait below is for an answer the
         // page does not show yet. Once the newest read shows "pending", an earlier read (the page
         // opening, the first focus) has returned or was dropped, and the log holds every run of them.
         await countIpcCalls(session, ['workspaces:pull-request']);
@@ -200,10 +203,10 @@ describe('changes sidebar: built app', () => {
         setGh(gh, { list: prJson({ checks: 'failing' }) });
         await openShip(page, W1.id);
         await dispatchFocus(page);
-        await waitForText((shown) => shown.includes('Checks failing'));
+        await waitForText((shown) => shown.includes('CI / check-failing'));
         setGh(gh, { list: prJson({ checks: 'pending' }) });
         await dispatchFocus(page);
-        await waitForText((shown) => shown.includes('Checks pending'));
+        await waitForText((shown) => shown.includes('CI / check-pending'));
 
         // A read queued behind the newest one is asked in the turn that shows the newest: it has reached the main
         // process after the page's next answer, and every read so far is over once the handler has answered them.
@@ -212,7 +215,7 @@ describe('changes sidebar: built app', () => {
         await ipcAnswered(session, 'workspaces:pull-request', reads);
         // The pull request merged meanwhile; a file written in the worktree must not read it.
         setGh(gh, { list: prJson({ state: 'MERGED', checks: 'passing' }) });
-        const before = ghRuns(gh).length;
+        const before = prListRuns(gh).length;
         await selectBarTab(page, 'Diff');
         writeFileSync(join(W1.path, 'tick.txt'), 'x\n');
         await expectListed(page, ['tick.txt'], ['tick.txt']);
@@ -221,7 +224,7 @@ describe('changes sidebar: built app', () => {
         // answers of the page, came.
         await afterIpcAnswers(page);
         expect(await ipcCalls(session, 'workspaces:pull-request'), 'a write reads no pull request').toBe(reads);
-        expect(ghRuns(gh)).toHaveLength(before);
+        expect(prListRuns(gh)).toHaveLength(before);
         await selectBarTab(page, 'Pull request');
         await page.locator(PANEL).getByText('Open', { exact: true }).waitFor();
         expect(await page.locator(PANEL).getByText('Merged', { exact: true }).count(), 'still the open pull request').toBe(0);
@@ -231,7 +234,7 @@ describe('changes sidebar: built app', () => {
         const within = startClock();
         await untilAnswered(session, 'workspaces:pull-request', () => dispatchFocus(page));
         within('the focus read the pull request', 5_000);
-        expect(ghRuns(gh).length, 'a focus reads the pull request whichever tab shows').toBeGreaterThan(before);
+        expect(prListRuns(gh).length, 'a focus reads the pull request whichever tab shows').toBeGreaterThan(before);
         await selectBarTab(page, 'Pull request');
         await waitForText((shown) => /\bMerged\b/.test(shown));
         rmSync(join(W1.path, 'tick.txt'));
@@ -245,12 +248,12 @@ describe('changes sidebar: built app', () => {
         expect(await fsEventWatchersOf(session), 'no watcher on the worktree').toBeLessThan(watchersOpen);
         const reads2 = await ipcCalls(session, 'workspaces:pull-request');
         await ipcAnswered(session, 'workspaces:pull-request', reads2);
-        const runs = ghRuns(gh).length;
+        const runs = prListRuns(gh).length;
         writeFileSync(join(W1.path, 'closed.txt'), 'x\n');
         await dispatchFocus(page);
         await afterIpcAnswers(page);
         expect(await ipcCalls(session, 'workspaces:pull-request'), 'a focus with the rail shown reads no pull request').toBe(reads2);
-        expect(ghRuns(gh), 'a focus with the rail shown runs no gh').toHaveLength(runs);
+        expect(prListRuns(gh), 'a focus with the rail shown runs no gh read of the bar').toHaveLength(runs);
 
         await page.reload();
         await page.getByText(versionLabel).waitFor();
@@ -261,7 +264,7 @@ describe('changes sidebar: built app', () => {
         await dispatchFocus(page);
         await afterIpcAnswers(page);
         expect(await ipcCalls(session, 'workspaces:pull-request')).toBe(reads2);
-        expect(ghRuns(gh)).toHaveLength(runs);
+        expect(prListRuns(gh)).toHaveLength(runs);
       } finally {
         // A failure must leave neither a file in the worktree nor an answer of this test to the next one.
         for (const name of leftovers) rmSync(join(W1.path, name), { force: true });
@@ -308,7 +311,7 @@ describe('changes sidebar: built app', () => {
         // A pull request opens meanwhile: nothing reads it until the commit succeeds.
         setGh(gh, { list: prJson({ title: 'After the commit', checks: 'pending' }) });
         await commitThroughPanel(page, 'Commit then read');
-        await waitForText((shown) => shown.includes('After the commit') && shown.includes('#7 · Checks pending'));
+        await waitForText((shown) => shown.includes('After the commit') && shown.includes('CI / check-pending'));
 
         // It merges meanwhile: nothing reads it until the push succeeds.
         setGh(gh, { list: prJson({ title: 'After the commit', state: 'MERGED', checks: 'passing' }) });
@@ -513,7 +516,7 @@ describe('changes sidebar: built app', () => {
       await link.waitFor();
       within('the pull request link showed', 5_000);
       expect(await link.getAttribute('href')).toBe(PR_URL);
-      await waitForText((shown) => shown.includes('Ship the flow') && shown.includes('#7 · Checks pending'));
+      await waitForText((shown) => shown.includes('Ship the flow') && shown.includes('CI / check-pending'));
       expect(await shipButton(page, 'Create pull request').count()).toBe(0);
       const creates = ghRuns(gh).filter((run) => run.args[0] === 'pr' && run.args[1] === 'create');
       const args = ['pr', 'create', '--base', 'main', '--head', 'ship-flow', '--title', 'Ship the flow', '--body', 'Line 1\nLine 2'];
@@ -670,7 +673,7 @@ describe('changes sidebar: built app', () => {
       const gitLines = () => readFileSync(fx.gitLog, 'utf8').split('\n').filter(Boolean).length;
       const headsBefore = [branch, clean, detached].map((path) => gitIn(path, 'rev-parse', 'HEAD'));
       const originBefore = gitIn(origin, 'for-each-ref');
-      const ghBefore = ghRuns(gh).length;
+      const ghBefore = prListRuns(gh).length;
       const gitBefore = gitLines();
 
       const extra: Record<string, unknown[]> = { status: [], commit: ['A message'], push: [], pullRequest: [], createPullRequest: ['A title', 'A body'] };
@@ -688,7 +691,7 @@ describe('changes sidebar: built app', () => {
       expect(await call('createPullRequest', [ship.root, detached, 'A title', ''])).toEqual(refused('wt-api-detached has no branch.'));
 
       // Nothing ran: no commit, push or pull request, no gh run, the dirty file still uncommitted.
-      expect(ghRuns(gh)).toHaveLength(ghBefore);
+      expect(prListRuns(gh)).toHaveLength(ghBefore);
       const ran = readFileSync(fx.gitLog, 'utf8').split('\n').filter(Boolean).slice(gitBefore);
       expect(ran.filter((line) => ['add', 'commit', 'push'].includes(line.split(' ')[1]!))).toEqual([]);
       expect([branch, clean, detached].map((path) => gitIn(path, 'rev-parse', 'HEAD'))).toEqual(headsBefore);
@@ -725,7 +728,7 @@ describe('changes sidebar: built app', () => {
         'workspaces:pull-request': 'rejected',
         'workspaces:create-pull-request': 'rejected',
       });
-      expect(ghRuns(gh)).toHaveLength(ghBefore);
+      expect(prListRuns(gh)).toHaveLength(ghBefore);
       expect(gitIn(branch, 'status', '--porcelain')).toBe('?? dirty.txt');
       expect(gitIn(origin, 'for-each-ref')).toBe(originBefore);
     });

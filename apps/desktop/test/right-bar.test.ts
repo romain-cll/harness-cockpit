@@ -265,10 +265,12 @@ describe('changes sidebar: built app', () => {
     await openSessionById(page, A.id);
     await setChangesOpen(page, true, 'Diff');
     await waitForPanelText(page, (text) => text.includes('main.ts'));
-    const title = rightBar(page).getByText('Changes', { exact: true }).first();
-    const against = rightBar(page).getByText('against main', { exact: true });
-    const plus = rightBar(page).getByText(/^\+15005$/);
-    const minus = rightBar(page).getByText(/^[−-]6$/);
+    // The Pull request panel stays mounted: its diff row also shows "+N" and "−N".
+    const diffPanel = rightBar(page).getByRole('tabpanel', { name: 'Diff' });
+    const title = diffPanel.getByText('Changes', { exact: true }).first();
+    const against = diffPanel.getByText('against main', { exact: true });
+    const plus = diffPanel.getByText(/^\+15005$/);
+    const minus = diffPanel.getByText(/^[−-]6$/);
     await plus.waitFor();
     await minus.waitFor();
 
@@ -283,7 +285,7 @@ describe('changes sidebar: built app', () => {
 
     await openSessionById(page, B.id);
     await waitForPanelText(page, (text) => text.includes('No changes against main.'));
-    expect(await rightBar(page).getByText(/^[+−-]\d+$/).count(), 'no sum without a change').toBe(0);
+    expect(await rightBar(page).getByRole('tabpanel', { name: 'Diff' }).getByText(/^[+−-]\d+$/).count(), 'no sum without a change').toBe(0);
   });
 
   test('right bar AC8 — each file is a 26 px row (radius 8 px) with its status letter in 11 px monospace in its token, the name, the muted folder and the counts in their tokens; the first file is selected when the bar opens and a click selects another', async () => {
