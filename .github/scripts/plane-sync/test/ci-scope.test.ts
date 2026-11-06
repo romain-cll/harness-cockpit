@@ -102,6 +102,7 @@ describe('ci-scope.sh', () => {
     { listed: ['@cockpit/daemon', '@cockpit/cli'], desktop: 'false', packages: 'true', name: 'packages but not the desktop app' },
     { listed: [DESKTOP, '@cockpit/daemon'], desktop: 'true', packages: 'true', name: 'both' },
     { listed: [PLANE_SYNC], desktop: 'false', packages: 'false', name: 'plane-sync alone' },
+    { listed: [], desktop: 'false', packages: 'false', name: 'nothing (a docs-only pull request)' },
   ])('AC1 — a pull request touching none of the global files, turbo lists $name', ({ listed, desktop, packages }) => {
     const { output, calls } = run(mergeRepo(['AGENTS.md']), 'pull_request', listed);
     expect(output).toEqual({ flag: '--affected', desktop, packages });
