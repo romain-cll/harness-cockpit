@@ -1490,6 +1490,9 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
     markClosed(({ id }) => id === sessionId);
   });
 
+  // The sessions whose resume is under way: a daemon holds none of them yet.
+  const resuming = new Set<string>();
+
   // The ids of the sessions a connected daemon holds.
   const heldSessionIds = () =>
     new Set([...terminals.values(), ...otherDaemons.flatMap((daemon) => daemon.terminals)].flatMap(({ sessionId }) => (sessionId === undefined ? [] : [sessionId])));
@@ -1598,9 +1601,14 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
     const session = state.sessions.find(({ id }) => id === sessionId);
     const { project, harnessSessionId } = session ?? {};
     if (!session || project === undefined || harnessSessionId === undefined) return { status: 'refused', message: 'This session has no conversation to resume.' };
-    // A session a daemon holds runs: starting it again would run two agents.
-    if (heldSessionIds().has(sessionId)) return { status: 'refused', message: `${session.name} is already running.` };
-    return startSession(event.sender, session.harness, size, { workspace: { project, path: session.directory } }, { ...session, harnessSessionId });
+    // A session a daemon holds runs, and one whose start is under way is about to: either would run two agents.
+    if (heldSessionIds().has(sessionId) || resuming.has(sessionId)) return { status: 'refused', message: `${session.name} is already running.` };
+    resuming.add(sessionId);
+    try {
+      return await startSession(event.sender, session.harness, size, { workspace: { project, path: session.directory } }, { ...session, harnessSessionId });
+    } finally {
+      resuming.delete(sessionId);
+    }
   });
   ipcMain.handle('sessions:start', (event, harnessId: string, size: { cols: number; rows: number }, options?: StartSessionOptions) => {
     if (!isFromApp(event)) throw new Error('sessions:start refused: unexpected origin');

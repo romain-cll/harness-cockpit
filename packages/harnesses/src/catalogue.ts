@@ -162,7 +162,7 @@ const catalogue: Harness[] = [
       const name = /^OC \| (.+)$/.exec(title)?.[1]?.replace(/…$/, '');
       return name === undefined || name === '' ? null : name;
     },
-    // Its plugin (`status.ts`) pipes the plain id of the session, ending with a newline.
+    // Its plugin (`status.ts`) pipes the plain id of the session.
     sessionIdFrom: (input) => input.trim() || null,
   },
 ];

@@ -73,7 +73,13 @@ interface Tab {
   /** Set for an agent's tab. */
   session?: { id: string; harness: string };
   /** Set for the tab of a session whose terminal was lost; `reboot` when the Mac restarted since it began. */
-  ended?: { reboot: boolean; /** `<binary> <resume arguments>`, set when the session has a conversation to resume. */ resumeCommand?: string };
+  ended?: {
+    reboot: boolean;
+    /** `<binary> <resume arguments>`, set when the session has a conversation to resume. */
+    resumeCommand?: string;
+    /** Its harness is starting again; kept here so the button stays disabled when the tab is deselected and shown again. */
+    resuming?: boolean;
+  };
 }
 
 interface View {
@@ -180,17 +186,30 @@ function replaceEnded(path: string, pane: string, key: string) {
 // its own key, so its name, pane, position and selection stay. A refusal goes to the message slot and the tab stays.
 async function resumeEnded(path: string, pane: string, key: string) {
   const ended = viewOf(path).tabs.get(key);
-  if (!ended?.session) return;
-  const result = await resumeSession(ended.session.id, path);
-  setProjectsMessage(result.status === 'refused' ? result.message : undefined);
-  if (result.status !== 'started') return;
+  // One start at a time, and only for a tab still ended: a second call never reaches the start.
+  if (!ended?.session || !ended.ended || ended.ended.resuming) return;
+  setResuming(path, key, true);
+  try {
+    const result = await resumeSession(ended.session.id, path);
+    setProjectsMessage(result.status === 'refused' ? result.message : undefined);
+    if (result.status !== 'started') return;
+    const view = viewOf(path);
+    const live = getSessionTerminal(result.session.id);
+    // The user closed the tab while the harness started: it has no tab to run in.
+    if (!live || !view.tabs.get(key)?.ended) return void endSessions([result.session.id]);
+    const tab: Tab = { key, live, name: ended.name, session: ended.session };
+    watchTitle(path, tab);
+    commit(path, { ...view, focusedPane: pane, request: view.request + 1, tabs: new Map(view.tabs).set(key, tab) });
+  } finally {
+    setResuming(path, key, false);
+  }
+}
+
+// Marks the ended tab as starting again, or not; a tab that is no longer ended (closed, or running) is left as it is.
+function setResuming(path: string, key: string, resuming: boolean) {
   const view = viewOf(path);
-  const live = getSessionTerminal(result.session.id);
-  // The user closed the tab while the harness started: it has no tab to run in.
-  if (!live || !view.tabs.get(key)?.ended) return void endSessions([result.session.id]);
-  const tab: Tab = { key, live, name: ended.name, session: ended.session };
-  watchTitle(path, tab);
-  commit(path, { ...view, focusedPane: pane, request: view.request + 1, tabs: new Map(view.tabs).set(key, tab) });
+  const tab = view.tabs.get(key);
+  if (tab?.ended) commit(path, { ...view, tabs: new Map(view.tabs).set(key, { ...tab, ended: { ...tab.ended, resuming } }) });
 }
 
 function splitPane(path: string, pane: string, direction: 'right' | 'down') {
@@ -557,8 +576,7 @@ function TabItem({
 
 // What an ended tab shows in place of a terminal: nothing runs; the harness can resume its conversation (when it
 // gave an id) or a new shell can take its place.
-function TerminalEnded({ reboot, resumeCommand, onResume, onNew }: { reboot: boolean; resumeCommand?: string; onResume: () => Promise<void>; onNew: () => void }) {
-  const [resuming, setResuming] = useState(false);
+function TerminalEnded({ reboot, resumeCommand, resuming, onResume, onNew }: { reboot: boolean; resumeCommand?: string; resuming: boolean; onResume: () => void; onNew: () => void }) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-3 p-8 text-center">
       <SquareTerminalIcon className="size-5 text-subtle" />
@@ -566,13 +584,7 @@ function TerminalEnded({ reboot, resumeCommand, onResume, onNew }: { reboot: boo
       {reboot && <p className="text-xs text-muted-foreground">Cockpit's background service stopped when your Mac restarted.</p>}
       <div className="flex gap-2">
         {resumeCommand !== undefined && (
-          <Button
-            disabled={resuming}
-            onClick={() => {
-              setResuming(true);
-              void onResume().finally(() => setResuming(false));
-            }}
-          >
+          <Button disabled={resuming} onClick={onResume}>
             Resume last session
           </Button>
         )}
@@ -659,7 +671,8 @@ function PaneView({
                 key === pane.selected && <TerminalEnded
                     reboot={ended?.reboot ?? false}
                     resumeCommand={ended?.resumeCommand}
-                    onResume={() => resumeEnded(path, pane.id, key)}
+                    resuming={ended?.resuming ?? false}
+                    onResume={() => void resumeEnded(path, pane.id, key)}
                     onNew={() => replaceEnded(path, pane.id, key)}
                   />
               )}
