@@ -115,7 +115,6 @@ interface ListedPullRequest {
   title: string;
   url: string;
   state: string;
-  isCrossRepository?: boolean;
   body?: string;
   headRefOid?: string;
   baseRefName?: string;
@@ -139,13 +138,7 @@ function checkRunOf(entry: Record<string, unknown>): CheckRun {
   };
 }
 
-/** How many pull requests of a branch are read to find the newest of the repository's own: forks' come first when newer. */
-const READ_LIMIT = 30;
-
-/**
- * The newest pull request of `branch`, whatever its state, or `null` when it has none. `--head` matches by branch name
- * across forks, so a fork's pull request from a branch of the same name (`main`, say) is skipped.
- */
+/** The newest pull request of `branch`, whatever its state, or `null` when it has none. */
 export async function findPullRequest(
   cwd: string,
   branch: string,
@@ -160,9 +153,9 @@ export async function findPullRequest(
       '--state',
       'all',
       '--limit',
-      String(READ_LIMIT),
+      '1',
       '--json',
-      'number,title,url,state,isCrossRepository,author,baseRefName,body,headRefOid,latestReviews,reviewDecision,statusCheckRollup',
+      'number,title,url,state,author,baseRefName,body,headRefOid,latestReviews,reviewDecision,statusCheckRollup',
     ],
     cwd,
     env,
@@ -173,7 +166,7 @@ export async function findPullRequest(
   } catch (error) {
     throw new GitHubError('GH_FAILED', `unreadable answer from gh: ${stdout.trim()}`, { cause: error });
   }
-  const newest = found.find((each) => !each.isCrossRepository);
+  const [newest] = found;
   if (!newest) return null;
   const rollup = newest.statusCheckRollup ?? [];
   return {
@@ -227,13 +220,13 @@ const STATES_QUERY = (count: number) => {
   const aliases = indexes
     .map(
       (index) =>
-        `b${index}:pullRequests(headRefName:$b${index},first:${READ_LIMIT},orderBy:{field:CREATED_AT,direction:DESC}){nodes{state isCrossRepository}}`,
+        `b${index}:pullRequests(headRefName:$b${index},first:1,orderBy:{field:CREATED_AT,direction:DESC}){nodes{state}}`,
     )
     .join(' ');
   return `query($owner:String!,$repo:String!,${variables}){repository(owner:$owner,name:$repo){${aliases}}}`;
 };
 
-/** The state of the newest pull request of each branch (a fork's skipped) in one `gh` run; a branch with none has no key. */
+/** The state of the newest pull request of each branch in one `gh` run; a branch with none has no key. */
 export async function pullRequestStates(
   cwd: string,
   branches: readonly string[],
@@ -257,7 +250,7 @@ export async function pullRequestStates(
   );
   const unreadable = (cause?: unknown) =>
     new GitHubError('GH_FAILED', `unreadable answer from gh: ${stdout.trim()}`, { cause });
-  let repository: Record<string, { nodes?: { state?: string; isCrossRepository?: boolean }[] }> | null | undefined;
+  let repository: Record<string, { nodes?: { state?: string }[] }> | null | undefined;
   try {
     repository = JSON.parse(stdout)?.data?.repository;
   } catch (error) {
@@ -266,8 +259,7 @@ export async function pullRequestStates(
   if (!repository || typeof repository !== 'object') throw unreadable();
   const states: Record<string, PullRequest['state']> = {};
   branches.forEach((branch, index) => {
-    const own = repository[`b${index}`]?.nodes?.find((node) => !node.isCrossRepository);
-    const state = STATES[own?.state ?? ''];
+    const state = STATES[repository[`b${index}`]?.nodes?.[0]?.state ?? ''];
     if (state) states[branch] = state;
   });
   return states;

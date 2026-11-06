@@ -749,6 +749,14 @@ const hasMainWorkspace = (project: string) => state.projects.some((entry) => ent
 // The main workspace's path is its project's.
 const isMainWorkspace = (project: string, path: string) => path === project && hasMainWorkspace(project);
 
+// Whether the main workspace's `branch` is the base the changes are compared with: it has no pull request of its own,
+// and `gh pr list --head` would match a fork's of that name.
+async function onBaseBranch(project: string, branch: string | null): Promise<boolean> {
+  if (branch === null) return false;
+  const { defaultBase } = await listBranches(project, { env: await shellEnv });
+  return defaultBase?.replace(/^origin\//, '') === branch;
+}
+
 // A project with its workspaces, which git tells: the linked worktrees, and the main working tree when the project has its main workspace.
 async function toProject({ path, mainWorkspace }: { path: string; mainWorkspace?: boolean }): Promise<Project> {
   const project = { path, name: basename(path) };
@@ -1305,7 +1313,9 @@ function startProjects(
     forProject<PullRequestResult>(event, 'workspaces:pull-request', project, async () => {
       const workspace = await findWorkspace({ project, path });
       if ('status' in workspace) return workspace;
-      if (workspace.branch === null) return { status: 'read', pullRequest: null };
+      if (workspace.branch === null || (isMainWorkspace(project, path) && (await onBaseBranch(project, workspace.branch)))) {
+        return { status: 'read', pullRequest: null };
+      }
       try {
         return { status: 'read', pullRequest: await findPullRequest(path, workspace.branch, { env: await shellEnv }) };
       } catch (error) {
@@ -1375,8 +1385,10 @@ function startProjects(
   ipcMain.handle('workspaces:pull-request-states', (event, project: string): Promise<PullRequestStatesResult> =>
     forProject<PullRequestStatesResult>(event, 'workspaces:pull-request-states', project, async () => {
       const env = await shellEnv;
-      const main = hasMainWorkspace(project);
-      const branches = (await listWorktrees(project, { env })).flatMap((worktree) => ((worktree.main && !main) || worktree.branch === null ? [] : [worktree.branch]));
+      const worktrees = await listWorktrees(project, { env });
+      // The main working tree counts for a marked project, unless it is on the base branch.
+      const withMain = hasMainWorkspace(project) && !(await onBaseBranch(project, worktrees.find((worktree) => worktree.main)?.branch ?? null));
+      const branches = worktrees.flatMap((worktree) => ((worktree.main && !withMain) || worktree.branch === null ? [] : [worktree.branch]));
       if (branches.length === 0 || !(await hasRemote(project, { env }))) return { status: 'read', states: {} };
       try {
         return { status: 'read', states: await pullRequestStates(project, branches, { env }) };
