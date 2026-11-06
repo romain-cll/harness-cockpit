@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { type Page } from 'playwright-core';
-import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, test, onTestFailed } from 'vitest';
 import { sendFromComposer } from '../composer';
 import { freePort, isAlive, launchEnv, MAIN_PROCESS_ERROR, packagedAppDir, type Session, versionLabel } from '../launch';
 import { makeTestDir } from '../run-root';
@@ -257,6 +257,20 @@ export const describeMode = (mode: string, launch: () => Promise<Session>) => de
 
     test('smoke path (b), workspace scripts AC19, setup through the CLI AC11 — workspaces: the composer with "Terminal" creates a worktree under COCKPIT_HOME from the base main and lists it, its page opens with a shell tab that runs the setup (no agent); "Delete workspace…" runs `cockpit teardown`, which writes the login-shell PATH and the worktree path, then removes the folder, the worktree, the branch and the row', async () => {
       const { page } = session;
+      onTestFailed(async () => {
+        const dump = await page.evaluate(() => ({
+          url: location.href,
+          tabs: [...document.querySelectorAll('[role="tab"]')].map((tab) => `${tab.textContent}|${tab.getAttribute('aria-selected')}`),
+          terminals: [...document.querySelectorAll('.xterm')].map((element) => ({
+            visibility: getComputedStyle(element).visibility,
+            size: `${element.getBoundingClientRect().width}x${element.getBoundingClientRect().height}`,
+            rows: [...element.querySelectorAll('.xterm-rows > div')].map((row) => (row.textContent ?? '').trimEnd()).filter(Boolean),
+          })),
+          main: (document.querySelector('main') as HTMLElement | null)?.innerText.slice(0, 800),
+        }));
+        console.log('DIAG-DUMP', JSON.stringify(dump, null, 1));
+        console.log('DIAG-OUTPUT', session.output().slice(-4000));
+      });
       const repo = makeRepo('smoke-workspace');
       folders.push(repo);
       const branch = 'smoke-ws';
