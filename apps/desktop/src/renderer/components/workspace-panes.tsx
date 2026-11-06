@@ -13,6 +13,7 @@ import {
   getSessionDots,
   getSessionTerminal,
   restoreTerminals,
+  resumeSession,
   startSession,
   subscribe as subscribeTerminals,
   type LiveTerminal,
@@ -72,7 +73,13 @@ interface Tab {
   /** Set for an agent's tab. */
   session?: { id: string; harness: string };
   /** Set for the tab of a session whose terminal was lost; `reboot` when the Mac restarted since it began. */
-  ended?: { reboot: boolean };
+  ended?: {
+    reboot: boolean;
+    /** `<binary> <resume arguments>`, set when the session has a conversation to resume. */
+    resumeCommand?: string;
+    /** Its harness is starting again; kept here so the button stays disabled when the tab is deselected and shown again. */
+    resuming?: boolean;
+  };
 }
 
 interface View {
@@ -173,6 +180,36 @@ function replaceEnded(path: string, pane: string, key: string) {
   const tabs = new Map(view.tabs);
   tabs.delete(key);
   commit(path, { layout, focusedPane: pane, request: view.request + 1, tabs: tabs.set(shell.key, shell) });
+}
+
+// The ended tab runs its harness again, resuming the conversation: the same tab, now holding the new terminal under
+// its own key, so its name, pane, position and selection stay. A refusal goes to the message slot and the tab stays.
+async function resumeEnded(path: string, pane: string, key: string) {
+  const ended = viewOf(path).tabs.get(key);
+  // One start at a time, and only for a tab still ended: a second call never reaches the start.
+  if (!ended?.session || !ended.ended || ended.ended.resuming) return;
+  setResuming(path, key, true);
+  try {
+    const result = await resumeSession(ended.session.id, path);
+    setProjectsMessage(result.status === 'refused' ? result.message : undefined);
+    if (result.status !== 'started') return;
+    const view = viewOf(path);
+    const live = getSessionTerminal(result.session.id);
+    // The user closed the tab while the harness started: it has no tab to run in.
+    if (!live || !view.tabs.get(key)?.ended) return void endSessions([result.session.id]);
+    const tab: Tab = { key, live, name: ended.name, session: ended.session };
+    watchTitle(path, tab);
+    commit(path, { ...view, focusedPane: pane, request: view.request + 1, tabs: new Map(view.tabs).set(key, tab) });
+  } finally {
+    setResuming(path, key, false);
+  }
+}
+
+// Marks the ended tab as starting again, or not; a tab that is no longer ended (closed, or running) is left as it is.
+function setResuming(path: string, key: string, resuming: boolean) {
+  const view = viewOf(path);
+  const tab = view.tabs.get(key);
+  if (tab?.ended) commit(path, { ...view, tabs: new Map(view.tabs).set(key, { ...tab, ended: { ...tab.ended, resuming } }) });
 }
 
 function splitPane(path: string, pane: string, direction: 'right' | 'down') {
@@ -295,13 +332,13 @@ async function restore(again: boolean): Promise<void> {
     const layout = addTab(view.layout, first.id, key);
     commit(workspace, { ...view, layout: selectTab(layout, first.id, first.selected ?? key), tabs: new Map(view.tabs).set(key, tab) });
   }
-  for (const { sessionId, reboot } of ended) {
+  for (const { sessionId, reboot, resumeCommand } of ended) {
     const session = sessions.find(({ id }) => id === sessionId);
     const key = `s:${sessionId}`;
     if (!session || viewOf(session.directory).tabs.has(key)) continue;
     const view = viewOf(session.directory);
     const first = panesOf(view.layout)[0]!;
-    const tab: Tab = { key, name: session.name, session: { id: sessionId, harness: session.harness }, ended: { reboot } };
+    const tab: Tab = { key, name: session.name, session: { id: sessionId, harness: session.harness }, ended: { reboot, resumeCommand } };
     const layout = addTab(view.layout, first.id, key);
     commit(session.directory, { ...view, layout: selectTab(layout, first.id, first.selected ?? key), tabs: new Map(view.tabs).set(key, tab) });
   }
@@ -537,16 +574,25 @@ function TabItem({
   );
 }
 
-// What an ended tab shows in place of a terminal: nothing runs, a new shell can take its place.
-function TerminalEnded({ reboot, onNew }: { reboot: boolean; onNew: () => void }) {
+// What an ended tab shows in place of a terminal: nothing runs; the harness can resume its conversation (when it
+// gave an id) or a new shell can take its place.
+function TerminalEnded({ reboot, resumeCommand, resuming, onResume, onNew }: { reboot: boolean; resumeCommand?: string; resuming: boolean; onResume: () => void; onNew: () => void }) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-3 p-8 text-center">
       <SquareTerminalIcon className="size-5 text-subtle" />
       <h2 className="font-heading text-sm font-medium">This terminal ended</h2>
       {reboot && <p className="text-xs text-muted-foreground">Cockpit's background service stopped when your Mac restarted.</p>}
-      <Button variant="outline" onClick={onNew}>
-        New terminal here
-      </Button>
+      <div className="flex gap-2">
+        {resumeCommand !== undefined && (
+          <Button disabled={resuming} onClick={onResume}>
+            Resume last session
+          </Button>
+        )}
+        <Button variant="outline" onClick={onNew}>
+          New terminal here
+        </Button>
+      </div>
+      {resumeCommand !== undefined && <p className="font-mono text-xs text-subtle break-all">{resumeCommand}</p>}
     </div>
   );
 }
@@ -622,7 +668,13 @@ function PaneView({
                 <Terminal live={live} focused={pane.id === view.focusedPane && key === pane.selected} request={view.request} />
               ) : (
                 // Only the selected one is in the page: an ended tab has no terminal to keep alive.
-                key === pane.selected && <TerminalEnded reboot={ended?.reboot ?? false} onNew={() => replaceEnded(path, pane.id, key)} />
+                key === pane.selected && <TerminalEnded
+                    reboot={ended?.reboot ?? false}
+                    resumeCommand={ended?.resumeCommand}
+                    resuming={ended?.resuming ?? false}
+                    onResume={() => void resumeEnded(path, pane.id, key)}
+                    onNew={() => replaceEnded(path, pane.id, key)}
+                  />
               )}
             </div>
           );

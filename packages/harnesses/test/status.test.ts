@@ -27,6 +27,8 @@ type Event = 'working' | 'waiting' | 'finished';
 const CLI = "/Applications/Co ckpit's $(touch pwned).app/Contents/Resources/bin/cockpit";
 const quoted = (path: string) => `'${path.replaceAll("'", "'\\''")}'`;
 const command = (event: Event) => `${quoted(CLI)} status ${event}`;
+// COCKPIT-30: the hook line that hands the hook's stdin to the harness's adapter.
+const sessionIdCommand = (harness: 'claude-code' | 'codex') => `${quoted(CLI)} session-id ${harness}`;
 
 const created: string[] = [];
 const closers: Array<() => void> = [];
@@ -70,7 +72,8 @@ describe('Claude Code (AC2)', () => {
       const groups = settings.hooks[name]!;
       expect(groups, name).toHaveLength(1);
       expect(groups[0]!.matcher, `${name} has no matcher`).toBeUndefined();
-      expect(groups[0]!.hooks, name).toHaveLength(1);
+      // COCKPIT-30: the session-id hook is the second hook of the UserPromptSubmit group.
+      expect(groups[0]!.hooks, name).toHaveLength(name === 'UserPromptSubmit' ? 2 : 1);
       const hook = groups[0]!.hooks[0]!;
       expect(hook, name).toMatchObject({ type: 'command', command: command(event) });
       expect(hook.timeout).toBe(5);
@@ -78,6 +81,67 @@ describe('Claude Code (AC2)', () => {
     }
     // Nothing is written anywhere for Claude Code.
     expect(await readdir(pluginsDir)).toEqual([]);
+  });
+});
+
+// --- The session-id hook (COCKPIT-30) ---------------------------------------------------------
+
+describe('the session-id hook (COCKPIT-30)', () => {
+  test('AC1 — Claude Code: the UserPromptSubmit group runs the status hook, then `<cli> session-id claude-code`, a synchronous command; no other event has it', async () => {
+    const { args } = await launch('claude-code');
+    const settings = JSON.parse(args[1]!) as { hooks: Record<string, Array<{ hooks: Array<Record<string, unknown>> }>> };
+
+    const hooks = settings.hooks.UserPromptSubmit![0]!.hooks;
+    expect(hooks).toHaveLength(2);
+    expect(hooks[0]).toMatchObject({ type: 'command', command: command('working') });
+    expect(hooks[1]).toMatchObject({ type: 'command', command: sessionIdCommand('claude-code') });
+    expect(hooks[1]!.async ?? false).toBe(false);
+    for (const [name, groups] of Object.entries(settings.hooks)) {
+      if (name === 'UserPromptSubmit') continue;
+      expect(JSON.stringify(groups), name).not.toContain('session-id');
+    }
+  });
+
+  test('AC1, AC2 — Codex: the UserPromptSubmit group runs the status hook, then `<cli> session-id codex` with timeout 3; no other event has it', async () => {
+    const { args } = await launch('codex');
+    const hooks = parseToml(args[2]!.slice('hooks='.length)) as Record<string, Array<{ hooks: Array<Record<string, unknown>> }>>;
+
+    const group = hooks.UserPromptSubmit![0]!.hooks;
+    expect(group).toHaveLength(2);
+    expect(group[0]).toMatchObject({ type: 'command', command: command('working') });
+    expect(group[1]).toMatchObject({ type: 'command', command: sessionIdCommand('codex') });
+    // The trusted hash is computed for a timeout of 3 s.
+    expect(group[1]!.timeout).toBe(3);
+    expect(group[1]!.async ?? false).toBe(false);
+    for (const [name, groups] of Object.entries(hooks)) {
+      if (name === 'UserPromptSubmit' || name === 'state') continue;
+      expect(JSON.stringify(groups), name).not.toContain('session-id');
+    }
+  });
+
+  test('AC2 — Codex: the state table holds the second hook\'s trusted_hash under :0:1, computed by codexTrustHash, and the six status hooks keep their :0:0 keys', async () => {
+    const { args } = await launch('codex');
+    const { state } = parseToml(args[2]!.slice('hooks='.length)) as { state: Record<string, { trusted_hash: string }> };
+
+    const key = '/<session-flags>/config.toml:user_prompt_submit:0:1';
+    expect(state[key]).toEqual({ trusted_hash: codexTrustHash('user_prompt_submit', sessionIdCommand('codex')) });
+    expect(state[key]!.trusted_hash).toBe(expectedHash('user_prompt_submit', sessionIdCommand('codex')));
+    expect(Object.keys(state).sort()).toEqual(
+      ['user_prompt_submit:0:0', 'post_tool_use:0:0', 'permission_request:0:0', 'pre_tool_use:0:0', 'stop:0:0', 'interrupt:0:0', 'user_prompt_submit:0:1']
+        .map((suffix) => `/<session-flags>/config.toml:${suffix}`)
+        .sort(),
+    );
+  });
+
+  test("AC1 — a path with a space and a ' is single-quoted in the session-id line too, for both harnesses", async () => {
+    const cli = "/a b/it's/cockpit";
+    const claude = await statusLaunch('claude-code', { cli, pluginsDir: await tempDir(), env: {} });
+    const codex = await statusLaunch('codex', { cli, pluginsDir: await tempDir(), env: {} });
+
+    const claudeLine = (JSON.parse(claude.args[1]!) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> }).hooks.UserPromptSubmit![0]!.hooks[1]!.command;
+    const codexLine = (parseToml(codex.args[2]!.slice('hooks='.length)) as Record<string, Array<{ hooks: Array<{ command: string }> }>>).UserPromptSubmit![0]!.hooks[1]!.command;
+    expect(claudeLine).toBe("'/a b/it'\\''s/cockpit' session-id claude-code");
+    expect(codexLine).toBe("'/a b/it'\\''s/cockpit' session-id codex");
   });
 });
 
@@ -295,13 +359,15 @@ describe('Codex (AC3)', () => {
       const groups = hooks[name] as Group[];
       expect(groups, name).toHaveLength(1);
       expect(groups[0]!.matcher, `${name} matcher`).toBe(matcher);
-      expect(groups[0]!.hooks, name).toHaveLength(1);
+      // COCKPIT-30: the session-id hook is the second hook of the UserPromptSubmit group.
+      expect(groups[0]!.hooks, name).toHaveLength(name === 'UserPromptSubmit' ? 2 : 1);
       const hook = groups[0]!.hooks[0]!;
       expect(hook, name).toMatchObject({ type: 'command', command: command(event) });
       expect(hook.timeout).toBe(3);
       expect(hook.async ?? false, `${name} is synchronous`).toBe(false);
       state[`/<session-flags>/config.toml:${snake}:0:0`] = { trusted_hash: expectedHash(snake, command(event), matcher) };
     }
+    state['/<session-flags>/config.toml:user_prompt_submit:0:1'] = { trusted_hash: expectedHash('user_prompt_submit', sessionIdCommand('codex')) };
     expect(hooks.state).toEqual(state);
     // Nothing is written anywhere for Codex.
     expect(await readdir(pluginsDir)).toEqual([]);
@@ -565,5 +631,74 @@ describe('OpenCode plugin (AC6)', () => {
 
     await follow(['working']);
     expect(await lines()).toEqual([reported('working')]);
+  });
+
+  // --- COCKPIT-30 AC3: the session id --------------------------------------------------------
+
+  // A stub CLI that reports each `session-id` run to the channel as `<arguments>|<stdin>`; `status` runs are ignored.
+  // It sits in a folder whose name holds a space and `$(…)`, so a plugin that went through `/bin/sh` would not find it.
+  async function idPlugin(dir: string, pipes: ReturnType<typeof channel>, name: string): Promise<Plugin> {
+    const stubDir = join(dir, `cli ${name} $(touch pwned)`);
+    const cli = join(stubDir, 'cockpit');
+    await mkdir(stubDir, { recursive: true });
+    await writeFile(cli, `#!/bin/sh\n[ "$1" = session-id ] || exit 0\nid=$(cat)\nprintf '%s %s|%s\\n' "$1" "$2" "$id" > '${pipes.eventsPath}'\n`);
+    chmodSync(cli, 0o755);
+    const pluginsDir = join(dir, name);
+    await statusLaunch('opencode', { cli, pluginsDir, env: {} });
+    const module = (await import(/* @vite-ignore */ pathToFileURL(join(pluginsDir, 'opencode-status', 'server.js')).href)) as { default: Plugin };
+    return module.default;
+  }
+
+  // An event stream the test feeds one event at a time, and a `ctx.session.get` that answers from `infos`
+  // (OpenCode's `Session.Info`: a subagent's has a `parentID`).
+  function feed(infos: Record<string, { parentID?: string }>) {
+    const queue: unknown[] = [];
+    let wake: (() => void) | undefined;
+    const context = {
+      event: {
+        subscribe: () =>
+          (async function* () {
+            for (;;) {
+              while (queue.length === 0) await new Promise<void>((resolve) => (wake = resolve));
+              yield queue.shift();
+            }
+          })(),
+      },
+      session: { get: async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, ...infos[sessionID] }) },
+    };
+    return {
+      context,
+      push: (event: unknown) => {
+        queue.push(event);
+        wake?.();
+      },
+    };
+  }
+
+  test('AC3, AC5 — session.execution.started of a session with no parentID runs `<cli> session-id opencode` with the id on stdin, byte for byte; a subagent session (a parentID) and an id equal to the last one reported run nothing; a different id runs it again', async () => {
+    process.env.COCKPIT_SOCKET = '/unused.sock';
+    process.env.COCKPIT_SESSION_ID = 'cockpit-session';
+    const dir = await tempDir();
+    const pipes = channel(dir);
+    const plugin = await idPlugin(dir, pipes, 'ids');
+    const events = feed({ child: { parentID: 'root' } });
+    await Promise.resolve(plugin.setup(events.context));
+
+    events.push(started('root'));
+    expect(await pipes.next()).toBe('session-id opencode|root');
+    // A subagent, then the same root again: neither runs anything. The next report is the next line the stub writes.
+    events.push(started('child'));
+    events.push(started('root'));
+    events.push(started('not/a:uuid é'));
+    expect(await pipes.next()).toBe('session-id opencode|not/a:uuid é');
+    events.push(started('root'));
+    expect(await pipes.next()).toBe('session-id opencode|root');
+
+    // A copy of the plugin on the same channel reports its one event: nothing else was written before it.
+    const probe = await idPlugin(dir, pipes, 'probe');
+    const probed = feed({});
+    await Promise.resolve(probe.setup(probed.context));
+    probed.push(started('probe'));
+    expect(await pipes.next()).toBe('session-id opencode|probe');
   });
 });

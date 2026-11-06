@@ -273,16 +273,22 @@ function parseEvent(text: string): SessionReport | string {
     return 'body is not JSON';
   }
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return 'body is not an object';
-  const { sessionId, event, exitCode, ...others } = value as Record<string, unknown>;
+  const { sessionId, event, exitCode, harnessSessionId, ...others } = value as Record<string, unknown>;
   if (Object.keys(others).length > 0) return `unexpected field: ${Object.keys(others)[0]}`;
   if (typeof sessionId !== 'string') return 'sessionId must be a string';
+  if (event === 'harness-session') {
+    if (typeof harnessSessionId !== 'string' || harnessSessionId === '') return 'harnessSessionId must be a non-empty string';
+    if ('exitCode' in (value as object)) return 'unexpected field: exitCode';
+    return { sessionId, event, harnessSessionId };
+  }
+  if ('harnessSessionId' in (value as object)) return 'unexpected field: harnessSessionId';
   if (event === 'exited') {
     if (exitCode !== null && !Number.isInteger(exitCode)) return 'exitCode must be an integer or null';
     return { sessionId, event, exitCode: exitCode as number | null };
   }
   if ('exitCode' in (value as object)) return 'unexpected field: exitCode';
   const events: readonly unknown[] = [...SESSION_EVENTS, ...SETUP_EVENTS];
-  if (!events.includes(event)) return `event must be one of ${[...SESSION_EVENTS, ...SETUP_EVENTS, 'exited'].join(', ')}`;
+  if (!events.includes(event)) return `event must be one of ${[...SESSION_EVENTS, ...SETUP_EVENTS, 'exited', 'harness-session'].join(', ')}`;
   return { sessionId, event: event as SessionEventName | SetupEventName };
 }
 

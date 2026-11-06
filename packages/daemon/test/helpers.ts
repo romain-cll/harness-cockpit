@@ -100,7 +100,7 @@ export interface Connection {
   client: DaemonClient;
   data: Array<{ id: unknown; seq: number; data: string }>;
   exits: Array<{ id: unknown; exitCode: number | null; signal: number | null }>;
-  statuses: Array<{ sessionId: string; event: string; exitCode?: number | null }>;
+  statuses: Array<{ sessionId: string; event: string; exitCode?: number | null; harnessSessionId?: string }>;
   closed: () => boolean;
   output: (id: unknown) => string;
   /** Resolves once `condition()` holds, checked at once and at each data, exit, status or close event of this connection. */

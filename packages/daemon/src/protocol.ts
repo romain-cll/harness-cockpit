@@ -42,10 +42,14 @@ export type SetupEventName = 'setup-running' | 'setup-done' | 'setup-failed';
 /** The last setup event a session reported, as `list` gives it. */
 export type SetupState = 'running' | 'done' | 'failed';
 
-/** What a client of the status endpoint sends: a status, a setup event, or the agent's exit (`null` for a signal). */
+/**
+ * What a client of the status endpoint sends: a status, a setup event, the agent's exit (`null` for a signal) or the
+ * harness's own id for the conversation, an opaque string to the daemon.
+ */
 export type SessionReport =
   | { sessionId: string; event: SessionEventName | SetupEventName }
-  | { sessionId: string; event: 'exited'; exitCode: number | null };
+  | { sessionId: string; event: 'exited'; exitCode: number | null }
+  | { sessionId: string; event: 'harness-session'; harnessSessionId: string };
 
 export interface TerminalInfo {
   id: number;
@@ -63,6 +67,8 @@ export interface TerminalInfo {
   setup?: SetupState;
   /** The exit code of the agent, once the session reported `exited` (`null` for a signal). */
   exitCode?: number | null;
+  /** The last conversation id the harness reported. */
+  harnessSessionId?: string;
 }
 
 export interface Hello {

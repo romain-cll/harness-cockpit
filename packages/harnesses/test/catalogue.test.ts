@@ -155,6 +155,59 @@ describe('frozen catalogue', () => {
   });
 });
 
+describe('sessionIdFrom (COCKPIT-30 AC1)', () => {
+  // A conversation id no harness would make: it must come out byte for byte (AC5).
+  const ODD = 'not/a:uuid é';
+  // The hook input of the docs: JSON on stdin with `session_id` (Claude Code: https://code.claude.com/docs/en/hooks;
+  // Codex: `UserPromptSubmitCommandInput`).
+  const hookInput = (fields: Record<string, unknown>) =>
+    JSON.stringify({ transcript_path: '/home/u/.claude/projects/x/y.jsonl', cwd: '/work', hook_event_name: 'UserPromptSubmit', prompt: 'fix the bug', ...fields });
+
+  test.each(['claude-code', 'codex'])('AC1 — %s: reads session_id from the hook JSON', (id) => {
+    expect(harness(id).sessionIdFrom(hookInput({ session_id: 'abc-123' }))).toBe('abc-123');
+  });
+
+  test.each(['claude-code', 'codex'])('AC5 — %s: an id that looks like no harness\'s comes out byte for byte', (id) => {
+    expect(harness(id).sessionIdFrom(hookInput({ session_id: ODD }))).toBe(ODD);
+  });
+
+  test.each(['claude-code', 'codex'])('AC1 — %s: a subagent\'s hook carries the main session\'s id, which is the one read', (id) => {
+    expect(harness(id).sessionIdFrom(hookInput({ session_id: 'main-id', agent_id: 'sub-1', agent_type: 'Explore' }))).toBe('main-id');
+  });
+
+  test.each([
+    ['an empty input', ''],
+    ['text that is not JSON', 'not json'],
+    ['a JSON array', '[]'],
+    ['JSON null', 'null'],
+    ['an object without session_id', '{}'],
+    ['an empty session_id', '{"session_id":""}'],
+    ['a numeric session_id', '{"session_id":7}'],
+    ['a null session_id', '{"session_id":null}'],
+    ['another spelling of the field', '{"sessionId":"abc","sessionID":"abc"}'],
+  ])('AC6 — claude-code and codex: %s gives no id', (_label, input) => {
+    expect(harness('claude-code').sessionIdFrom(input)).toBeNull();
+    expect(harness('codex').sessionIdFrom(input)).toBeNull();
+  });
+
+  test('AC1 — opencode: the plain id its plugin sends, trimmed', () => {
+    expect(harness('opencode').sessionIdFrom('ses_abc123')).toBe('ses_abc123');
+    expect(harness('opencode').sessionIdFrom('ses_abc123\n')).toBe('ses_abc123');
+    expect(harness('opencode').sessionIdFrom('  ses_abc123 \n')).toBe('ses_abc123');
+  });
+
+  test('AC5 — opencode: an id that looks like no harness\'s comes out byte for byte', () => {
+    expect(harness('opencode').sessionIdFrom(ODD)).toBe(ODD);
+  });
+
+  test.each([
+    ['an empty input', ''],
+    ['blanks', '  \n'],
+  ])('AC6 — opencode: %s gives no id', (_label, input) => {
+    expect(harness('opencode').sessionIdFrom(input)).toBeNull();
+  });
+});
+
 describe('Electron boundary', () => {
   const packageDir = join(import.meta.dirname, '..');
 

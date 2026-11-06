@@ -26,6 +26,11 @@ export interface Harness {
    * the title is not derived from the user's prompt (the idle title, an unrelated title, `""`).
    */
   promptTitle(title: string): string | null;
+  /**
+   * The conversation id in what the harness's hook (or plugin) pipes to `cockpit session-id <harness>`, or
+   * `null` when the input holds none. The id is an opaque string to everything but this adapter.
+   */
+  sessionIdFrom(input: string): string | null;
 }
 
 // Every fact below was checked on 2026-10-20 against the source named next to it. The flags and
@@ -34,6 +39,21 @@ export interface Harness {
 // An empty variable counts as unset.
 function home(env: NodeJS.ProcessEnv): string {
   return env.HOME || homedir();
+}
+
+// Claude Code and Codex hooks get JSON on stdin with the conversation id as a string `session_id`
+// (https://code.claude.com/docs/en/hooks, Claude Code 2.1.319; Codex: `UserPromptSubmitCommandInput` in
+// `hooks/src/events/user_prompt_submit.rs`, `rust-v0.163.0`).
+function hookSessionId(input: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(input);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const id = (parsed as Record<string, unknown>).session_id;
+  return typeof id === 'string' && id !== '' ? id : null;
 }
 
 // Callers share one catalogue and none may change it for the others: it is frozen
@@ -66,6 +86,9 @@ const catalogue: Harness[] = [
       const name = /^[◐◑✳] (.+)$/.exec(title)?.[1];
       return name === undefined || name === 'Claude Code' ? null : name;
     },
+    // A subagent's hook carries the main session's id plus `agent_id` (same docs page), so the id read is
+    // always the main conversation's.
+    sessionIdFrom: hookSessionId,
   },
   // Codex 0.163.0 (2026-10-15), sources in openai/codex `codex-rs` at `rust-v0.163.0`
   {
@@ -102,6 +125,9 @@ const catalogue: Harness[] = [
       const name = segments.slice(0, -1).join(' | ');
       return /^[\s⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]*$/.test(name) ? null : name;
     },
+    // `Session::session_id()` is "the identity shared by the root thread and all descendant threads", equal to
+    // the root thread's id, so a subagent's hook gives the id `codex resume` takes (`core/src/session/session.rs`).
+    sessionIdFrom: hookSessionId,
   },
   // OpenCode 2.0.31
   {
@@ -136,6 +162,8 @@ const catalogue: Harness[] = [
       const name = /^OC \| (.+)$/.exec(title)?.[1]?.replace(/…$/, '');
       return name === undefined || name === '' ? null : name;
     },
+    // Its plugin (`status.ts`) pipes the plain id of the session.
+    sessionIdFrom: (input) => input.trim() || null,
   },
 ];
 
