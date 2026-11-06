@@ -4,6 +4,7 @@ import {
   ChevronRightIcon,
   CheckIcon,
   CodeXmlIcon,
+  CopyIcon,
   FolderMinusIcon,
   FolderOpenIcon,
   FolderPlusIcon,
@@ -137,8 +138,18 @@ const AppBadge = ({ name }: { name: string }) => (
 const kindIcon = { editor: CodeXmlIcon, terminal: SquareTerminalIcon };
 
 // The items of a workspace's menu that open its worktree: the editor and the terminal shown first, a
-// submenu of each kind listing every detected app (the one shown first checked), and the Finder.
-function OpenItems({ apps, onOpen, onReveal }: { apps?: AppsResult; onOpen: (app: string) => void; onReveal: () => void }) {
+// submenu of each kind listing every detected app (the one shown first checked), the Finder and the path.
+function OpenItems({
+  apps,
+  onOpen,
+  onReveal,
+  onCopyPath,
+}: {
+  apps?: AppsResult;
+  onOpen: (app: string) => void;
+  onReveal: () => void;
+  onCopyPath: () => void;
+}) {
   if (!apps) return null;
   const submenu = (kind: 'editor' | 'terminal', list: AvailableApp[]) => {
     const Icon = kindIcon[kind];
@@ -182,6 +193,10 @@ function OpenItems({ apps, onOpen, onReveal }: { apps?: AppsResult; onOpen: (app
       <DropdownMenuItem onClick={onReveal}>
         <FolderOpenIcon />
         Reveal in Finder
+      </DropdownMenuItem>
+      <DropdownMenuItem onClick={onCopyPath}>
+        <CopyIcon />
+        Copy path
       </DropdownMenuItem>
       <DropdownMenuSeparator />
     </>
@@ -233,8 +248,9 @@ export function Projects({ projects, sessions, failedSetups }: { projects: Proje
           return collapsedProjects.has(path) || branches.length === 0 ? [] : [{ project: path, branches }];
         }),
   );
-  // The editors and terminals found when a workspace's menu last opened.
+  // The editors and terminals found when a workspace's or project's menu last opened.
   const [apps, setApps] = useState<AppsResult>();
+  const editor = apps?.editors.find(({ id }) => id === apps.editor);
   // The project whose removal dialog is open.
   const [removing, setRemoving] = useState<Project>();
 
@@ -337,11 +353,26 @@ export function Projects({ projects, sessions, failedSetups }: { projects: Proje
                     )
                   }
                   label={`Actions for ${project.name}`}
+                  onOpenChange={(open) => open && void window.api.workspaces.apps().then(setApps)}
                 >
                   <DropdownMenuItem onClick={() => void navigate({ to: '/', search: { project: project.path } })}>
                     <PlusIcon />
                     New workspace
                   </DropdownMenuItem>
+                  {!project.missing && (
+                    <>
+                      {editor && (
+                        <DropdownMenuItem onClick={() => void window.api.projects.open(project.path, editor.id).then(opened)}>
+                          <CodeXmlIcon />
+                          <span className="truncate">Open in {editor.name}</span>
+                        </DropdownMenuItem>
+                      )}
+                      <DropdownMenuItem onClick={() => void window.api.projects.reveal(project.path).then(opened)}>
+                        <FolderOpenIcon />
+                        Reveal in Finder
+                      </DropdownMenuItem>
+                    </>
+                  )}
                   <DropdownMenuSeparator />
                   <DropdownMenuItem variant="destructive" onClick={() => setRemoving(project)}>
                     <FolderMinusIcon />
@@ -403,6 +434,7 @@ export function Projects({ projects, sessions, failedSetups }: { projects: Proje
                                 apps={apps}
                                 onOpen={(app) => void window.api.workspaces.open(project.path, workspace.path, app).then(opened)}
                                 onReveal={() => void window.api.workspaces.reveal(project.path, workspace.path).then(opened)}
+                                onCopyPath={() => void navigator.clipboard.writeText(workspace.path)}
                               />
                               <DropdownMenuItem variant="destructive" onClick={() => setDeleting({ project, workspace })}>
                                 <Trash2Icon />

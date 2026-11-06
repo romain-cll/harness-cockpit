@@ -359,6 +359,10 @@ export interface Api {
     updatePath(from: string): Promise<UpdatePathResult>;
     /** Forgets the project; its files stay on disk. */
     remove(path: string): Promise<void>;
+    /** Shows the project's folder in the Finder. Refused when the path is not a project of Cockpit. */
+    reveal(path: string): Promise<OpenWorkspaceResult>;
+    /** Opens the project's folder in the detected app `app`, and remembers it. Refused when the path is not a project of Cockpit. */
+    open(path: string, app: string): Promise<OpenWorkspaceResult>;
     /** Calls `listener` when the main process changed a project's workspaces (a workspace named from its agent's title). */
     onChanged(listener: () => void): () => void;
   };
