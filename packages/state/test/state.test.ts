@@ -14,6 +14,7 @@ import {
   saveState,
   sessionName,
   setHarnessSessionId,
+  setMainWorkspace,
   type Session,
   updateProjectPath,
 } from '../src/index';
@@ -977,6 +978,92 @@ describe('COCKPIT-69 AC13 — the open mark of a workspace session', () => {
     const state = { version: 1, projects: [], sessions: [workspaceSession({ id: 'a', open: true })] };
 
     expect(closeSession(state, 'nobody').sessions).toEqual(state.sessions);
+  });
+});
+
+describe('COCKPIT-71 AC17 — the main workspace mark of a project', () => {
+  const marked = () => ({
+    version: 1,
+    editor: 'zed',
+    projects: [{ path: '/a' }, { path: '/old/b', mainWorkspace: true }, { path: '/c' }],
+    sessions: [
+      session({ id: 's1', directory: '/old/b', project: '/old/b' }),
+      session({ id: 's2', directory: '/old/b-ws', project: '/old/b' }),
+      session({ id: 's3', directory: '/a', project: '/a' }),
+      session({ id: 's4', directory: '/loose' }),
+    ],
+  });
+
+  test('AC17 — setMainWorkspace marks the project at that path only, leaves the given state and the other fields alone, and saves and loads back as marked', () => {
+    const before = { version: 1, extra: 'kept', projects: [{ path: '/a' }, { path: '/b' }], sessions: [] };
+
+    const next = setMainWorkspace(before, '/b', true);
+
+    expect(next.projects).toEqual([{ path: '/a' }, { path: '/b', mainWorkspace: true }]);
+    expect(next.projects[0]).not.toHaveProperty('mainWorkspace');
+    expect(next).toMatchObject({ version: 1, extra: 'kept' });
+    expect(before).toEqual({ version: 1, extra: 'kept', projects: [{ path: '/a' }, { path: '/b' }], sessions: [] });
+
+    mkdirSync(dir, { recursive: true });
+    saveState(dir, next);
+    expect(JSON.parse(readFileSync(file, 'utf8')).projects).toEqual([{ path: '/a' }, { path: '/b', mainWorkspace: true }]);
+    const unchanged = snapshot();
+    expect(loadState(dir).projects).toEqual(next.projects);
+    expect(snapshot()).toEqual(unchanged);
+    expect(backups()).toEqual([]);
+  });
+
+  test('AC17 — setMainWorkspace with false clears the mark, and the cleared file no longer marks the project', () => {
+    const next = setMainWorkspace(marked(), '/old/b', false);
+
+    expect(next.projects.find((project) => project.path === '/old/b')?.mainWorkspace).not.toBe(true);
+    expect(next.projects.map((project) => project.path)).toEqual(['/a', '/old/b', '/c']);
+
+    mkdirSync(dir, { recursive: true });
+    saveState(dir, next);
+    expect(loadState(dir).projects.find((project) => project.path === '/old/b')?.mainWorkspace).not.toBe(true);
+  });
+
+  test('AC17 — updateProjectPath moves the mark with the project, keeping its place, and moves the sessions whose directory was the old path; a worktree session keeps its directory', () => {
+    const before = marked();
+
+    const next = updateProjectPath(before, '/old/b', '/new/b');
+
+    expect(next.projects).toEqual([{ path: '/a' }, { path: '/new/b', mainWorkspace: true }, { path: '/c' }]);
+    expect(next.sessions.map(({ id, project, directory }) => ({ id, project, directory }))).toEqual([
+      { id: 's1', project: '/new/b', directory: '/new/b' },
+      { id: 's2', project: '/new/b', directory: '/old/b-ws' },
+      { id: 's3', project: '/a', directory: '/a' },
+      { id: 's4', project: undefined, directory: '/loose' },
+    ]);
+    expect(before).toEqual(marked());
+  });
+
+  test('AC17 — updateProjectPath of an unmarked project adds no mark', () => {
+    const next = updateProjectPath(marked(), '/a', '/new/a');
+
+    expect(next.projects[0]).toEqual({ path: '/new/a' });
+    expect(next.projects[0]).not.toHaveProperty('mainWorkspace');
+    expect(next.projects[1]).toEqual({ path: '/old/b', mainWorkspace: true });
+  });
+
+  test('AC17 — removeProject takes the mark with the project', () => {
+    const next = removeProject(marked(), '/old/b');
+
+    expect(next.projects).toEqual([{ path: '/a' }, { path: '/c' }]);
+  });
+
+  test('AC17 — a state.json without the field reads as unmarked, version 1, and is not rewritten', () => {
+    seed('{ "version": 1, "projects": [{ "path": "/a" }, { "path": "/b" }] }\n');
+    const before = snapshot();
+
+    const state = loadState(dir);
+
+    expect(state.version).toBe(1);
+    expect(state.projects).toEqual([{ path: '/a' }, { path: '/b' }]);
+    for (const project of state.projects) expect(project.mainWorkspace).not.toBe(true);
+    expect(snapshot()).toEqual(before);
+    expect(backups()).toEqual([]);
   });
 });
 

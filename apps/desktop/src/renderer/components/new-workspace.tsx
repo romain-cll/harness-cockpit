@@ -1,6 +1,6 @@
 import { rootRouteId, useLoaderData, useNavigate, useRouter, useSearch } from '@tanstack/react-router';
 import { ArrowUpIcon, ChevronDownIcon, GitBranchIcon, LoaderCircleIcon, RefreshCwIcon } from 'lucide-react';
-import { useEffect, useState, useSyncExternalStore, type KeyboardEvent } from 'react';
+import { useEffect, useId, useState, useSyncExternalStore, type KeyboardEvent } from 'react';
 import type { AvailableHarness, BranchesResult, Project } from '../../shared/api';
 import { startSession } from '@/components/live-terminals';
 import { claimNavigation } from '@/components/navigation-claim';
@@ -30,6 +30,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { InputGroupTextarea } from '@/components/ui/input-group';
+import { Switch } from '@/components/ui/switch';
 import { setProjectsMessage } from '@/components/workspace-panes';
 
 // The pseudo-harness of "Terminal": no agent CLI. In a workspace it is the setup shell tab; with no project, a session running the login shell.
@@ -148,6 +149,19 @@ function BaseSelect({ branches, base, onChange }: { branches?: BranchesResult; b
   );
 }
 
+// Turned off, a send runs in the project's folder, on the branch checked out, instead of a worktree made from the base.
+function WorktreeSwitch({ checked, onChange }: { checked: boolean; onChange: (checked: boolean) => void }) {
+  const labelId = useId();
+  return (
+    <label className="flex h-6 items-center gap-1.5 px-2 text-xs font-normal">
+      <Switch checked={checked} onCheckedChange={onChange} aria-labelledby={labelId} />
+      <span id={labelId} className={checked ? 'text-foreground' : 'text-muted-foreground'}>
+        Worktree
+      </span>
+    </label>
+  );
+}
+
 function ProjectSelect({ projects, project }: { projects: Project[]; project?: Project }) {
   const navigate = useNavigate();
   return (
@@ -206,8 +220,8 @@ export function restoreDraft(next: Draft) {
 /**
  * The home page: describe a task, pick the project, the agent and the base, send. A send makes the
  * workspace (a worktree on a branch named after the task) and opens its page: the agent runs there on the
- * prompt after the workspace's setup, or "Terminal" shows the setup, then the login shell. With no project
- * the session's own page opens.
+ * prompt after the workspace's setup, or "Terminal" shows the setup, then the login shell. With the Worktree
+ * switch off it runs in the project's folder instead, with no setup. With no project the session's own page opens.
  */
 export function NewWorkspace() {
   const version = useSyncExternalStore(
@@ -234,11 +248,15 @@ function Composer() {
   const [read, setRead] = useState<{ path: string; branches: BranchesResult }>();
   const [picked, setPicked] = useState(draft && { path: draft.project, base: draft.base });
   useEffect(() => void (draft = undefined), []);
+  // The project whose Worktree switch is off (the agent then runs in its folder); the switch is on again once the project changes or the composer is left.
+  const [withoutWorktree, setWithoutWorktree] = useState<string>();
   const [sending, setSending] = useState(false);
   // Why the last send was refused, cleared when the next one starts.
   const [message, setMessage] = useState<string>();
 
   const path = project?.path;
+  if (withoutWorktree !== undefined && withoutWorktree !== path) setWithoutWorktree(undefined);
+  const worktree = withoutWorktree === undefined;
   useEffect(() => {
     if (path === undefined) return;
     let current = true;
@@ -259,7 +277,7 @@ function Composer() {
         ? choice
         : (harnesses[0]?.id ?? TERMINAL);
   const task = prompt.trim();
-  const canSend = task !== '' && agent !== undefined && (project === undefined || (branches?.status === 'listed' && base !== null)) && !sending;
+  const canSend = task !== '' && agent !== undefined && (project === undefined || !worktree || (branches?.status === 'listed' && base !== null)) && !sending;
 
   async function send() {
     if (!canSend || agent === undefined) return;
@@ -269,9 +287,10 @@ function Composer() {
     const mayNavigate = claimNavigation(router.history);
     try {
       const withAgent = agent !== TERMINAL;
-      if (project && base !== null) {
+      if (project && (!worktree || base !== null)) {
         // The workspace exists as a row from the reservation on; the main process makes it and starts the agent.
-        const reserved = await window.api.workspaces.compose(project.path, task, base, agent);
+        // Without a worktree there is no base: it opens the project's folder.
+        const reserved = await window.api.workspaces.compose(project.path, task, worktree ? base : null, agent);
         if (reserved.status === 'refused') {
           // A refusal the user left the page before hearing goes under Projects.
           if (mayNavigate()) setMessage(reserved.message);
@@ -329,7 +348,8 @@ function Composer() {
           <div className="flex items-center gap-1.5">
             <ProjectSelect projects={projects} project={project} />
             <AgentSelect harnesses={harnesses} agent={agent} onChange={setChoice} onDetectAgain={detectAgain} />
-            {project && <BaseSelect branches={branches} base={base} onChange={(next) => path !== undefined && setPicked({ path, base: next })} />}
+            {project && <WorktreeSwitch checked={worktree} onChange={(on) => setWithoutWorktree(on ? undefined : path)} />}
+            {project && worktree && <BaseSelect branches={branches} base={base} onChange={(next) => path !== undefined && setPicked({ path, base: next })} />}
             <Button
               type="submit"
               size="icon"

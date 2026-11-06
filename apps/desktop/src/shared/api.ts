@@ -23,7 +23,7 @@ export interface PtySpawnOptions {
  */
 export type PtySpawnRequest = Pick<PtySpawnOptions, 'cols' | 'rows'> &
   Partial<PtySpawnOptions> & {
-    /** The linked worktree the terminal belongs to: its `cwd` unless one is given, and the daemon lists it with it. */
+    /** The workspace (a linked worktree, or the project folder) the terminal belongs to: its `cwd` unless one is given, and the daemon lists it with it. */
     workspace?: string;
   };
 
@@ -81,12 +81,15 @@ export interface EndedSession {
 
 /**
  * A linked git worktree of a project; `name` is the readable name the composer gave it
- * (`branch.<branch>.cockpitName`), else its branch, or its folder name when detached.
+ * (`branch.<branch>.cockpitName`), else its branch, or its folder name when detached. The main workspace
+ * (`main`) is the project's own folder, named after the branch checked out.
  */
 export interface Workspace {
   path: string;
   name: string;
   branch: string | null;
+  /** The project's main working tree, not a worktree: the workspace the composer makes with its Worktree switch off. */
+  main?: true;
   /** The main process is still setting it up (its worktree, then its session): the row and the page say so. */
   settingUp?: true;
 }
@@ -286,7 +289,7 @@ export type SetupState = 'running' | 'done' | 'failed';
 export type SessionEvent = SessionStatus | 'setup-running' | 'setup-done' | 'setup-failed' | 'exited';
 
 /**
- * `workspace`: run in that linked worktree of a project instead of a new folder. `prompt`: the
+ * `workspace`: run in that workspace of a project (a linked worktree, or the project folder) instead of a new folder. `prompt`: the
  * harness's initial prompt (trimmed; blank means none).
  */
 export interface StartSessionOptions {
@@ -380,9 +383,10 @@ export interface Api {
     /**
      * Reserves a branch named after the task and the worktree's path, answers at once, and makes the worktree
      * then starts `harness` (`terminal`: the setup shell) in the main process, which needs no page for it:
-     * `onSettled` tells the end. A refusal here reserved nothing.
+     * `onSettled` tells the end. A refusal here reserved nothing. A `null` base makes no branch, no worktree and
+     * no setup: the project is marked and `harness` starts in its folder, the main workspace.
      */
-    compose(project: string, task: string, base: string, harness: string): Promise<ComposeResult>;
+    compose(project: string, task: string, base: string | null, harness: string): Promise<ComposeResult>;
     /** The workspaces whose worktree could not be created and that nobody dismissed. */
     failedSetups(): Promise<FailedSetup[]>;
     /** Forgets a failed setup. */
@@ -403,14 +407,14 @@ export interface Api {
     ): Promise<RemoveWorkspaceResult>;
     /** The detected editors and terminals, looked up at each call. */
     apps(): Promise<AppsResult>;
-    /** Shows the worktree in the Finder. Refused when the path is not a linked worktree of the project. */
+    /** Shows the worktree in the Finder. Refused when the path is not a workspace of the project. */
     reveal(project: string, path: string): Promise<OpenWorkspaceResult>;
     /** Opens the worktree in the detected app `app`, and remembers it as the editor or terminal shown first. */
     open(project: string, path: string, app: string): Promise<OpenWorkspaceResult>;
 
     /**
      * The working tree of a workspace (commits, uncommitted edits, untracked files) against its base.
-     * Refused when the path is not a linked worktree of the project, or when there is no base.
+     * Refused when the path is not a workspace of the project, or when there is no base.
      */
     changes(project: string, path: string): Promise<ChangesResult>;
     /** Git's unified diff of one file of `changes`. */
@@ -425,7 +429,7 @@ export interface Api {
     /**
      * Runs `cockpit teardown` (the `teardown` commands of the repository's `.cockpit/config.json`) in the
      * worktree, in a pty owned by the calling window. Refused when the project is not in the app state, the path is
-     * not one of its linked worktrees, or the config is invalid.
+     * not one of its workspaces, or the config is invalid.
      */
     teardown(project: string, path: string, size: { cols: number; rows: number }): Promise<TeardownResult>;
 
@@ -458,7 +462,7 @@ export interface Api {
     /**
      * Runs the harness in a new folder, or in `options.workspace`, in a pty owned by the calling window.
      * The harness `terminal` runs the login shell instead of an agent CLI; it serves a session with no project.
-     * Refused when the project is not in the app state or the path is not one of its linked worktrees.
+     * Refused when the project is not in the app state or the path is not one of its workspaces.
      */
     start(harness: string, size: { cols: number; rows: number }, options?: StartSessionOptions): Promise<StartSessionResult>;
     /**

@@ -31,9 +31,11 @@ import {
   waitForNewSession,
   waitForSelectedTab,
   waitForWorkspacePage,
+  worktreeSwitch,
 } from './composer';
 import { projectColour } from '../src/renderer/components/project-colour';
 import { openPopup } from './composer';
+import { readSwitchLook } from './support/main-workspace';
 import { afterIpcAnswers, countIpcCalls, ipcCalls, stateSnapshot } from './support/projects';
 import { expectNoErrors, launchBuiltWith, makeSessionsFixture, sessionEntries, sessionIdOf, type SessionsFixture } from './support/sessions';
 import {
@@ -306,7 +308,11 @@ describe('new workspace page: built app', () => {
         expect(await select.evaluate((element) => getComputedStyle(element).borderTopLeftRadius), scheme).toBe('8px');
       }
       expect(agent!.x - (project!.x + project!.width), `project to agent, ${scheme}`).toBeCloseTo(6, 0);
-      expect(base!.x - (agent!.x + agent!.width), `agent to base, ${scheme}`).toBeCloseTo(6, 0);
+      // COCKPIT-71 AC1: the Worktree switch sits between the agent select and the base select.
+      expect(await worktreeSwitch(page).count(), `the Worktree switch, ${scheme}`).toBe(1);
+      const control = (await page.evaluate(readSwitchLook))!.control!;
+      expect(control.left - (agent!.x + agent!.width), `agent to switch, ${scheme}`).toBeCloseTo(6, 0);
+      expect(base!.x - control.right, `switch to base, ${scheme}`).toBeCloseTo(6, 0);
       expect(create!.width, scheme).toBeCloseTo(26, 0);
       expect(create!.height, scheme).toBeCloseTo(26, 0);
       expect(create!.x, 'at the right of the toolbar').toBeGreaterThan(base!.x + base!.width);
