@@ -1,8 +1,9 @@
 import { rootRouteId, useLoaderData, useNavigate, useRouter, useSearch } from '@tanstack/react-router';
 import { ArrowUpIcon, ChevronDownIcon, GitBranchIcon, LoaderCircleIcon, RefreshCwIcon } from 'lucide-react';
-import { useEffect, useState, type KeyboardEvent } from 'react';
+import { useEffect, useState, useSyncExternalStore, type KeyboardEvent } from 'react';
 import type { AvailableHarness, BranchesResult, Project } from '../../shared/api';
 import { startSession } from '@/components/live-terminals';
+import { claimNavigation } from '@/components/navigation-claim';
 import { PageHeader } from '@/components/page-header';
 import { ProjectBadge } from '@/components/project-badge';
 import { detectHarnesses, useDetectedHarnesses } from '@/components/start-session-menu';
@@ -29,7 +30,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { InputGroupTextarea } from '@/components/ui/input-group';
-import { addSessionTab, openShellTab } from '@/components/workspace-panes';
+import { setProjectsMessage } from '@/components/workspace-panes';
 
 // The pseudo-harness of "Terminal": no agent CLI. In a workspace it is the setup shell tab; with no project, a session running the login shell.
 const TERMINAL = 'terminal';
@@ -184,6 +185,24 @@ function ProjectSelect({ projects, project }: { projects: Project[]; project?: P
   );
 }
 
+// A refused send, put back in the composer by its "Back to composer" button. Module-level: the button is in the
+// sidebar or on the workspace page, and the composer takes it when it mounts. A new draft mounts a new composer.
+interface Draft {
+  prompt: string;
+  project: string;
+  agent: string;
+  base: string;
+}
+let draft: Draft | undefined;
+let draftVersion = 0;
+const draftListeners = new Set<() => void>();
+
+export function restoreDraft(next: Draft) {
+  draft = next;
+  draftVersion++;
+  for (const listener of draftListeners) listener();
+}
+
 /**
  * The home page: describe a task, pick the project, the agent and the base, send. A send makes the
  * workspace (a worktree on a branch named after the task) and opens its page: the agent runs there on the
@@ -191,6 +210,17 @@ function ProjectSelect({ projects, project }: { projects: Project[]; project?: P
  * the session's own page opens.
  */
 export function NewWorkspace() {
+  const version = useSyncExternalStore(
+    (listener) => {
+      draftListeners.add(listener);
+      return () => void draftListeners.delete(listener);
+    },
+    () => draftVersion,
+  );
+  return <Composer key={version} />;
+}
+
+function Composer() {
   const router = useRouter();
   const navigate = useNavigate();
   const { projects } = useLoaderData({ from: rootRouteId });
@@ -198,13 +228,14 @@ export function NewWorkspace() {
   // `?project=none` is no project; a missing or unknown path is the first project of the sidebar.
   const project = requested === 'none' ? undefined : (projects.find(({ path }) => path === requested) ?? projects[0]);
   const { harnesses, detectAgain } = useHarnesses();
-  const [choice, setChoice] = useState<string>();
-  const [prompt, setPrompt] = useState('');
+  const [choice, setChoice] = useState(draft?.agent);
+  const [prompt, setPrompt] = useState(draft?.prompt ?? '');
   // The branches of a project, and the base picked for it; both belong to the path they were read for.
   const [read, setRead] = useState<{ path: string; branches: BranchesResult }>();
-  const [picked, setPicked] = useState<{ path: string; base: string }>();
+  const [picked, setPicked] = useState(draft && { path: draft.project, base: draft.base });
+  useEffect(() => void (draft = undefined), []);
   const [sending, setSending] = useState(false);
-  // Why the last send was refused, cleared by the next one that succeeds.
+  // Why the last send was refused, cleared when the next one starts.
   const [message, setMessage] = useState<string>();
 
   const path = project?.path;
@@ -233,46 +264,33 @@ export function NewWorkspace() {
   async function send() {
     if (!canSend || agent === undefined) return;
     setSending(true);
+    setMessage(undefined);
+    // The user may go elsewhere while the main process works: the page navigates only if they did not.
+    const mayNavigate = claimNavigation(router.history);
     try {
       const withAgent = agent !== TERMINAL;
       if (project && base !== null) {
-        const created = await window.api.workspaces.create(project.path, task, base);
-        if (created.status === 'refused') {
-          setMessage(created.message);
+        // The workspace exists as a row from the reservation on; the main process makes it and starts the agent.
+        const reserved = await window.api.workspaces.compose(project.path, task, base, agent);
+        if (reserved.status === 'refused') {
+          // A refusal the user left the page before hearing goes under Projects.
+          if (mayNavigate()) setMessage(reserved.message);
+          else setProjectsMessage(reserved.message);
           return;
         }
-        const workspace = created.workspace.path;
-        // The sidebar lists the workspace, whether or not its session starts.
         await router.invalidate();
-        if (withAgent) {
-          const started = await startSession(agent, {
-            workspace: { project: project.path, path: workspace },
-            setup: true,
-            prompt: task,
-            nameFromTitle: true,
-          });
-          if (started.status === 'refused') {
-            setMessage(started.message);
-            return;
-          }
-          addSessionTab(started.session);
-        } else {
-          // "Terminal" is the workspace's setup shell tab, no session.
-          openShellTab(workspace, { setup: true });
-        }
-        setMessage(undefined);
-        await router.invalidate();
-        await navigate({ to: '/workspace', search: { path: workspace } });
+        if (mayNavigate()) await navigate({ to: '/workspace', search: { path: reserved.path } });
         return;
       }
       const started = await startSession(agent, withAgent ? { prompt: task } : undefined);
       if (started.status === 'refused') {
-        setMessage(started.message);
+        // A refusal the user left the page before hearing goes under Projects.
+        if (mayNavigate()) setMessage(started.message);
+        else setProjectsMessage(started.message);
         return;
       }
-      setMessage(undefined);
       await router.invalidate();
-      await navigate({ to: '/sessions/$sessionId', params: { sessionId: started.session.id } });
+      if (mayNavigate()) await navigate({ to: '/sessions/$sessionId', params: { sessionId: started.session.id } });
     } finally {
       setSending(false);
     }

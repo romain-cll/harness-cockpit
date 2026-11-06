@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { mkdir, rm, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { homedir } from 'node:os';
+import { homedir, uptime } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
@@ -13,6 +13,8 @@ import {
   ensureDaemon,
   listDaemonFiles,
   PROTOCOL_VERSION,
+  readTerminals,
+  shutdownDaemon,
   type DaemonClient,
   type SessionReport,
   type SetupState,
@@ -26,6 +28,7 @@ import { apps, defaultApplicationDirs, detectApps, LaunchError, openIn, reveal, 
 import {
   addProject,
   addSession,
+  closeSession,
   loadState,
   NewerStateError,
   ProjectExistsError,
@@ -33,6 +36,7 @@ import {
   removeProject,
   saveState,
   sessionName,
+  type Session,
   updateProjectPath,
   type State,
 } from '@cockpit/state';
@@ -54,6 +58,7 @@ import {
   pushBranch,
   readWorkspaceConfig,
   removalState,
+  reservedPath,
   removeWorktree,
   repairWorktrees,
   watchWorktree,
@@ -82,14 +87,18 @@ import type {
   ChangesResult,
   CloneRequest,
   CommitResult,
+  ComposeResult,
   CreatePullRequestResult,
   CreateRequest,
   CreateWorkspaceResult,
   DaemonStatus,
   DiffResult,
+  EndedSession,
+  FailedSetup,
   ListedTerminal,
   Project,
   OpenWorkspaceResult,
+  OutdatedTerminal,
   PtySpawnOptions,
   PtySpawnRequest,
   PullRequestResult,
@@ -98,10 +107,12 @@ import type {
   RemovalResult,
   RemoveWorkspaceResult,
   SessionStatus,
+  SettledSetup,
   TeardownResult,
   StartSessionOptions,
   StartSessionResult,
   UpdatePathResult,
+  Workspace,
 } from '../shared/api';
 import daemonPath from './daemon?modulePath';
 import { devFolderName } from './dev-folder';
@@ -241,6 +252,23 @@ const sessionStatuses = new Map<string, SessionStatus>();
 // clears the entry.
 const pendingNames = new Map<string, { worktree: string; harness: Harness }>();
 
+// The workspaces the composer sent and the main process is still making (by worktree path): the branch and
+// the path are reserved, the worktree is created, then the agent or the setup shell starts. `projects:list`
+// shows them as rows being set up. In memory only: an app quit during the setup forgets them.
+interface Setup {
+  project: string;
+  path: string;
+  branch: string;
+  base: string;
+  /** A harness id, or `terminal` for the setup shell. */
+  harness: string;
+  task: string;
+}
+const setups = new Map<string, Setup>();
+
+// The sends whose worktree could not be created, kept until the user dismisses them ("Back to composer").
+let failedSetups: FailedSetup[] = [];
+
 // A session's program set a terminal title. The daemon forwards only those between the markers
 // `cockpit setup` writes around the agent, so the setup's and the login shell's never get here. The
 // first one its harness derives from the prompt names the workspace: the branch follows it (`nameWorkspace`) and the windows list again.
@@ -376,6 +404,23 @@ let ownDaemon: Daemon | undefined;
 let startingOwn: Promise<Daemon> | undefined;
 // Why this app's daemon could not start; unset while it can.
 let daemonFailure: string | undefined;
+// The shells and sessions lost with a daemon that died, until a daemon starts again.
+let lostTerminals = 0;
+// The daemons of another protocol that hold a shell or a session, by what they listed at launch. They are
+// not connected to: `GET /terminals` and `POST /shutdown` are all the app says to them.
+let otherDaemons: Array<{ socket: string; terminals: TerminalInfo[] }> = [];
+// The user chose "Later" for them: the dialog is not offered again until the next launch.
+let outdatedDeferred = false;
+
+function daemonStatus(): DaemonStatus {
+  if (daemonFailure !== undefined) return { status: 'down', reason: daemonFailure, log: existsSync(ownFiles.log) };
+  return lostTerminals > 0 ? { status: 'stopped', terminals: lostTerminals } : { status: 'running' };
+}
+
+// Tells every page that the daemon's status may have changed.
+function announceDaemonChange(): void {
+  for (const window of BrowserWindow.getAllWindows()) window.webContents.send('daemon:changed');
+}
 
 function register(daemon: Daemon, info: TerminalInfo, owner?: WebContents): Terminal {
   const terminal: Terminal = { ...info, appId: ++lastTerminalId, daemon, ...(owner && { owner }) };
@@ -389,8 +434,26 @@ function end(daemon: Daemon, remote: number, exit: TerminalExit): void {
   if (!terminal) return;
   daemon.terminals.delete(remote);
   terminals.delete(terminal.appId);
-  if (terminal.sessionId !== undefined) pendingNames.delete(terminal.sessionId);
-  if (terminal.owner && !terminal.owner.isDestroyed()) terminal.owner.send('pty:exit', terminal.appId, exit);
+  if (terminal.sessionId !== undefined) {
+    pendingNames.delete(terminal.sessionId);
+    // A terminal that ended on its own is not lost: only a daemon that died (`exitCode: null`) leaves the mark.
+    // One the page asked to kill (a deleted workspace) is left as it is.
+    if (exit.exitCode !== null && !terminal.closing) markClosed(({ id }) => id === terminal.sessionId);
+  }
+  // One nobody attached to yet (a workspace's, started by the main process) tells every window.
+  const hearers = terminal.owner ? [terminal.owner] : BrowserWindow.getAllWindows().map(({ webContents }) => webContents);
+  for (const contents of hearers) if (!contents.isDestroyed()) contents.send('pty:exit', terminal.appId, exit);
+}
+
+// A workspace session is marked open in `state.json` from its start until its tab closes (`sessions:dismiss`),
+// its terminal exits by itself, or its workspace or project goes (the session stays stored): one still marked that
+// no daemon holds lost its terminal with a daemon.
+function markClosed(match: (session: Session) => boolean): void {
+  const open = state.sessions.filter((session) => session.open && match(session));
+  if (open.length === 0) return;
+  const next = open.reduce((current, { id }) => closeSession(current, id), state);
+  saveState(app.getPath('userData'), next);
+  state = next;
 }
 
 // Takes a connected client into use: its output goes to the window that owns each terminal, its
@@ -407,8 +470,10 @@ async function adopt(client: DaemonClient): Promise<Daemon> {
   client.onTitle((event) => void nameFromTitle(event));
   client.onClose(() => {
     daemon.alive = false;
+    lostTerminals += [...daemon.terminals.values()].filter(({ kind, closing }) => kind !== 'commands' && !closing).length;
     for (const remote of daemon.terminals.keys()) end(daemon, remote, { exitCode: null, signal: null });
     if (ownDaemon === daemon) ownDaemon = undefined;
+    announceDaemonChange();
   });
   for (const info of await client.list().catch(() => [])) {
     if (info.kind === 'commands') continue;
@@ -442,24 +507,31 @@ function spawnDaemon(): ChildProcess {
 
 // This app's daemon, started when it is not running. Rejects with the reason it cannot start.
 function ensureOwnDaemon(): Promise<Daemon> {
-  if (ownDaemon?.alive) return Promise.resolve(ownDaemon);
+  if (ownDaemon?.alive) {
+    // Terminals lost with another build's daemon are over: nothing stopped is left to restart.
+    if (lostTerminals > 0) {
+      lostTerminals = 0;
+      announceDaemonChange();
+    }
+    return Promise.resolve(ownDaemon);
+  }
   startingOwn ??= (async () => {
+    const before = JSON.stringify(daemonStatus());
     try {
       ownDaemon = await adopt(await ensureDaemon({ home: cockpitHome, build: daemonBuild, spawn: spawnDaemon }));
       daemonFailure = undefined;
+      lostTerminals = 0;
       return ownDaemon;
     } catch (error) {
       daemonFailure = error instanceof Error ? error.message : String(error);
       throw new Error(daemonFailure);
     } finally {
       startingOwn = undefined;
+      if (JSON.stringify(daemonStatus()) !== before) announceDaemonChange();
     }
   })();
   return startingOwn;
 }
-
-const daemonStatus = (): DaemonStatus =>
-  daemonFailure === undefined ? { status: 'running' } : { status: 'down', reason: daemonFailure, log: existsSync(ownFiles.log) };
 
 // Connects to this app's daemon, starting it when needed, and to the daemons of other builds that
 // still hold terminals (their app was updated): the older ones first, so the terminals list in
@@ -478,6 +550,16 @@ async function connectDaemons(): Promise<void> {
     } catch (error) {
       // Stale files of a daemon that is gone say nothing; one that is there and silent is noted.
       if (error instanceof DaemonNotAnsweringError) console.error(`Cockpit skipped a background service of another build: ${error.message}`);
+    }
+  }
+  // The daemons of other protocols are listed, never connected to: their terminals are the dialog's.
+  for (const { socket } of listDaemonFiles(cockpitHome).filter(({ protocol }) => protocol !== PROTOCOL_VERSION)) {
+    try {
+      const held = (await readTerminals(socket)).filter(({ kind }) => kind !== 'commands');
+      if (held.length > 0) otherDaemons.push({ socket, terminals: held });
+    } catch (error) {
+      // Stale files of a daemon that is gone say nothing; one that is there and silent is noted.
+      if (error instanceof DaemonNotAnsweringError) console.error(`Cockpit skipped a background service of another protocol: ${error.message}`);
     }
   }
   try {
@@ -501,18 +583,19 @@ function startTerminals() {
     terminal.daemon.client.kill(terminal.id);
   };
 
-  // Spawns with the defaults, for the window that will receive the output. A spawn that resolves
+  // Spawns with the defaults, for the window that will receive the output (none: the main process starts
+  // it for a workspace being set up, and the page that shows it attaches later). A spawn that resolves
   // after its page navigated or was destroyed (the daemon was busy) is killed at once: no page is
   // left to own it, and it throws `PageGoneError`. `before` is the page's ending count the caller
   // read when it started waiting.
   const spawnFor = async (
-    contents: WebContents,
+    contents: WebContents | undefined,
     request: PtySpawnRequest,
-    { kind, sessionId, workspace, before = endingsOf(contents) }: { kind: TerminalKind; sessionId?: string; workspace?: string; before?: number },
+    { kind, sessionId, workspace, before = contents && endingsOf(contents) }: { kind: TerminalKind; sessionId?: string; workspace?: string; before?: number },
   ) => {
     const daemon = await ensureOwnDaemon();
     const options = await withSpawnDefaults(request);
-    const { cwd, cols, rows } = options;
+    const { command, cwd, cols, rows } = options;
     const remote = await daemon.client.spawn({
       kind,
       ...options,
@@ -521,10 +604,10 @@ function startTerminals() {
     });
     const terminal = register(
       daemon,
-      { id: remote, kind, cwd, cols, rows, ...(sessionId !== undefined && { sessionId }), ...(workspace !== undefined && { workspace }) },
+      { id: remote, kind, command, cwd, cols, rows, ...(sessionId !== undefined && { sessionId }), ...(workspace !== undefined && { workspace }) },
       contents,
     );
-    if (contents.isDestroyed() || endingsOf(contents) !== before) {
+    if (contents && (contents.isDestroyed() || endingsOf(contents) !== before)) {
       kill(terminal.appId);
       throw new PageGoneError();
     }
@@ -533,12 +616,9 @@ function startTerminals() {
 
   ipcMain.handle('pty:spawn', (event, request: PtySpawnRequest) => {
     if (!isFromApp(event)) throw new Error('pty:spawn refused: unexpected origin');
-    // A shell of a workspace runs in its worktree; with `setup` it is `cockpit setup --shell`.
-    const { workspace, setup, ...options } = request;
-    const spawning: PtySpawnRequest =
-      workspace === undefined
-        ? options
-        : { cwd: workspace, ...(setup && { command: cliPath, args: ['setup', '--shell'] }), ...options };
+    // A shell of a workspace runs in its worktree.
+    const { workspace, ...options } = request;
+    const spawning: PtySpawnRequest = workspace === undefined ? options : { cwd: workspace, ...options };
     // The reply of a page that is gone reaches no one: the handler does not reject for it.
     return spawnFor(event.sender, spawning, { kind: 'shell', workspace }).catch((error: unknown) => {
       if (error instanceof PageGoneError) return -1;
@@ -612,6 +692,42 @@ function startTerminals() {
     await shell.openPath(ownFiles.log);
   });
 
+  // The terminals of daemons of another protocol, for the dialog that offers to end them.
+  ipcMain.handle('daemon:outdated', (event): OutdatedTerminal[] => {
+    if (!isFromApp(event)) throw new Error('daemon:outdated refused: unexpected origin');
+    if (outdatedDeferred) return [];
+    return otherDaemons.flatMap(({ terminals: held }) =>
+      held.map(({ kind, command, sessionId, status }) => {
+        const session = sessionId === undefined ? undefined : state.sessions.find(({ id }) => id === sessionId);
+        return {
+          kind: kind === 'session' ? 'session' : 'shell',
+          name: session?.name ?? (kind === 'session' ? 'Session' : 'Terminal'),
+          program: harnesses.find(({ id }) => id === session?.harness)?.name ?? basename(command),
+          ...(status && { status }),
+        };
+      }),
+    );
+  });
+  ipcMain.handle('daemon:restart', async (event): Promise<{ status: 'restarted' } | Refused> => {
+    if (!isFromApp(event)) throw new Error('daemon:restart refused: unexpected origin');
+    const remaining: typeof otherDaemons = [];
+    let failure: string | undefined;
+    for (const daemon of otherDaemons) {
+      try {
+        await shutdownDaemon(daemon.socket);
+      } catch (error) {
+        remaining.push(daemon);
+        failure ??= error instanceof Error ? error.message : String(error);
+      }
+    }
+    otherDaemons = remaining;
+    return failure === undefined ? { status: 'restarted' } : { status: 'refused', message: failure };
+  });
+  ipcMain.handle('daemon:later', (event) => {
+    if (!isFromApp(event)) throw new Error('daemon:later refused: unexpected origin');
+    outdatedDeferred = true;
+  });
+
   return { spawnFor, endingsOf, kill };
 }
 
@@ -632,9 +748,16 @@ async function toProject({ path }: { path: string }): Promise<Project> {
   if (gone) return { ...project, workspaces: [], missing: true };
   try {
     const worktrees = await listWorktrees(path, { env: await shellEnv });
-    const workspaces = worktrees
+    const workspaces: Workspace[] = worktrees
       .filter((worktree) => !worktree.main)
       .map(({ path, branch, name }) => ({ path, name: name ?? branch ?? basename(path), branch }));
+    // A workspace being set up is a row from the reservation on, whether git lists its worktree yet or not.
+    for (const setup of setups.values()) {
+      if (setup.project !== path) continue;
+      const listed = workspaces.find((workspace) => workspace.path === setup.path);
+      if (listed) listed.settingUp = true;
+      else workspaces.push({ path: setup.path, name: setup.branch, branch: setup.branch, settingUp: true });
+    }
     return { ...project, workspaces };
   } catch (error) {
     if (!(error instanceof WorkspaceError)) throw error;
@@ -642,11 +765,34 @@ async function toProject({ path }: { path: string }): Promise<Project> {
   }
 }
 
+// What a refused worktree creation says, for the errors that name the branch or the worktrees folder.
+function creationRefusal(error: WorkspaceError, name: string): string | undefined {
+  if (error.code === 'BRANCH_EXISTS') return `A branch named ${name} already exists.`;
+  if (error.code === 'INVALID_BRANCH_NAME') return `${name} is not a valid branch name.`;
+  if (error.code === 'FS_FAILED') {
+    const errno = (error.cause as NodeJS.ErrnoException | undefined)?.code ?? error.message;
+    return `Cockpit could not create its worktrees folder ${worktreesRoot}: ${errno}.`;
+  }
+  return undefined;
+}
+
+// The terminal size a workspace's first terminal starts at; the page that shows it resizes it.
+const SETUP_SIZE = { cols: 80, rows: 24 };
+
+// Tells every window that a workspace stopped setting up.
+function settle(settled: SettledSetup): void {
+  for (const window of BrowserWindow.getAllWindows()) window.webContents.send('workspaces:settled', settled);
+}
+
 // git is checked on the first `projects:git` call and the answer kept for the launch.
 let gitCheck: Promise<'ok' | 'missing'> | undefined;
 
 // The projects the user added, kept in `state.json`.
-function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typeof startTerminals>): void {
+function startProjects(
+  userData: string,
+  { spawnFor, endingsOf }: ReturnType<typeof startTerminals>,
+  startSession: ReturnType<typeof startSessions>,
+): void {
   ipcMain.handle('projects:list', (event) => {
     if (!isFromApp(event)) throw new Error('projects:list refused: unexpected origin');
     return Promise.all(state.projects.map(toProject));
@@ -808,6 +954,7 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
     if (next.projects.length === state.projects.length) return;
     saveState(userData, next);
     state = next;
+    markClosed(({ project }) => project === path);
   });
 
   // The project at `from` moved: the user picks its repository again. Its worktrees are reconnected after the
@@ -878,15 +1025,80 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
         return { status: 'created', workspace: { path, name: branch ?? basename(path), branch } };
       },
       (error) => {
-        if (error.code === 'BRANCH_EXISTS') return { status: 'refused', message: `A branch named ${name} already exists.` };
-        if (error.code === 'INVALID_BRANCH_NAME') return { status: 'refused', message: `${name} is not a valid branch name.` };
-        if (error.code === 'FS_FAILED') {
-          const errno = (error.cause as NodeJS.ErrnoException | undefined)?.code ?? error.message;
-          return { status: 'refused', message: `Cockpit could not create its worktrees folder ${worktreesRoot}: ${errno}.` };
-        }
-        return undefined;
+        const message = creationRefusal(error, name);
+        return message === undefined ? undefined : { status: 'refused', message };
       },
     );
+  });
+
+  // Makes the worktree, then starts the agent (or the setup shell) in it, with no page: the workspace page
+  // may be gone, reloaded or elsewhere meanwhile. The row is a "setting up" one until this ends.
+  async function runSetup({ project, path, branch, base, harness, task }: Setup): Promise<void> {
+    try {
+      await createWorktree({ repo: project, root: worktreesRoot, branch, base, env: await shellEnv });
+    } catch (error) {
+      const message =
+        error instanceof WorkspaceError ? (creationRefusal(error, branch) ?? describeFailure(error, project)) : error instanceof Error ? error.message : String(error);
+      failedSetups.push({ id: randomUUID(), project, path, name: branch, message, prompt: task, agent: harness, base });
+      setups.delete(path);
+      settle({ path });
+      return;
+    }
+    let message: string | undefined;
+    try {
+      if (harness === 'terminal') {
+        // As the agent's start does: no shell for a project that is gone.
+        const found = await findWorkspace({ project, path });
+        if ('status' in found) message = found.message;
+        // The repository's setup, then the login shell.
+        else await spawnFor(undefined, { ...SETUP_SIZE, cwd: path, command: cliPath, args: ['setup', '--shell'] }, { kind: 'shell', workspace: path });
+      } else {
+        const started = await startSession(undefined, harness, SETUP_SIZE, {
+          workspace: { project, path },
+          setup: true,
+          prompt: task,
+          nameFromTitle: true,
+        });
+        if (started.status === 'refused') message = started.message;
+      }
+    } catch (error) {
+      message = `Could not start Terminal: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    setups.delete(path);
+    settle({ path, ...(message !== undefined && { message }) });
+  }
+
+  // Reserves the branch and the worktree's path, answers, and sets the workspace up in the background.
+  ipcMain.handle('workspaces:compose', (event, project: string, task: string, base: string, harness: string): Promise<ComposeResult> => {
+    let name = task;
+    return forProject<ComposeResult>(
+      event,
+      'workspaces:compose',
+      project,
+      async () => {
+        const env = await shellEnv;
+        const reserved = [...setups.values()].filter((setup) => setup.project === project).map((setup) => setup.branch);
+        name = await availableBranch(project, task, { env, root: worktreesRoot, reserved });
+        const path = await reservedPath({ repo: project, root: worktreesRoot, branch: name, env });
+        const setup: Setup = { project, path, branch: name, base, harness, task };
+        setups.set(path, setup);
+        void runSetup(setup);
+        return { status: 'reserved', path, name };
+      },
+      (error) => {
+        const message = creationRefusal(error, name);
+        return message === undefined ? undefined : { status: 'refused', message };
+      },
+    );
+  });
+
+  ipcMain.handle('workspaces:failed-setups', (event): FailedSetup[] => {
+    if (!isFromApp(event)) throw new Error('workspaces:failed-setups refused: unexpected origin');
+    return failedSetups;
+  });
+  ipcMain.handle('workspaces:dismiss-setup', (event, id: string): void => {
+    if (!isFromApp(event)) throw new Error('workspaces:dismiss-setup refused: unexpected origin');
+    failedSetups = failedSetups.filter((failed) => failed.id !== id);
   });
 
   ipcMain.handle('workspaces:removal', (event, project: string, path: string): Promise<RemovalResult> =>
@@ -917,10 +1129,14 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
             forceBranch: options.forceBranch,
             env: await shellEnv,
           });
+          markClosed(({ directory }) => directory === path);
           return { status: 'removed', branchKept: false };
         },
         (error) => {
-          if (error.code === 'BRANCH_NOT_MERGED') return { status: 'removed', branchKept: true };
+          if (error.code === 'BRANCH_NOT_MERGED') {
+            markClosed(({ directory }) => directory === path);
+            return { status: 'removed', branchKept: true };
+          }
           if (error.code === 'DIRTY_WORKTREE') return { status: 'dirty' };
           return undefined;
         },
@@ -1161,8 +1377,8 @@ function startProjects(userData: string, { spawnFor, endingsOf }: ReturnType<typ
 // Sessions outside any project: an agent CLI run in a folder of its own under
 // the Cockpit home, in a pty of the daemon. The sessions are kept in `state.json`; the pty runs on
 // when the page or the app goes (and ends with the daemon: a start after it died starts a new one),
-// the folder stays.
-function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnType<typeof startTerminals>): void {
+// the folder stays. Returns the start, which the main process also runs itself, for no page.
+function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnType<typeof startTerminals>) {
   // Detected on the first call that needs it, never at startup: detecting runs
   // each CLI's `--version`, and an app that never starts a session should not.
   let detection: Promise<DetectedHarness[]> | undefined;
@@ -1184,97 +1400,120 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
     return [...state.sessions].reverse();
   });
 
-  ipcMain.handle(
-    'sessions:start',
-    async (event, harnessId: string, size: { cols: number; rows: number }, options?: StartSessionOptions): Promise<StartSessionResult> => {
-      if (!isFromApp(event)) throw new Error('sessions:start refused: unexpected origin');
-      // A page that ends while detection or the worktree check runs starts nothing.
-      const endings = endingsOf(event.sender);
-      // `terminal` is no agent CLI: the login shell, always available, never detected.
-      const login = harnessId === 'terminal';
-      const catalogued = harnesses.find(({ id }) => id === harnessId);
-      const found = login ? undefined : (await detected()).find(({ id }) => id === harnessId);
-      const harness = login ? { id: 'terminal', name: 'Terminal' } : catalogued;
-      if (!harness || (!login && !found)) return { status: 'refused', message: `${harness?.name ?? harnessId} is not installed.` };
-      // Detected at launch, removed since: nothing is created or spawned.
-      if (found && !isFile(found.path)) return { status: 'refused', message: `Could not start ${harness.name}: ${found.path} not found.` };
-      // The agent runs in the daemon: without it nothing is created, spawned or stored.
-      try {
-        await ensureOwnDaemon();
-      } catch (error) {
-        return { status: 'refused', message: `Could not start ${harness.name}: ${error instanceof Error ? error.message : String(error)}` };
-      }
+  // The workspace sessions still marked open that no daemon holds, in creation order: their terminal was lost
+  // with a daemon. One that began before the Mac started proves a restart.
+  ipcMain.handle('sessions:ended', (event): EndedSession[] => {
+    if (!isFromApp(event)) throw new Error('sessions:ended refused: unexpected origin');
+    const held = new Set([...terminals.values(), ...otherDaemons.flatMap((daemon) => daemon.terminals)].flatMap(({ sessionId }) => (sessionId === undefined ? [] : [sessionId])));
+    const bootedAt = Date.now() - uptime() * 1000;
+    return state.sessions
+      .filter(({ id, open, project }) => open && project !== undefined && !held.has(id))
+      .map(({ id, createdAt }) => ({ sessionId: id, reboot: Date.parse(createdAt) < bootedAt }));
+  });
+  ipcMain.handle('sessions:dismiss', (event, sessionId: string) => {
+    if (!isFromApp(event)) throw new Error('sessions:dismiss refused: unexpected origin');
+    markClosed(({ id }) => id === sessionId);
+  });
 
-      // In a workspace the session runs in the worktree, which is the user's: nothing is created
-      // or removed there. Otherwise it gets a folder of its own, removed if the start fails.
-      const workspace = options?.workspace;
-      if (workspace) {
-        const found = await findWorkspace(workspace);
-        if ('status' in found) return found;
+  // Starts the harness for `contents`, the window that owns the terminal, or for none.
+  async function startSession(
+    contents: WebContents | undefined,
+    harnessId: string,
+    size: { cols: number; rows: number },
+    options?: StartSessionOptions,
+  ): Promise<StartSessionResult> {
+    // A page that ends while detection or the worktree check runs starts nothing.
+    const endings = contents && endingsOf(contents);
+    // `terminal` is no agent CLI: the login shell, always available, never detected.
+    const login = harnessId === 'terminal';
+    const catalogued = harnesses.find(({ id }) => id === harnessId);
+    const found = login ? undefined : (await detected()).find(({ id }) => id === harnessId);
+    const harness = login ? { id: 'terminal', name: 'Terminal' } : catalogued;
+    if (!harness || (!login && !found)) return { status: 'refused', message: `${harness?.name ?? harnessId} is not installed.` };
+    // Detected at launch, removed since: nothing is created or spawned.
+    if (found && !isFile(found.path)) return { status: 'refused', message: `Could not start ${harness.name}: ${found.path} not found.` };
+    // The agent runs in the daemon: without it nothing is created, spawned or stored.
+    try {
+      await ensureOwnDaemon();
+    } catch (error) {
+      return { status: 'refused', message: `Could not start ${harness.name}: ${error instanceof Error ? error.message : String(error)}` };
+    }
+
+    // In a workspace the session runs in the worktree, which is the user's: nothing is created
+    // or removed there. Otherwise it gets a folder of its own, removed if the start fails.
+    const workspace = options?.workspace;
+    if (workspace) {
+      const found = await findWorkspace(workspace);
+      if ('status' in found) return found;
+    }
+    if (contents && endingsOf(contents) !== endings) {
+      return { status: 'refused', message: `Could not start ${harness.name}: the page that asked for it is gone` };
+    }
+    const id = randomUUID();
+    const directory = workspace?.path ?? join(cockpitHome, 'sessions', id);
+    const prompt = options?.prompt?.trim() || undefined;
+    let ptyId: number | undefined;
+    try {
+      if (!workspace) mkdirSync(directory, { recursive: true });
+      let env = await terminalEnv({
+        COCKPIT_SESSION_ID: id,
+        ...(workspace && { COCKPIT_WORKSPACE_PATH: workspace.path }),
+      });
+      const viaSetup = workspace && options?.setup;
+      let command: { command?: string; args?: string[] };
+      if (catalogued && found) {
+        // The harness is told, through its arguments and environment, to report its status to the daemon.
+        const status = await statusLaunch(catalogued.id, { cli: cliPath, pluginsDir: join(cockpitHome, 'plugins'), env });
+        env = status.env as Record<string, string>;
+        // From the composer the terminal runs `cockpit setup`, which runs the repository's setup, then
+        // the agent, then the login shell. The agent follows `--then` by the path detection found, so
+        // that binary is the one that runs.
+        const agentArgs = [...status.args, ...catalogued.start(prompt)];
+        command = viaSetup
+          ? { command: cliPath, args: ['setup', '--shell', '--then', found.path, ...agentArgs] }
+          : { command: found.path, args: agentArgs };
+      } else {
+        // The login shell: the spawn defaults run `$SHELL -l`.
+        command = {};
       }
-      if (endingsOf(event.sender) !== endings) {
-        return { status: 'refused', message: `Could not start ${harness.name}: the page that asked for it is gone` };
+      // The composer names the workspace after the first title the agent derives from the prompt. The
+      // entry exists before the spawn, so no title can arrive ahead of it.
+      if (workspace && options?.nameFromTitle && catalogued) {
+        pendingNames.set(id, { worktree: workspace.path, harness: catalogued });
       }
-      const id = randomUUID();
-      const directory = workspace?.path ?? join(cockpitHome, 'sessions', id);
-      const prompt = options?.prompt?.trim() || undefined;
-      let ptyId: number | undefined;
-      try {
-        if (!workspace) mkdirSync(directory, { recursive: true });
-        let env = await terminalEnv({
-          COCKPIT_SESSION_ID: id,
-          ...(workspace && { COCKPIT_WORKSPACE_PATH: workspace.path }),
-        });
-        const viaSetup = workspace && options?.setup;
-        let command: { command?: string; args?: string[] };
-        if (catalogued && found) {
-          // The harness is told, through its arguments and environment, to report its status to the daemon.
-          const status = await statusLaunch(catalogued.id, { cli: cliPath, pluginsDir: join(cockpitHome, 'plugins'), env });
-          env = status.env as Record<string, string>;
-          // From the composer the terminal runs `cockpit setup`, which runs the repository's setup, then
-          // the agent, then the login shell. The agent follows `--then` by the path detection found, so
-          // that binary is the one that runs.
-          const agentArgs = [...status.args, ...catalogued.start(prompt)];
-          command = viaSetup
-            ? { command: cliPath, args: ['setup', '--shell', '--then', found.path, ...agentArgs] }
-            : { command: found.path, args: agentArgs };
-        } else {
-          // The login shell: the spawn defaults run `$SHELL -l`.
-          command = {};
-        }
-        // The composer names the workspace after the first title the agent derives from the prompt. The
-        // entry exists before the spawn, so no title can arrive ahead of it.
-        if (workspace && options?.nameFromTitle && catalogued) {
-          pendingNames.set(id, { worktree: workspace.path, harness: catalogued });
-        }
-        ptyId = await spawnFor(
-          event.sender,
-          { ...size, ...command, cwd: directory, env },
-          { kind: 'session', sessionId: id, workspace: workspace?.path, before: endings },
-        );
-        const session = {
-          id,
-          name: sessionName(state, harness, workspace?.path),
-          harness: harness.id,
-          directory,
-          createdAt: new Date().toISOString(),
-          ...(workspace && { project: workspace.project }),
-        };
-        const next = addSession(state, session);
-        saveState(userData, next);
-        state = next;
-        return { status: 'started', session, ptyId };
-      } catch (error) {
-        pendingNames.delete(id);
-        if (ptyId !== undefined) kill(ptyId);
-        if (!workspace) rmSync(directory, { recursive: true, force: true });
-        return {
-          status: 'refused',
-          message: `Could not start ${harness.name}: ${error instanceof Error ? error.message : String(error)}`,
-        };
-      }
-    },
-  );
+      ptyId = await spawnFor(
+        contents,
+        { ...size, ...command, cwd: directory, env },
+        { kind: 'session', sessionId: id, workspace: workspace?.path, before: endings },
+      );
+      const session = {
+        id,
+        name: sessionName(state, harness, workspace?.path),
+        harness: harness.id,
+        directory,
+        createdAt: new Date().toISOString(),
+        ...(workspace && { project: workspace.project, open: true }),
+      };
+      const next = addSession(state, session);
+      saveState(userData, next);
+      state = next;
+      return { status: 'started', session, ptyId };
+    } catch (error) {
+      pendingNames.delete(id);
+      if (ptyId !== undefined) kill(ptyId);
+      if (!workspace) rmSync(directory, { recursive: true, force: true });
+      return {
+        status: 'refused',
+        message: `Could not start ${harness.name}: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  ipcMain.handle('sessions:start', (event, harnessId: string, size: { cols: number; rows: number }, options?: StartSessionOptions) => {
+    if (!isFromApp(event)) throw new Error('sessions:start refused: unexpected origin');
+    return startSession(event.sender, harnessId, size, options);
+  });
+  return startSession;
 }
 
 // Why `gh` could not read a pull request, as shown in the Changes sidebar.
@@ -1343,8 +1582,7 @@ void app.whenReady().then(async () => {
   });
   await connectDaemons();
   const pty = startTerminals();
-  startProjects(userData, pty);
-  startSessions(userData, pty);
+  startProjects(userData, pty, startSessions(userData, pty));
 
   createWindow();
 

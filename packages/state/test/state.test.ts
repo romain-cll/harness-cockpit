@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import {
   addProject,
   addSession,
+  closeSession,
   loadState,
   NewerStateError,
   ProjectExistsError,
@@ -916,5 +917,64 @@ describe('COCKPIT-72 AC22 — updateProjectPath', () => {
     expect(() => updateProjectPath(before, '/old/b', '/c')).toThrow(ProjectExistsError);
 
     expect(before).toEqual(state());
+  });
+});
+
+describe('COCKPIT-69 AC13 — the open mark of a workspace session', () => {
+  const workspaceSession = (overrides: Partial<Session> = {}) => session({ project: '/repo', directory: '/home/.cockpit/worktrees/repo-1234abcd/a', ...overrides });
+
+  test('AC13 — an open mark is read as written, true or false, without rewriting the file; a session stored without one reads as it was', () => {
+    const stored = [workspaceSession({ id: 'a', open: true }), workspaceSession({ id: 'b', open: false }), workspaceSession({ id: 'c' })];
+    seed(`${JSON.stringify({ version: 1, sessions: stored })}\n`);
+    const before = snapshot();
+
+    const state = loadState(dir);
+
+    expect(state.sessions).toEqual(stored);
+    expect(state.sessions[2]).not.toHaveProperty('open');
+    expect(snapshot()).toEqual(before);
+    expect(backups()).toEqual([]);
+  });
+
+  test.each([
+    ['a string', '"yes"'],
+    ['a number', '1'],
+    ['null', 'null'],
+    ['an object', '{}'],
+  ])('AC13 — a session whose open mark is %s sets the file aside', (_name, open) => {
+    const content = `{ "version": 1, "sessions": [{ "id": "a", "name": "Claude Code 1", "harness": "claude-code", "directory": "/d", "createdAt": "2026-10-23T10:00:00.000Z", "project": "/repo", "open": ${open} }] }\n`;
+    seed(content);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    expect(loadState(dir)).toEqual({ version: 1, projects: [], sessions: [] });
+
+    const found = backups();
+    expect(found).toHaveLength(1);
+    expect(readFileSync(join(dir, found[0]!), 'utf8')).toBe(content);
+  });
+
+  test('AC13 — closeSession clears the mark of that session only, leaves the given state alone and keeps the other fields; the result is saved and loads back unchanged', () => {
+    const state = { version: 1, extra: 'kept', projects: [{ path: '/repo' }], sessions: [workspaceSession({ id: 'a', open: true }), workspaceSession({ id: 'b', open: true })] };
+
+    const next = closeSession(state, 'a');
+
+    expect(next.sessions[0]!.open).not.toBe(true);
+    expect(next.sessions[0]).toMatchObject({ id: 'a', name: 'Claude Code 1', harness: 'claude-code', project: '/repo' });
+    expect(next.sessions[1]).toEqual(state.sessions[1]);
+    expect(next).toMatchObject({ extra: 'kept', projects: [{ path: '/repo' }] });
+    expect(state.sessions[0]!.open).toBe(true);
+    expect(next).not.toBe(state);
+
+    mkdirSync(dir, { recursive: true });
+    saveState(dir, next);
+    const before = snapshot();
+    expect(loadState(dir).sessions).toEqual(next.sessions);
+    expect(snapshot()).toEqual(before);
+  });
+
+  test('AC13 — closeSession with an id no session has returns the same sessions', () => {
+    const state = { version: 1, projects: [], sessions: [workspaceSession({ id: 'a', open: true })] };
+
+    expect(closeSession(state, 'nobody').sessions).toEqual(state.sessions);
   });
 });

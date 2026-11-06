@@ -172,18 +172,44 @@ function freeName(text: string, taken: Set<string>): string {
 /**
  * The branch name for `text` in `repo`: its slug, with `-2`, `-3`… appended while a local branch has that
  * name. With `root` (the worktrees root) a name whose worktree folder exists there is taken too: a renamed
- * workspace keeps its folder, so the name its branch left would be refused by the next creation.
+ * workspace keeps its folder, so the name its branch left would be refused by the next creation. The
+ * `reserved` names (workspaces being set up, which have no branch yet) are taken as well.
  */
-export async function availableBranch(repo: string, text: string, { env, root }: GitEnv & { root?: string } = {}): Promise<string> {
+export async function availableBranch(
+  repo: string,
+  text: string,
+  { env, root, reserved = [] }: GitEnv & { root?: string; reserved?: string[] } = {},
+): Promise<string> {
   await checkGit(env);
   const main = await repositoryRoot(repo, env);
   const taken = await localBranches(main, env);
+  for (const name of reserved) taken.add(name);
   if (root === undefined) return freeName(text, taken);
   const folder = join(root, projectFolder(main));
   const slug = branchSlug(text);
   let name = slug;
   for (let n = 2; taken.has(name) || (await exists(join(folder, name))); n++) name = `${slug}-${n}`;
   return name;
+}
+
+/**
+ * Creates `requestedRoot` if needed and gives its canonical path, so the paths built from it match the ones git
+ * reports (symbolic links, macOS `/var`). One that cannot be created is `FS_FAILED`, naming the errno code.
+ */
+async function canonicalRoot(requestedRoot: string): Promise<string> {
+  try {
+    await mkdir(requestedRoot, { recursive: true });
+    return await realpath(requestedRoot);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? (error instanceof Error ? error.message : String(error));
+    throw new WorkspaceError('FS_FAILED', `cannot create ${requestedRoot}: ${code}`, { cause: error });
+  }
+}
+
+/** The path `createWorktree` gives the worktree of `branch`, creating `root` as it does (`FS_FAILED` when it cannot). */
+export async function reservedPath({ repo, root, branch, env }: { repo: string; root: string; branch: string } & GitEnv): Promise<string> {
+  await checkGit(env);
+  return join(await canonicalRoot(root), projectFolder(await repositoryRoot(repo, env)), branch);
 }
 
 const queues = new Map<string, Promise<void>>();
@@ -240,15 +266,7 @@ export async function createWorktree({
     if (base !== undefined && exists) throw new WorkspaceError('BRANCH_EXISTS', `branch already exists: ${branch}`);
     // Canonical, so the paths built from it match the ones git reports (symbolic links, macOS `/var`).
     // Created only now that every check passed, so a refusal leaves no folder behind.
-    let root: string;
-    try {
-      await mkdir(requestedRoot, { recursive: true });
-      root = await realpath(requestedRoot);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code ?? (error instanceof Error ? error.message : String(error));
-      throw new WorkspaceError('FS_FAILED', `cannot create ${requestedRoot}: ${code}`, { cause: error });
-    }
-    const path = join(root, project, branch);
+    const path = join(await canonicalRoot(requestedRoot), project, branch);
     const registered = (await findLinked(await list(main, env), path)) !== undefined;
 
     try {

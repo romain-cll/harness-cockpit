@@ -1,4 +1,4 @@
-export { connectDaemon, DaemonNotAnsweringError, ensureDaemon } from './client';
+export { connectDaemon, DaemonNotAnsweringError, ensureDaemon, readTerminals, shutdownDaemon } from './client';
 export type { DaemonChild, DaemonClient, EnsureDaemonOptions, TimeoutOptions } from './client';
 export { reportReady, runDaemonEntry } from './entry';
 export type { EntryIo } from './entry';

@@ -43,9 +43,11 @@ function mapPane(layout: Layout, id: string, change: (pane: Pane) => Layout): La
   return { ...layout, first: mapPane(layout.first, id, change), second: mapPane(layout.second, id, change) };
 }
 
-/** A new tab at the end of the pane, selected. */
+/** A new tab at the end of the pane, selected; unchanged when a pane already holds the tab. */
 export const addTab = (layout: Layout, pane: string, tab: string): Layout =>
-  mapPane(layout, pane, (found) => ({ ...found, tabs: [...found.tabs, tab], selected: tab }));
+  panesOf(layout).some(({ tabs }) => tabs.includes(tab))
+    ? layout
+    : mapPane(layout, pane, (found) => ({ ...found, tabs: [...found.tabs, tab], selected: tab }));
 
 export const selectTab = (layout: Layout, pane: string, tab: string): Layout =>
   mapPane(layout, pane, (found) => ({ ...found, selected: tab }));
@@ -199,3 +201,9 @@ const rank = (label: string) => {
 export function workspaceStatus(labels: string[]): string | null {
   return labels.reduce<string | null>((best, label) => (best === null || rank(label) < rank(best) ? label : best), null);
 }
+
+/** The banner of a page after the daemon died with `count` terminals. */
+export const stoppedMessage = (count: number) => `Background service stopped · ${count} terminal${count === 1 ? '' : 's'} ended`;
+
+/** The sentence of the dialog that offers to end the terminals of a daemon of another protocol. */
+export const restartMessage = (count: number) => `Restarting it ends ${count === 1 ? 'this terminal' : `these ${count} terminals`}:`;

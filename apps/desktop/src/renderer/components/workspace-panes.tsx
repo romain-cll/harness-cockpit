@@ -1,9 +1,10 @@
 import { useRouter } from '@tanstack/react-router';
 import { Columns2Icon, CopyIcon, PanelLeftOpenIcon, PlusIcon, Rows2Icon, SquareTerminalIcon, XIcon } from 'lucide-react';
-import { useRef, useState, useSyncExternalStore } from 'react';
-import type { Project, Session, StartSessionResult, Workspace } from '../../shared/api';
+import { useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
+import type { Project, Session, SettledSetup, StartSessionResult, Workspace } from '../../shared/api';
 import { toggleSidebar, useSidebarCollapsed } from '@/components/collapsed';
 import { HarnessIcon } from '@/components/harness-icon';
+import { StatusIcon } from '@/components/sessions';
 import {
   agentRuns,
   closeLiveTerminal,
@@ -62,13 +63,16 @@ import { cn } from 'cn';
 
 interface Tab {
   key: string;
-  live: LiveTerminal;
+  /** Absent for an ended tab: the terminal was lost with its daemon and nothing runs. */
+  live?: LiveTerminal;
   /** The label until the program sets a title: the session's name, or `Terminal`. */
   name: string;
   /** The title the program set (OSC 0 or 2), as it sent it. */
   title?: string;
   /** Set for an agent's tab. */
   session?: { id: string; harness: string };
+  /** Set for the tab of a session whose terminal was lost; `reboot` when the Mac restarted since it began. */
+  ended?: { reboot: boolean };
 }
 
 interface View {
@@ -119,7 +123,7 @@ function setTitle(path: string, key: string, title: string) {
 }
 
 // The tab's label follows the title its program sets.
-const watchTitle = (path: string, { key, live }: Tab) => void live.term.onTitleChange((title) => setTitle(path, key, title));
+const watchTitle = (path: string, { key, live }: Tab) => void live?.term.onTitleChange((title) => setTitle(path, key, title));
 
 function addToView(path: string, tab: Tab, pane?: string) {
   const view = viewOf(path);
@@ -133,11 +137,10 @@ function addToView(path: string, tab: Tab, pane?: string) {
   });
 }
 
-// A shell in the worktree; with `setup` it runs the repository's setup first. A tab with a terminal
-// whose spawn is pending already takes keys.
-function newShell(path: string, setup = false): Tab {
+// A shell in the worktree. A tab with a terminal whose spawn is pending already takes keys.
+function newShell(path: string): Tab {
   const key = nextId('t');
-  const { entry, started } = createLiveTerminal(({ cols, rows }) => window.api.pty.spawn({ cols, rows, workspace: path, ...(setup && { setup }) }));
+  const { entry, started } = createLiveTerminal(({ cols, rows }) => window.api.pty.spawn({ cols, rows, workspace: path }));
   started.catch((error: unknown) => {
     // The tab may have been closed before the spawn rejected.
     if (views.get(path)?.tabs.get(key)?.live !== entry) return;
@@ -147,14 +150,29 @@ function newShell(path: string, setup = false): Tab {
 }
 
 /** A new shell tab at the end of the pane (the focused one by default), selected, with the keyboard. */
-export function openShellTab(path: string, { pane, setup }: { pane?: string; setup?: boolean } = {}) {
-  addToView(path, newShell(path, setup), pane);
+export function openShellTab(path: string, { pane }: { pane?: string } = {}) {
+  addToView(path, newShell(path), pane);
 }
 
 /** The tab of a session the store holds, at the end of the pane (the focused one by default). */
 export function addSessionTab(session: Session, pane?: string) {
   const live = getSessionTerminal(session.id);
   if (live) addToView(session.directory, { key: `s:${session.id}`, live, name: session.name, session: { id: session.id, harness: session.harness } }, pane);
+}
+
+// The ended tab becomes a shell in the worktree, in its pane, selected and with the keyboard.
+function replaceEnded(path: string, pane: string, key: string) {
+  const view = viewOf(path);
+  const ended = view.tabs.get(key);
+  if (!ended?.session) return;
+  void window.api.sessions.dismiss(ended.session.id);
+  const shell = newShell(path);
+  watchTitle(path, shell);
+  // The shell is added first so the pane never empties, which would remove it.
+  const { layout } = closeTab(addTab(view.layout, pane, shell.key), pane, key);
+  const tabs = new Map(view.tabs);
+  tabs.delete(key);
+  commit(path, { layout, focusedPane: pane, request: view.request + 1, tabs: tabs.set(shell.key, shell) });
 }
 
 function splitPane(path: string, pane: string, direction: 'right' | 'down') {
@@ -204,8 +222,13 @@ function closeNow(path: string, pane: string, key: string) {
   const view = viewOf(path);
   const tab = view.tabs.get(key);
   if (!tab) return;
-  if (tab.session) endSessions([tab.session.id]);
-  else closeLiveTerminal(tab.live);
+  if (tab.session) {
+    endSessions([tab.session.id]);
+    // The user closed it: it is not an ended tab at the next launch.
+    void window.api.sessions.dismiss(tab.session.id);
+  } else if (tab.live) {
+    closeLiveTerminal(tab.live);
+  }
   const { layout, focus } = closeTab(view.layout, pane, key);
   const tabs = new Map(view.tabs);
   tabs.delete(key);
@@ -219,7 +242,7 @@ export function closeWorkspace(path: string) {
   views.delete(path);
   for (const { live, session } of view.tabs.values()) {
     if (session) endSessions([session.id]);
-    else closeLiveTerminal(live);
+    else if (live) closeLiveTerminal(live);
   }
   for (const listener of listeners) listener();
 }
@@ -253,8 +276,10 @@ export function restoreFromDaemon(again = false): Promise<void> {
 
 async function restore(again: boolean): Promise<void> {
   const restored = await restoreTerminals(again);
-  if (restored.length === 0) return;
-  const sessions = restored.some(({ sessionId }) => sessionId !== undefined) ? await window.api.sessions.list() : [];
+  // The sessions that lost their terminal with a daemon come back as ended tabs, after the running ones.
+  const ended = await window.api.sessions.ended();
+  if (restored.length === 0 && ended.length === 0) return;
+  const sessions = restored.some(({ sessionId }) => sessionId !== undefined) || ended.length > 0 ? await window.api.sessions.list() : [];
   for (const { entry, workspace, sessionId } of restored) {
     const session = sessions.find(({ id }) => id === sessionId);
     const view = viewOf(workspace);
@@ -270,6 +295,26 @@ async function restore(again: boolean): Promise<void> {
     const layout = addTab(view.layout, first.id, key);
     commit(workspace, { ...view, layout: selectTab(layout, first.id, first.selected ?? key), tabs: new Map(view.tabs).set(key, tab) });
   }
+  for (const { sessionId, reboot } of ended) {
+    const session = sessions.find(({ id }) => id === sessionId);
+    const key = `s:${sessionId}`;
+    if (!session || viewOf(session.directory).tabs.has(key)) continue;
+    const view = viewOf(session.directory);
+    const first = panesOf(view.layout)[0]!;
+    const tab: Tab = { key, name: session.name, session: { id: sessionId, harness: session.harness }, ended: { reboot } };
+    const layout = addTab(view.layout, first.id, key);
+    commit(session.directory, { ...view, layout: selectTab(layout, first.id, first.selected ?? key), tabs: new Map(view.tabs).set(key, tab) });
+  }
+}
+
+/**
+ * A workspace stopped setting up (COCKPIT-89): the terminals the main process started for it join the page as
+ * tabs, the first selected and holding the keyboard, and a refused start shows under Projects.
+ */
+export async function showSettled({ path, message }: SettledSetup): Promise<void> {
+  if (message !== undefined) setProjectsMessage(message);
+  await restoreFromDaemon(true);
+  if (views.get(path)?.tabs.size) refocus(path);
 }
 
 // --- The message slot and the row status --------------------------------------------
@@ -296,7 +341,10 @@ export const useProjectsMessage = () =>
 export function useWorkspaceStatus(path: string): string | undefined {
   const view = useSyncExternalStore(subscribeViews, () => views.get(path));
   const dots = useSyncExternalStore(subscribeTerminals, getSessionDots);
-  const labels = [...(view?.tabs.values() ?? [])].flatMap(({ session }) => (session && dots.get(session.id) ? [dots.get(session.id)!] : []));
+  const labels = [...(view?.tabs.values() ?? [])].flatMap(({ session, ended }) => {
+    const label = ended ? 'Ended' : session && dots.get(session.id);
+    return label ? [label] : [];
+  });
   return workspaceStatus(labels) ?? undefined;
 }
 
@@ -402,6 +450,9 @@ function TabItem({
   onRefocus: () => void;
 }) {
   const label = labelOf(tab);
+  // A terminal lost with its daemon ends with neither code nor signal.
+  const exit = useSyncExternalStore(subscribeTerminals, () => tab.live?.exit);
+  const ended = tab.ended !== undefined || (exit?.exitCode === null && exit.signal === null);
   // Whether the menu moved the keyboard (a new pane, another tab): it then keeps it, not the tab.
   const moved = useRef(false);
   return (
@@ -427,7 +478,13 @@ function TabItem({
           onClick={onSelect}
           className="flex h-full min-w-0 flex-1 cursor-default items-center gap-2 text-left outline-none focus-visible:underline"
         >
-          {tab.session ? <HarnessIcon harness={tab.session.harness} className="size-3.5 shrink-0" /> : <SquareTerminalIcon className="size-3.5 shrink-0" />}
+          {ended ? (
+            <StatusIcon label="Ended" />
+          ) : tab.session ? (
+            <HarnessIcon harness={tab.session.harness} className="size-3.5 shrink-0" />
+          ) : (
+            <SquareTerminalIcon className="size-3.5 shrink-0" />
+          )}
           <span className="min-w-0 truncate">{label}</span>
         </button>
         <button
@@ -480,6 +537,20 @@ function TabItem({
   );
 }
 
+// What an ended tab shows in place of a terminal: nothing runs, a new shell can take its place.
+function TerminalEnded({ reboot, onNew }: { reboot: boolean; onNew: () => void }) {
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-3 p-8 text-center">
+      <SquareTerminalIcon className="size-5 text-subtle" />
+      <h2 className="font-heading text-sm font-medium">This terminal ended</h2>
+      {reboot && <p className="text-xs text-muted-foreground">Cockpit's background service stopped when your Mac restarted.</p>}
+      <Button variant="outline" onClick={onNew}>
+        New terminal here
+      </Button>
+    </div>
+  );
+}
+
 // A pane: its tab bar, and the terminals of its tabs stacked under it, only the selected one visible.
 // The panes of a workspace sit in one flat list keyed by id and are placed by their box, so splitting
 // or closing a neighbour never remounts a pane, and the terminals of unselected tabs keep their size.
@@ -491,6 +562,7 @@ function PaneView({
   box,
   sidebarHidden,
   waiting,
+  banner,
   onClose,
 }: {
   project: Project;
@@ -501,6 +573,8 @@ function PaneView({
   sidebarHidden: boolean;
   /** The terminals of the previous page are being shown again: no empty state yet. */
   waiting: boolean;
+  /** The banner is shown under the top tab bar: the top row starts below it. */
+  banner: boolean;
   onClose: (pane: string, tab: Tab) => void;
 }) {
   const router = useRouter();
@@ -538,13 +612,21 @@ function PaneView({
           />
         </div>
       </div>
-      <div className="relative min-h-0 flex-1">
+      <div className={cn('relative min-h-0 flex-1', top && banner && 'mt-9')}>
         {pane.tabs.length === 0 && !waiting && <p className="flex h-full items-center justify-center text-xs text-muted-foreground">No tab open</p>}
-        {pane.tabs.map((key) => (
-          <div key={key} className={cn('absolute inset-0', key !== pane.selected && 'invisible')}>
-            <Terminal live={view.tabs.get(key)!.live} focused={pane.id === view.focusedPane && key === pane.selected} request={view.request} />
-          </div>
-        ))}
+        {pane.tabs.map((key) => {
+          const { live, ended } = view.tabs.get(key)!;
+          return (
+            <div key={key} className={cn('absolute inset-0', key !== pane.selected && 'invisible')}>
+              {live ? (
+                <Terminal live={live} focused={pane.id === view.focusedPane && key === pane.selected} request={view.request} />
+              ) : (
+                // Only the selected one is in the page: an ended tab has no terminal to keep alive.
+                key === pane.selected && <TerminalEnded reboot={ended?.reboot ?? false} onNew={() => replaceEnded(path, pane.id, key)} />
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -610,7 +692,7 @@ function Separator({ path, spec }: { path: string; spec: SeparatorSpec }) {
 }
 
 /** The panes of a workspace: tab bars in the top row of the window, the terminals under them. */
-export function WorkspacePanes({ project, workspace }: { project: Project; workspace: Workspace }) {
+export function WorkspacePanes({ project, workspace, banner }: { project: Project; workspace: Workspace; banner?: ReactNode }) {
   const view = useSyncExternalStore(subscribeViews, () => viewOf(workspace.path));
   const waiting = useRestoring();
   const sidebarHidden = useSidebarCollapsed();
@@ -641,9 +723,11 @@ export function WorkspacePanes({ project, workspace }: { project: Project; works
           box={box}
           sidebarHidden={sidebarHidden}
           waiting={waiting}
+          banner={banner !== undefined}
           onClose={requestClose}
         />
       ))}
+      {banner !== undefined && <div className="absolute inset-x-2 top-10 z-10">{banner}</div>}
       {/* Last in the DOM is on top: a nested separator ends at the outer one, which wins where they meet. */}
       {separators(view.layout).reverse().map((spec) => (
         <Separator key={`s${spec.path.join('')}`} path={workspace.path} spec={spec} />

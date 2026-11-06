@@ -151,7 +151,7 @@ describe('built app', () => {
       await waitForEntries(page, [clone.root, ...linkedWorktrees(clone).map((worktree) => worktree.path)]);
     });
 
-    test('AC8 — a base deleted after the composer opened shows the error message in the composer and creates nothing', async () => {
+    test('AC8, COCKPIT-89 AC6 — a base deleted after the composer opened is refused on the workspace page ("Back to composer", the message naming the base), the row is gone and nothing is created', async () => {
       const { page } = session;
       const develop = gitIn(clone.root, 'rev-parse', 'refs/remotes/origin/develop');
       const before = { git: gitState(clone), listing: worktreeListing(clone) };
@@ -163,11 +163,14 @@ describe('built app', () => {
       gitIn(clone.root, 'update-ref', '-d', 'refs/remotes/origin/develop');
       try {
         await createButton(page).click();
+        // The page of the workspace opens first, then the refusal replaces its loading text.
+        const back = page.locator('main').getByRole('button', { name: 'Back to composer', exact: true });
+        await back.waitFor();
         // A message that names the base git could not find.
-        const message = await waitForMessage(page);
-        expect(message).toContain('origin/develop');
+        expect(await page.locator('main').innerText()).toContain('origin/develop');
 
-        expect(new URL(page.url()).pathname).toBe('/');
+        expect(new URL(page.url()).pathname).toBe('/workspace');
+        expect(await entryTitles(page)).not.toContain(worktreePath(session, clone, 'orphan-base'));
         expect(localBranches(clone)).not.toContain('orphan-base');
         expect(worktreeListing(clone)).toEqual(before.listing);
       } finally {
@@ -278,6 +281,39 @@ describe('built app', () => {
       });
       expect(localBranches(clone)).not.toContain('from-elsewhere');
       expect(existsSync(path)).toBe(true);
+    });
+
+    test('COCKPIT-89 AC13 — the handlers of compose, the failed setups and their dismissal reject a sender frame from another origin and create nothing', async () => {
+      const { page } = session;
+      const path = worktreePath(session, clone, 'from-elsewhere');
+      const before = { git: gitState(clone), listing: worktreeListing(clone), titles: await entryTitles(page) };
+      // The compose handler is `workspaces:compose`; the other two new ones are found by their channels
+      // (`workspaces:<...>setup<...>`), whatever the spelling.
+      const results = await session.evaluateInMain<Record<string, string>>(`(async () => {
+        const handlers = ${INVOKE_HANDLERS};
+        const channels = ['workspaces:compose', ...[...handlers.keys()].filter((channel) => /^workspaces:.*setup/.test(channel))];
+        const results = {};
+        for (const channel of channels) {
+          const handler = handlers.get(channel);
+          if (!handler) { results[channel] = 'no handler'; continue; }
+          try {
+            await handler({ senderFrame: { url: 'https://example.com/' }, sender: null }, ${JSON.stringify(clone.root)}, 'from elsewhere', 'main', ${JSON.stringify(path)}, { harness: 'terminal', size: { cols: 80, rows: 24 } });
+            results[channel] = 'resolved';
+          } catch {
+            results[channel] = 'rejected';
+          }
+        }
+        return results;
+      })()`);
+
+      expect(Object.keys(results), 'compose, the failed setups and the dismissal').toHaveLength(3);
+      expect(results['workspaces:compose']).toBe('rejected');
+      expect(Object.values(results)).toEqual(['rejected', 'rejected', 'rejected']);
+      expect(localBranches(clone)).not.toContain('from-elsewhere');
+      expect(existsSync(path)).toBe(false);
+      expect(worktreeListing(clone)).toEqual(before.listing);
+      expect(gitState(clone)).toEqual(before.git);
+      expect(await entryTitles(page)).toEqual(before.titles);
     });
 
     // The FSEvents watchers the main process holds.

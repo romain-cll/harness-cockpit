@@ -112,6 +112,43 @@ export function connectDaemon(socketPath: string, { timeoutMs = DEFAULT_TIMEOUT_
   });
 }
 
+/** One authorized HTTP request to a daemon's socket, answered with the status and body; a daemon that does not answer in time rejects with `DaemonNotAnsweringError`. */
+function callDaemon(socketPath: string, method: string, path: string): Promise<{ status: number; text: string }> {
+  return new Promise((resolve, reject) => {
+    let token: string;
+    try {
+      token = readFileSync(tokenPathOf(socketPath), 'utf8');
+    } catch (error) {
+      return reject(error);
+    }
+    const req = request({ socketPath, method, path, headers: { authorization: `Bearer ${token}` }, agent: false, timeout: DEFAULT_TIMEOUT_MS }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('error', reject);
+      res.on('end', () => resolve({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString('utf8') }));
+    });
+    req.on('timeout', () => {
+      reject(new DaemonNotAnsweringError(socketPath, DEFAULT_TIMEOUT_MS));
+      req.destroy();
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+/** The shells and sessions a daemon of any protocol runs (`GET /terminals`, frozen across protocols). Rejects when it refuses or does not answer. */
+export async function readTerminals(socketPath: string): Promise<TerminalInfo[]> {
+  const { status, text } = await callDaemon(socketPath, 'GET', '/terminals');
+  if (status !== 200) throw new Error(`the background service refused to list its terminals (HTTP ${status})`);
+  return JSON.parse(text) as TerminalInfo[];
+}
+
+/** Asks a daemon of any protocol to end its terminals and exit (`POST /shutdown`, frozen across protocols). Rejects when it refuses or does not answer. */
+export async function shutdownDaemon(socketPath: string): Promise<void> {
+  const { status } = await callDaemon(socketPath, 'POST', '/shutdown');
+  if (status !== 202) throw new Error(`the background service refused to stop (HTTP ${status})`);
+}
+
 function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutMs: number): DaemonClient {
   let lastId = 0;
   const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();

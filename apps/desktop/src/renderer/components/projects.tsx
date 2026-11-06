@@ -15,7 +15,7 @@ import {
   TriangleAlertIcon,
 } from 'lucide-react';
 import { useState, useSyncExternalStore, type ReactNode } from 'react';
-import type { AppsResult, AvailableApp, OpenWorkspaceResult, Project, Session, StartSessionResult, Workspace } from '../../shared/api';
+import type { AppsResult, AvailableApp, FailedSetup, OpenWorkspaceResult, Project, Session, StartSessionResult, Workspace } from '../../shared/api';
 import { showRefusal, useAddProject } from '@/components/add-project';
 import { toggleProject, toggleProjects, useCollapsedProjects, useProjectsCollapsed } from '@/components/collapsed';
 import { DeleteWorkspaceDialog } from '@/components/delete-workspace-dialog';
@@ -38,6 +38,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { addSessionTab, closeWorkspace, setProjectsMessage, useProjectsMessage, useWorkspaceStatus } from '@/components/workspace-panes';
+import { RefusedSetups } from '@/components/workspace-setup';
 import { cn } from 'cn';
 
 // The workspace whose Delete dialog is open. Module-level so that the Changes sidebar can open it
@@ -82,7 +83,8 @@ function Entry({
   trailing?: ReactNode;
   row?: (props: { className: string; children: ReactNode }) => ReactNode;
   onOpenChange?: (open: boolean) => void;
-  children: ReactNode;
+  /** The items of the "…" menu; an entry without any has no menu. */
+  children?: ReactNode;
 }) {
   const content = (
     <>
@@ -90,7 +92,7 @@ function Entry({
       {name} {after} {trailing}
     </>
   );
-  const className = extra ? 'pr-14' : 'pr-8';
+  const className = extra ? 'pr-14' : children ? 'pr-8' : 'pr-2';
   return (
     <div className="group/entry relative">
       {row ? (
@@ -101,23 +103,25 @@ function Entry({
         </div>
       )}
       {extra}
-      <DropdownMenu onOpenChange={onOpenChange}>
-        <DropdownMenuTrigger
-          render={
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              aria-label={label}
-              className="absolute top-1 right-1 opacity-0 group-hover/entry:opacity-100 focus-visible:opacity-100 aria-expanded:opacity-100"
-            />
-          }
-        >
-          <MoreHorizontalIcon />
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-50">
-          {children}
-        </DropdownMenuContent>
-      </DropdownMenu>
+      {children && (
+        <DropdownMenu onOpenChange={onOpenChange}>
+          <DropdownMenuTrigger
+            render={
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label={label}
+                className="absolute top-1 right-1 opacity-0 group-hover/entry:opacity-100 focus-visible:opacity-100 aria-expanded:opacity-100"
+              />
+            }
+          >
+            <MoreHorizontalIcon />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-50">
+            {children}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
     </div>
   );
 }
@@ -193,18 +197,21 @@ function SetupLabel({ state }: { state?: 'running' | 'failed' }) {
   );
 }
 
-// A workspace's row: a link to its page, with the icon of its most urgent session.
+// A workspace's row: a link to its page, with the icon of its most urgent session. A workspace being set up is
+// no entry of the list yet: its link has no title, the path is on its name.
 function WorkspaceName({ workspace }: { workspace: Workspace }) {
   const status = useWorkspaceStatus(workspace.path);
   return (
     <>
       <StatusIcon label={status} />
-      <span className={cn('truncate', !status && 'text-muted-foreground')}>{workspace.name}</span>
+      <span title={workspace.settingUp ? workspace.path : undefined} className={cn('truncate', !status && 'text-muted-foreground')}>
+        {workspace.name}
+      </span>
     </>
   );
 }
 
-export function Projects({ projects, sessions }: { projects: Project[]; sessions: Session[] }) {
+export function Projects({ projects, sessions, failedSetups }: { projects: Project[]; sessions: Session[]; failedSetups: FailedSetup[] }) {
   const router = useRouter();
   const navigate = useNavigate();
   // Why the last start was refused, or that a deletion kept its branch; cleared by the next add, start or deletion that succeeds.
@@ -291,6 +298,7 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
           {message}
         </p>
       )}
+      <RefusedSetups failedSetups={failedSetups} />
       {!collapsed && (
         <ul className="flex min-h-0 flex-1 flex-col gap-px overflow-y-auto">
           {projects.map((project) => {
@@ -350,12 +358,12 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
                           icon={null}
                           name={<WorkspaceName workspace={workspace} />}
                           label={`Actions for ${workspace.name}`}
-                          trailing={<SetupLabel state={setups.get(workspace.path)} />}
+                          trailing={<SetupLabel state={workspace.settingUp ? 'running' : setups.get(workspace.path)} />}
                           row={({ className, children }) => (
                             <Link
                               to="/workspace"
                               search={{ path: workspace.path }}
-                              title={workspace.path}
+                              title={workspace.settingUp ? undefined : workspace.path}
                               className={cn(linkRowClass, 'pl-[30px]', className)}
                             >
                               {children}
@@ -363,27 +371,33 @@ export function Projects({ projects, sessions }: { projects: Project[]; sessions
                           )}
                           onOpenChange={(open) => open && void window.api.workspaces.apps().then(setApps)}
                           extra={
-                            <StartSessionMenu
-                              label={`Start session in ${workspace.name}`}
-                              className="absolute top-1 right-7 opacity-0 group-hover/entry:opacity-100 focus-visible:opacity-100 aria-expanded:opacity-100"
-                              onStart={(harness) => {
-                                const mayNavigate = claimNavigation(router.history);
-                                void startSession(harness, { workspace: { project: project.path, path: workspace.path } }).then((result) =>
-                                  started(result, mayNavigate),
-                                );
-                              }}
-                            />
+                            !workspace.settingUp && (
+                              <StartSessionMenu
+                                label={`Start session in ${workspace.name}`}
+                                className="absolute top-1 right-7 opacity-0 group-hover/entry:opacity-100 focus-visible:opacity-100 aria-expanded:opacity-100"
+                                onStart={(harness) => {
+                                  const mayNavigate = claimNavigation(router.history);
+                                  void startSession(harness, { workspace: { project: project.path, path: workspace.path } }).then((result) =>
+                                    started(result, mayNavigate),
+                                  );
+                                }}
+                              />
+                            )
                           }
                         >
-                          <OpenItems
-                            apps={apps}
-                            onOpen={(app) => void window.api.workspaces.open(project.path, workspace.path, app).then(opened)}
-                            onReveal={() => void window.api.workspaces.reveal(project.path, workspace.path).then(opened)}
-                          />
-                          <DropdownMenuItem variant="destructive" onClick={() => setDeleting({ project, workspace })}>
-                            <Trash2Icon />
-                            Delete workspace…
-                          </DropdownMenuItem>
+                          {!workspace.settingUp && (
+                            <>
+                              <OpenItems
+                                apps={apps}
+                                onOpen={(app) => void window.api.workspaces.open(project.path, workspace.path, app).then(opened)}
+                                onReveal={() => void window.api.workspaces.reveal(project.path, workspace.path).then(opened)}
+                              />
+                              <DropdownMenuItem variant="destructive" onClick={() => setDeleting({ project, workspace })}>
+                                <Trash2Icon />
+                                Delete workspace…
+                              </DropdownMenuItem>
+                            </>
+                          )}
                         </Entry>
                       </li>
                     ))}

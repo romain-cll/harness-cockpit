@@ -11,6 +11,10 @@ import { addOpenFixture, allSessionLinkIds, childPidsOf, closeMenus, controlToke
 import { ensurePtyLog, exitCount, focusedPane, focusTerminal, goHome, killPtyHost, openShellTab, outputOf, ptyHostPid, ptyKill, ptyWrite, spawnShell, terminalOfSession, terminalRows, typeLine, untilPtyLog, visiblePanes, waitForExit, waitForOutput, waitForRow } from './support/terminal';
 
 // The full block runs in the built app only (see the split rule in AGENTS.md).
+
+// COCKPIT-69: these assertions are about sessions staying stored; the `open` mark a deletion or a removal clears is not theirs.
+const ignoringOpen = (sessions: unknown[]) => sessions.map((entry) => Object.fromEntries(Object.entries(entry as object).filter(([key]) => key !== 'open')));
+
 describe('sessions: built app', () => {
   let fx: SessionsFixture;
   let session: Session;
@@ -424,6 +428,7 @@ describe('sessions: built app', () => {
       directory: path,
       project: repo.root,
       createdAt: expect.any(String),
+      open: true,
     });
     expect(sessionFoldersIn(session.cockpitHome)).toEqual(foldersBefore);
   });
@@ -513,6 +518,7 @@ describe('sessions: built app', () => {
       directory: ws.plus.path,
       project: repo.root,
       createdAt: expect.any(String),
+      open: true,
     });
     expect(sessionFoldersIn(session.cockpitHome)).toEqual(foldersBefore);
   });
@@ -548,7 +554,7 @@ describe('sessions: built app', () => {
     expect(namesIn(ws.plus.path)).toEqual(['Claude Code 1', 'Claude Code 2']);
   });
 
-  test('workspace sessions AC7 — a save that fails after the spawn keeps the new workspace and its files, shows "Could not start Claude Code: …" in the composer, leaves no harness process and the sessions unchanged', async () => {
+  test('workspace sessions AC7 — a save that fails after the spawn keeps the new workspace and its files, shows "Could not start Claude Code: …" under Projects (COCKPIT-89), leaves no harness process and the sessions unchanged', async () => {
     const { page } = session;
     const before = {
       state: stateSnapshot(session.dataDir),
@@ -574,12 +580,12 @@ describe('sessions: built app', () => {
       expect(existsSync(join(path, 'README.md'))).toBe(true);
       expect(linkedWorktrees(repo)).toContainEqual({ path, branch: 'save-fails' });
 
-      const message = await waitForMessage(page);
-      expect(message.startsWith('Could not start Claude Code:')).toBe(true);
+      // The workspace page opened with the send; the refusal shows in the sidebar's message slot under Projects.
+      const status = page.locator('aside [role="status"]').filter({ hasText: /^\s*Could not start Claude Code:/ }).first();
+      await status.waitFor();
       // Only a save after a successful spawn raises it.
-      expect(message).toContain('EISDIR');
-      expect(new URL(page.url()).pathname).toBe('/');
-      expect(await promptBox(page).inputValue()).toBe('save fails');
+      expect(await status.innerText()).toContain('EISDIR');
+      expect(new URL(page.url()).pathname).toBe('/workspace');
 
       // The harness was spawned (the message carries the save error), then killed by the rollback.
       // The rollback kills the spawned harness: its exit is reported to the page, which has logged since the click.
@@ -716,7 +722,7 @@ describe('sessions: built app', () => {
     await waitForExit(page, terminal);
     expect(isAlive(ws.fix.pid)).toBe(false);
     expect(await allSessionLinkIds(page)).not.toContain(ws.fix.id);
-    expect(sessionsInState(session.dataDir)).toEqual(sessionsBefore);
+    expect(ignoringOpen(sessionsInState(session.dataDir))).toEqual(ignoringOpen(sessionsBefore));
     expect(sessionsInState(session.dataDir).map((entry) => entry.id)).toContain(ws.fix.id);
     const sent = (await removeOptions(session)).slice(removesBefore);
     expect(sent.map((options) => options.force ?? false)).toEqual([false, true]);
@@ -751,7 +757,7 @@ describe('sessions: built app', () => {
     for (const pid of running) expect(isAlive(pid)).toBe(false);
     const shown = await allSessionLinkIds(page);
     for (const id of [ws.blank.id, ...ws.plus.ids]) expect(shown).not.toContain(id);
-    expect(sessionsInState(session.dataDir)).toEqual(sessionsBefore);
+    expect(ignoringOpen(sessionsInState(session.dataDir))).toEqual(ignoringOpen(sessionsBefore));
 
     // Added again, the workspaces come back with no tab: the processes ended, and a session that ended is not shown.
     await addRepository(session, repo);
@@ -760,7 +766,7 @@ describe('sessions: built app', () => {
       await page.getByText('No tab open', { exact: true }).waitFor();
       expect(await workspaceTabs(page)).toEqual([]);
     }
-    expect(sessionsInState(session.dataDir)).toEqual(sessionsBefore);
+    expect(ignoringOpen(sessionsInState(session.dataDir))).toEqual(ignoringOpen(sessionsBefore));
   });
 
   // --- Open a workspace in an editor, a terminal or the Finder (COCKPIT-33). They run in
@@ -1132,7 +1138,7 @@ describe('sessions: built app', () => {
       expect(hookCommandsOf(fx, 'claude', stub.pid).UserPromptSubmit).toBe(`${singleQuoted(REPOSITORY_CLI)} status working`);
       expect(await waitForSetupLabel(page, path, null)).toBeNull();
       expect(await setupLinkCount(page)).toBe(0);
-      expect(storedIn(path)).toEqual([{ id, name: 'Claude Code 1', harness: 'claude-code', directory: path, project: repo.root, createdAt: expect.any(String) }]);
+      expect(storedIn(path)).toEqual([{ id, name: 'Claude Code 1', harness: 'claude-code', directory: path, project: repo.root, createdAt: expect.any(String), open: true }]);
     }, 60_000);
 
     test('AC3, AC4, AC6, AC10 — a failing command stops the setup (the later ones do not run) with the failure line, the hint and the login shell prompt, no agent, and "Setup failed" (destructive) on the row, which a reload keeps; after fixing the config, "cockpit setup" typed in that shell runs it again ("Setting up", then no label) and returns to the same shell; "--then claude" starts the agent', async () => {
