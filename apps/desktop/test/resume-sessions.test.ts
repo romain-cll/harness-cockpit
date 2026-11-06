@@ -254,9 +254,13 @@ describe('resume sessions: built app', () => {
     // Nothing was connected to hear it.
     expect(storedIdOf(ids.withId)).toBe(AFTER_RESUME_ID);
 
+    // The state is written on adoption, before the window exists: `session` is
+    // the relaunched one only once its launch has resolved.
+    let relaunch: ReturnType<typeof launchBuiltWith> | undefined;
     await untilState(dataDir, (state) => harnessIdOf(state, ids.withId) === UNSEEN_ID, async () => {
-      session = await launchBuiltWith(env, dataDir, home);
+      relaunch = launchBuiltWith(env, dataDir, home);
     });
+    session = await relaunch!;
 
     expect(storedIdOf(ids.withId)).toBe(UNSEEN_ID);
     await session.page.getByText(versionLabel).waitFor();
