@@ -71,14 +71,29 @@ describe('built app', () => {
     }
   });
 
-  const WORKSPACE_ITEMS = ['Open in Visual Studio Code', 'Open in Terminal', 'Open in editor', 'Open in terminal', 'Reveal in Finder', 'Copy path', 'Delete workspace…'];
+  // The detected apps, in catalogue order. The app shown first is the remembered one, else the first of its kind: what
+  // an earlier test remembered (an editor picked) changes the menus, so no test assumes a pristine state.
+  const EDITORS = [{ id: 'vscode', name: 'Visual Studio Code' }, { id: 'cursor', name: 'Cursor' }];
+  const TERMINALS = [{ id: 'terminal', name: 'Terminal' }, { id: 'ghostty', name: 'Ghostty' }];
+  const shownApps = () => {
+    const remembered = rememberedApps(session.dataDir);
+    return {
+      editor: EDITORS.find(({ id }) => id === remembered.editor) ?? EDITORS[0]!,
+      terminal: TERMINALS.find(({ id }) => id === remembered.terminal) ?? TERMINALS[0]!,
+    };
+  };
+
+  const workspaceItems = () => {
+    const { editor, terminal } = shownApps();
+    return [`Open in ${editor.name}`, `Open in ${terminal.name}`, 'Open in editor', 'Open in terminal', 'Reveal in Finder', 'Copy path', 'Delete workspace…'];
+  };
 
   // Opens the "…" menu of the workspace and waits until every item is there (the apps arrive after the menu opens).
   async function openWorkspaceMenu() {
     const { page } = session;
     await openMenu(page, workspace);
     const menu = workspaceMenu(page, workspace);
-    for (const name of WORKSPACE_ITEMS) await menu.getByRole('menuitem', { name, exact: true }).waitFor();
+    for (const name of workspaceItems()) await menu.getByRole('menuitem', { name, exact: true }).waitFor();
     return menu;
   }
 
@@ -115,7 +130,8 @@ describe('built app', () => {
   test('COCKPIT-68 AC1, COCKPIT-88 AC1 — a workspace\'s "…" menu is 200 px wide, radius 10, padding 4, filled with --menu; its items are 28 px high, 12 px, weight 400, radius 8, with a 14 px icon of stroke 1.25, in order, "Copy path" (Copy icon, no shortcut) right after "Reveal in Finder", ending after a separator with "Delete workspace…" in the destructive color; a highlighted item is filled with --hover, in both schemes', async () => {
     const { page } = session;
     const menu = await openWorkspaceMenu();
-    expect(await topLevelItems(menu)).toEqual(WORKSPACE_ITEMS);
+    const items = workspaceItems();
+    expect(await topLevelItems(menu)).toEqual(items);
     expect(await menu.getByRole('menuitem', { name: 'Copy path', exact: true }).locator('svg').first().getAttribute('class')).toMatch(/lucide-copy(\s|$)/);
 
     for (const scheme of SCHEMES) {
@@ -128,7 +144,7 @@ describe('built app', () => {
       expect(look.radius, `popup radius, ${scheme}`).toBe('10px');
       expect(look.padding, `popup padding, ${scheme}`).toEqual(['4px', '4px', '4px', '4px']);
       expect(look.background, `popup fill, ${scheme}`).toBe(fill);
-      expect(look.items.map((item) => item.text)).toEqual(WORKSPACE_ITEMS);
+      expect(look.items.map((item) => item.text)).toEqual(items);
       for (const item of look.items) {
         expect(item.height, `${item.text} height, ${scheme}`).toBe(28);
         expect(item.fontSize, `${item.text} font size, ${scheme}`).toBe('12px');
@@ -170,17 +186,18 @@ describe('built app', () => {
 
   test('COCKPIT-68 AC2 — in the "Open in editor" and "Open in terminal" submenus the app shown first carries a check mark and every app a letter badge', async () => {
     await openWorkspaceMenu();
+    const shown = shownApps();
 
-    for (const [trigger, apps] of [
-      ['Open in editor', ['Visual Studio Code', 'Cursor']],
-      ['Open in terminal', ['Terminal', 'Ghostty']],
+    for (const [trigger, apps, first] of [
+      ['Open in editor', EDITORS, shown.editor],
+      ['Open in terminal', TERMINALS, shown.terminal],
     ] as const) {
       const rows = await readApps(await openSubmenu(session.page, trigger));
-      expect(rows.map((row) => row.name), trigger).toEqual(apps);
+      expect(rows.map((row) => row.name), trigger).toEqual(apps.map(({ name }) => name));
       expect(
         rows.map((row) => row.check),
-        `${trigger}: the check mark is on the first app only`,
-      ).toEqual([1, 0]);
+        `${trigger}: the check mark is on the app shown first only`,
+      ).toEqual(apps.map(({ id }) => (id === first.id ? 1 : 0)));
       expect(
         rows.map((row) => row.badges),
         `${trigger}: one letter badge per app`,
@@ -201,15 +218,14 @@ describe('built app', () => {
     return menu;
   }
 
-  const PROJECT_ITEMS = ['New workspace', 'Open in Visual Studio Code', 'Reveal in Finder', 'Remove project…'];
+  const projectItems = () => ['New workspace', `Open in ${shownApps().editor.name}`, 'Reveal in Finder', 'Remove project…'];
 
   test('COCKPIT-68 AC3, COCKPIT-88 AC3 — a project\'s "…" menu holds "New workspace" (Plus), "Open in <editor>" (CodeXml), "Reveal in Finder" (FolderOpen) and, after a separator, "Remove project…" (FolderMinus, destructive color): no terminal entry, no submenu, no "Files stay on disk" line', async () => {
     const { page } = session;
-    // Nothing is remembered yet: the first detected editor, in catalogue order, is shown.
-    expect(rememberedApps(session.dataDir).editor).toBeUndefined();
-    const menu = await openProjectMenu(repo, PROJECT_ITEMS);
+    const items = projectItems();
+    const menu = await openProjectMenu(repo, items);
 
-    expect(await topLevelItems(menu)).toEqual(PROJECT_ITEMS);
+    expect(await topLevelItems(menu)).toEqual(items);
     expect(await menu.innerText()).not.toContain('Files stay on disk');
     const look = await menu.evaluate((popup) => {
       const items = [...popup.querySelectorAll('[role="menuitem"]')] as HTMLElement[];
@@ -271,22 +287,23 @@ describe('built app', () => {
   test('COCKPIT-88 AC9 — an `open` that exits non-zero shows "Could not open … in <app>: <reason>" or "Could not reveal … in the Finder: <reason>" in the Projects message slot, remembers nothing, and the next success clears it', async () => {
     const { page } = session;
     const stateBefore = stateSnapshot(session.dataDir);
-    expect(rememberedApps(session.dataDir).editor).toBeUndefined();
+    const rememberedBefore = rememberedApps(session.dataDir);
+    const editor = shownApps().editor.name;
 
     // The stderr, trimmed.
     setOpenOutcome(open, { code: 3, stderr: '  Unable to find application\n\n' });
-    await openProjectMenu(repo, PROJECT_ITEMS);
-    await untilAnswered(session, 'projects:open', () => pickTopItem(page, 'Open in Visual Studio Code'));
-    const openMessage = `Could not open ${repo.root} in Visual Studio Code: Unable to find application`;
+    await openProjectMenu(repo, projectItems());
+    await untilAnswered(session, 'projects:open', () => pickTopItem(page, `Open in ${editor}`));
+    const openMessage = `Could not open ${repo.root} in ${editor}: Unable to find application`;
     await waitForLine(page, openMessage);
     expect(await isBelowProjectsHeader(page, { text: openMessage })).toBe(true);
     expect(await messagesShown()).toEqual([openMessage]);
     expect(stateSnapshot(session.dataDir)).toEqual(stateBefore);
-    expect(rememberedApps(session.dataDir).editor).toBeUndefined();
+    expect(rememberedApps(session.dataDir)).toEqual(rememberedBefore);
 
     // Empty stderr: the exit code. The next refusal replaces the message.
     setOpenOutcome(open, { code: 5 });
-    await openProjectMenu(repo, PROJECT_ITEMS);
+    await openProjectMenu(repo, projectItems());
     await untilAnswered(session, 'projects:reveal', () => pickTopItem(page, 'Reveal in Finder'));
     const revealMessage = `Could not reveal ${repo.root} in the Finder: open exited with code 5`;
     await waitForLine(page, revealMessage);
@@ -294,7 +311,7 @@ describe('built app', () => {
 
     // A success clears it.
     setOpenOutcome(open);
-    await openProjectMenu(repo, PROJECT_ITEMS);
+    await openProjectMenu(repo, projectItems());
     await untilAnswered(session, 'projects:reveal', () => pickTopItem(page, 'Reveal in Finder'));
     await untilRead(page, readSidebarLines, (lines) => !lines.some((line) => /^Could not (open|reveal) /.test(line)));
     expect(stateSnapshot(session.dataDir)).toEqual(stateBefore);
@@ -303,7 +320,7 @@ describe('built app', () => {
   test('COCKPIT-88 AC6 — a project\'s "Reveal in Finder" runs open -R <project path>', async () => {
     const { page } = session;
     const runs = openRuns(open).length;
-    await openProjectMenu(repo, PROJECT_ITEMS);
+    await openProjectMenu(repo, projectItems());
     await untilAnswered(session, 'projects:reveal', () => pickTopItem(page, 'Reveal in Finder'));
 
     // The handler answered after the run: no other run follows it.
@@ -313,25 +330,32 @@ describe('built app', () => {
 
   test('COCKPIT-88 AC4 — the entry names the remembered editor, else the first detected one; picking it runs open -a <bundle> <project path> and remembers an editor not yet remembered', async () => {
     const { page } = session;
-    expect(rememberedApps(session.dataDir).editor).toBeUndefined();
 
-    // Nothing remembered: Visual Studio Code, the first in catalogue order, is shown and then remembered.
+    // The editor shown (the first in catalogue order when nothing is remembered) is run, and remembered.
+    const first = shownApps().editor;
+    const other = EDITORS.find(({ id }) => id !== first.id)!;
     let runs = openRuns(open).length;
-    await openProjectMenu(repo, PROJECT_ITEMS);
-    await untilAnswered(session, 'projects:open', () => pickTopItem(page, 'Open in Visual Studio Code'));
-    expect(openRuns(open).slice(runs)).toEqual([['-a', bundle('Visual Studio Code'), repo.root]]);
-    expect(rememberedApps(session.dataDir).editor).toBe('vscode');
+    await openProjectMenu(repo, projectItems());
+    await untilAnswered(session, 'projects:open', () => pickTopItem(page, `Open in ${first.name}`));
+    expect(openRuns(open).slice(runs)).toEqual([['-a', bundle(first.name), repo.root]]);
+    expect(rememberedApps(session.dataDir).editor).toBe(first.id);
 
     // Another editor remembered through the workspace's menu: the project's entry names it.
     await openWorkspaceMenu();
-    await untilAnswered(session, 'workspaces:open', () => pickInSubmenu(page, 'Open in editor', 'Cursor'));
-    expect(rememberedApps(session.dataDir).editor).toBe('cursor');
+    await untilAnswered(session, 'workspaces:open', () => pickInSubmenu(page, 'Open in editor', other.name));
+    expect(rememberedApps(session.dataDir).editor).toBe(other.id);
     runs = openRuns(open).length;
-    await openProjectMenu(repo, ['New workspace', 'Open in Cursor', 'Reveal in Finder', 'Remove project…']);
-    expect(await topLevelItems(page.getByRole('menu', { name: `Actions for ${repo.name}`, exact: true }))).toEqual(['New workspace', 'Open in Cursor', 'Reveal in Finder', 'Remove project…']);
-    await untilAnswered(session, 'projects:open', () => pickTopItem(page, 'Open in Cursor'));
-    expect(openRuns(open).slice(runs)).toEqual([['-a', bundle('Cursor'), repo.root]]);
-    expect(rememberedApps(session.dataDir).editor).toBe('cursor');
+    const named = ['New workspace', `Open in ${other.name}`, 'Reveal in Finder', 'Remove project…'];
+    await openProjectMenu(repo, named);
+    expect(await topLevelItems(page.getByRole('menu', { name: `Actions for ${repo.name}`, exact: true }))).toEqual(named);
+    await untilAnswered(session, 'projects:open', () => pickTopItem(page, `Open in ${other.name}`));
+    expect(openRuns(open).slice(runs)).toEqual([['-a', bundle(other.name), repo.root]]);
+    expect(rememberedApps(session.dataDir).editor).toBe(other.id);
+
+    // Leave the first editor shown again, so the tests after this one see the menus they saw before it.
+    await openWorkspaceMenu();
+    await untilAnswered(session, 'workspaces:open', () => pickInSubmenu(page, 'Open in editor', first.name));
+    expect(rememberedApps(session.dataDir).editor).toBe(first.id);
   });
 
   // Calls `window.api.projects[call]` in the page.
@@ -385,7 +409,9 @@ describe('built app', () => {
 
   test('COCKPIT-88 AC2 — "Copy path" in the menu of a workspace that is not shown puts its worktree path on the clipboard', async () => {
     const { page } = session;
-    await openWorkspaceMenu();
+    // Only "Copy path" is awaited: the other items depend on the apps found and the ones remembered.
+    await openMenu(page, workspace);
+    await workspaceMenu(page, workspace).getByRole('menuitem', { name: 'Copy path', exact: true }).waitFor();
     await session.evaluateInMain(`require('electron').clipboard.writeText('before')`);
     // The page copies with `navigator.clipboard.writeText`: the test tells when that write has settled.
     await page.evaluate(() => {
