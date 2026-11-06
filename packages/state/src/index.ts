@@ -7,6 +7,8 @@ export const STATE_VERSION = 1;
 export interface Project {
   // The repository's root, as git reports it.
   path: string;
+  // Set when the project has a workspace with no worktree, which opens `path` itself.
+  mainWorkspace?: boolean;
 }
 
 // A run of an agent CLI, in a folder of its own outside any project, or in a workspace of a project.
@@ -58,7 +60,9 @@ export class ProjectExistsError extends Error {
 }
 
 function isProject(value: unknown): value is Project {
-  return typeof value === 'object' && value !== null && typeof (value as { path?: unknown }).path === 'string';
+  if (typeof value !== 'object' || value === null) return false;
+  const { path, mainWorkspace } = value as Record<string, unknown>;
+  return typeof path === 'string' && (mainWorkspace === undefined || typeof mainWorkspace === 'boolean');
 }
 
 function isSession(value: unknown): value is Session {
@@ -116,13 +120,28 @@ export function removeProject(state: State, path: string): State {
   return { ...state, projects: state.projects.filter((project) => project.path !== path) };
 }
 
-// The project at `from` takes the path `to`, keeping its place in the list; its sessions follow.
+// Sets or clears the main workspace mark of the project at `path`.
+export function setMainWorkspace(state: State, path: string, on: boolean): State {
+  return {
+    ...state,
+    projects: state.projects.map((project) => {
+      if (project.path !== path) return project;
+      const { mainWorkspace: _, ...rest } = project;
+      return on ? { ...rest, mainWorkspace: true } : rest;
+    }),
+  };
+}
+
+// The project at `from` takes the path `to`, keeping its place in the list and its mark; its sessions follow,
+// a main workspace's too (their `directory` is the old path).
 export function updateProjectPath(state: State, from: string, to: string): State {
   if (state.projects.some((project) => project.path === to)) throw new ProjectExistsError(to);
   return {
     ...state,
-    projects: state.projects.map((project) => (project.path === from ? { path: to } : project)),
-    sessions: state.sessions.map((session) => (session.project === from ? { ...session, project: to } : session)),
+    projects: state.projects.map((project) => (project.path === from ? { ...project, path: to } : project)),
+    sessions: state.sessions.map((session) =>
+      session.project === from ? { ...session, project: to, directory: session.directory === from ? to : session.directory } : session,
+    ),
   };
 }
 

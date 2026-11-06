@@ -36,6 +36,7 @@ import {
   removeProject,
   saveState,
   sessionName,
+  setMainWorkspace,
   type Session,
   updateProjectPath,
   type State,
@@ -265,7 +266,8 @@ interface Setup {
   project: string;
   path: string;
   branch: string;
-  base: string;
+  /** `null`: no worktree, the workspace opens the project's folder (the main workspace). */
+  base: string | null;
   /** A harness id, or `terminal` for the setup shell. */
   harness: string;
   task: string;
@@ -742,8 +744,13 @@ function describeFailure(error: WorkspaceError, path: string): string {
   return error.code === 'NOT_A_REPOSITORY' ? `${path} is not a git repository.` : error.message;
 }
 
-// A project with its workspaces, which git tells: the linked worktrees, the main one being the project.
-async function toProject({ path }: { path: string }): Promise<Project> {
+// Whether the project has its main workspace, the one with no worktree.
+const hasMainWorkspace = (project: string) => state.projects.some((entry) => entry.path === project && entry.mainWorkspace === true);
+// The main workspace's path is its project's.
+const isMainWorkspace = (project: string, path: string) => path === project && hasMainWorkspace(project);
+
+// A project with its workspaces, which git tells: the linked worktrees, and the main working tree when the project has its main workspace.
+async function toProject({ path, mainWorkspace }: { path: string; mainWorkspace?: boolean }): Promise<Project> {
   const project = { path, name: basename(path) };
   // An absent folder, or a path that is not a folder (a file took its place), is "not found"; any other failure
   // (EACCES, EIO…) goes on to git, as before.
@@ -755,8 +762,10 @@ async function toProject({ path }: { path: string }): Promise<Project> {
   try {
     const worktrees = await listWorktrees(path, { env: await shellEnv });
     const workspaces: Workspace[] = worktrees
-      .filter((worktree) => !worktree.main)
-      .map(({ path, branch, name }) => ({ path, name: name ?? branch ?? basename(path), branch }));
+      .filter((worktree) => mainWorkspace || !worktree.main)
+      .map(({ path, branch, name, main }): Workspace =>
+        main ? { path, name: branch ?? basename(path), branch, main: true } : { path, name: name ?? branch ?? basename(path), branch },
+      );
     // A workspace being set up is a row from the reservation on, whether git lists its worktree yet or not.
     for (const setup of setups.values()) {
       if (setup.project !== path) continue;
@@ -1037,18 +1046,21 @@ function startProjects(
     );
   });
 
-  // Makes the worktree, then starts the agent (or the setup shell) in it, with no page: the workspace page
-  // may be gone, reloaded or elsewhere meanwhile. The row is a "setting up" one until this ends.
+  // Makes the worktree (none for the main workspace, which opens the project's folder), then starts the agent (or
+  // the setup shell) in it, with no page: the workspace page may be gone, reloaded or elsewhere meanwhile. The row
+  // is a "setting up" one until this ends.
   async function runSetup({ project, path, branch, base, harness, task }: Setup): Promise<void> {
-    try {
-      await createWorktree({ repo: project, root: worktreesRoot, branch, base, env: await shellEnv });
-    } catch (error) {
-      const message =
-        error instanceof WorkspaceError ? (creationRefusal(error, branch) ?? describeFailure(error, project)) : error instanceof Error ? error.message : String(error);
-      failedSetups.push({ id: randomUUID(), project, path, name: branch, message, prompt: task, agent: harness, base });
-      setups.delete(path);
-      settle({ path });
-      return;
+    if (base !== null) {
+      try {
+        await createWorktree({ repo: project, root: worktreesRoot, branch, base, env: await shellEnv });
+      } catch (error) {
+        const message =
+          error instanceof WorkspaceError ? (creationRefusal(error, branch) ?? describeFailure(error, project)) : error instanceof Error ? error.message : String(error);
+        failedSetups.push({ id: randomUUID(), project, path, name: branch, message, prompt: task, agent: harness, base });
+        setups.delete(path);
+        settle({ path });
+        return;
+      }
     }
     let message: string | undefined;
     try {
@@ -1056,14 +1068,17 @@ function startProjects(
         // As the agent's start does: no shell for a project that is gone.
         const found = await findWorkspace({ project, path });
         if ('status' in found) message = found.message;
-        // The repository's setup, then the login shell.
-        else await spawnFor(undefined, { ...SETUP_SIZE, cwd: path, command: cliPath, args: ['setup', '--shell'] }, { kind: 'shell', workspace: path });
+        // The repository's setup, then the login shell (the main workspace runs no setup).
+        else {
+          const command = base === null ? {} : { command: cliPath, args: ['setup', '--shell'] };
+          await spawnFor(undefined, { ...SETUP_SIZE, cwd: path, ...command }, { kind: 'shell', workspace: path });
+        }
       } else {
         const started = await startSession(undefined, harness, SETUP_SIZE, {
           workspace: { project, path },
-          setup: true,
+          setup: base !== null,
           prompt: task,
-          nameFromTitle: true,
+          nameFromTitle: base !== null,
         });
         if (started.status === 'refused') message = started.message;
       }
@@ -1074,8 +1089,9 @@ function startProjects(
     settle({ path, ...(message !== undefined && { message }) });
   }
 
-  // Reserves the branch and the worktree's path, answers, and sets the workspace up in the background.
-  ipcMain.handle('workspaces:compose', (event, project: string, task: string, base: string, harness: string): Promise<ComposeResult> => {
+  // Reserves the branch and the worktree's path, answers, and sets the workspace up in the background. A `null`
+  // base is the main workspace: the project is marked and its path is the workspace's, named after its branch.
+  ipcMain.handle('workspaces:compose', (event, project: string, task: string, base: string | null, harness: string): Promise<ComposeResult> => {
     let name = task;
     return forProject<ComposeResult>(
       event,
@@ -1083,9 +1099,18 @@ function startProjects(
       project,
       async () => {
         const env = await shellEnv;
-        const reserved = [...setups.values()].filter((setup) => setup.project === project).map((setup) => setup.branch);
-        name = await availableBranch(project, task, { env, root: worktreesRoot, reserved });
-        const path = await reservedPath({ repo: project, root: worktreesRoot, branch: name, env });
+        let path = project;
+        if (base === null) {
+          name = workspaceName((await listWorktrees(project, { env })).find((worktree) => worktree.main)!);
+          if (!hasMainWorkspace(project)) {
+            const refused = commit(setMainWorkspace(state, project, true));
+            if (refused) return refused;
+          }
+        } else {
+          const taken = [...setups.values()].filter((setup) => setup.project === project).map((setup) => setup.branch);
+          name = await availableBranch(project, task, { env, root: worktreesRoot, reserved: taken });
+          path = await reservedPath({ repo: project, root: worktreesRoot, branch: name, env });
+        }
         const setup: Setup = { project, path, branch: name, base, harness, task };
         setups.set(path, setup);
         void runSetup(setup);
@@ -1109,6 +1134,8 @@ function startProjects(
 
   ipcMain.handle('workspaces:removal', (event, project: string, path: string): Promise<RemovalResult> =>
     forProject<RemovalResult>(event, 'workspaces:removal', project, async () => {
+      // Nothing is removed from the disk: the dialog has nothing to warn of.
+      if (isMainWorkspace(project, path)) return { status: 'read', uncommitted: false, merged: null };
       const { uncommitted, merged } = await removalState({ repo: project, path, env: await shellEnv });
       return { status: 'read', uncommitted, merged };
     }),
@@ -1127,6 +1154,13 @@ function startProjects(
         'workspaces:remove',
         project,
         async () => {
+          // The folder is the user's: only the mark goes, and the sessions close.
+          if (isMainWorkspace(project, path)) {
+            const refused = commit(setMainWorkspace(state, project, false));
+            if (refused) return refused;
+            markClosed(({ directory }) => directory === path);
+            return { status: 'removed', branchKept: false };
+          }
           await removeWorktree({
             repo: project,
             path,
@@ -1341,7 +1375,8 @@ function startProjects(
   ipcMain.handle('workspaces:pull-request-states', (event, project: string): Promise<PullRequestStatesResult> =>
     forProject<PullRequestStatesResult>(event, 'workspaces:pull-request-states', project, async () => {
       const env = await shellEnv;
-      const branches = (await listWorktrees(project, { env })).flatMap((worktree) => (worktree.main || worktree.branch === null ? [] : [worktree.branch]));
+      const main = hasMainWorkspace(project);
+      const branches = (await listWorktrees(project, { env })).flatMap((worktree) => ((worktree.main && !main) || worktree.branch === null ? [] : [worktree.branch]));
       if (branches.length === 0 || !(await hasRemote(project, { env }))) return { status: 'read', states: {} };
       try {
         return { status: 'read', states: await pullRequestStates(project, branches, { env }) };
@@ -1410,6 +1445,7 @@ function startProjects(
         const endings = endingsOf(event.sender);
         const workspace = await findWorkspace({ project, path });
         if ('status' in workspace) return workspace;
+        if (isMainWorkspace(project, path)) return { status: 'none' };
         const config = await readWorkspaceConfig({ repo: project, path, env: await shellEnv });
         if (config.teardown.length === 0) return { status: 'none' };
         try {
@@ -1579,14 +1615,14 @@ function describeReadFailure(error: GitHubError): string {
 // What the user calls a workspace: its branch, or its folder name when detached.
 const workspaceName = ({ branch, path }: Worktree) => branch ?? basename(path);
 
-// A workspace is a project of the state and one of its linked worktrees (git tells).
+// A workspace is a project of the state and one of its linked worktrees (git tells), or its main working tree when it has its main workspace.
 async function findWorkspace({ project, path }: { project: string; path: string }): Promise<Worktree | Refused> {
   if (!state.projects.some((entry) => entry.path === project)) {
     return { status: 'refused', message: `${project} is not a project in Cockpit.` };
   }
   try {
     const worktrees = await listWorktrees(project, { env: await shellEnv });
-    const found = worktrees.find((worktree) => !worktree.main && worktree.path === path);
+    const found = worktrees.find((worktree) => (!worktree.main || hasMainWorkspace(project)) && worktree.path === path);
     if (found) return found;
     return { status: 'refused', message: `${path} is not a workspace of ${basename(project)}.` };
   } catch (error) {

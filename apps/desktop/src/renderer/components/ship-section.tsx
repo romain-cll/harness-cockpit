@@ -193,8 +193,8 @@ export function ShipSection({
   const base = changes?.status === 'listed' ? changes.base.replace(/^origin\//, '') : undefined;
   const unpushed = git?.unpushed ?? 0;
   const pushed = git !== undefined && git.upstream !== null && unpushed === 0;
-  // Pull requests are offered once `gh` answered, for a branch with no pull request or only a closed one.
-  const canOffer = pullRequest?.status === 'read' && (found === null || found?.state === 'closed') && git?.branch != null;
+  // Pull requests are offered once `gh` answered, for a branch with no pull request or only a closed one, other than the one the changes are compared with.
+  const canOffer = pullRequest?.status === 'read' && (found === null || found?.state === 'closed') && git?.branch != null && git.branch !== base;
   const state = found && STATES[found.state];
 
   return (

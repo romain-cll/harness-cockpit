@@ -24,7 +24,7 @@ export function DeleteWorkspaceDialog({
   project: Project;
   workspace: Workspace;
   onClose: () => void;
-  /** Called once the worktree is gone; `branchKept` says its branch was not merged and stays. */
+  /** Called once the workspace is gone (its worktree, for a linked one); `branchKept` says its branch was not merged and stays. */
   onRemoved: (branchKept: boolean) => Promise<void>;
 }) {
   // What the dialog read when it opened: whether the worktree holds uncommitted changes, whether the branch is
@@ -38,7 +38,7 @@ export function DeleteWorkspaceDialog({
   const [message, setMessage] = useState<string>();
   const [busy, setBusy] = useState(false);
   // The branch box is shown once the read answered, for a workspace listed with a branch.
-  const boxShown = read && workspace.branch !== null;
+  const boxShown = read && workspace.branch !== null && !workspace.main;
   // The teardown runs once per dialog, in a terminal the dialog shows; it ends with the dialog.
   const [terminal, setTerminal] = useState<LiveTerminal>();
   const tornDown = useRef(false);
@@ -126,7 +126,9 @@ export function DeleteWorkspaceDialog({
         <AlertDialogHeader>
           <AlertDialogTitle>Delete {workspace.name}?</AlertDialogTitle>
           <AlertDialogDescription>
-            {`This deletes the worktree, the workspace's folder on this Mac, and ends its running sessions.`}
+            {workspace.main
+              ? `This ends its running sessions. Nothing is removed from the disk: the project's folder and its branch stay as they are.`
+              : `This deletes the worktree, the workspace's folder on this Mac, and ends its running sessions.`}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <div className="rounded-md border bg-muted px-2 py-1.5 text-xs break-all">{workspace.path}</div>
