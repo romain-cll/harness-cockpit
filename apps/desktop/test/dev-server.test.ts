@@ -8,7 +8,7 @@ import { describeMode } from './support/mode-checks';
 import { describePanesDevServerSmoke } from './support/panes';
 import { addRepository, makeRepo, untilAnswered, worktreePath, writeConfig } from './support/projects';
 import { addGhFixture, addOrigin, expectChangesShowNewFile, expectShipSmoke, type GhFixture, GIT_APP_ENV } from './support/right-bar';
-import { addOpenFixture, createPlainWorkspace, createWorkspaceWithAgent, devFolderOfThisWorktree, devHomeIn, expectControlEndpoint, expectNoErrors, expectSetupSpawnedWithDetectedPath, expectSetupThenAgent, FIRST_MENU, launchDevWith, makeSessionsFixture, type OpenFixture, openWorkspaceMenu, pickInSubmenu, readStub, rememberedApps, REPOSITORY_CLI, type SessionsFixture, sessionsInState, startForeignSetup, startSession, waitForOpenRuns, waitForSessionEntries, waitForWorkspaceTabs } from './support/sessions';
+import { addOpenFixture, createPlainWorkspace, createWorkspaceWithAgent, devFolderOfThisWorktree, devHomeIn, expectControlEndpoint, expectNoErrors, expectResumeSmoke, expectSetupSpawnedWithDetectedPath, expectSetupThenAgent, FIRST_MENU, launchDevWith, makeSessionsFixture, type OpenFixture, openWorkspaceMenu, pickInSubmenu, readStub, rememberedApps, REPOSITORY_CLI, type SessionsFixture, sessionsInState, startForeignSetup, startSession, waitForOpenRuns, waitForSessionEntries, waitForWorkspaceTabs } from './support/sessions';
 
 describeMode('dev server', launchDev);
 
@@ -108,6 +108,16 @@ describe('sessions smoke path: dev server', () => {
 
   test('logs no error and keeps running', async () => {
     await expectNoErrors(session);
+  });
+
+  // COCKPIT-30: after the checks above, since it loses the daemon.
+  test('resume smoke path, COCKPIT-30 — a session reports its conversation id, its daemon is lost, the page reloads and "Resume last session" starts the harness with the status arguments then `--resume <id>`', async () => {
+    const repo = makeRepo('smoke-resume-ws');
+    try {
+      await expectResumeSmoke(session, fx, repo, REPOSITORY_CLI);
+    } finally {
+      rmSync(repo.parent, { recursive: true, force: true });
+    }
   });
 });
 

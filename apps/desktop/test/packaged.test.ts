@@ -10,7 +10,7 @@ import { describeMode } from './support/mode-checks';
 import { describePanesPackagedSmoke } from './support/panes';
 import { addProject, addRepository, entryTitles, makeRepo, projectsInState, removeThroughMenu, sidebarEntries, sidebarLines, snapshotRepo, stateSnapshot, type TempRepo, untilAnswered, waitForEntries, worktreePath, writeConfig } from './support/projects';
 import { addGhFixture, addOrigin, expectChangesShowNewFile, expectShipSmoke, type GhFixture, GIT_APP_ENV } from './support/right-bar';
-import { addOpenFixture, controlTokenIn, createWorkspaceWithAgent, expectControlEndpoint, expectNoErrors, expectSetupSpawnedWithDetectedPath, expectSetupThenAgent, FIRST_MENU, launchPackagedWith, makeSessionsFixture, type OpenFixture, openSessionEntry, openWorkspaceMenu, PACKAGED_CLI, pickInSubmenu, readStub, rememberedApps, sessionEntries, type SessionsFixture, sessionsInState, startForeignSetup, startSession, waitForOpenRuns, waitForSessionEntries, waitForWorkspaceTabs } from './support/sessions';
+import { addOpenFixture, controlTokenIn, createWorkspaceWithAgent, describeResumeSmoke, expectControlEndpoint, expectNoErrors, expectSetupSpawnedWithDetectedPath, expectSetupThenAgent, FIRST_MENU, launchPackagedWith, makeSessionsFixture, type OpenFixture, openSessionEntry, openWorkspaceMenu, PACKAGED_CLI, pickInSubmenu, readStub, rememberedApps, sessionEntries, type SessionsFixture, sessionsInState, startForeignSetup, startSession, waitForOpenRuns, waitForSessionEntries, waitForWorkspaceTabs } from './support/sessions';
 import { clearFocusCalls, FRONT_CALLS, frontCalls, runSecondLaunch, stubFocus, windowCount } from './support/single-instance';
 import { applicationType, consoleErrorsOf, watchFrontmost } from './support/terminal';
 
@@ -445,3 +445,5 @@ describe.runIf(process.env.CI)('packaged app without the background switch', () 
 
 describePanesPackagedSmoke();
 describeDaemonPackagedSmoke();
+
+describeResumeSmoke('packaged app', (fx) => launchPackagedWith(fx.env()), PACKAGED_CLI);

@@ -24,7 +24,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 
 const BINARY = resolve(import.meta.dirname, '../dist/cockpit');
 const TOKEN = 'b'.repeat(64);
-const USAGE_LINES = ['cockpit status <working|waiting|finished>', 'cockpit setup [--then <command> [args…]]', 'cockpit teardown'];
+const USAGE_LINES = ['cockpit status <working|waiting|finished>', 'cockpit session-id', 'cockpit setup [--then <command> [args…]]', 'cockpit teardown'];
 const BRANCH = 'feat-setup';
 const HEADER = (what: 'setup' | 'teardown') => `cockpit ${what} · ${BRANCH} · .cockpit/config.json`;
 

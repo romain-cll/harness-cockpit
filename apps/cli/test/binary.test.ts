@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer as createHttpServer } from 'node:http';
 import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -10,7 +11,7 @@ import { afterEach, beforeAll, describe, expect, test } from 'vitest';
 // builds `dist/cockpit` before `test`.
 
 const BINARY = resolve(import.meta.dirname, '../dist/cockpit');
-const USAGE_LINES = ['cockpit status <working|waiting|finished>', 'cockpit setup [--then <command> [args…]]', 'cockpit teardown'];
+const USAGE_LINES = ['cockpit status <working|waiting|finished>', 'cockpit session-id', 'cockpit setup [--then <command> [args…]]', 'cockpit teardown'];
 const TOKEN = 'a'.repeat(64);
 
 const cleanups: Array<() => void> = [];
@@ -46,10 +47,28 @@ async function listenSilent(socketPath: string) {
   return { connections: () => connections };
 }
 
-function run(args: string[], env: Record<string, string>) {
+/** A daemon that records each request (`Authorization` header and body) and answers 204. */
+async function listenRecording(socketPath: string) {
+  const requests: Array<{ authorization: string | undefined; body: string }> = [];
+  const server = createHttpServer((request, response) => {
+    let body = '';
+    request.on('data', (chunk) => (body += chunk));
+    request.on('end', () => {
+      requests.push({ authorization: request.headers.authorization, body });
+      response.writeHead(204).end();
+    });
+  });
+  await new Promise<void>((done) => server.listen(socketPath, done));
+  cleanups.push(() => void server.close());
+  return { requests: () => requests };
+}
+
+// `input` is what a hook pipes to the binary's stdin; without it stdin stays open and unread, as before.
+function run(args: string[], env: Record<string, string>, input?: string) {
   return new Promise<{ code: number | null; out: string; err: string; ms: number }>((done, fail) => {
     const started = Date.now();
     const child = spawn(BINARY, args, { env: { PATH: process.env.PATH ?? '', ...env } });
+    if (input !== undefined) child.stdin.end(input);
     let out = '';
     let err = '';
     child.stdout.on('data', (chunk) => (out += chunk));
@@ -95,6 +114,61 @@ describe('cockpit status, the compiled binary', () => {
     const server = await listenSilent(socket);
 
     const result = await run(['status', 'working', 'extra'], { COCKPIT_SOCKET: socket, COCKPIT_SESSION_ID: 'session-1' });
+
+    expect(result).toMatchObject({ code: 2, out: '' });
+    expect(result.err.startsWith('usage:')).toBe(true);
+    for (const line of USAGE_LINES) expect(result.err).toContain(line);
+    expect(server.connections()).toBe(0);
+  });
+});
+
+// COCKPIT-30: Bun's `process.stdin` is what ships, so the stdin of a hook is read by the compiled binary once.
+describe('cockpit session-id, the compiled binary', () => {
+  const env = (socket: string) => ({ COCKPIT_SOCKET: socket, COCKPIT_SESSION_ID: 'session-1' });
+  const socketIn = (home: string) => {
+    const socket = join(home, 'daemon-1-aaaa1111.sock');
+    writeFileSync(socket.replace(/\.sock$/, '.token'), TOKEN);
+    return socket;
+  };
+
+  test.each([
+    ['claude-code', (id: string) => JSON.stringify({ session_id: id, hook_event_name: 'UserPromptSubmit', prompt: 'hello' })],
+    ['codex', (id: string) => JSON.stringify({ session_id: id, hook_event_name: 'UserPromptSubmit', prompt: 'hello' })],
+    ['opencode', (id: string) => `${id}\n`],
+  ])('AC1, AC5 — %s: the id read from stdin, an odd one byte for byte, is posted for the session with the token; exit 0 and nothing on stdout or stderr', async (harness, input) => {
+    const socket = socketIn(makeHome());
+    const daemon = await listenRecording(socket);
+
+    const result = await run(['session-id', harness], env(socket), input('not/a:uuid é'));
+
+    expect(result).toMatchObject({ code: 0, out: '', err: '' });
+    expect(daemon.requests().map(({ authorization, body }) => ({ authorization, body: JSON.parse(body) as unknown }))).toEqual([
+      { authorization: `Bearer ${TOKEN}`, body: { sessionId: 'session-1', event: 'harness-session', harnessSessionId: 'not/a:uuid é' } },
+    ]);
+  });
+
+  test('AC6 — a stdin with no id: exit 0, nothing on stdout or stderr and nothing sent', async () => {
+    const socket = socketIn(makeHome());
+    const daemon = await listenRecording(socket);
+
+    const result = await run(['session-id', 'claude-code'], env(socket), '{"hook_event_name":"UserPromptSubmit"}');
+
+    expect(result).toMatchObject({ code: 0, out: '', err: '' });
+    expect(daemon.requests()).toEqual([]);
+  });
+
+  test('AC6 — no COCKPIT_SOCKET: exit 0 within 3 s and nothing on stdout or stderr', async () => {
+    const result = await run(['session-id', 'claude-code'], { COCKPIT_SESSION_ID: 'session-1' }, '{"session_id":"abc"}');
+
+    expect(result).toMatchObject({ code: 0, out: '', err: '' });
+    expect(result.ms).toBeLessThan(3_000);
+  });
+
+  test('AC6 — session-id with no argument: the usage on stderr, exit 2, and no connection to the daemon', async () => {
+    const socket = socketIn(makeHome());
+    const server = await listenSilent(socket);
+
+    const result = await run(['session-id'], env(socket), '{"session_id":"abc"}');
 
     expect(result).toMatchObject({ code: 2, out: '' });
     expect(result.err.startsWith('usage:')).toBe(true);
