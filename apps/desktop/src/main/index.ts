@@ -1656,3 +1656,7 @@ void app.whenReady().then(async () => {
     if (process.platform === 'darwin') app.focus({ steal: true });
   });
 });
+
+export function ciProofLint() {
+  debugger;
+}
