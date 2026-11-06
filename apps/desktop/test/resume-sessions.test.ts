@@ -297,6 +297,11 @@ describe('resume sessions: built app', () => {
     fx.releaseVersions();
     await ipcAnswered(session, 'sessions:resume', calls + 2);
     const facts = await readStub(page);
+    // The start has ended and its agent runs: the session is held by the daemon, no longer by a start under way.
+    const whileRunning = await page.evaluate(
+      (sessionId) => (window as unknown as Api).api.sessions.resume(sessionId, { cols: 80, rows: 24 }),
+      ids.withId,
+    );
     const terminalsOfSession = await page.evaluate(
       async (sessionId) => (await (window as unknown as { api: { pty: { list(): Promise<Array<{ sessionId?: string }>> } } }).api.pty.list()).filter((terminal) => terminal.sessionId === sessionId).length,
       ids.withId,
@@ -304,7 +309,8 @@ describe('resume sessions: built app', () => {
 
     expect(disabledAfterSwitch, 'the button stays disabled across a tab switch').toBe(true);
     expect(direct, 'the session whose start is under way is refused').toMatchObject({ status: 'refused' });
-    expect(await ipcCalls(session, 'sessions:resume')).toBe(calls + 2);
+    expect(whileRunning, 'the session a daemon holds is refused').toMatchObject({ status: 'refused' });
+    expect(await ipcCalls(session, 'sessions:resume')).toBe(calls + 3);
     expect(terminalsOfSession, 'one terminal for the session').toBe(1);
     expect(launchFiles(fx)).toHaveLength(launches.length + 1);
     expect(readLaunch(fx, 'claude', facts.pid).args.slice(-2)).toEqual(['--resume', AFTER_RESUME_ID]);
