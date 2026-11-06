@@ -1,0 +1,28 @@
+name: Setup
+description: Node, Bun, the caches and the locked dependencies
+
+runs:
+  using: composite
+  steps:
+    # The oldest Node line the repository supports.
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 22
+
+    # Installs the Bun version pinned in `packageManager`.
+    - uses: oven-sh/setup-bun@v2
+
+    # One key per job: with a shared key the first job to end saves, and a job
+    # without Electron (`packages`) would save a cache no later run replaces.
+    - uses: actions/cache@v6
+      with:
+        path: |
+          ~/.bun/install/cache
+          ~/Library/Caches/electron
+        key: ${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('bun.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+          ${{ runner.os }}-${{ runner.arch }}-
+
+    - run: bun install --frozen-lockfile
+      shell: bash
