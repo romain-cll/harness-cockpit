@@ -1,11 +1,11 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { basename, join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 import { launchBuilt, launchSpawned, type Session, untilRead, versionLabel } from './launch';
 import { makeTestDir } from './run-root';
-import { addProject, afterIpcAnswers, countIpcCalls, entryTitles, ipcCalls, isBelowProjectsHeader, makePlainFolder, makeRepo, projectsGit, projectsInState, readGitAlert, refusalsShown, removeThroughMenu, sidebarEntries, sidebarLines, snapshotRepo, startProjectRemoval, stateSnapshot, type TempRepo, untilFewerOverlays, waitForEntries, waitForLine } from './support/projects';
+import { addProject, afterIpcAnswers, countIpcCalls, entryTitles, ipcCalls, isBelowProjectsHeader, makePlainFolder, makeRepo, openDialogs, projectsGit, projectsInState, readGitAlert, refusalsShown, removeThroughMenu, sidebarEntries, sidebarLines, snapshotRepo, startProjectRemoval, stateSnapshot, type TempRepo, untilFewerOverlays, waitForEntries } from './support/projects';
 import { expectNoErrors } from './support/sessions';
 import { dropTerminalWorkspace, watchFrontmost } from './support/terminal';
 
@@ -88,43 +88,61 @@ describe('built app', () => {
       expect(existsSync(join(session.dataDir, 'state.json.tmp'))).toBe(false);
     });
 
-    test('AC2 — adding the same repository again, by its root or a subfolder, keeps one entry, shows a message and leaves state.json alone', async () => {
+    test('AC2, COCKPIT-72 AC7 — adding the same repository again, by its root or a subfolder, keeps one entry and opens a dialog with one OK button saying "<name> is already in Cockpit."; the Projects section shows no message and state.json is left alone', async () => {
       const { page } = session;
       const message = `${alpha.name} is already in Cockpit.`;
       const before = stateSnapshot(session.dataDir);
 
       for (const pick of [alpha.root, join(alpha.root, 'src')]) {
         await addProject(session, pick);
-        await waitForLine(page, message);
+        const dialog = openDialogs(page).filter({ hasText: message });
+        await dialog.waitFor();
 
+        expect(await dialog.getByRole('button', { name: 'OK', exact: true }).count()).toBe(1);
+        expect(await dialog.getByRole('button', { name: 'Cancel' }).count()).toBe(0);
         expect(await entryTitles(page)).toEqual([alpha.root]);
-        expect(await refusalsShown(page)).toEqual([message]);
-        expect(await isBelowProjectsHeader(page, { text: message })).toBe(true);
+        expect(await page.locator('aside [role="status"]').count()).toBe(0);
+        expect(await refusalsShown(page)).toEqual([]);
         expect(stateSnapshot(session.dataDir)).toEqual(before);
+
+        await dialog.getByRole('button', { name: 'OK', exact: true }).click();
+        await dialog.waitFor({ state: 'hidden' });
       }
     });
 
-    test('AC3 — a folder outside any git repository is refused with a message, no entry and state.json untouched', async () => {
+    test('AC3, COCKPIT-72 AC5 — a folder outside any git repository opens "This folder is not a git repository" naming the folder, with Cancel and "Initialize git repository"; no entry, no message, state.json untouched, and Cancel closes it and changes nothing', async () => {
       const { page } = session;
-      const message = `${plain.root} is not in a git repository.`;
       const before = stateSnapshot(session.dataDir);
+      const onDisk = readdirSync(plain.root);
 
       await addProject(session, plain.root);
-      await waitForLine(page, message);
+      const dialog = openDialogs(page).filter({ hasText: 'This folder is not a git repository' });
+      await dialog.waitFor();
 
+      expect(await dialog.innerText()).toContain(plain.root);
+      expect(await dialog.getByRole('button', { name: 'Cancel', exact: true }).count()).toBe(1);
+      expect(await dialog.getByRole('button', { name: 'Initialize git repository', exact: true }).count()).toBe(1);
       expect(await entryTitles(page)).toEqual([alpha.root]);
-      expect(await refusalsShown(page)).toEqual([message]);
-      expect(await isBelowProjectsHeader(page, { text: message })).toBe(true);
+      expect(await page.locator('aside [role="status"]').count()).toBe(0);
       expect(stateSnapshot(session.dataDir)).toEqual(before);
+
+      await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await dialog.waitFor({ state: 'hidden' });
+      await afterIpcAnswers(page);
+      expect(await entryTitles(page)).toEqual([alpha.root]);
+      expect(stateSnapshot(session.dataDir)).toEqual(before);
+      expect(existsSync(join(plain.root, '.git'))).toBe(false);
+      expect(readdirSync(plain.root)).toEqual(onDisk);
     });
 
-    test('AC4 — a message goes away when a valid repository is added, and the project appears', async () => {
+    test('AC4 — a valid repository added after the refusals is listed with no dialog and no message left', async () => {
       const { page } = session;
-      expect(await refusalsShown(page), 'a message is shown before the add').not.toEqual([]);
+      expect(await openDialogs(page).count(), 'the refusals left no dialog open').toBe(0);
 
       await addProject(session, bravo.root);
       await waitForEntries(page, [alpha.root, bravo.root]);
 
+      expect(await openDialogs(page).count()).toBe(0);
       expect(await refusalsShown(page)).toEqual([]);
       expect(projectsInState(session.dataDir)).toEqual([{ path: alpha.root }, { path: bravo.root }]);
     });
@@ -245,20 +263,24 @@ describe('built app with no git on the login shell PATH', () => {
     if (repo) rmSync(repo.parent, { recursive: true, force: true });
   });
 
-  test('AC12 — adding a repository is refused with "git is not installed", no entry, and state.json untouched', async () => {
+  test('AC12, COCKPIT-72 AC7 — adding a repository is refused with a dialog with one OK button saying "git is not installed", no entry, no message in the Projects section, and state.json untouched', async () => {
     const { page } = session;
     await page.getByText(versionLabel).waitFor();
     const before = stateSnapshot(session.dataDir);
 
     await addProject(session, repo.root);
-    // The line is the refusal the add answered: no entry was added by then.
-    await waitForLine(page, 'git is not installed');
+    const dialog = openDialogs(page).filter({ hasText: 'git is not installed' });
+    await dialog.waitFor();
 
+    expect(await dialog.getByRole('button', { name: 'OK', exact: true }).count()).toBe(1);
     expect(await entryTitles(page)).toEqual([]);
-    expect(await isBelowProjectsHeader(page, { text: 'git is not installed' })).toBe(true);
+    expect(await page.locator('aside [role="status"]').filter({ hasText: 'git is not installed' }).count()).toBe(0);
     expect(stateSnapshot(session.dataDir)).toEqual(before);
     expect(projectsInState(session.dataDir) ?? []).toEqual([]);
     expect(existsSync(join(session.dataDir, 'state.json.tmp'))).toBe(false);
+
+    await dialog.getByRole('button', { name: 'OK', exact: true }).click();
+    await dialog.waitFor({ state: 'hidden' });
   });
 
   test('COCKPIT-65 AC10 — an amber alert with a triangle-alert icon sits under the New workspace link and above the Projects header, and projects.git() answers "missing"', async () => {

@@ -116,6 +116,16 @@ export function removeProject(state: State, path: string): State {
   return { ...state, projects: state.projects.filter((project) => project.path !== path) };
 }
 
+// The project at `from` takes the path `to`, keeping its place in the list; its sessions follow.
+export function updateProjectPath(state: State, from: string, to: string): State {
+  if (state.projects.some((project) => project.path === to)) throw new ProjectExistsError(to);
+  return {
+    ...state,
+    projects: state.projects.map((project) => (project.path === from ? { path: to } : project)),
+    sessions: state.sessions.map((session) => (session.project === from ? { ...session, project: to } : session)),
+  };
+}
+
 export function rememberApp(state: State, kind: 'editor' | 'terminal', id: string): State {
   return { ...state, [kind]: id };
 }

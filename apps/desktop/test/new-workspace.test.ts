@@ -805,7 +805,8 @@ describe('new workspace page: built app', () => {
     for (const repo of [clone, nodef, gone, refuse]) {
       await page.evaluate((path) => (globalThis as unknown as { api: { projects: { remove(path: string): Promise<unknown> } } }).api.projects.remove(path), repo.root);
     }
-    await openComposer(page);
+    // `/` is the empty state without a project (COCKPIT-72 AC1): the composer is at `/?project=none`.
+    await openComposer(page, 'none');
     expect(await textOf(projectSelect(page))).toBe('No project');
     expect(await baseSelect(page).count()).toBe(0);
   });
@@ -821,6 +822,8 @@ describe('built app without any agent CLI on the login shell PATH', () => {
     dataDir = makeTestDir('d-');
     session = await launchBuiltWith(fx.env(), dataDir);
     await session.page.getByText(versionLabel).waitFor();
+    // `/` is the empty state without a project (COCKPIT-72 AC1): the composer is at `/?project=none`.
+    await openComposer(session.page, 'none');
   });
 
   afterAll(async () => {

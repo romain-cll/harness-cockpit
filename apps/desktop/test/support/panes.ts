@@ -11,6 +11,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { sendFromComposer } from '../composer';
 import { daemonSocketIn, isAlive, launchDev, launchPackaged, launchSpawned, quitApp, type Session, untilIn, untilRead, versionLabel, watchTerminalEnd } from '../launch';
 import { makeTestDir } from '../run-root';
+import { pickAddItem } from './projects';
 
 
 // COCKPIT-70: the workspace page, panes with tabs of agents and shells. The built app runs the full
@@ -186,7 +187,7 @@ export async function stubPicker(session: Session, pick: string) {
 export async function addRepository(session: Session, repo: TempRepo) {
   const { page } = session;
   await stubPicker(session, repo.root);
-  await page.getByRole('button', { name: 'Add project', exact: true }).click();
+  await pickAddItem(page, 'Open project…');
   await page.getByRole('button', { name: `Actions for ${repo.name}`, exact: true }).waitFor({ state: 'attached' });
 }
 
@@ -238,9 +239,10 @@ export async function openWorkspace(page: Page, name: string, path: string) {
   await onWorkspacePage(page, path, name);
 }
 
+// The home page (`/`) is the composer with a project in Cockpit and the empty state without (COCKPIT-72).
 export async function goHome(page: Page) {
   await page.getByRole('link', { name: 'New workspace', exact: true }).click();
-  await page.getByRole('heading', { name: 'New workspace', exact: true }).waitFor();
+  await page.getByRole('heading', { name: 'New workspace', exact: true }).or(page.getByText('No projects yet', { exact: true })).waitFor();
 }
 
 // A pane is the tab bar (`tablist`) of the workspace region, found by role and auto-waited. The panes are rendered

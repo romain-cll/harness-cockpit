@@ -2,9 +2,9 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
-import { baseSelect, chooseBase, createButton, openComposer, projectSelect, promptBox, sendFromComposer, textOf, useAgent, waitForBase, waitForMessage } from './composer';
-import { launchBuilt, type Session, untilRead, versionLabel } from './launch';
-import { addProject, addRepository, afterIpcAnswers, branchBox, countIpcCalls, deleteButton, deleteDialog, dismissDialogs, dispatchFocus, entryTitles, errorMark, expectNoNewErrors, gitIn, gitState, INVOKE_HANDLERS, ipcCalls, isBelowProjectsHeader, linesOf, linkedWorktrees, localBranches, makeClone, makeLightRepo, missingFolderBlock, mutedColor, openDeleteDialog, openDialogs, openMenu, projectsInState, readBaseOptions, readSidebarLines, removeOptions, removeProjectDialog, removeThroughMenu, sha8, sidebarEntries, sidebarLines, stateSnapshot, stubPicker, type TempClone, type TempRepo, tokenColor, untilAnswered, untilFewerOverlays, waitForDialogLine, waitForEntries, waitForEntry, waitForLine, waitForNoEntry, worktreePath } from './support/projects';
+import { baseSelect, chooseBase, createButton, norm, openComposer, projectSelect, promptBox, sendFromComposer, textOf, useAgent, waitForBase, waitForMessage } from './composer';
+import { launchBuilt, type Session, versionLabel } from './launch';
+import { addProject, addRepository, afterIpcAnswers, branchBox, countIpcCalls, deleteButton, deleteDialog, dismissDialogs, dispatchFocus, entryTitles, errorMark, expectNoNewErrors, gitIn, gitState, INVOKE_HANDLERS, ipcCalls, isBelowProjectsHeader, linesOf, linkedWorktrees, localBranches, makeClone, makeLightRepo, missingFolderBlock, mutedColor, openDeleteDialog, openDialogs, openMenu, projectsInState, readBaseOptions, removeOptions, removeProjectDialog, removeThroughMenu, sha8, sidebarEntries, sidebarLines, stateSnapshot, stubPicker, type TempClone, type TempRepo, tokenColor, untilAnswered, untilFewerOverlays, waitForDialogLine, waitForEntries, waitForEntry, waitForLine, waitForNoEntry, worktreePath } from './support/projects';
 import { expectNoErrors, workspacesApi } from './support/sessions';
 import { dropTerminalWorkspace, goHome, type PtyWindow, watchFrontmost } from './support/terminal';
 
@@ -950,7 +950,7 @@ describe('built app', () => {
     }, 120_000);
   });
 
-  test('workspaces AC20 — a failing save refuses the add with "Cockpit could not save its data: <error>", lists nothing, leaves state.json as it was and logs no error', async () => {
+  test('workspaces AC20, COCKPIT-72 AC7 — a failing save refuses the add with a one-button dialog "Cockpit could not save its data: <error>", lists nothing, leaves state.json as it was and logs no error', async () => {
     const { page } = session;
     const repo = makeLightRepo('ws-save');
     try {
@@ -963,14 +963,17 @@ describe('built app', () => {
 
       try {
         await addProject(session, repo.root);
-        const [message] = (
-          await untilRead(page, readSidebarLines, (lines) => lines.some((line) => line.startsWith('Cockpit could not save its data: ')))
-        ).filter((line) => line.startsWith('Cockpit could not save its data: '));
+        const dialog = openDialogs(page).filter({ hasText: 'Cockpit could not save its data: ' });
+        await dialog.waitFor();
+        const message = norm(await dialog.innerText());
 
-        expect(message).toBeDefined();
-        expect(message!.length).toBeGreaterThan('Cockpit could not save its data: '.length);
+        expect(message.length).toBeGreaterThan('Cockpit could not save its data: '.length);
         expect(message).toContain('EISDIR');
-        expect(await isBelowProjectsHeader(page, { text: message! })).toBe(true);
+        expect(await dialog.getByRole('button', { name: 'OK', exact: true }).count()).toBe(1);
+        expect(await dialog.getByRole('button', { name: 'Cancel' }).count()).toBe(0);
+        expect(await page.locator('aside [role="status"]').count(), 'the Projects section shows no message').toBe(0);
+        await dialog.getByRole('button', { name: 'OK', exact: true }).click();
+        await dialog.waitFor({ state: 'hidden' });
         expect(await entryTitles(page)).toEqual([]);
         expect(stateSnapshot(session.dataDir)).toEqual(before);
         await expectNoNewErrors(session, mark);

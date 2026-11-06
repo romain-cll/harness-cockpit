@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, type ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -19,6 +19,9 @@ export type WorkspaceErrorCode =
   | 'NO_BASE'
   | 'GIT_MISSING'
   | 'GIT_TOO_OLD'
+  | 'DESTINATION_EXISTS'
+  | 'GIT_IDENTITY_MISSING'
+  | 'GIT_DIR_EXISTS'
   | 'GIT_FAILED'
   | 'FS_FAILED';
 
@@ -38,17 +41,27 @@ export interface GitOptions {
   env?: NodeJS.ProcessEnv;
   /** Overrides the default stdout buffer of 256 MiB. */
   maxBuffer?: number;
+  /** Ends git (SIGTERM) when aborted; the call then settles once git has exited. */
+  signal?: AbortSignal;
 }
 
 /**
  * Runs git without a shell and resolves to its stdout. Every failure is `GIT_FAILED`, a missing
  * executable included: with a `cwd`, ENOENT also means the folder is missing.
  */
-export async function git(args: string[], { cwd, env, maxBuffer }: GitOptions = {}): Promise<string> {
+export async function git(args: string[], { cwd, env, maxBuffer, signal }: GitOptions = {}): Promise<string> {
+  let child: ChildProcess | undefined;
   try {
-    const { stdout } = await execFileAsync('git', args, { cwd, env, maxBuffer: maxBuffer ?? DEFAULT_MAX_BUFFER });
-    return stdout;
+    // Started inside the `try`: a `cwd` that is a file makes `spawn` throw at once.
+    const run = execFileAsync('git', args, { cwd, env, signal, maxBuffer: maxBuffer ?? DEFAULT_MAX_BUFFER });
+    child = run.child;
+    return (await run).stdout;
   } catch (error) {
+    // `execFile` rejects at the abort, before git has exited and finished what it was doing.
+    const running = child;
+    if (running && signal?.aborted && running.exitCode === null && running.signalCode === null) {
+      await new Promise((resolve) => running.once('exit', resolve));
+    }
     const failure = error as NodeJS.ErrnoException & { stderr?: string };
     throw new WorkspaceError(
       'GIT_FAILED',

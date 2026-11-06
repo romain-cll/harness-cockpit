@@ -331,9 +331,10 @@ export async function focusedPane(page: Page): Promise<Pane> {
   return pane;
 }
 
+// The home page (`/`) is the composer with a project in Cockpit and the empty state without (COCKPIT-72).
 export async function goHome(page: Page) {
   await page.getByRole('link', { name: 'New workspace', exact: true }).click();
-  await page.getByRole('heading', { name: 'New workspace', exact: true }).waitFor();
+  await page.getByRole('heading', { name: 'New workspace', exact: true }).or(page.getByText('No projects yet', { exact: true })).waitFor();
 }
 
 // Ends every shell of the daemon (COCKPIT-55: the shells outlive the page, so a reload shows them

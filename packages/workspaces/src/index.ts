@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { access, mkdir, readFile, realpath } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, rm } from 'node:fs/promises';
 import { basename, isAbsolute, join } from 'node:path';
 import { checkGit, git, list, succeeds, WorkspaceError, type GitEnv, type Worktree } from './git';
 
@@ -28,6 +28,69 @@ async function linkedWorktree(worktrees: Worktree[], path: string): Promise<Work
   const worktree = await findLinked(worktrees, path);
   if (!worktree) throw new WorkspaceError('GIT_FAILED', `not a linked worktree: ${path}`);
   return worktree;
+}
+
+/**
+ * Clones `url` into `path`, which must not exist (`DESTINATION_EXISTS`); git creates the parent folders.
+ * `GIT_TERMINAL_PROMPT=0` so a credential prompt fails instead of waiting. Aborting `signal` ends git. Past the
+ * existence check, a clone that fails or is aborted leaves no `path`: git keeps its folder when it dies or fails
+ * during the checkout, so it is removed once git has exited.
+ */
+export async function cloneRepository({
+  url,
+  path,
+  env,
+  signal,
+}: {
+  url: string;
+  path: string;
+  signal?: AbortSignal;
+} & GitEnv): Promise<void> {
+  await checkGit(env);
+  if (await exists(path)) throw new WorkspaceError('DESTINATION_EXISTS', `${path} already exists.`);
+  try {
+    await git(['clone', '--', url, path], { env: { ...env, GIT_TERMINAL_PROMPT: '0' }, signal });
+  } catch (error) {
+    // A removal that fails (the location holds a file where a folder is needed) never replaces git's error.
+    await rm(path, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+/**
+ * Makes `path` (an existing folder) a repository holding one empty commit, so that a worktree can start from
+ * it; its files stay untracked. Without an identity git resolves in the new repository, `GIT_IDENTITY_MISSING`.
+ * On any failure `.git` is removed again. A folder that already has one is left untouched, so the rollback only
+ * removes what this call made: it resolves if git reads the folder as a repository (a retry after a failed save),
+ * else `GIT_DIR_EXISTS`.
+ */
+export async function initRepository({ path, env }: { path: string } & GitEnv): Promise<void> {
+  await checkGit(env);
+  if (await exists(join(path, '.git'))) {
+    if (await succeeds(['rev-parse', '--show-toplevel'], { cwd: path, env })) return;
+    throw new WorkspaceError('GIT_DIR_EXISTS', `${path} already has a .git that git cannot use. Nothing was changed.`);
+  }
+  try {
+    await git(['init'], { cwd: path, env });
+    for (const variable of ['GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT']) {
+      if (!(await succeeds(['var', variable], { cwd: path, env }))) {
+        throw new WorkspaceError(
+          'GIT_IDENTITY_MISSING',
+          'Git needs your name and email to commit. Set user.name and user.email, then try again.',
+        );
+      }
+    }
+    await git(['commit', '--allow-empty', '--no-gpg-sign', '-m', 'Initial commit'], { cwd: path, env });
+  } catch (error) {
+    await rm(join(path, '.git'), { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+/** Reconnects the linked worktrees of `repo` after it moved (`git worktree repair`). */
+export async function repairWorktrees(repo: string, { env }: GitEnv = {}): Promise<void> {
+  await checkGit(env);
+  await git(['worktree', 'repair'], { cwd: repo, env });
 }
 
 /** The main working tree of the repository containing `path`, which may be inside a linked worktree. */
@@ -70,7 +133,8 @@ export async function listWorktrees(repo: string, { env }: GitEnv = {}): Promise
 /** The folder of a project's worktrees under the root: its name and a hash of its path. */
 const projectFolder = (main: string) => `${basename(main)}-${createHash('sha256').update(main).digest('hex').slice(0, 8)}`;
 
-const exists = (path: string) => access(path).then(() => true, () => false);
+// `lstat`, so a dangling symbolic link exists too.
+const exists = (path: string) => lstat(path).then(() => true, () => false);
 
 const MAX_SLUG = 40;
 

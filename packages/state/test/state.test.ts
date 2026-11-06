@@ -14,6 +14,7 @@ import {
   saveState,
   sessionName,
   type Session,
+  updateProjectPath,
 } from '../src/index';
 
 // Records the calls `saveState` and `loadState` make on the file system, in
@@ -864,6 +865,58 @@ describe('open workspace AC5 — rememberApp', () => {
   test('AC5 — replaces the app remembered before', () => {
     const next = rememberApp({ ...base, editor: 'vscode', terminal: 'terminal' }, 'editor', 'cursor');
     expect(next).toEqual({ ...base, editor: 'cursor', terminal: 'terminal' });
+  });
+});
+
+describe('COCKPIT-72 AC22 — updateProjectPath', () => {
+  const state = () => ({
+    version: 1,
+    editor: 'zed',
+    projects: [{ path: '/a' }, { path: '/old/b' }, { path: '/c' }],
+    sessions: [
+      session({ id: 's1', directory: '/old/b-ws', project: '/old/b' }),
+      session({ id: 's2', directory: '/a-ws', project: '/a' }),
+      session({ id: 's3', directory: '/loose' }),
+      session({ id: 's4', directory: '/old/b-ws-2', project: '/old/b' }),
+    ],
+  });
+
+  test('AC22 — the project keeps its place in the list with the new path, and the other fields stay', () => {
+    const before = state();
+
+    const next = updateProjectPath(before, '/old/b', '/new/b');
+
+    expect(next.projects).toEqual([{ path: '/a' }, { path: '/new/b' }, { path: '/c' }]);
+    expect(next.editor).toBe('zed');
+    expect(next.version).toBe(1);
+  });
+
+  test('AC22 — the sessions of the project hold the new path in `project`; the others and every directory are left alone', () => {
+    const next = updateProjectPath(state(), '/old/b', '/new/b');
+
+    expect(next.sessions.map(({ id, project, directory }) => ({ id, project, directory }))).toEqual([
+      { id: 's1', project: '/new/b', directory: '/old/b-ws' },
+      { id: 's2', project: '/a', directory: '/a-ws' },
+      { id: 's3', project: undefined, directory: '/loose' },
+      { id: 's4', project: '/new/b', directory: '/old/b-ws-2' },
+    ]);
+    expect(Object.keys(next.sessions[2]!)).not.toContain('project');
+  });
+
+  test('AC22 — leaves the given state as it was', () => {
+    const before = state();
+
+    updateProjectPath(before, '/old/b', '/new/b');
+
+    expect(before).toEqual(state());
+  });
+
+  test('AC22 — throws ProjectExistsError when the new path is already listed, and the state stays as it was', () => {
+    const before = state();
+
+    expect(() => updateProjectPath(before, '/old/b', '/c')).toThrow(ProjectExistsError);
+
+    expect(before).toEqual(state());
   });
 });
 

@@ -1,5 +1,6 @@
 import { createRootRoute, Outlet, useLocation, useNavigate, useRouter } from '@tanstack/react-router';
 import { useEffect } from 'react';
+import { AddProject } from '@/components/add-project';
 import { AppSidebar } from '@/components/app-sidebar';
 import { useSidebarCollapsed } from '@/components/collapsed';
 import { RestartServiceDialog } from '@/components/daemon-down';
@@ -68,6 +69,7 @@ function RootLayout() {
       <main className="flex min-w-0 flex-1 flex-col bg-background p-2">
         <Outlet />
       </main>
+      <AddProject />
       <RestartServiceDialog />
       {workspace && !workspace.workspace.settingUp &&
         (rightBarOpen ? (
