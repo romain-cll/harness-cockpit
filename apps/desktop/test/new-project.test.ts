@@ -830,7 +830,8 @@ describe('initialize over a .git git cannot use: built app', () => {
     repo = makeRepo('foreign-owner');
     gitIn(repo.root, 'commit', '--allow-empty', '-m', 'second');
     // Through the fake login shell, git takes the folder's `.git` for another user's: it will not read it.
-    writeFileSync(join(fx.root, 'early'), 'export GIT_TEST_ASSUME_DIFFERENT_OWNER=1\n');
+    // No user config: the CI runner's global `safe.directory = *` would turn the ownership check off.
+    writeFileSync(join(fx.root, 'early'), 'export GIT_TEST_ASSUME_DIFFERENT_OWNER=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1\n');
     session = await launchBuiltWith(fx.env());
     await session.page.getByText(versionLabel).waitFor();
     await stubPicker(session, null);
