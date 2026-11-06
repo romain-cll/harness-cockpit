@@ -1163,10 +1163,7 @@ function startProjects(
     return { editors: available('editor'), terminals: available('terminal'), editor: shown('editor'), terminal: shown('terminal') };
   });
 
-  ipcMain.handle('workspaces:reveal', async (event, project: string, path: string): Promise<OpenWorkspaceResult> => {
-    if (!isFromApp(event)) throw new Error('workspaces:reveal refused: unexpected origin');
-    const workspace = await findWorkspace({ project, path });
-    if ('status' in workspace) return workspace;
+  async function revealFolder(path: string): Promise<OpenWorkspaceResult> {
     try {
       await reveal(path, { env: await shellEnv });
       return { status: 'opened' };
@@ -1174,13 +1171,10 @@ function startProjects(
       if (!(error instanceof LaunchError)) throw error;
       return { status: 'refused', message: `Could not reveal ${path} in the Finder: ${error.message}` };
     }
-  });
+  }
 
-  // Opens the worktree in a detected app by its bundle's path, then remembers the app.
-  ipcMain.handle('workspaces:open', async (event, project: string, path: string, appId: string): Promise<OpenWorkspaceResult> => {
-    if (!isFromApp(event)) throw new Error('workspaces:open refused: unexpected origin');
-    const workspace = await findWorkspace({ project, path });
-    if ('status' in workspace) return workspace;
+  // Opens the folder in a detected app by its bundle's path, then remembers the app.
+  async function openFolder(path: string, appId: string): Promise<OpenWorkspaceResult> {
     const entry = apps.find(({ id }) => id === appId);
     const bundle = entry && (await detectApps(applicationDirs)).find(({ id }) => id === entry.id);
     if (!entry || !bundle) return { status: 'refused', message: `${entry?.name ?? appId} is not installed.` };
@@ -1200,7 +1194,29 @@ function startProjects(
     }
     state = next;
     return { status: 'opened' };
+  }
+
+  ipcMain.handle('workspaces:reveal', async (event, project: string, path: string): Promise<OpenWorkspaceResult> => {
+    if (!isFromApp(event)) throw new Error('workspaces:reveal refused: unexpected origin');
+    const workspace = await findWorkspace({ project, path });
+    if ('status' in workspace) return workspace;
+    return revealFolder(path);
   });
+
+  ipcMain.handle('workspaces:open', async (event, project: string, path: string, appId: string): Promise<OpenWorkspaceResult> => {
+    if (!isFromApp(event)) throw new Error('workspaces:open refused: unexpected origin');
+    const workspace = await findWorkspace({ project, path });
+    if ('status' in workspace) return workspace;
+    return openFolder(path, appId);
+  });
+
+  ipcMain.handle('projects:reveal', (event, path: string): Promise<OpenWorkspaceResult> =>
+    forProject<OpenWorkspaceResult>(event, 'projects:reveal', path, () => revealFolder(path)),
+  );
+
+  ipcMain.handle('projects:open', (event, path: string, appId: string): Promise<OpenWorkspaceResult> =>
+    forProject<OpenWorkspaceResult>(event, 'projects:open', path, () => openFolder(path, appId)),
+  );
 
   ipcMain.handle('workspaces:changes', (event, project: string, path: string): Promise<ChangesResult> =>
     forProject<ChangesResult>(event, 'workspaces:changes', project, async () => {

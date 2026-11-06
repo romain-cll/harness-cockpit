@@ -8,9 +8,9 @@ import { makeTestDir } from './run-root';
 import { describeDaemonPackagedSmoke } from './support/daemon';
 import { describeMode } from './support/mode-checks';
 import { describePanesPackagedSmoke } from './support/panes';
-import { addProject, addRepository, entryTitles, makeRepo, projectsInState, removeThroughMenu, sidebarEntries, sidebarLines, snapshotRepo, stateSnapshot, type TempRepo, untilAnswered, waitForEntries, worktreePath, writeConfig } from './support/projects';
+import { addProject, addRepository, entryTitles, makeRepo, openMenu, projectsInState, removeThroughMenu, sidebarEntries, sidebarLines, snapshotRepo, stateSnapshot, type TempRepo, untilAnswered, waitForEntries, worktreePath, writeConfig } from './support/projects';
 import { addGhFixture, addOrigin, expectChangesShowNewFile, expectShipSmoke, type GhFixture, GIT_APP_ENV } from './support/right-bar';
-import { addOpenFixture, controlTokenIn, createWorkspaceWithAgent, expectControlEndpoint, expectNoErrors, expectSetupSpawnedWithDetectedPath, expectSetupThenAgent, FIRST_MENU, launchPackagedWith, makeSessionsFixture, type OpenFixture, openSessionEntry, openWorkspaceMenu, PACKAGED_CLI, pickInSubmenu, readStub, rememberedApps, sessionEntries, type SessionsFixture, sessionsInState, startForeignSetup, startSession, waitForOpenRuns, waitForSessionEntries, waitForWorkspaceTabs } from './support/sessions';
+import { addOpenFixture, controlTokenIn, createWorkspaceWithAgent, expectControlEndpoint, expectNoErrors, expectSetupSpawnedWithDetectedPath, expectSetupThenAgent, FIRST_MENU, launchPackagedWith, makeSessionsFixture, type OpenFixture, openSessionEntry, openWorkspaceMenu, PACKAGED_CLI, pickInSubmenu, pickTopItem, readStub, rememberedApps, sessionEntries, type SessionsFixture, sessionsInState, startForeignSetup, startSession, waitForOpenRuns, waitForSessionEntries, waitForWorkspaceTabs } from './support/sessions';
 import { clearFocusCalls, FRONT_CALLS, frontCalls, runSecondLaunch, stubFocus, windowCount } from './support/single-instance';
 import { applicationType, consoleErrorsOf, watchFrontmost } from './support/terminal';
 
@@ -367,6 +367,11 @@ describe('packaged app sessions after a restart', () => {
       await untilAnswered(first, 'workspaces:open', () => pickInSubmenu(first.page, 'Open in editor', 'Cursor'));
       expect(await waitForOpenRuns(open, 1)).toEqual([['-a', join(open.apps, 'Cursor.app'), wsPath]]);
       expect(rememberedApps(dataDir).editor).toBe('cursor');
+
+      // Project menu smoke path (COCKPIT-88): "Reveal in Finder".
+      await openMenu(first.page, repo.root);
+      await untilAnswered(first, 'projects:reveal', () => pickTopItem(first.page, 'Reveal in Finder'));
+      expect((await waitForOpenRuns(open, 2)).at(-1)).toEqual(['-R', repo.root]);
 
       // Changes sidebar smoke path (COCKPIT-34 AC16): a file written in the worktree shows with its diff.
       await expectChangesShowNewFile(first.page, wsPath);
