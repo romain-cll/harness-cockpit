@@ -44,7 +44,26 @@ import {
   type Repo,
 } from './support/composer-fixture';
 import { afterIpcAnswers, afterRender, countIpcCalls, deleteButton, dispatchFocus, gitIn, ipcAnswered, ipcCalls, makeClone as makeProjectClone, openDialogs, sidebarEntries, untilDeleteReady } from './support/projects';
-import { addGhFixture, commitField, expectListed, GIT_APP_ENV, prJson, prLink, selectBarTab, setChangesOpen, setGh, shipButton, waitForShipText, type GhFixture } from './support/right-bar';
+import {
+  addGhFixture,
+  branchesOfRun,
+  commitField,
+  expectListed,
+  ghRuns,
+  GIT_APP_ENV,
+  graphqlRuns,
+  mergeMethodButton,
+  panelText,
+  prJson,
+  prLink,
+  prListRuns,
+  selectBarTab,
+  setChangesOpen,
+  setGh,
+  shipButton,
+  waitForShipText,
+  type GhFixture,
+} from './support/right-bar';
 import { type SessionsFixture } from './support/sessions';
 import { type PtyWindow } from './support/terminal';
 import { untilEvents, watchEvents } from './support/daemon';
@@ -566,6 +585,34 @@ describe('main workspace: built app', () => {
     expect(gitIn(bar.root, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('main');
     expect(gitIn(bar.root, 'log', '-1', '--format=%s')).toBe('Commit on the default branch');
     expect(gitIn(bar.root, 'status', '--porcelain')).toBe('');
+  });
+
+  test('AC18 — a main workspace on the base branch, in a repository whose pull request has a head of that branch\'s name (a fork\'s), runs no gh read for the branch: the Pull request tab shows no pull request and no Merge row, the sidebar\'s read does not ask for the branch and the row has no icon', async () => {
+    const { page } = session;
+    const branch = gitIn(bar.root, 'rev-parse', '--abbrev-ref', 'HEAD');
+    expect(branch, 'the main workspace is on the base branch').toBe('main');
+    await countIpcCalls(session, ['workspaces:pull-request', 'workspaces:pull-request-states']);
+    // The stub answers a pull request, and an open state, for the branch's name: a read would show them.
+    setGh(gh, { list: prJson({ title: 'From a fork' }), states: { main: 'OPEN' } });
+    const before = ghRuns(gh).length;
+
+    // The tab mounts again (a read of its own) and the window focuses (the sidebar's read and the tab's).
+    await selectBarTab(page, 'Diff');
+    await selectBarTab(page, 'Pull request');
+    await dispatchFocus(page);
+    await afterIpcAnswers(page);
+    for (const channel of ['workspaces:pull-request', 'workspaces:pull-request-states']) await ipcAnswered(session, channel, await ipcCalls(session, channel));
+    await afterRender(page);
+
+    const runs = ghRuns(gh).slice(before);
+    expect(runs.filter((run) => run.args[0] === 'pr' && run.args[1] === 'list'), 'no pull request list for the branch').toEqual([]);
+    expect(runs.flatMap((run) => branchesOfRun(run)), 'the sidebar\'s read does not ask for the branch').not.toContain('main');
+    expect(prListRuns(gh).length + graphqlRuns(gh).length).toBeGreaterThan(0);
+    expect(await prLink(page).count(), 'no pull request in the tab').toBe(0);
+    expect(await shipButton(page, 'Squash and merge').count(), 'no Merge row').toBe(0);
+    expect(await mergeMethodButton(page).count()).toBe(0);
+    expect(await panelText(page)).not.toMatch(/From a fork|#7/);
+    expect(await mainRowLink(page, bar.root).getByRole('img', { name: /^Pull request/ }).count(), 'no icon on the row').toBe(0);
   });
 
   test('logs no error and keeps running', async () => {
