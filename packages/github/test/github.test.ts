@@ -80,7 +80,7 @@ cat '${bin}/list.json'
 
 /** The fields of the `--json` argument of a run, sorted: the order gh is asked in does not matter. */
 const jsonFields = (args: string[]) => args[args.indexOf('--json') + 1]!.split(',').sort();
-const LIST_FIELDS = ['author', 'baseRefName', 'body', 'headRefOid', 'latestReviews', 'number', 'reviewDecision', 'state', 'statusCheckRollup', 'title', 'url'];
+const LIST_FIELDS = ['author', 'baseRefName', 'body', 'headRefOid', 'isCrossRepository', 'latestReviews', 'number', 'reviewDecision', 'state', 'statusCheckRollup', 'title', 'url'];
 
 const failWith = (stub: Stub, { code, stderr }: { code: number; stderr: string }) =>
   Promise.all([writeFile(join(stub.bin, 'code'), String(code)), writeFile(join(stub.bin, 'stderr'), stderr)]);
@@ -106,17 +106,36 @@ async function failure(promise: Promise<unknown>): Promise<GitHubError> {
 }
 
 describe('findPullRequest', () => {
-  test('AC1 — runs gh pr list for the branch, all states, the newest one, in the given folder with GH_PROMPT_DISABLED=1 and the env passed, asking for the author, body, head, reviews and checks', async () => {
+  test('AC1 — runs gh pr list for the branch, all states, the newest 30, in the given folder with GH_PROMPT_DISABLED=1 and the env passed, asking for the author, body, head, reviews, checks and whether it is cross-repository', async () => {
     const stub = await makeStub();
 
     await findPullRequest(stub.cwd, 'feature/login', { env: stub.env });
 
     const [run] = await stub.runs();
     expect(await stub.runs()).toHaveLength(1);
-    expect(run!.slice(0, 11)).toEqual([stub.cwd, '1', 'passed-env', 'pr', 'list', '--head', 'feature/login', '--state', 'all', '--limit', '1']);
+    expect(run!.slice(0, 11)).toEqual([stub.cwd, '1', 'passed-env', 'pr', 'list', '--head', 'feature/login', '--state', 'all', '--limit', '30']);
     expect(run![11]).toBe('--json');
     expect(jsonFields(run!)).toEqual(LIST_FIELDS);
     expect(run).toHaveLength(13);
+  });
+
+  test('COCKPIT-71 AC18 — a newer pull request from a fork is ignored: the repository\'s own, older, is the answer', async () => {
+    const stub = await makeStub();
+    await stub.list(
+      listJson(
+        pr({ number: 9, title: 'From a fork', state: 'OPEN', isCrossRepository: true }),
+        pr({ number: 7, title: 'Our own', state: 'MERGED', isCrossRepository: false }),
+      ),
+    );
+
+    expect(await findPullRequest(stub.cwd, 'main', { env: stub.env })).toMatchObject({ number: 7, title: 'Our own', state: 'merged' });
+  });
+
+  test('COCKPIT-71 AC18 — only pull requests from forks is no pull request', async () => {
+    const stub = await makeStub();
+    await stub.list(listJson(pr({ number: 9, isCrossRepository: true }), pr({ number: 8, isCrossRepository: true })));
+
+    expect(await findPullRequest(stub.cwd, 'main', { env: stub.env })).toBeNull();
   });
 
   test('AC1 — gives null when the branch has no pull request', async () => {
@@ -276,7 +295,7 @@ describe('createPullRequest', () => {
         'Line one\nLine two $(not run)',
       ],
     ]);
-    expect(listRun!.slice(0, 11)).toEqual([stub.cwd, '1', 'passed-env', 'pr', 'list', '--head', 'feature/login', '--state', 'all', '--limit', '1']);
+    expect(listRun!.slice(0, 11)).toEqual([stub.cwd, '1', 'passed-env', 'pr', 'list', '--head', 'feature/login', '--state', 'all', '--limit', '30']);
     expect(jsonFields(listRun!)).toEqual(LIST_FIELDS);
     expect(result).toMatchObject({
       number: 7,
@@ -448,6 +467,45 @@ describe('pullRequestStates', () => {
     for (const variable of ['$b0', '$b1', '$b2']) expect(query).toContain(variable);
     expect([...flagged('-F'), ...flagged('-f')].join(' ')).toContain('owner={owner}');
     expect([...flagged('-F'), ...flagged('-f')].join(' ')).toContain('repo={repo}');
+  });
+
+  // Each alias holds the nodes `gh` answers, newest first, with the `isCrossRepository` the query asks for.
+  const nodesAnswer = (aliases: Record<string, Array<{ state: string; isCrossRepository: boolean }>>) =>
+    JSON.stringify({ data: { repository: Object.fromEntries(Object.entries(aliases).map(([alias, nodes]) => [alias, { nodes }])) } });
+
+  test('COCKPIT-71 AC18 — the query reads 30 pull requests per branch with isCrossRepository', async () => {
+    const stub = await makeStub();
+    await stub.graphql(nodesAnswer({ b0: [] }));
+
+    await pullRequestStates(stub.cwd, ['a'], { env: stub.env });
+
+    const [, , , ...args] = (await stub.runs())[0]!;
+    const query = args.find((arg) => arg.startsWith('query='))!;
+    expect(query).toContain('first:30');
+    expect(query).toContain('isCrossRepository');
+    expect(query).not.toContain('first:1,');
+  });
+
+  test('COCKPIT-71 AC18 — a newer pull request from a fork is ignored (the own one gives the state); a branch with only forks\' pull requests has no state', async () => {
+    const stub = await makeStub();
+    await stub.graphql(
+      nodesAnswer({
+        b0: [
+          { state: 'OPEN', isCrossRepository: true },
+          { state: 'MERGED', isCrossRepository: false },
+        ],
+        b1: [{ state: 'OPEN', isCrossRepository: true }],
+        b2: [
+          { state: 'CLOSED', isCrossRepository: false },
+          { state: 'OPEN', isCrossRepository: true },
+        ],
+      }),
+    );
+
+    const states = await pullRequestStates(stub.cwd, ['own-older', 'fork-only', 'own-newest'], { env: stub.env });
+
+    expect(states).toEqual({ 'own-older': 'merged', 'own-newest': 'closed' });
+    expect('fork-only' in states).toBe(false);
   });
 
   test('AC16 — gives the state of the newest pull request of each branch, in lower case, a branch with none has no state', async () => {

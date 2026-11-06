@@ -16,7 +16,6 @@ import {
   projectSelect,
   promptBox,
   sendFromComposer,
-  textOf,
   useAgent,
   waitForAgent,
   waitForBase,
@@ -259,8 +258,8 @@ describe('main workspace: built app', () => {
     await waitForWorktree(page, false);
 
     await page.getByRole('button', { name: 'Start session', exact: true }).click();
-    await page.waitForURL((url) => url.searchParams.get('project') === 'none');
-    expect(await textOf(projectSelect(page))).toBe('No project');
+    // The router pushes the URL before it renders: wait for the page's own content.
+    await projectSelect(page).filter({ hasText: 'No project' }).waitFor();
     expect(await worktreeSwitch(page).count()).toBe(0);
 
     await openComposerFromSidebar(page, ui.root);

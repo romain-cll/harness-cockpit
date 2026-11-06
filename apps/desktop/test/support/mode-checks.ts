@@ -310,7 +310,6 @@ export const describeMode = (mode: string, launch: () => Promise<Session>) => de
       const before = gitState(repo);
 
       await sendFromComposer(page, repo, { prompt: 'Smoke main', worktree: false });
-      await page.waitForURL((url) => url.pathname === '/workspace' && url.searchParams.get('path') === repo.root);
       await typeLine(page, 'pwd -P');
       await waitForRow(page, repo.root);
       expect(gitState(repo)).toEqual(before);
