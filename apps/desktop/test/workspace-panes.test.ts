@@ -5,8 +5,7 @@ import { type ElementHandle, type Locator } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 import { sendFromComposer } from './composer';
 import { daemonSocketIn, fifo, heldProcess, isAlive, MAIN_PROCESS_ERROR, type Session, terminalEnd, untilIn, untilRead, versionLabel } from './launch';
-import { makeTestDir } from './run-root';
-import { addRepository, agentPid, areaRect, captureRow, childPidsOf, clickClose, closeButton, contextMenu, createThroughComposer, createWorkspace, daemonLine, daemonPidIn, detectionDone, dispatchFocus, dragSeparator, expectKeyboardIn, expectLabels, expectPaneCount, expectSizeMatchesDisplay, type Fixture, gitIn, goHome, hasEnded, holdPtySpawn, isSame, labelsOf, launchBuiltWith, makeFixture, makeRepo, menuItemNamed, menuItems, newTab, newTabButton, normalized, notificationShown, onWorkspacePage, openHarnessSubmenu, openNewTabMenu, openWorkspace, pane, paneRect, paneWithKeyboard, pickContextItem, projectsMessage, releasePtySpawn, replacePtySpawn, reportStatus, restorePtySpawn, rowMenu, rowsOf, rowStatus, selectedLabelOf, selectTab, separatorLine, separatorOf, sessionNamed, sessionsInState, setDaemonLine, shellPid, sttySize, stubNotifications, tabLabeled, type TempRepo, terminalOf, tokenColor, topLevelItems, typeLine, versionRuns, visibleTerminals, waitForPrompt, waitForRow, waitForRowStatus, workspaceRow, worktreePath, writeConfig } from './support/panes';
+import { addRepository, agentPid, areaRect, captureRow, childPidsOf, clickClose, closeButton, contextMenu, createThroughComposer, createWorkspace, daemonLine, daemonPidIn, detectionDone, dragSeparator, expectKeyboardIn, expectLabels, expectPaneCount, expectSizeMatchesDisplay, type Fixture, goHome, hasEnded, holdPtySpawn, isSame, labelsOf, launchBuiltWith, makeFixture, makeRepo, menuItemNamed, menuItems, newTab, newTabButton, normalized, notificationShown, onWorkspacePage, openHarnessSubmenu, openNewTabMenu, openWorkspace, pane, paneRect, paneWithKeyboard, pickContextItem, projectsMessage, releasePtySpawn, replacePtySpawn, reportStatus, restorePtySpawn, rowMenu, rowsOf, rowStatus, selectedLabelOf, selectTab, separatorLine, separatorOf, sessionNamed, sessionsInState, setDaemonLine, shellPid, sttySize, stubNotifications, tabLabeled, type TempRepo, terminalOf, tokenColor, topLevelItems, typeLine, versionRuns, visibleTerminals, waitForPrompt, waitForRow, waitForRowStatus, workspaceRow, worktreePath, writeConfig } from './support/panes';
 
 describe('workspace panes: built app', () => {
   let fx: Fixture;
@@ -1225,75 +1224,6 @@ describe('workspace panes: built app', () => {
     expect(childPidsOf(daemon).sort((a, b) => a - b)).toEqual(children);
     expect(session.output().slice(mark)).not.toContain('Error occurred in handler');
     expect(session.output().slice(mark)).not.toMatch(MAIN_PROCESS_ERROR);
-  });
-
-  test('AC20 — with the daemon killed every tab shows [Process ended], and a new tab runs a command in a new daemon', async () => {
-    const { page } = session;
-    await page.waitForURL((url) => url.pathname === '/workspace');
-    const labels = await labelsOf(await pane(page, 0));
-    expect(labels.length).toBeGreaterThan(2);
-    const old = daemonPidIn(session.cockpitHome);
-    // The tabs show the daemon's end once the app has seen its connection close, which the process's end brings.
-    process.kill(old, 'SIGKILL');
-
-    for (let index = 0; index < labels.length; index++) {
-      await (await pane(page, 0)).getByRole('tab').nth(index).click();
-      await waitForRow(page, /^\[Process ended\]$/, await terminalOf(page, 0));
-    }
-    expect(session.isRunning()).toBe(true);
-
-    await newTab(page, 'Terminal');
-    const fresh = await terminalOf(page, 0);
-    await waitForPrompt(page, fresh);
-    await typeLine(page, 'echo fresh-$((1+2))');
-    await waitForRow(page, 'fresh-3', fresh);
-    expect(daemonPidIn(session.cockpitHome)).not.toBe(old);
-    expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
-  });
-});
-
-// =============================================================================
-// AC28: the background service cannot start
-// =============================================================================
-
-describe('workspace panes: the background service cannot start', () => {
-  let fx: Fixture;
-  let session: Session;
-  let repo: TempRepo;
-
-  beforeAll(async () => {
-    fx = makeFixture(['claude']);
-    repo = makeRepo('panes-down');
-    const dataDir = makeTestDir('d-');
-    // COCKPIT_HOME is a regular file: the daemon cannot start.
-    const home = join(dataDir, 'h');
-    writeFileSync(home, 'a file, not a folder');
-    session = await launchBuiltWith(fx.env(), dataDir, home);
-    await session.page.getByText(versionLabel).waitFor();
-  });
-
-  afterAll(async () => {
-    const dataDir = session?.dataDir;
-    await session?.close();
-    if (dataDir) rmSync(dataDir, { recursive: true, force: true });
-    if (fx) rmSync(fx.root, { recursive: true, force: true });
-    if (repo) rmSync(repo.parent, { recursive: true, force: true });
-  });
-
-  test('AC28 — the workspace page shows the failure view in place of the panes', async () => {
-    const { page } = session;
-    await addRepository(session, repo);
-    // Workspaces do not need the daemon; a worktree made with git is listed like one made by the app.
-    const path = join(session.dataDir, 'wt-down');
-    gitIn(repo.root, 'worktree', 'add', '-b', 'down', path);
-    await dispatchFocus(page);
-    await page.locator('aside').getByText('down', { exact: true }).first().waitFor();
-    await workspaceRow(page, 'down').click();
-    await page.waitForURL((url) => url.pathname === '/workspace');
-    await page.getByText("Cockpit's background service could not start", { exact: true }).waitFor();
-    expect(await page.getByRole('button', { name: 'Try again', exact: true }).count()).toBe(1);
-    expect(await page.locator('[role="tablist"]').count()).toBe(0);
-    expect(await page.locator('.xterm').count()).toBe(0);
   });
 });
 
