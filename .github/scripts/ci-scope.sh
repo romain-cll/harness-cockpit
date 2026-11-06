@@ -22,7 +22,7 @@ else
   desktop=false
   packages=false
   if grep -qx '@cockpit/desktop' <<<"$names"; then desktop=true; fi
-  if grep -vqxE '@cockpit/desktop|@cockpit/plane-sync' <<<"$names"; then packages=true; fi
+  if [ -n "$names" ] && grep -vqxE '@cockpit/desktop|@cockpit/plane-sync' <<<"$names"; then packages=true; fi
 fi
 
 {
