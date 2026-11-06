@@ -774,20 +774,21 @@ export const topLevelItems = async (menu: ReturnType<Page['locator']>) => trimme
 export const workspaceMenu = (page: Page, path: string) => page.getByRole('menu', { name: `Actions for ${basename(path)}`, exact: true });
 export const submenuNamed = (page: Page, trigger: 'Open in editor' | 'Open in terminal') => page.getByRole('menu', { name: trigger, exact: true });
 
-// Opens the "…" menu of the workspace at `path` and waits until the items above "Delete workspace…"
-// are exactly `expected` (in any order), "Delete workspace…" being last. The apps arrive after the menu
-// opens, and a menu opened again shows the earlier ones until they do: each item `expected` is awaited,
-// then the absence of any other.
+// Opens the "…" menu of the workspace at `path` and waits until the items above "Copy path" and "Delete workspace…"
+// are exactly `expected` (in any order), "Copy path" and "Delete workspace…" being the last two (COCKPIT-88: items
+// always there). The apps arrive after the menu opens, and a menu opened again shows the earlier ones until they
+// do: each item `expected` is awaited, then the absence of any other.
 export async function openWorkspaceMenu(page: Page, path: string, expected: string[]) {
   await openMenu(page, path);
   const wanted = [...expected].sort();
   const menu = workspaceMenu(page, path);
+  const always = ['Copy path', 'Delete workspace…'];
   const exactly = (names: string[]) => new RegExp(`^\\s*(?:${names.map(escapeRegExp).join('|')})\\s*$`);
-  for (const name of [...expected, 'Delete workspace…']) await menu.getByRole('menuitem').filter({ hasText: exactly([name]) }).waitFor();
-  await menu.getByRole('menuitem').filter({ hasNotText: exactly([...expected, 'Delete workspace…']) }).first().waitFor({ state: 'detached' });
+  for (const name of [...expected, ...always]) await menu.getByRole('menuitem').filter({ hasText: exactly([name]) }).waitFor();
+  await menu.getByRole('menuitem').filter({ hasNotText: exactly([...expected, ...always]) }).first().waitFor({ state: 'detached' });
   const items = await topLevelItems(menu);
-  expect(items.at(-1), 'the app items sit above "Delete workspace…"').toBe('Delete workspace…');
-  expect(items.slice(0, -1).sort()).toEqual(wanted);
+  expect(items.slice(-2), 'the app items sit above "Copy path" and "Delete workspace…"').toEqual(always);
+  expect(items.slice(0, -2).sort()).toEqual(wanted);
 }
 
 // Opens a submenu of the "…" menu with one hover and returns its items. Base UI opens a submenu on hover

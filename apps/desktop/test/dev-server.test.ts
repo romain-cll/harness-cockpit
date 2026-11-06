@@ -6,9 +6,9 @@ import { makeTestDir } from './run-root';
 import { describeDaemonDevServerSmoke } from './support/daemon';
 import { describeMode } from './support/mode-checks';
 import { describePanesDevServerSmoke } from './support/panes';
-import { addRepository, makeRepo, untilAnswered, worktreePath, writeConfig } from './support/projects';
+import { addRepository, makeRepo, openMenu, untilAnswered, worktreePath, writeConfig } from './support/projects';
 import { addGhFixture, addOrigin, expectChangesShowNewFile, expectShipSmoke, type GhFixture, GIT_APP_ENV } from './support/right-bar';
-import { addOpenFixture, createPlainWorkspace, createWorkspaceWithAgent, devFolderOfThisWorktree, devHomeIn, expectControlEndpoint, expectNoErrors, expectResumeSmoke, expectSetupSpawnedWithDetectedPath, expectSetupThenAgent, FIRST_MENU, launchDevWith, makeSessionsFixture, type OpenFixture, openWorkspaceMenu, pickInSubmenu, readStub, rememberedApps, REPOSITORY_CLI, type SessionsFixture, sessionsInState, startForeignSetup, startSession, waitForOpenRuns, waitForSessionEntries, waitForWorkspaceTabs } from './support/sessions';
+import { addOpenFixture, createPlainWorkspace, createWorkspaceWithAgent, devFolderOfThisWorktree, devHomeIn, expectControlEndpoint, expectNoErrors, expectResumeSmoke, expectSetupSpawnedWithDetectedPath, expectSetupThenAgent, FIRST_MENU, launchDevWith, makeSessionsFixture, type OpenFixture, openWorkspaceMenu, pickInSubmenu, pickTopItem, readStub, rememberedApps, REPOSITORY_CLI, type SessionsFixture, sessionsInState, startForeignSetup, startSession, waitForOpenRuns, waitForSessionEntries, waitForWorkspaceTabs } from './support/sessions';
 
 describeMode('dev server', launchDev);
 
@@ -101,6 +101,20 @@ describe('sessions smoke path: dev server', () => {
 
       expect(await waitForOpenRuns(open, 1)).toEqual([['-a', join(open.apps, 'Cursor.app'), path]]);
       expect(rememberedApps(session.dataDir).editor).toBe('cursor');
+    } finally {
+      rmSync(repo.parent, { recursive: true, force: true });
+    }
+  });
+
+  test('project menu smoke path (COCKPIT-88) — "Reveal in Finder" runs open -R <project path>', async () => {
+    const { page } = session;
+    const repo = makeRepo('smoke-reveal-project');
+    try {
+      await addRepository(session, repo);
+      await openMenu(page, repo.root);
+      await untilAnswered(session, 'projects:reveal', () => pickTopItem(page, 'Reveal in Finder'));
+
+      expect((await waitForOpenRuns(open, 2)).at(-1)).toEqual(['-R', repo.root]);
     } finally {
       rmSync(repo.parent, { recursive: true, force: true });
     }

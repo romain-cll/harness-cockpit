@@ -95,8 +95,10 @@ describe('built app', () => {
       await addRepository(session, clone);
 
       await openMenu(page, clone.root);
-      const items = await page.getByRole('menuitem').allInnerTexts();
-      expect(items.map((item) => item.trim())).toEqual(['New workspace', 'Remove project…']);
+      // The editor and the Finder entries in between depend on the machine's apps (COCKPIT-88): the first and last items are the ones this test is about.
+      const items = (await page.getByRole('menuitem').allInnerTexts()).map((item) => item.trim());
+      expect(items[0]).toBe('New workspace');
+      expect(items.at(-1)).toBe('Remove project…');
       await page.getByRole('menuitem', { name: 'New workspace', exact: true }).click();
 
       await page.waitForURL((url) => url.searchParams.get('project') === clone.root);

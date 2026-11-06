@@ -35,6 +35,8 @@ const api: Api = {
     home: () => ipcRenderer.invoke('projects:home'),
     updatePath: (from) => ipcRenderer.invoke('projects:update-path', from),
     remove: (path) => ipcRenderer.invoke('projects:remove', path),
+    reveal: (path) => ipcRenderer.invoke('projects:reveal', path),
+    open: (path, app) => ipcRenderer.invoke('projects:open', path, app),
     onChanged: (listener) => subscribe('projects:changed', listener),
   },
   workspaces: {
