@@ -36,6 +36,8 @@ const HANGUP_GRACE_MS = 1000;
 export function createTerminals(onEnd: () => void) {
   const terminals = new Map<unknown, Terminal>();
   let lastId = 0;
+  // Who waits for the last terminal to end.
+  const emptied: Array<() => void> = [];
 
   // node-pty throws on a bad size, and on a terminal whose pty closed but whose exit was not
   // reported yet. A failure stays with its own terminal: it ends through its exit event.
@@ -76,7 +78,7 @@ export function createTerminals(onEnd: () => void) {
       headless.loadAddon(serializer);
 
       const id = ++lastId;
-      const info: TerminalInfo = { id, kind, cwd, cols, rows, ...(sessionId !== undefined && { sessionId }), ...(workspace !== undefined && { workspace }) };
+      const info: TerminalInfo = { id, kind, command, cwd, cols, rows, ...(sessionId !== undefined && { sessionId }), ...(workspace !== undefined && { workspace }) };
       const terminal: Terminal = {
         info,
         pty,
@@ -116,6 +118,7 @@ export function createTerminals(onEnd: () => void) {
         headless.dispose();
         for (const each of terminal.subscribers) each.exit(id, { exitCode, signal: signal ?? null });
         onEnd();
+        if (terminals.size === 0) for (const resolve of emptied.splice(0)) resolve();
       });
       return id;
     },
@@ -172,6 +175,9 @@ export function createTerminals(onEnd: () => void) {
       }
       return false;
     },
+
+    /** Settles once no terminal runs: after `killAll`, when each has exited (a hang-up ignored is followed by SIGKILL). */
+    whenEmpty: (): Promise<void> => (terminals.size === 0 ? Promise.resolve() : new Promise((resolve) => emptied.push(resolve))),
 
     killAll: () => {
       for (const id of terminals.keys()) withTerminal(id, hangUp);

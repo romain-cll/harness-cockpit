@@ -68,11 +68,17 @@ const api: Api = {
     start: (harness, size, options) => ipcRenderer.invoke('sessions:start', harness, size, options),
     onStatus: (listener) => subscribe('sessions:status', listener),
     onOpen: (listener) => subscribe('sessions:open', listener),
+    ended: () => ipcRenderer.invoke('sessions:ended'),
+    dismiss: (sessionId) => ipcRenderer.invoke('sessions:dismiss', sessionId),
   },
   daemon: {
     status: () => ipcRenderer.invoke('daemon:status'),
     retry: () => ipcRenderer.invoke('daemon:retry'),
     showLog: () => ipcRenderer.invoke('daemon:show-log'),
+    onChanged: (listener) => subscribe('daemon:changed', listener),
+    outdated: () => ipcRenderer.invoke('daemon:outdated'),
+    restart: () => ipcRenderer.invoke('daemon:restart'),
+    later: () => ipcRenderer.invoke('daemon:later'),
   },
   getShellPath: () => ipcRenderer.invoke('get-shell-path'),
 };

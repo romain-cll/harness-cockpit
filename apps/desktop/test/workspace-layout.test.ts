@@ -6,8 +6,10 @@ import {
   closeTab,
   separators,
   setRatio,
+  restartMessage,
   singlePane,
   split,
+  stoppedMessage,
   tabLabel,
   workspaceStatus,
   type Layout,
@@ -26,6 +28,18 @@ describe('addTab', () => {
 
   test('AC1 — a pane with no tab takes one', () => {
     expect(addTab(singlePane('p1', []), 'p1', 'a')).toEqual(pane('p1', ['a'], 'a'));
+  });
+});
+
+describe('addTab, a tab a pane already holds', () => {
+  test('AC25 — adding a tab the pane holds, or another pane holds, leaves the layout unchanged', () => {
+    const layout = split(singlePane('p1', ['a', 'b']), 'p1', 'right', 'p2', 'c');
+    const before = structuredClone(layout);
+
+    expect(addTab(layout, 'p1', 'b')).toEqual(before);
+    expect(addTab(layout, 'p1', 'c')).toEqual(before);
+    expect(addTab(layout, 'p2', 'a')).toEqual(before);
+    expect(layout).toEqual(before);
   });
 });
 
@@ -370,5 +384,21 @@ describe('split and closeTab keep the ratios', () => {
 
   test('AC8 — closing the left pane of a resized split gives the whole area to the other one', () => {
     expect(rounded(boxes(closeTab(resized(), 'p1', 'a').layout))).toEqual([{ pane: 'p2', left: 0, top: 0, width: 100, height: 100 }]);
+  });
+});
+
+describe('stoppedMessage', () => {
+  test('AC2, AC3 — the banner reads "Background service stopped · N terminals ended", and "1 terminal ended" for a single one', () => {
+    expect(stoppedMessage(3)).toBe('Background service stopped · 3 terminals ended');
+    expect(stoppedMessage(2)).toBe('Background service stopped · 2 terminals ended');
+    expect(stoppedMessage(1)).toBe('Background service stopped · 1 terminal ended');
+  });
+});
+
+describe('restartMessage', () => {
+  test('AC16 — the dialog\'s sentence names the number of terminals, and says "this terminal" for a single one', () => {
+    expect(restartMessage(3)).toBe('Restarting it ends these 3 terminals:');
+    expect(restartMessage(2)).toBe('Restarting it ends these 2 terminals:');
+    expect(restartMessage(1)).toBe('Restarting it ends this terminal:');
   });
 });

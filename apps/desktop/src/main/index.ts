@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { homedir } from 'node:os';
+import { homedir, uptime } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
@@ -13,6 +13,8 @@ import {
   ensureDaemon,
   listDaemonFiles,
   PROTOCOL_VERSION,
+  readTerminals,
+  shutdownDaemon,
   type DaemonClient,
   type SessionReport,
   type SetupState,
@@ -26,6 +28,7 @@ import { apps, defaultApplicationDirs, detectApps, LaunchError, openIn, reveal, 
 import {
   addProject,
   addSession,
+  closeSession,
   loadState,
   NewerStateError,
   ProjectExistsError,
@@ -33,6 +36,7 @@ import {
   removeProject,
   saveState,
   sessionName,
+  type Session,
   type State,
 } from '@cockpit/state';
 import {
@@ -83,10 +87,12 @@ import type {
   CreateWorkspaceResult,
   DaemonStatus,
   DiffResult,
+  EndedSession,
   FailedSetup,
   ListedTerminal,
   Project,
   OpenWorkspaceResult,
+  OutdatedTerminal,
   PtySpawnOptions,
   PtySpawnRequest,
   PullRequestResult,
@@ -390,6 +396,23 @@ let ownDaemon: Daemon | undefined;
 let startingOwn: Promise<Daemon> | undefined;
 // Why this app's daemon could not start; unset while it can.
 let daemonFailure: string | undefined;
+// The shells and sessions lost with a daemon that died, until a daemon starts again.
+let lostTerminals = 0;
+// The daemons of another protocol that hold a shell or a session, by what they listed at launch. They are
+// not connected to: `GET /terminals` and `POST /shutdown` are all the app says to them.
+let otherDaemons: Array<{ socket: string; terminals: TerminalInfo[] }> = [];
+// The user chose "Later" for them: the dialog is not offered again until the next launch.
+let outdatedDeferred = false;
+
+function daemonStatus(): DaemonStatus {
+  if (daemonFailure !== undefined) return { status: 'down', reason: daemonFailure, log: existsSync(ownFiles.log) };
+  return lostTerminals > 0 ? { status: 'stopped', terminals: lostTerminals } : { status: 'running' };
+}
+
+// Tells every page that the daemon's status may have changed.
+function announceDaemonChange(): void {
+  for (const window of BrowserWindow.getAllWindows()) window.webContents.send('daemon:changed');
+}
 
 function register(daemon: Daemon, info: TerminalInfo, owner?: WebContents): Terminal {
   const terminal: Terminal = { ...info, appId: ++lastTerminalId, daemon, ...(owner && { owner }) };
@@ -403,10 +426,26 @@ function end(daemon: Daemon, remote: number, exit: TerminalExit): void {
   if (!terminal) return;
   daemon.terminals.delete(remote);
   terminals.delete(terminal.appId);
-  if (terminal.sessionId !== undefined) pendingNames.delete(terminal.sessionId);
+  if (terminal.sessionId !== undefined) {
+    pendingNames.delete(terminal.sessionId);
+    // A terminal that ended on its own is not lost: only a daemon that died (`exitCode: null`) leaves the mark.
+    // One the page asked to kill (a deleted workspace) is left as it is.
+    if (exit.exitCode !== null && !terminal.closing) markClosed(({ id }) => id === terminal.sessionId);
+  }
   // One nobody attached to yet (a workspace's, started by the main process) tells every window.
   const hearers = terminal.owner ? [terminal.owner] : BrowserWindow.getAllWindows().map(({ webContents }) => webContents);
   for (const contents of hearers) if (!contents.isDestroyed()) contents.send('pty:exit', terminal.appId, exit);
+}
+
+// A workspace session is marked open in `state.json` from its start until its tab closes (`sessions:dismiss`),
+// its terminal exits by itself, or its workspace or project goes (the session stays stored): one still marked that
+// no daemon holds lost its terminal with a daemon.
+function markClosed(match: (session: Session) => boolean): void {
+  const open = state.sessions.filter((session) => session.open && match(session));
+  if (open.length === 0) return;
+  const next = open.reduce((current, { id }) => closeSession(current, id), state);
+  saveState(app.getPath('userData'), next);
+  state = next;
 }
 
 // Takes a connected client into use: its output goes to the window that owns each terminal, its
@@ -423,8 +462,10 @@ async function adopt(client: DaemonClient): Promise<Daemon> {
   client.onTitle((event) => void nameFromTitle(event));
   client.onClose(() => {
     daemon.alive = false;
+    lostTerminals += [...daemon.terminals.values()].filter(({ kind, closing }) => kind !== 'commands' && !closing).length;
     for (const remote of daemon.terminals.keys()) end(daemon, remote, { exitCode: null, signal: null });
     if (ownDaemon === daemon) ownDaemon = undefined;
+    announceDaemonChange();
   });
   for (const info of await client.list().catch(() => [])) {
     if (info.kind === 'commands') continue;
@@ -458,24 +499,31 @@ function spawnDaemon(): ChildProcess {
 
 // This app's daemon, started when it is not running. Rejects with the reason it cannot start.
 function ensureOwnDaemon(): Promise<Daemon> {
-  if (ownDaemon?.alive) return Promise.resolve(ownDaemon);
+  if (ownDaemon?.alive) {
+    // Terminals lost with another build's daemon are over: nothing stopped is left to restart.
+    if (lostTerminals > 0) {
+      lostTerminals = 0;
+      announceDaemonChange();
+    }
+    return Promise.resolve(ownDaemon);
+  }
   startingOwn ??= (async () => {
+    const before = JSON.stringify(daemonStatus());
     try {
       ownDaemon = await adopt(await ensureDaemon({ home: cockpitHome, build: daemonBuild, spawn: spawnDaemon }));
       daemonFailure = undefined;
+      lostTerminals = 0;
       return ownDaemon;
     } catch (error) {
       daemonFailure = error instanceof Error ? error.message : String(error);
       throw new Error(daemonFailure);
     } finally {
       startingOwn = undefined;
+      if (JSON.stringify(daemonStatus()) !== before) announceDaemonChange();
     }
   })();
   return startingOwn;
 }
-
-const daemonStatus = (): DaemonStatus =>
-  daemonFailure === undefined ? { status: 'running' } : { status: 'down', reason: daemonFailure, log: existsSync(ownFiles.log) };
 
 // Connects to this app's daemon, starting it when needed, and to the daemons of other builds that
 // still hold terminals (their app was updated): the older ones first, so the terminals list in
@@ -494,6 +542,16 @@ async function connectDaemons(): Promise<void> {
     } catch (error) {
       // Stale files of a daemon that is gone say nothing; one that is there and silent is noted.
       if (error instanceof DaemonNotAnsweringError) console.error(`Cockpit skipped a background service of another build: ${error.message}`);
+    }
+  }
+  // The daemons of other protocols are listed, never connected to: their terminals are the dialog's.
+  for (const { socket } of listDaemonFiles(cockpitHome).filter(({ protocol }) => protocol !== PROTOCOL_VERSION)) {
+    try {
+      const held = (await readTerminals(socket)).filter(({ kind }) => kind !== 'commands');
+      if (held.length > 0) otherDaemons.push({ socket, terminals: held });
+    } catch (error) {
+      // Stale files of a daemon that is gone say nothing; one that is there and silent is noted.
+      if (error instanceof DaemonNotAnsweringError) console.error(`Cockpit skipped a background service of another protocol: ${error.message}`);
     }
   }
   try {
@@ -529,7 +587,7 @@ function startTerminals() {
   ) => {
     const daemon = await ensureOwnDaemon();
     const options = await withSpawnDefaults(request);
-    const { cwd, cols, rows } = options;
+    const { command, cwd, cols, rows } = options;
     const remote = await daemon.client.spawn({
       kind,
       ...options,
@@ -538,7 +596,7 @@ function startTerminals() {
     });
     const terminal = register(
       daemon,
-      { id: remote, kind, cwd, cols, rows, ...(sessionId !== undefined && { sessionId }), ...(workspace !== undefined && { workspace }) },
+      { id: remote, kind, command, cwd, cols, rows, ...(sessionId !== undefined && { sessionId }), ...(workspace !== undefined && { workspace }) },
       contents,
     );
     if (contents && (contents.isDestroyed() || endingsOf(contents) !== before)) {
@@ -624,6 +682,42 @@ function startTerminals() {
   ipcMain.handle('daemon:show-log', async (event) => {
     if (!isFromApp(event)) throw new Error('daemon:show-log refused: unexpected origin');
     await shell.openPath(ownFiles.log);
+  });
+
+  // The terminals of daemons of another protocol, for the dialog that offers to end them.
+  ipcMain.handle('daemon:outdated', (event): OutdatedTerminal[] => {
+    if (!isFromApp(event)) throw new Error('daemon:outdated refused: unexpected origin');
+    if (outdatedDeferred) return [];
+    return otherDaemons.flatMap(({ terminals: held }) =>
+      held.map(({ kind, command, sessionId, status }) => {
+        const session = sessionId === undefined ? undefined : state.sessions.find(({ id }) => id === sessionId);
+        return {
+          kind: kind === 'session' ? 'session' : 'shell',
+          name: session?.name ?? (kind === 'session' ? 'Session' : 'Terminal'),
+          program: harnesses.find(({ id }) => id === session?.harness)?.name ?? basename(command),
+          ...(status && { status }),
+        };
+      }),
+    );
+  });
+  ipcMain.handle('daemon:restart', async (event): Promise<{ status: 'restarted' } | Refused> => {
+    if (!isFromApp(event)) throw new Error('daemon:restart refused: unexpected origin');
+    const remaining: typeof otherDaemons = [];
+    let failure: string | undefined;
+    for (const daemon of otherDaemons) {
+      try {
+        await shutdownDaemon(daemon.socket);
+      } catch (error) {
+        remaining.push(daemon);
+        failure ??= error instanceof Error ? error.message : String(error);
+      }
+    }
+    otherDaemons = remaining;
+    return failure === undefined ? { status: 'restarted' } : { status: 'refused', message: failure };
+  });
+  ipcMain.handle('daemon:later', (event) => {
+    if (!isFromApp(event)) throw new Error('daemon:later refused: unexpected origin');
+    outdatedDeferred = true;
   });
 
   return { spawnFor, endingsOf, kill };
@@ -743,6 +837,7 @@ function startProjects(
     if (next.projects.length === state.projects.length) return;
     saveState(userData, next);
     state = next;
+    markClosed(({ project }) => project === path);
   });
 
   // Runs `action` for a project of the state, turning a git failure into a refusal (or into what
@@ -891,10 +986,14 @@ function startProjects(
             forceBranch: options.forceBranch,
             env: await shellEnv,
           });
+          markClosed(({ directory }) => directory === path);
           return { status: 'removed', branchKept: false };
         },
         (error) => {
-          if (error.code === 'BRANCH_NOT_MERGED') return { status: 'removed', branchKept: true };
+          if (error.code === 'BRANCH_NOT_MERGED') {
+            markClosed(({ directory }) => directory === path);
+            return { status: 'removed', branchKept: true };
+          }
           if (error.code === 'DIRTY_WORKTREE') return { status: 'dirty' };
           return undefined;
         },
@@ -1158,6 +1257,21 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
     return [...state.sessions].reverse();
   });
 
+  // The workspace sessions still marked open that no daemon holds, in creation order: their terminal was lost
+  // with a daemon. One that began before the Mac started proves a restart.
+  ipcMain.handle('sessions:ended', (event): EndedSession[] => {
+    if (!isFromApp(event)) throw new Error('sessions:ended refused: unexpected origin');
+    const held = new Set([...terminals.values(), ...otherDaemons.flatMap((daemon) => daemon.terminals)].flatMap(({ sessionId }) => (sessionId === undefined ? [] : [sessionId])));
+    const bootedAt = Date.now() - uptime() * 1000;
+    return state.sessions
+      .filter(({ id, open, project }) => open && project !== undefined && !held.has(id))
+      .map(({ id, createdAt }) => ({ sessionId: id, reboot: Date.parse(createdAt) < bootedAt }));
+  });
+  ipcMain.handle('sessions:dismiss', (event, sessionId: string) => {
+    if (!isFromApp(event)) throw new Error('sessions:dismiss refused: unexpected origin');
+    markClosed(({ id }) => id === sessionId);
+  });
+
   // Starts the harness for `contents`, the window that owns the terminal, or for none.
   async function startSession(
     contents: WebContents | undefined,
@@ -1235,7 +1349,7 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
         harness: harness.id,
         directory,
         createdAt: new Date().toISOString(),
-        ...(workspace && { project: workspace.project }),
+        ...(workspace && { project: workspace.project, open: true }),
       };
       const next = addSession(state, session);
       saveState(userData, next);
