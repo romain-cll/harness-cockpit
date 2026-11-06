@@ -288,11 +288,18 @@ export const getSessionTerminal = (id: string) => sessionTerminals.get(id);
 /**
  * Starts the session in the main process and, once it is running, keeps its terminal.
  */
-export async function startSession(harness: string, options?: StartSessionOptions): Promise<StartSessionResult> {
-  // What `sessions.start` answered, which the terminal's start cannot return.
+export const startSession = (harness: string, options?: StartSessionOptions) =>
+  startLive((size) => window.api.sessions.start(harness, size, options), options?.workspace?.path);
+
+/** Starts an ended session again in the main process, resuming its conversation, and keeps its new terminal. */
+export const resumeSession = (sessionId: string, workspace: string) =>
+  startLive((size) => window.api.sessions.resume(sessionId, size), workspace);
+
+async function startLive(request: (size: { cols: number; rows: number }) => Promise<StartSessionResult>, workspace?: string): Promise<StartSessionResult> {
+  // What the main process answered, which the terminal's start cannot return.
   const answer: { result?: StartSessionResult } = {};
   const { entry, started } = createLiveTerminal(async (size) => {
-    const result = await window.api.sessions.start(harness, size, options);
+    const result = await request(size);
     answer.result = result;
     if (result.status === 'refused') throw new Error(result.message);
     return result.ptyId;
@@ -307,7 +314,7 @@ export async function startSession(harness: string, options?: StartSessionOption
   const result = answer.result!;
   if (result.status === 'started') {
     sessionTerminals.set(result.session.id, entry);
-    if (options?.workspace) sessionWorkspaces.set(result.session.id, options.workspace.path);
+    if (workspace) sessionWorkspaces.set(result.session.id, workspace);
   }
   publish();
   return result;

@@ -35,6 +35,8 @@ const api: Api = {
     home: () => ipcRenderer.invoke('projects:home'),
     updatePath: (from) => ipcRenderer.invoke('projects:update-path', from),
     remove: (path) => ipcRenderer.invoke('projects:remove', path),
+    reveal: (path) => ipcRenderer.invoke('projects:reveal', path),
+    open: (path, app) => ipcRenderer.invoke('projects:open', path, app),
     onChanged: (listener) => subscribe('projects:changed', listener),
   },
   workspaces: {
@@ -77,6 +79,7 @@ const api: Api = {
     harnesses: (options) => ipcRenderer.invoke('sessions:harnesses', options),
     list: () => ipcRenderer.invoke('sessions:list'),
     start: (harness, size, options) => ipcRenderer.invoke('sessions:start', harness, size, options),
+    resume: (sessionId, size) => ipcRenderer.invoke('sessions:resume', sessionId, size),
     onStatus: (listener) => subscribe('sessions:status', listener),
     onOpen: (listener) => subscribe('sessions:open', listener),
     ended: () => ipcRenderer.invoke('sessions:ended'),

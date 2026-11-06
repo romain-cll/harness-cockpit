@@ -75,6 +75,8 @@ export interface OutdatedTerminal {
 export interface EndedSession {
   sessionId: string;
   reboot: boolean;
+  /** `<binary> <resume arguments>`; present when the session has a conversation id, which is what offers "Resume last session". */
+  resumeCommand?: string;
 }
 
 /**
@@ -362,6 +364,10 @@ export interface Api {
     updatePath(from: string): Promise<UpdatePathResult>;
     /** Forgets the project; its files stay on disk. */
     remove(path: string): Promise<void>;
+    /** Shows the project's folder in the Finder. Refused when the path is not a project of Cockpit. */
+    reveal(path: string): Promise<OpenWorkspaceResult>;
+    /** Opens the project's folder in the detected app `app`, and remembers it. Refused when the path is not a project of Cockpit. */
+    open(path: string, app: string): Promise<OpenWorkspaceResult>;
     /** Calls `listener` when the main process changed a project's workspaces (a workspace named from its agent's title). */
     onChanged(listener: () => void): () => void;
   };
@@ -466,6 +472,11 @@ export interface Api {
     onStatus(listener: (sessionId: string, event: SessionEvent, exitCode?: number | null) => void): () => void;
     /** Calls `listener` with the id of the session whose notification the user clicked. */
     onOpen(listener: (sessionId: string) => void): () => void;
+    /**
+     * Runs the harness again for an ended session, resuming its conversation: the same session in the same worktree,
+     * in a pty owned by the calling window. Refused when the session has no id, or a daemon already holds it.
+     */
+    resume(sessionId: string, size: { cols: number; rows: number }): Promise<StartSessionResult>;
     /** The workspace sessions whose terminal was lost with its daemon, in creation order. */
     ended(): Promise<EndedSession[]>;
     /** Forgets that a session was open: its ended tab does not come back. */

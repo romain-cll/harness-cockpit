@@ -27,7 +27,7 @@ import {
   waitForSelectedTab,
   waitForWorkspacePage,
 } from './composer';
-import { afterIpcAnswers, ipcAnswered, removeThroughMenu, waitForSetupLabel } from './support/projects';
+import { afterIpcAnswers, errorMark, expectNoNewErrors, gitState, ipcAnswered, removeThroughMenu, stateSnapshot, waitForSetupLabel } from './support/projects';
 import { daemonPidIn } from './support/panes';
 import { locationsSeen, recordLocations, watchStarts } from './support/sessions';
 import { activePane, goHome, type PtyWindow } from './support/terminal';
@@ -480,12 +480,20 @@ describe('workspace setup status: built app', () => {
     expect(startsOf(fx, 'claude').slice(startsBefore).map((start) => start.cwd)).toEqual([path]);
   }, 60_000);
 
-  test('COCKPIT-89 AC10 — a worktrees folder that cannot be created refuses the send before any workspace is reserved: the composer stays with its message, text and selections and no row ever appears', async () => {
+  test('COCKPIT-89 AC10, COCKPIT-42 AC3 — a worktrees folder that cannot be created refuses the send before any workspace is reserved: the composer stays with "Cockpit could not create its worktrees folder <root>: EEXIST.", its text and selections, no row ever appears, state.json and the git state are as they were and no error is logged', async () => {
     const { page } = session;
     const root = join(home, 'worktrees');
     const aside = `${root}.aside`;
     const path = worktreeOf(clone, 'no-root');
     mkdirSync(root, { recursive: true });
+    // `git worktree list --porcelain` marks the worktrees under a folder that is moved aside as `prunable`:
+    // those lines only reflect that folder, every other line of the git state is compared.
+    const gitStateWithoutPrunable = () => {
+      const state = gitState(clone);
+      return { ...state, worktrees: state.worktrees.split('\n').filter((line) => !line.startsWith('prunable ')).join('\n') };
+    };
+    const before = { git: gitStateWithoutPrunable(), state: stateSnapshot(dataDir) };
+    const mark = await errorMark(session);
     renameSync(root, aside);
     writeFileSync(root, 'not a folder');
     try {
@@ -505,7 +513,7 @@ describe('workspace setup status: built app', () => {
       }, path);
       await createButton(page).click();
 
-      expect(await waitForMessage(page)).toMatch(/^Cockpit could not create its worktrees folder .*: EEXIST\.$/);
+      expect(await waitForMessage(page)).toBe(`Cockpit could not create its worktrees folder ${root}: EEXIST.`);
       await createButton(page).and(page.locator('button:enabled')).waitFor();
       expect(new URL(page.url()).pathname).toBe('/');
       expect(await promptBox(page).inputValue()).toBe('no root');
@@ -515,6 +523,9 @@ describe('workspace setup status: built app', () => {
       expect(await page.evaluate(() => (window as unknown as { __rowSeen: boolean }).__rowSeen), 'no row appeared').toBe(false);
       expect(await entryOf(page, path).count()).toBe(0);
       expect(localBranches(clone)).not.toContain('no-root');
+      expect(gitStateWithoutPrunable()).toEqual(before.git);
+      expect(stateSnapshot(dataDir)).toEqual(before.state);
+      await expectNoNewErrors(session, mark);
     } finally {
       rmSync(root, { force: true });
       renameSync(aside, root);

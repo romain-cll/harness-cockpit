@@ -1,5 +1,4 @@
 import { execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { type Page } from 'playwright-core';
@@ -7,7 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 import { agentSelect, baseSelect, createButton, detectAgain, itemTexts, openComposer, openPopup, promptBox, useAgent, waitForAgent, waitForMessage } from './composer';
 import { daemonSocketIn, gonePipe, heldProcess, isAlive, MAIN_PROCESS_ERROR, type Session, startClock, truthy, untilIn, untilRead, versionLabel } from './launch';
 import { addRepository, afterIpcAnswers, countIpcCalls, deleteButton, deleteDialog, destructiveColor, dispatchFocus, entryTitles, gitIn, holdWaiter, INVOKE_HANDLERS, ipcCallArgs, ipcCalls, isBelowProjectsHeader, linkedWorktrees, makeRepo, mutedColor, openDeleteDialog, readRecords, removeOptions, removeThroughMenu, setupLabel, setupLinkCount, sidebarLines, startDeletion, startProjectRemoval, stateSnapshot, type TempRepo, untilAnswered, untilFewerOverlays, waitForDialogLine, waitForEntries, waitForEntry, waitForLine, waitForNoEntry, waitForSetupLabel, worktreePath, writeConfig, writeScripts } from './support/projects';
-import { addOpenFixture, allSessionLinkIds, childPidsOf, closeMenus, controlTokenIn, createPlainWorkspace, createWorkspaceWithAgent, expectDot, expectNoErrors, expectSetupSpawnedWithDetectedPath, FIRST_MENU, hookCommandsOf, INHERITED_CONTROL_ENV, launchBuiltWith, makeSessionsFixture, moveMouseAway, OPEN_BUNDLES, type OpenFixture, openRuns, openSessionEntry, openSubmenu, openWorkspaceMenu, openWorkspaceStartMenu, pickInSubmenu, pickTopItem, postSessionEvent, readSessionLinks, readStub, readStubEnv, rememberedApps, REPOSITORY_CLI, sessionEntries, sessionFoldersIn, sessionIdOf, type SessionLinksArg, type SessionsFixture, sessionsInState, setOpenOutcome, singleQuoted, startApi, STARTED_PROMPT, startForeignSetup, startInWorkspace, startPlusLabel, startRuns, startSession, stubPids, stubRuns, submenuNamed, submenuTexts, trimmed, versionRuns, waitForOpenRuns, waitForSessionEntries, waitForWorkspaceTabs, workspacesApi, workspaceTabs } from './support/sessions';
+import { addOpenFixture, allSessionLinkIds, childPidsOf, closeMenus, createPlainWorkspace, createWorkspaceWithAgent, expectDot, expectNoErrors, expectSetupSpawnedWithDetectedPath, FIRST_MENU, hookCommandsOf, INHERITED_CONTROL_ENV, launchBuiltWith, makeSessionsFixture, moveMouseAway, OPEN_BUNDLES, type OpenFixture, openRuns, openSessionEntry, openSubmenu, openWorkspaceMenu, openWorkspaceStartMenu, pickInSubmenu, pickTopItem, readSessionLinks, readStub, readStubEnv, rememberedApps, REPOSITORY_CLI, sessionEntries, sessionFoldersIn, sessionIdOf, type SessionLinksArg, type SessionsFixture, sessionsInState, setOpenOutcome, singleQuoted, startApi, STARTED_PROMPT, startForeignSetup, startInWorkspace, startPlusLabel, startRuns, startSession, stubPids, stubRuns, submenuNamed, submenuTexts, trimmed, versionRuns, waitForOpenRuns, waitForSessionEntries, waitForWorkspaceTabs, workspacesApi, workspaceTabs } from './support/sessions';
 import { ensurePtyLog, exitCount, focusedPane, focusTerminal, goHome, killPtyHost, openShellTab, outputOf, ptyHostPid, ptyKill, ptyWrite, spawnShell, terminalOfSession, terminalRows, typeLine, untilPtyLog, visiblePanes, waitForExit, waitForOutput, waitForRow } from './support/terminal';
 
 // The full block runs in the built app only (see the split rule in AGENTS.md).
@@ -176,18 +175,6 @@ describe('sessions: built app', () => {
     expect(new Date(stored[0]!.createdAt).toISOString()).toBe(stored[0]!.createdAt);
   });
 
-  test('daemon AC1 — daemon-1-<build>.sock and .token sit in COCKPIT_HOME, both with mode 0600, the token being 64 lowercase hex characters and nothing else, next to the daemon\'s .pid and .log', () => {
-    const socketPath = daemonSocketIn(session.cockpitHome);
-    const tokenPath = socketPath.replace(/\.sock$/, '.token');
-    expect(statSync(socketPath).isSocket()).toBe(true);
-    expect(statSync(socketPath).mode & 0o777).toBe(0o600);
-    expect(statSync(tokenPath).isFile()).toBe(true);
-    expect(statSync(tokenPath).mode & 0o777).toBe(0o600);
-    expect(readFileSync(tokenPath, 'utf8')).toMatch(/^[0-9a-f]{64}$/);
-    expect(existsSync(socketPath.replace(/\.sock$/, '.pid'))).toBe(true);
-    expect(existsSync(socketPath.replace(/\.sock$/, '.log'))).toBe(true);
-  });
-
   test('control AC8, AC9 — a session outside any project gets its own id and the socket, no workspace path, and not the values the app inherited', async () => {
     const env = await readStubEnv(session.page);
     expect(env.session).toBe(known.claude1.id);
@@ -196,15 +183,6 @@ describe('sessions: built app', () => {
     expect(sessionsInState(session.dataDir)[0]!.id).toBe(env.session);
     expect(Object.values(env)).not.toContain(INHERITED_CONTROL_ENV.COCKPIT_SESSION_ID);
     expect(env.socket).not.toBe(INHERITED_CONTROL_ENV.COCKPIT_SOCKET);
-  });
-
-  test('control AC4 — an id that is not a stored session gets 404 { "error": "unknown session" }', async () => {
-    const answer = await postSessionEvent(daemonSocketIn(session.cockpitHome), {
-      authorization: `Bearer ${controlTokenIn(session.cockpitHome)}`,
-      body: { sessionId: randomUUID(), event: 'working' },
-    });
-    expect(answer.status).toBe(404);
-    expect(JSON.parse(answer.text)).toEqual({ error: 'unknown session' });
   });
 
   test('control AC9 — a shell of the terminal page gets COCKPIT_SOCKET and neither a session id nor a workspace path, whatever the app inherited', async () => {

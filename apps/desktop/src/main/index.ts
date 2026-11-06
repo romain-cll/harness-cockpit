@@ -36,6 +36,7 @@ import {
   removeProject,
   saveState,
   sessionName,
+  setHarnessSessionId,
   setMainWorkspace,
   type Session,
   updateProjectPath,
@@ -295,7 +296,17 @@ async function nameFromTitle({ sessionId, title }: { sessionId: string; title: s
   for (const window of BrowserWindow.getAllWindows()) window.webContents.send('projects:changed');
 }
 
-// A session reported to a daemon: a harness hook (a status), or `cockpit setup` (a setup state, the
+// Keeps the harness's id for a session's conversation, an opaque string: the last one reported wins, and
+// nothing is written when it is the one stored.
+function storeHarnessSessionId(sessionId: string, harnessSessionId: string): void {
+  const session = state.sessions.find(({ id }) => id === sessionId);
+  if (!session || session.harnessSessionId === harnessSessionId) return;
+  const next = setHarnessSessionId(state, sessionId, harnessSessionId);
+  saveState(app.getPath('userData'), next);
+  state = next;
+}
+
+// A session reported to a daemon: a harness hook (a status or the conversation's id), or `cockpit setup` (a setup state, the
 // agent's exit). The window that holds the session's terminal is told of a change; a macOS
 // notification is raised for `waiting` and `finished` when no Cockpit window is focused, and
 // clicking it shows a window (a new one when none is open) on the session's page.
@@ -306,6 +317,10 @@ function reportSessionStatus(report: SessionReport): void {
   const terminal = [...terminals.values()].find((each) => each.sessionId === sessionId);
   const owner = terminal?.owner && !terminal.owner.isDestroyed() ? terminal.owner : undefined;
 
+  if (report.event === 'harness-session') {
+    storeHarnessSessionId(sessionId, report.harnessSessionId);
+    return;
+  }
   if (report.event === 'exited') {
     pendingNames.delete(sessionId);
     if (terminal) terminal.exitCode = report.exitCode;
@@ -487,6 +502,8 @@ async function adopt(client: DaemonClient): Promise<Daemon> {
     if (info.kind === 'commands') continue;
     register(daemon, info);
     if (info.sessionId !== undefined && info.status !== undefined) sessionStatuses.set(info.sessionId, info.status);
+    // An id reported while no app was connected.
+    if (info.sessionId !== undefined && info.harnessSessionId !== undefined) storeHarnessSessionId(info.sessionId, info.harnessSessionId);
   }
   return daemon;
 }
@@ -1205,10 +1222,7 @@ function startProjects(
     return { editors: available('editor'), terminals: available('terminal'), editor: shown('editor'), terminal: shown('terminal') };
   });
 
-  ipcMain.handle('workspaces:reveal', async (event, project: string, path: string): Promise<OpenWorkspaceResult> => {
-    if (!isFromApp(event)) throw new Error('workspaces:reveal refused: unexpected origin');
-    const workspace = await findWorkspace({ project, path });
-    if ('status' in workspace) return workspace;
+  async function revealFolder(path: string): Promise<OpenWorkspaceResult> {
     try {
       await reveal(path, { env: await shellEnv });
       return { status: 'opened' };
@@ -1216,13 +1230,10 @@ function startProjects(
       if (!(error instanceof LaunchError)) throw error;
       return { status: 'refused', message: `Could not reveal ${path} in the Finder: ${error.message}` };
     }
-  });
+  }
 
-  // Opens the worktree in a detected app by its bundle's path, then remembers the app.
-  ipcMain.handle('workspaces:open', async (event, project: string, path: string, appId: string): Promise<OpenWorkspaceResult> => {
-    if (!isFromApp(event)) throw new Error('workspaces:open refused: unexpected origin');
-    const workspace = await findWorkspace({ project, path });
-    if ('status' in workspace) return workspace;
+  // Opens the folder in a detected app by its bundle's path, then remembers the app.
+  async function openFolder(path: string, appId: string): Promise<OpenWorkspaceResult> {
     const entry = apps.find(({ id }) => id === appId);
     const bundle = entry && (await detectApps(applicationDirs)).find(({ id }) => id === entry.id);
     if (!entry || !bundle) return { status: 'refused', message: `${entry?.name ?? appId} is not installed.` };
@@ -1242,7 +1253,29 @@ function startProjects(
     }
     state = next;
     return { status: 'opened' };
+  }
+
+  ipcMain.handle('workspaces:reveal', async (event, project: string, path: string): Promise<OpenWorkspaceResult> => {
+    if (!isFromApp(event)) throw new Error('workspaces:reveal refused: unexpected origin');
+    const workspace = await findWorkspace({ project, path });
+    if ('status' in workspace) return workspace;
+    return revealFolder(path);
   });
+
+  ipcMain.handle('workspaces:open', async (event, project: string, path: string, appId: string): Promise<OpenWorkspaceResult> => {
+    if (!isFromApp(event)) throw new Error('workspaces:open refused: unexpected origin');
+    const workspace = await findWorkspace({ project, path });
+    if ('status' in workspace) return workspace;
+    return openFolder(path, appId);
+  });
+
+  ipcMain.handle('projects:reveal', (event, path: string): Promise<OpenWorkspaceResult> =>
+    forProject<OpenWorkspaceResult>(event, 'projects:reveal', path, () => revealFolder(path)),
+  );
+
+  ipcMain.handle('projects:open', (event, path: string, appId: string): Promise<OpenWorkspaceResult> =>
+    forProject<OpenWorkspaceResult>(event, 'projects:open', path, () => openFolder(path, appId)),
+  );
 
   ipcMain.handle('workspaces:changes', (event, project: string, path: string): Promise<ChangesResult> =>
     forProject<ChangesResult>(event, 'workspaces:changes', project, async () => {
@@ -1505,23 +1538,37 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
   // with a daemon. One that began before the Mac started proves a restart.
   ipcMain.handle('sessions:ended', (event): EndedSession[] => {
     if (!isFromApp(event)) throw new Error('sessions:ended refused: unexpected origin');
-    const held = new Set([...terminals.values(), ...otherDaemons.flatMap((daemon) => daemon.terminals)].flatMap(({ sessionId }) => (sessionId === undefined ? [] : [sessionId])));
+    const held = heldSessionIds();
     const bootedAt = Date.now() - uptime() * 1000;
     return state.sessions
       .filter(({ id, open, project }) => open && project !== undefined && !held.has(id))
-      .map(({ id, createdAt }) => ({ sessionId: id, reboot: Date.parse(createdAt) < bootedAt }));
+      .map(({ id, createdAt, harness, harnessSessionId }) => {
+        const catalogued = harnesses.find((each) => each.id === harness);
+        // What "Resume last session" runs: offered only for a session with an id.
+        const resumeCommand = catalogued && harnessSessionId !== undefined ? [catalogued.binary, ...catalogued.resume(harnessSessionId)].join(' ') : undefined;
+        return { sessionId: id, reboot: Date.parse(createdAt) < bootedAt, ...(resumeCommand !== undefined && { resumeCommand }) };
+      });
   });
   ipcMain.handle('sessions:dismiss', (event, sessionId: string) => {
     if (!isFromApp(event)) throw new Error('sessions:dismiss refused: unexpected origin');
     markClosed(({ id }) => id === sessionId);
   });
 
-  // Starts the harness for `contents`, the window that owns the terminal, or for none.
+  // The sessions whose resume is under way: a daemon holds none of them yet.
+  const resuming = new Set<string>();
+
+  // The ids of the sessions a connected daemon holds.
+  const heldSessionIds = () =>
+    new Set([...terminals.values(), ...otherDaemons.flatMap((daemon) => daemon.terminals)].flatMap(({ sessionId }) => (sessionId === undefined ? [] : [sessionId])));
+
+  // Starts the harness for `contents`, the window that owns the terminal, or for none. With `resume`, a stored
+  // session that lost its terminal: the same record and id, the harness resuming its conversation.
   async function startSession(
     contents: WebContents | undefined,
     harnessId: string,
     size: { cols: number; rows: number },
     options?: StartSessionOptions,
+    resume?: Session & { harnessSessionId: string },
   ): Promise<StartSessionResult> {
     // A page that ends while detection or the worktree check runs starts nothing.
     const endings = contents && endingsOf(contents);
@@ -1550,7 +1597,9 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
     if (contents && endingsOf(contents) !== endings) {
       return { status: 'refused', message: `Could not start ${harness.name}: the page that asked for it is gone` };
     }
-    const id = randomUUID();
+    const id = resume?.id ?? randomUUID();
+    // A resumed session's last status is not the new agent's.
+    if (resume) sessionStatuses.delete(id);
     const directory = workspace?.path ?? join(cockpitHome, 'sessions', id);
     const prompt = options?.prompt?.trim() || undefined;
     let ptyId: number | undefined;
@@ -1569,7 +1618,7 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
         // From the composer the terminal runs `cockpit setup`, which runs the repository's setup, then
         // the agent, then the login shell. The agent follows `--then` by the path detection found, so
         // that binary is the one that runs.
-        const agentArgs = [...status.args, ...catalogued.start(prompt)];
+        const agentArgs = [...status.args, ...(resume ? catalogued.resume(resume.harnessSessionId) : catalogued.start(prompt))];
         command = viaSetup
           ? { command: cliPath, args: ['setup', '--shell', '--then', found.path, ...agentArgs] }
           : { command: found.path, args: agentArgs };
@@ -1587,6 +1636,7 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
         { ...size, ...command, cwd: directory, env },
         { kind: 'session', sessionId: id, workspace: workspace?.path, before: endings },
       );
+      if (resume) return { status: 'started', session: resume, ptyId };
       const session = {
         id,
         name: sessionName(state, harness, workspace?.path),
@@ -1610,6 +1660,20 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
     }
   }
 
+  ipcMain.handle('sessions:resume', async (event, sessionId: string, size: { cols: number; rows: number }): Promise<StartSessionResult> => {
+    if (!isFromApp(event)) throw new Error('sessions:resume refused: unexpected origin');
+    const session = state.sessions.find(({ id }) => id === sessionId);
+    const { project, harnessSessionId } = session ?? {};
+    if (!session || project === undefined || harnessSessionId === undefined) return { status: 'refused', message: 'This session has no conversation to resume.' };
+    // A session a daemon holds runs, and one whose start is under way is about to: either would run two agents.
+    if (heldSessionIds().has(sessionId) || resuming.has(sessionId)) return { status: 'refused', message: `${session.name} is already running.` };
+    resuming.add(sessionId);
+    try {
+      return await startSession(event.sender, session.harness, size, { workspace: { project, path: session.directory } }, { ...session, harnessSessionId });
+    } finally {
+      resuming.delete(sessionId);
+    }
+  });
   ipcMain.handle('sessions:start', (event, harnessId: string, size: { cols: number; rows: number }, options?: StartSessionOptions) => {
     if (!isFromApp(event)) throw new Error('sessions:start refused: unexpected origin');
     return startSession(event.sender, harnessId, size, options);

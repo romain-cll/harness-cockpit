@@ -44,10 +44,9 @@ describe('turbo.json', () => {
 });
 
 describe('ci.yml', () => {
-  test('AC7 — a step runs bun turbo run build typecheck lint test', () => {
-    expect(read('.github', 'workflows', 'ci.yml')).toMatch(
-      /^\s*-?\s*run:\s*bun turbo run build typecheck lint test\s*$/m,
-    );
+  // COCKPIT-62: the CI is split into jobs; the `lint` job runs the lint task (`ci-workflow.test.ts` pins the jobs).
+  test('AC7 — a step runs bun turbo run lint', () => {
+    expect(read('.github', 'workflows', 'ci.yml')).toMatch(/^\s*-?\s*run:\s*bun turbo run lint(\s.*)?$/m);
   });
 });
 

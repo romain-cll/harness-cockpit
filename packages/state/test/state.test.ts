@@ -13,6 +13,7 @@ import {
   removeProject,
   saveState,
   sessionName,
+  setHarnessSessionId,
   setMainWorkspace,
   type Session,
   updateProjectPath,
@@ -1063,5 +1064,71 @@ describe('COCKPIT-71 AC17 — the main workspace mark of a project', () => {
     for (const project of state.projects) expect(project.mainWorkspace).not.toBe(true);
     expect(snapshot()).toEqual(before);
     expect(backups()).toEqual([]);
+  });
+});
+
+describe('COCKPIT-30 AC15 — the harness session id', () => {
+  const workspaceSession = (overrides: Partial<Session> = {}) => session({ project: '/repo', directory: '/home/.cockpit/worktrees/repo-1234abcd/a', open: true, ...overrides });
+
+  test('AC15 — a session stored with an id is read as written, whatever the string, and a session stored before the field reads with none; the file is not rewritten and the version stays 1', () => {
+    const stored = [workspaceSession({ id: 'a', harnessSessionId: 'not/a:uuid é' }), workspaceSession({ id: 'b' })];
+    seed(`${JSON.stringify({ version: 1, sessions: stored })}\n`);
+    const before = snapshot();
+
+    const state = loadState(dir);
+
+    expect(state.version).toBe(1);
+    expect(state.sessions).toEqual(stored);
+    expect(state.sessions[0]!.harnessSessionId).toBe('not/a:uuid é');
+    expect(state.sessions[1]).not.toHaveProperty('harnessSessionId');
+    expect(snapshot()).toEqual(before);
+    expect(backups()).toEqual([]);
+  });
+
+  test.each([
+    ['a number', '7'],
+    ['null', 'null'],
+    ['a boolean', 'true'],
+    ['an object', '{}'],
+    ['an array', '["x"]'],
+  ])('AC15 — a session whose harnessSessionId is %s sets the file aside like any other bad field', (_name, value) => {
+    const content = `{ "version": 1, "sessions": [{ "id": "a", "name": "Claude Code 1", "harness": "claude-code", "directory": "/d", "createdAt": "2026-11-06T10:00:00.000Z", "project": "/repo", "open": true, "harnessSessionId": ${value} }] }\n`;
+    seed(content);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    expect(loadState(dir)).toEqual({ version: 1, projects: [], sessions: [] });
+
+    const found = backups();
+    expect(found).toHaveLength(1);
+    expect(readFileSync(join(dir, found[0]!), 'utf8')).toBe(content);
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ version: 1 });
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  test('AC4 — setHarnessSessionId sets the id of that session only, replaces an earlier one, leaves the given state alone and keeps the other fields; saved, it loads back unchanged', () => {
+    const state = { version: 1, extra: 'kept', projects: [{ path: '/repo' }], sessions: [workspaceSession({ id: 'a', harnessSessionId: 'first' }), workspaceSession({ id: 'b' })] };
+
+    const next = setHarnessSessionId(state, 'a', 'not/a:uuid é');
+    const other = setHarnessSessionId(state, 'b', 'second');
+
+    expect(next.sessions[0]).toEqual({ ...state.sessions[0], harnessSessionId: 'not/a:uuid é' });
+    expect(next.sessions[1]).toEqual(state.sessions[1]);
+    expect(other.sessions[1]).toEqual({ ...state.sessions[1], harnessSessionId: 'second' });
+    expect(next).toMatchObject({ version: 1, extra: 'kept', projects: [{ path: '/repo' }] });
+    expect(state.sessions[0]!.harnessSessionId).toBe('first');
+    expect(state.sessions[1]).not.toHaveProperty('harnessSessionId');
+    expect(next).not.toBe(state);
+
+    mkdirSync(dir, { recursive: true });
+    saveState(dir, next);
+    const written = snapshot();
+    expect(loadState(dir)).toEqual(next);
+    expect(snapshot()).toEqual(written);
+  });
+
+  test('AC4 — setHarnessSessionId with an id no session has returns the same sessions', () => {
+    const state = { version: 1, projects: [], sessions: [workspaceSession({ id: 'a', harnessSessionId: 'first' })] };
+
+    expect(setHarnessSessionId(state, 'nobody', 'x').sessions).toEqual(state.sessions);
   });
 });

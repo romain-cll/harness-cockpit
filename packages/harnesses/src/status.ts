@@ -7,6 +7,8 @@ import type { HarnessId } from './catalogue';
 // argv and the environment of the spawn, never written in the user's repository or global
 // config. Every hook runs the `cockpit` CLI of `apps/cli`, `<cli> status <event>`, which always
 // exits 0 and prints nothing; this package does not depend on it: the caller passes in its path.
+// The `UserPromptSubmit` hook of Claude Code and Codex (and OpenCode's plugin) also runs
+// `<cli> session-id <harness>`, which hands the hook's stdin to the adapter's `sessionIdFrom`.
 //
 // Every fact below carries its source. Checked on 2026-10-25 against Claude Code 2.1.310,
 // Codex 0.163.0 and OpenCode 2.0.31.
@@ -42,9 +44,15 @@ export async function statusLaunch(
   const command = hookCommand(cli);
   switch (harnessId) {
     case 'claude-code':
-      return { args: ['--settings', JSON.stringify({ hooks: claudeHooks(command) })], env: { ...env } };
+      return {
+        args: ['--settings', JSON.stringify({ hooks: claudeHooks(command, sessionIdCommand(cli, harnessId)) })],
+        env: { ...env },
+      };
     case 'codex':
-      return { args: ['--no-daemon', '-c', `hooks=${codexHooks(command)}`], env: { ...env } };
+      return {
+        args: ['--no-daemon', '-c', `hooks=${codexHooks(command, sessionIdCommand(cli, harnessId))}`],
+        env: { ...env },
+      };
     case 'opencode':
       return openCodeLaunch(cli, pluginsDir, env);
   }
@@ -52,7 +60,9 @@ export async function statusLaunch(
 
 // The shell line of a hook (the harnesses run it by a shell): the CLI's path single-quoted, a `'`
 // in it written `'\''`, so a space, a `$(…)` or a quote reaches the CLI as part of one argument.
-const hookCommand = (cli: string) => (event: StatusEvent) => `'${cli.replaceAll("'", "'\\''")}' status ${event}`;
+const quoted = (cli: string) => `'${cli.replaceAll("'", "'\\''")}'`;
+const hookCommand = (cli: string) => (event: StatusEvent) => `${quoted(cli)} status ${event}`;
+const sessionIdCommand = (cli: string, harnessId: HarnessId) => `${quoted(cli)} session-id ${harnessId}`;
 
 // --- Claude Code ---------------------------------------------------------------------------
 
@@ -66,7 +76,11 @@ const hookCommand = (cli: string) => (event: StatusEvent) => `'${cli.replaceAll(
 // - Finished: `Stop`, `StopFailure`.
 // Not reported (same page): Esc and a rejected permission fire no hook, so the dot stays as
 // it was until the next report; an approved tool keeps "waiting" until it ends.
-function claudeHooks(command: (event: StatusEvent) => string) {
+// The session id is reported by the second hook of the `UserPromptSubmit` group: every hook gets
+// the JSON input with `session_id` on stdin (same page), and a prompt is sent only to a
+// conversation that exists, unlike `SessionStart`, which also fires for `/clear` and `/resume`
+// before any prompt.
+function claudeHooks(command: (event: StatusEvent) => string, sessionId: string) {
   const byEvent: Record<string, StatusEvent> = {
     UserPromptSubmit: 'working',
     PostToolUse: 'working',
@@ -80,7 +94,14 @@ function claudeHooks(command: (event: StatusEvent) => string) {
   return Object.fromEntries(
     Object.entries(byEvent).map(([name, event]) => [
       name,
-      [{ hooks: [{ type: 'command', command: command(event), timeout: 5 }] }],
+      [
+        {
+          hooks: [
+            { type: 'command', command: command(event), timeout: 5 },
+            ...(name === 'UserPromptSubmit' ? [{ type: 'command', command: sessionId, timeout: 5 }] : []),
+          ],
+        },
+      ],
     ]),
   );
 }
@@ -102,7 +123,9 @@ function claudeHooks(command: (event: StatusEvent) => string) {
 // a `-c` override being `/<session-flags>/config.toml` (source at `rust-v0.163.0`, not in the
 // docs). The hash is `sha256:` + hex SHA-256 of the key-sorted JSON of
 // `{ event_name, hooks: [{ async, command, timeout, type }], matcher? }`. The fixture of the
-// tests is a pair computed and accepted as trusted by the real Codex 0.163.0.
+// tests is a pair computed and accepted as trusted by the real Codex 0.163.0. A second hook of
+// a group has the same formula under the hook index 1 (`hooks/src/engine/discovery.rs`): the
+// session-id hook, second of the `UserPromptSubmit` group. Its pair was not run by a real Codex.
 const CODEX_TIMEOUT = 3;
 const CODEX_EVENTS: ReadonlyArray<{ name: string; snake: string; event: StatusEvent; matcher?: string }> = [
   { name: 'UserPromptSubmit', snake: 'user_prompt_submit', event: 'working' },
@@ -126,14 +149,22 @@ export function codexTrustHash(eventName: string, command: string, matcher?: str
 // A JSON string is a TOML basic string.
 const toml = (text: string) => JSON.stringify(text);
 
-function codexHooks(command: (event: StatusEvent) => string): string {
-  const events = CODEX_EVENTS.map(({ name, event, matcher }) => {
+function codexHooks(command: (event: StatusEvent) => string, sessionId: string): string {
+  // The commands of each event's group: its status hook, then (`UserPromptSubmit`) the session-id hook.
+  const groups = CODEX_EVENTS.map((entry) => ({
+    ...entry,
+    commands: [command(entry.event), ...(entry.name === 'UserPromptSubmit' ? [sessionId] : [])],
+  }));
+  const events = groups.map(({ name, matcher, commands }) => {
     const matching = matcher === undefined ? '' : `matcher=${toml(matcher)},`;
-    return `${name}=[{${matching}hooks=[{type="command",command=${toml(command(event))},timeout=${CODEX_TIMEOUT}}]}]`;
+    const hooks = commands.map((line) => `{type="command",command=${toml(line)},timeout=${CODEX_TIMEOUT}}`);
+    return `${name}=[{${matching}hooks=[${hooks.join(',')}]}]`;
   });
-  const state = CODEX_EVENTS.map(
-    ({ snake, event, matcher }) =>
-      `${toml(`/<session-flags>/config.toml:${snake}:0:0`)}={trusted_hash=${toml(codexTrustHash(snake, command(event), matcher))}}`,
+  const state = groups.flatMap(({ snake, matcher, commands }) =>
+    commands.map(
+      (line, index) =>
+        `${toml(`/<session-flags>/config.toml:${snake}:0:${index}`)}={trusted_hash=${toml(codexTrustHash(snake, line, matcher))}}`,
+    ),
   );
   return `{${events.join(',')},state={${state.join(',')}}}`;
 }
@@ -193,6 +224,10 @@ async function writePlugin(folder: string, cli: string): Promise<void> {
 // - `form.created`: `data.form.{ id, sessionID }`; `form.replied` and `form.cancelled`:
 //   `data.{ sessionID, id }`.
 // Not reported: a plain-text question ends the execution, so it reports `finished`.
+// - The session id: `session.execution.started` also fires for subagent sessions; the plugin's
+//   `ctx.session.get({ sessionID })` (`packages/plugin/src/promise/session.ts`) gives a
+//   `Session.Info`, whose `parentID` marks a subagent. A fork has `fork`, not `parentID`
+//   (`core/src/session/projector.ts`), so it counts as a root.
 
 /** The source text of the plugin; the path of the CLI is embedded as a JSON string. */
 export function openCodePlugin(cli: string): string {
@@ -206,6 +241,8 @@ const running = new Set();
 let ran = false;
 let current = null;
 let queue = Promise.resolve();
+let idQueue = Promise.resolve();
+let reportedId = null;
 
 function state() {
   for (const ids of pending.values()) if (ids.size > 0) return 'waiting';
@@ -219,6 +256,32 @@ function run(event) {
     const child = spawn(cli, ['status', event], { stdio: 'ignore' });
     child.on('error', resolve);
     child.on('close', resolve);
+  });
+}
+
+// \`<cli> session-id opencode\` with the id on stdin; the CLI is spawned directly, like \`status\`.
+function runId(id) {
+  return new Promise((resolve) => {
+    const child = spawn(cli, ['session-id', 'opencode'], { stdio: ['pipe', 'ignore', 'ignore'] });
+    child.stdin.on('error', () => {});
+    child.on('error', resolve);
+    child.on('close', resolve);
+    child.stdin.end(id);
+  });
+}
+
+// A root session's id, once per change and one at a time: a subagent's session (a \`parentID\`) is skipped.
+function reportId(ctx, sessionID) {
+  idQueue = idQueue.then(async () => {
+    try {
+      if (sessionID === reportedId) return;
+      const info = await ctx.session.get({ sessionID });
+      if (info.parentID) return;
+      reportedId = sessionID;
+      await runId(sessionID);
+    } catch {
+      // A session that cannot be read: not reported.
+    }
   });
 }
 
@@ -239,11 +302,12 @@ function remove(sessionID, id) {
   pending.get(sessionID)?.delete(id);
 }
 
-function handle({ type, data }) {
+function handle(ctx, { type, data }) {
   switch (type) {
     case 'session.execution.started':
       running.add(data.sessionID);
       ran = true;
+      reportId(ctx, data.sessionID);
       break;
     case 'session.execution.succeeded':
     case 'session.execution.failed':
@@ -277,7 +341,7 @@ export default {
     (async () => {
       for await (const event of ctx.event.subscribe()) {
         try {
-          handle(event);
+          handle(ctx, event);
         } catch {
           // An event of another shape: ignored.
         }

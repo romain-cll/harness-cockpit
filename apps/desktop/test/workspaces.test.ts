@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
@@ -95,11 +95,14 @@ describe('built app', () => {
       await addRepository(session, clone);
 
       await openMenu(page, clone.root);
-      const items = await page.getByRole('menuitem').allInnerTexts();
-      expect(items.map((item) => item.trim())).toEqual(['New workspace', 'Remove project…']);
+      // The editor and the Finder entries in between depend on the machine's apps (COCKPIT-88): the first and last items are the ones this test is about.
+      const items = (await page.getByRole('menuitem').allInnerTexts()).map((item) => item.trim());
+      expect(items[0]).toBe('New workspace');
+      expect(items.at(-1)).toBe('Remove project…');
       await page.getByRole('menuitem', { name: 'New workspace', exact: true }).click();
 
       await page.waitForURL((url) => url.searchParams.get('project') === clone.root);
+      expect(new URL(page.url()).pathname).toBe('/');
       expect(await textOf(projectSelect(page))).toContain(clone.name);
       expect(await openDialogs(page).count()).toBe(0);
     });
@@ -184,50 +187,6 @@ describe('built app', () => {
         gitIn(clone.root, 'update-ref', 'refs/remotes/origin/develop', develop);
       }
       expect(gitState(clone)).toEqual(before.git);
-    });
-
-    // COCKPIT-42: the composer words a worktrees folder that cannot be created.
-    // `git worktree list --porcelain` marks the worktrees under a folder that is moved aside as `prunable`:
-    // those lines only reflect that folder, every other line of the git state is compared.
-    const gitStateWithoutPrunable = (repo: TempRepo) => {
-      const state = gitState(repo);
-      return { ...state, worktrees: state.worktrees.split('\n').filter((line) => !line.startsWith('prunable ')).join('\n') };
-    };
-
-    test('workspaces COCKPIT-42 AC3 — a worktrees folder that is a regular file keeps the composer open with "Cockpit could not create its worktrees folder <root>: EEXIST.", lists no workspace, leaves state.json as it was and logs no error', async () => {
-      const { page } = session;
-      const root = join(session.cockpitHome, 'worktrees');
-      const aside = `${root}.aside`;
-      const titlesBefore = await entryTitles(page);
-      const git = gitStateWithoutPrunable(clone);
-      const state = stateSnapshot(session.dataDir);
-      const mark = await errorMark(session);
-      expect(existsSync(root), 'earlier tests created workspaces under the root').toBe(true);
-
-      renameSync(root, aside);
-      writeFileSync(root, 'not a folder');
-      try {
-        await openComposer(page, clone.root);
-        await useAgent(page, 'Terminal');
-        await waitForBase(page, 'origin/main');
-        await promptBox(page).fill('no root');
-        await createButton(page).click();
-        // The fresh composer shows no message before this one.
-        const message = await waitForMessage(page);
-        // The request is settled once "Create workspace" is enabled again.
-        await createButton(page).and(page.locator('button:enabled')).waitFor();
-
-        expect(message).toBe(`Cockpit could not create its worktrees folder ${root}: EEXIST.`);
-        expect(new URL(page.url()).pathname).toBe('/');
-        expect(await entryTitles(page)).toEqual(titlesBefore);
-        expect(gitStateWithoutPrunable(clone)).toEqual(git);
-        expect(localBranches(clone)).not.toContain('no-root');
-        expect(stateSnapshot(session.dataDir)).toEqual(state);
-        await expectNoNewErrors(session, mark);
-      } finally {
-        rmSync(root, { force: true });
-        renameSync(aside, root);
-      }
     });
 
     test('workspaces COCKPIT-42 AC7 — branches, create and remove refuse a project that is not in Cockpit with "<path> is not a project in Cockpit.", creating and changing nothing', async () => {
