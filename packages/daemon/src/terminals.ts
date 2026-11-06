@@ -169,6 +169,7 @@ export function createTerminals(onEnd: () => void) {
       for (const { info } of terminals.values()) {
         if (info.sessionId !== report.sessionId) continue;
         if (report.event === 'exited') info.exitCode = report.exitCode;
+        else if (report.event === 'harness-session') info.harnessSessionId = report.harnessSessionId;
         else if (report.event.startsWith('setup-')) info.setup = report.event.slice('setup-'.length) as SetupState;
         else info.status = report.event as SessionEventName;
         return true;

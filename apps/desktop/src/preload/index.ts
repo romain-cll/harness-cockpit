@@ -77,6 +77,7 @@ const api: Api = {
     harnesses: (options) => ipcRenderer.invoke('sessions:harnesses', options),
     list: () => ipcRenderer.invoke('sessions:list'),
     start: (harness, size, options) => ipcRenderer.invoke('sessions:start', harness, size, options),
+    resume: (sessionId, size) => ipcRenderer.invoke('sessions:resume', sessionId, size),
     onStatus: (listener) => subscribe('sessions:status', listener),
     onOpen: (listener) => subscribe('sessions:open', listener),
     ended: () => ipcRenderer.invoke('sessions:ended'),
