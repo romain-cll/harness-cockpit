@@ -106,6 +106,7 @@ describe('cockpit usage', () => {
     ['status with a setup event, which only the setup command reports', ['status', 'setup-running']],
     ['status with exited', ['status', 'exited']],
     ['session-id with no harness', ['session-id']],
+    ['session-id with a harness and an extra argument', ['session-id', 'claude-code', 'extra']],
   ])('AC12 — %s: the usage on stderr, exit 2, and nothing sent to the daemon', async (_label, argv) => {
     const home = makeHome();
     const files = daemonFiles(home, 1, 'aaaa1111');

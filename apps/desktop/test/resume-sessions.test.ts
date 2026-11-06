@@ -4,7 +4,7 @@ import { statusLaunch } from '@cockpit/harnesses';
 import { type Page } from 'playwright-core';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { daemonSocketIn, killDaemonsIn, MAIN_PROCESS_ERROR, quitApp, type Session, untilRead, versionLabel } from './launch';
-import { endedIconOf, expectTabCount, killDaemon, makeDataDir, tabNamed, tabNames, uniqueBuild } from './support/daemon';
+import { endedIconOf, expectTabCount, killDaemon, makeDataDir, newShellTab, tabNamed, tabNames, uniqueBuild } from './support/daemon';
 import { projectsMessage, waitForRowStatus } from './support/panes';
 import { addRepository, countIpcCalls, ipcAnswered, ipcCalls, makeRepo, type TempRepo } from './support/projects';
 import {
@@ -12,6 +12,7 @@ import {
   createPlainWorkspace,
   expectDot,
   harnessIdOf,
+  ipcReceived,
   launchBuiltWith,
   launchFiles,
   makeSessionsFixture,
@@ -70,7 +71,10 @@ describe('resume sessions: built app', () => {
   const storedIdOf = (sessionId: string) => harnessIdOf({ sessions: sessionsInState(dataDir) }, sessionId);
 
   beforeAll(async () => {
-    fx = makeSessionsFixture(['claude']);
+    // The `--version` of the stub waits for the test (AC14's held start): the first detection is let through here,
+    // the one AC14 holds is its own.
+    fx = makeSessionsFixture(['claude'], { slowVersion: true });
+    fx.releaseVersions();
     repo = makeRepo('resume-repo');
     dataDir = makeDataDir();
     home = join(dataDir, 'h');
@@ -85,6 +89,7 @@ describe('resume sessions: built app', () => {
   afterAll(async () => {
     await session?.close().catch(() => {});
     await killDaemonsIn(home);
+    fx?.endVersionHolds();
     if (dataDir) rmSync(dataDir, { recursive: true, force: true });
     if (fx) rmSync(fx.root, { recursive: true, force: true });
     if (repo) rmSync(repo.parent, { recursive: true, force: true });
@@ -213,7 +218,7 @@ describe('resume sessions: built app', () => {
     await page.getByText(`claude --resume ${AFTER_RESUME_ID}`, { exact: true }).waitFor();
   });
 
-  test('AC13 — with the harness gone, "Resume last session" shows the refusal in the Projects message slot, spawns nothing, leaves the tab ended and can be clicked again, which then resumes with the stored id', async () => {
+  test('AC13, AC12 — with the harness gone, "Resume last session" shows the refusal in the Projects message slot, spawns nothing, leaves the tab ended and can be clicked again, which then resumes with the stored id, clears the refusal and shows the status the agent reports again', async () => {
     const { page } = session;
     const binary = join(fx.bin, 'claude');
     const launches = launchFiles(fx);
@@ -227,6 +232,12 @@ describe('resume sessions: built app', () => {
       expect(launchFiles(fx)).toEqual(launches);
       expect(await endedIconOf(tabNamed(page, WITH_ID)).count()).toBe(1);
       await endedView(page).waitFor();
+      // The message is set before the start settles: the button is enabled once it has.
+      await untilRead(
+        page,
+        () => [...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Resume last session')?.disabled === false,
+        (enabled) => enabled,
+      );
       expect(await resumeButton(page).isEnabled(), 'the button can be clicked again').toBe(true);
     } finally {
       renameSync(`${binary}.gone`, binary);
@@ -237,6 +248,66 @@ describe('resume sessions: built app', () => {
     const facts = await readStub(page);
     expect(readLaunch(fx, 'claude', facts.pid).args).toEqual([...(await expectedStatusArgs()), '--resume', AFTER_RESUME_ID]);
     expect(launchFiles(fx)).toHaveLength(launches.length + 1);
+    expect(await endedIconOf(tabNamed(page, WITH_ID)).count()).toBe(0);
+    // A later success clears the refusal the slot showed.
+    await projectsMessage(page).filter({ hasText: /Claude Code/ }).waitFor({ state: 'detached' });
+    expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+
+    // The session reported `working` before its loss (AC12): the resumed agent reports it again and the dot shows it,
+    // which a status kept from before the loss would swallow as no change.
+    await focusTerminal(page);
+    await typeLine(page, 'hook UserPromptSubmit');
+    await waitForRow(page, 'hooked:UserPromptSubmit');
+    await expectDot(page, ids.withId, 'Working');
+  });
+
+  test('AC14 — a start under way is held in the main process: after a tab switch and back the button is still disabled, `sessions:resume` refuses the session, and once the start ends exactly one agent runs', async () => {
+    const { page } = session;
+    type Api = { api: { sessions: { harnesses(options: { again: boolean }): Promise<unknown>; resume(id: string, size: { cols: number; rows: number }): Promise<unknown>; ended(): Promise<unknown> } } };
+
+    await killDaemon(home);
+    await reloadToEndedTabs(page, [WITH_ID]);
+    // A second tab to switch to, made before the detection is held.
+    await newShellTab(page);
+    await expectTabCount(page, 2);
+    await tabNamed(page, WITH_ID).click();
+    await resumeButton(page).waitFor();
+    const launches = launchFiles(fx);
+    const calls = await ipcCalls(session, 'sessions:resume');
+
+    // Detection runs again and its `--version` waits for the test: the start parks in it, the main process holding it.
+    await page.evaluate(() => void (window as unknown as Api).api.sessions.harnesses({ again: true }));
+    await resumeButton(page).click();
+    await ipcReceived(session, 'sessions:resume', calls + 1);
+
+    await page.getByRole('tab').nth(1).click();
+    await tabNamed(page, WITH_ID).click();
+    await resumeButton(page).waitFor();
+    const disabledAfterSwitch = await resumeButton(page).isDisabled();
+
+    // The answer of a call the main process refuses comes before the answer of the one sent after it; a call it holds has none.
+    const direct = await page.evaluate(async (sessionId) => {
+      const { api } = window as unknown as Api;
+      let answer: unknown;
+      void api.sessions.resume(sessionId, { cols: 80, rows: 24 }).then((result) => (answer = result));
+      await api.sessions.ended();
+      return answer ?? null;
+    }, ids.withId);
+
+    fx.releaseVersions();
+    await ipcAnswered(session, 'sessions:resume', calls + 2);
+    const facts = await readStub(page);
+    const terminalsOfSession = await page.evaluate(
+      async (sessionId) => (await (window as unknown as { api: { pty: { list(): Promise<Array<{ sessionId?: string }>> } } }).api.pty.list()).filter((terminal) => terminal.sessionId === sessionId).length,
+      ids.withId,
+    );
+
+    expect(disabledAfterSwitch, 'the button stays disabled across a tab switch').toBe(true);
+    expect(direct, 'the session whose start is under way is refused').toMatchObject({ status: 'refused' });
+    expect(await ipcCalls(session, 'sessions:resume')).toBe(calls + 2);
+    expect(terminalsOfSession, 'one terminal for the session').toBe(1);
+    expect(launchFiles(fx)).toHaveLength(launches.length + 1);
+    expect(readLaunch(fx, 'claude', facts.pid).args.slice(-2)).toEqual(['--resume', AFTER_RESUME_ID]);
     expect(await endedIconOf(tabNamed(page, WITH_ID)).count()).toBe(0);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
   });

@@ -927,6 +927,23 @@ export async function closeOverlays(page: Page) {
 // A conversation id no harness would make: it must reach the harness byte for byte.
 export const ODD_HARNESS_ID = 'not/a:uuid é';
 
+// Resolves, in the main process, once `channel` has been called `count` times in all (`countIpcCalls`), whether
+// or not the calls have answered: the closing event of "the main process holds this call", for a handler that is
+// parked. Woken by the same watchers as `ipcAnswered`; no timer.
+export const ipcReceived = (session: Session, channel: string, count: number) =>
+  session.evaluateInMain(`new Promise((resolve) => {
+    const calls = globalThis.__ipcCalls[${JSON.stringify(channel)}];
+    const watchers = globalThis.__ipcWatchers;
+    const check = () => {
+      const at = watchers.indexOf(check);
+      if (calls.length < ${count} || at < 0) return;
+      watchers.splice(at, 1);
+      resolve(true);
+    };
+    watchers.push(check);
+    check();
+  })`);
+
 export const resumeButton = (page: Page) => page.getByRole('button', { name: 'Resume last session', exact: true });
 export const newTerminalButton = (page: Page) => page.getByRole('button', { name: 'New terminal here', exact: true });
 
