@@ -191,7 +191,12 @@ function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutM
         break;
       case 'status': {
         const { sessionId } = message;
-        const report: SessionReport = message.event === 'exited' ? { sessionId, event: 'exited', exitCode: message.exitCode } : { sessionId, event: message.event };
+        const report: SessionReport =
+          message.event === 'exited'
+            ? { sessionId, event: 'exited', exitCode: message.exitCode }
+            : message.event === 'harness-session'
+              ? { sessionId, event: 'harness-session', harnessSessionId: message.harnessSessionId }
+              : { sessionId, event: message.event };
         statusListeners.forEach((listener) => listener(report));
         break;
       }

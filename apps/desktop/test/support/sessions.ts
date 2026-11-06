@@ -1,16 +1,18 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { accessSync, chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { accessSync, chmodSync, closeSync, constants, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, watch, writeFileSync, writeSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { createRequire } from 'node:module';
 import { Socket } from 'node:net';
 import { basename, join, resolve } from 'node:path';
+import { statusLaunch } from '@cockpit/harnesses';
 import { type Page } from 'playwright-core';
-import { expect } from 'vitest';
+import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { sendFromComposer } from '../composer';
-import { appDir, daemonSocketIn, fifo, heldProcess, launchDev, launchPackaged, launchSpawned, MAIN_PROCESS_ERROR, packagedAppDir, type Session, startClock, untilRead } from '../launch';
+import { appDir, daemonSocketIn, fifo, heldProcess, launchDev, launchPackaged, launchSpawned, MAIN_PROCESS_ERROR, packagedAppDir, type Session, startClock, untilRead, versionLabel } from '../launch';
 import { makeTestDir } from '../run-root';
-import { countIpcCalls, dispatchFocus, entryTitles, gitIn, ipcAnswered, ipcCalls, openMenu, type TempRepo, untilFewerOverlays, waitForEntry, worktreePath } from './projects';
+import { killDaemon } from './daemon';
+import { addRepository, countIpcCalls, dispatchFocus, entryTitles, gitIn, ipcAnswered, ipcCalls, makeRepo, openMenu, type TempRepo, untilFewerOverlays, waitForEntry, worktreePath } from './projects';
 import { allConsoleErrorsOf, allPageErrorsOf, escapeRegExp, focusTerminal, terminalRows, typeLine, waitForRow } from './terminal';
 
 // --- Sessions (COCKPIT-25) ---------------------------------------------------
@@ -56,6 +58,14 @@ while IFS= read -r line; do
       command=$(printf '%s' "$SETTINGS" | /usr/bin/plutil -extract "hooks.$event.0.hooks.0.command" raw -o - - 2>/dev/null)
       [ -n "$command" ] && /bin/sh -c "$command"
       echo "hooked:$event" ;;
+    "session-hook "*)
+      # Runs the second hook of UserPromptSubmit (the one that reports the conversation id) with the hook JSON a
+      # harness gives it on stdin, {"session_id":"<id>"}: the stub's hook line above runs index 0, with the pty as
+      # stdin (COCKPIT-30).
+      id="\${line#session-hook }"
+      command=$(printf '%s' "$SETTINGS" | /usr/bin/plutil -extract "hooks.UserPromptSubmit.0.hooks.1.command" raw -o - - 2>/dev/null)
+      [ -n "$command" ] && printf '{"session_id":"%s"}' "$id" | /bin/sh -c "$command"
+      echo "session-hooked:$id" ;;
     *) echo "got:$line" ;;
   esac
 done
@@ -179,6 +189,10 @@ export interface StoredSession {
   createdAt: string;
   /** The repository root, for a session started in a workspace. */
   project?: string;
+  /** Set while a workspace session's tab is open (COCKPIT-69). */
+  open?: boolean;
+  /** The harness's own id for the conversation, reported at the user's prompt (COCKPIT-30). */
+  harnessSessionId?: string;
 }
 
 export const sessionsInState = (dataDir: string): StoredSession[] =>
@@ -908,3 +922,108 @@ export async function closeOverlays(page: Page) {
     await untilFewerOverlays(page, open);
   }
 }
+
+// --- Resume sessions (COCKPIT-30) --------------------------------------------
+
+// A conversation id no harness would make: it must reach the harness byte for byte.
+export const ODD_HARNESS_ID = 'not/a:uuid é';
+
+// Resolves, in the main process, once `channel` has been called `count` times in all (`countIpcCalls`), whether
+// or not the calls have answered: the closing event of "the main process holds this call", for a handler that is
+// parked. Woken by the same watchers as `ipcAnswered`; no timer.
+export const ipcReceived = (session: Session, channel: string, count: number) =>
+  session.evaluateInMain(`new Promise((resolve) => {
+    const calls = globalThis.__ipcCalls[${JSON.stringify(channel)}];
+    const watchers = globalThis.__ipcWatchers;
+    const check = () => {
+      const at = watchers.indexOf(check);
+      if (calls.length < ${count} || at < 0) return;
+      watchers.splice(at, 1);
+      resolve(true);
+    };
+    watchers.push(check);
+    check();
+  })`);
+
+export const resumeButton = (page: Page) => page.getByRole('button', { name: 'Resume last session', exact: true });
+export const newTerminalButton = (page: Page) => page.getByRole('button', { name: 'New terminal here', exact: true });
+
+export const harnessIdOf = (state: { sessions?: StoredSession[] }, sessionId: string) => state.sessions?.find((stored) => stored.id === sessionId)?.harnessSessionId;
+
+// Resolves once `holds` is true of the state `state.json` holds: read at once and after every change of the data
+// folder (the state is written to a temporary file and renamed over `state.json`). `action` runs after the watcher is
+// in place, so a write it causes is never missed; its rejection rejects. No timer.
+export function untilState(dataDir: string, holds: (state: { sessions?: StoredSession[] }) => boolean, action?: () => Promise<unknown>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      let state: { sessions?: StoredSession[] };
+      try {
+        state = JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')) as typeof state;
+      } catch {
+        return;
+      }
+      if (!holds(state)) return;
+      watcher.close();
+      resolve();
+    };
+    const watcher = watch(dataDir, check);
+    (action?.() ?? Promise.resolve()).then(check, (error: unknown) => {
+      watcher.close();
+      reject(error);
+    });
+  });
+}
+
+// The one smoke path of resuming, in a mode that does not run the feature's full block: a session of a workspace
+// reports its conversation id (the stub's `session-hook` line runs the hook the `--settings` it got hold), the daemon
+// is lost, the page reloads, the ended tab's "Resume last session" starts the harness again with `statusLaunch`'s
+// arguments followed by `--resume <id>`. `cli` is the compiled CLI the hooks name in this mode.
+export async function expectResumeSmoke(session: Session, fx: SessionsFixture, repo: TempRepo, cli: string): Promise<void> {
+  const { page, dataDir } = session;
+  const id = 'smoke-conversation';
+  await addRepository(session, repo);
+  const path = await createPlainWorkspace(session, repo, 'resume-smoke');
+  const sessionId = await startInWorkspace(page, path, 'resume-smoke', 'Claude Code', 'Claude Code 1');
+  await readStub(page);
+  await focusTerminal(page);
+  await untilState(dataDir, (state) => harnessIdOf(state, sessionId) === id, () => typeLine(page, `session-hook ${id}`));
+
+  await killDaemon(session.cockpitHome);
+  await page.reload();
+  await page.getByRole('tablist').first().waitFor();
+  const launches = launchFiles(fx);
+  await resumeButton(page).click();
+
+  const resumed = await readStub(page);
+  expect(launchFiles(fx)).toHaveLength(launches.length + 1);
+  const expected = await statusLaunch('claude-code', { cli, pluginsDir: join(fx.root, 'expected-plugins'), env: {} });
+  expect(readLaunch(fx, 'claude', resumed.pid).args).toEqual([...expected.args, '--resume', id]);
+  expect(resumed.cwd).toBe(realpathSync(path));
+  expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
+}
+
+// The smoke path in a mode of its own (the packaged app, the packaged app with launchd's environment): its own launch
+// with the fake login shell that holds the stub `claude`, and a repository of its own.
+export const describeResumeSmoke = (mode: string, launch: (fx: SessionsFixture) => Promise<Session>, cli: () => string) =>
+  describe(`resume sessions: ${mode} smoke path`, () => {
+    let fx: SessionsFixture;
+    let repo: TempRepo;
+    let session: Session | undefined;
+
+    beforeAll(async () => {
+      fx = makeSessionsFixture(['claude']);
+      repo = makeRepo('resume-smoke-repo');
+      session = await launch(fx);
+      await session.page.getByText(versionLabel).waitFor();
+    });
+
+    afterAll(async () => {
+      await session?.close().catch(() => {});
+      if (fx) rmSync(fx.root, { recursive: true, force: true });
+      if (repo) rmSync(repo.parent, { recursive: true, force: true });
+    });
+
+    test('COCKPIT-30 smoke path — a session reports its conversation id, its daemon is lost, the page reloads and "Resume last session" starts the harness with the status arguments then `--resume <id>`', async () => {
+      await expectResumeSmoke(session!, fx, repo, cli());
+    });
+  });

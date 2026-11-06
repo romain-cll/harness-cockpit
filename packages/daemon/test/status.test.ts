@@ -179,6 +179,70 @@ describe('POST /session-events', () => {
   });
 });
 
+// COCKPIT-30: the harness's own id for the session, kept as an opaque string.
+describe('POST /session-events: harness-session', () => {
+  const idOf = async (connection: Awaited<ReturnType<typeof start>>['connection'], sessionId: string) =>
+    (await connection.client.list()).find((entry) => entry.sessionId === sessionId)?.harnessSessionId;
+
+  test('AC7 — gets 204, reaches the clients as a status message and shows as harnessSessionId in list; a later id replaces it and a later status leaves it', async () => {
+    const { files, token, connection, sessionId } = await start();
+    expect(await idOf(connection, sessionId)).toBeUndefined();
+
+    expect(await post(files.socket, token, { sessionId, event: 'harness-session', harnessSessionId: 'conversation-1' })).toEqual({ status: 204, text: '' });
+
+    await connection.when(() => connection.statuses.length === 1);
+    expect(connection.statuses).toEqual([{ sessionId, event: 'harness-session', harnessSessionId: 'conversation-1' }]);
+    expect(await idOf(connection, sessionId)).toBe('conversation-1');
+    expect(await post(files.socket, token, { sessionId, event: 'harness-session', harnessSessionId: 'conversation-2' })).toEqual({ status: 204, text: '' });
+    expect(await idOf(connection, sessionId)).toBe('conversation-2');
+    expect(await post(files.socket, token, { sessionId, event: 'working' })).toEqual({ status: 204, text: '' });
+    expect(await idOf(connection, sessionId)).toBe('conversation-2');
+    // The id is not a status: the last status is untouched by the reports of ids.
+    expect((await connection.client.list()).find((entry) => entry.sessionId === sessionId)?.status).toBe('working');
+  });
+
+  test('AC5 — an id that looks like no harness\'s is stored and listed byte for byte', async () => {
+    const { files, token, connection, sessionId } = await start();
+    const odd = 'not/a:uuid é';
+
+    expect(await post(files.socket, token, { sessionId, event: 'harness-session', harnessSessionId: odd })).toEqual({ status: 204, text: '' });
+
+    expect(await idOf(connection, sessionId)).toBe(odd);
+  });
+
+  test('AC7 — an id for a session the daemon does not hold gets 404 { "error": "unknown session" } and no event', async () => {
+    const { files, token, connection } = await start();
+
+    const answer = await post(files.socket, token, { sessionId: 'nobody', event: 'harness-session', harnessSessionId: 'conversation-1' });
+
+    expect(answer.status).toBe(404);
+    expect(JSON.parse(answer.text)).toEqual({ error: 'unknown session' });
+    expect(connection.statuses).toEqual([]);
+  });
+
+  test.each([
+    ['an empty harnessSessionId', '{"sessionId":"session-1","event":"harness-session","harnessSessionId":""}'],
+    ['a numeric harnessSessionId', '{"sessionId":"session-1","event":"harness-session","harnessSessionId":7}'],
+    ['a null harnessSessionId', '{"sessionId":"session-1","event":"harness-session","harnessSessionId":null}'],
+    ['an object harnessSessionId', '{"sessionId":"session-1","event":"harness-session","harnessSessionId":{"id":"x"}}'],
+    ['no harnessSessionId', '{"sessionId":"session-1","event":"harness-session"}'],
+    ['a harnessSessionId on a status event', '{"sessionId":"session-1","event":"working","harnessSessionId":"conversation-1"}'],
+    ['a harnessSessionId on a setup event', '{"sessionId":"session-1","event":"setup-done","harnessSessionId":"conversation-1"}'],
+    ['a harnessSessionId on exited', '{"sessionId":"session-1","event":"exited","exitCode":0,"harnessSessionId":"conversation-1"}'],
+  ])('AC7 — %s gets 400 with an error reason, no event, and nothing stored', async (_label, body) => {
+    const { files, token, connection, sessionId } = await start();
+
+    const answer = await post(files.socket, token, body);
+
+    expect(answer.status).toBe(400);
+    const parsed = JSON.parse(answer.text) as { error?: unknown };
+    expect(Object.keys(parsed)).toEqual(['error']);
+    expect(typeof parsed.error).toBe('string');
+    expect(connection.statuses).toEqual([]);
+    expect(await idOf(connection, sessionId)).toBeUndefined();
+  });
+});
+
 describe('a server that answers 401 and closes before the body is written (AC17)', () => {
   test('AC17 — the request settles with the 401 or the write error, again and again, and no EPIPE or ECONNRESET goes unhandled', async () => {
     const home = makeHome();
