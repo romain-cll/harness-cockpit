@@ -13,34 +13,114 @@ concurrency:
 permissions:
   contents: read
 
+# turbo's --affected compares a pull request's merge commit with its first parent.
+env:
+  TURBO_SCM_BASE: HEAD^1
+  TURBO_SCM_HEAD: HEAD
+
 jobs:
-  # Required by the `main` ruleset: keep the job id in sync with it.
-  check:
-    # macOS: the desktop app is packaged for macOS, and the runner has a
-    # desktop session for the Electron tests.
-    runs-on: macos-latest
+  # Decides what the other jobs run (.github/scripts/ci-scope.sh).
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      flag: ${{ steps.scope.outputs.flag }}
+      desktop: ${{ steps.scope.outputs.desktop }}
+      packages: ${{ steps.scope.outputs.packages }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - uses: ./.github/actions/setup
+      - id: scope
+        run: .github/scripts/ci-scope.sh
+
+  lint:
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AFFECTED: ${{ needs.changes.outputs.flag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - uses: ./.github/actions/setup
+      - run: bun turbo run lint $AFFECTED
+
+  typecheck:
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AFFECTED: ${{ needs.changes.outputs.flag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - uses: ./.github/actions/setup
+      - run: bun turbo run typecheck $AFFECTED
+
+  # The plane-sync tests read other workspaces' files, so they run on every
+  # pull request: --affected would skip them on the changes they guard.
+  repo-checks:
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: bun turbo run test --filter=@cockpit/plane-sync
 
-      # The oldest Node line the repository supports.
-      - uses: actions/setup-node@v7
+  # macOS: workspaces (FSEvents), daemon and cli (ps, node-pty).
+  packages:
+    needs: changes
+    if: needs.changes.outputs.packages == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      AFFECTED: ${{ needs.changes.outputs.flag }}
+    steps:
+      - uses: actions/checkout@v7
         with:
-          node-version: 22
+          fetch-depth: 2
+      - uses: ./.github/actions/setup
+      - run: bun turbo run test $AFFECTED --filter='!@cockpit/desktop' --filter='!@cockpit/plane-sync'
 
-      # Installs the Bun version pinned in `packageManager`.
-      - uses: oven-sh/setup-bun@v2
+  # macOS: the app is packaged for macOS, and the runner has a desktop session
+  # for the Electron tests. Vitest's own sharding splits the test files, so a
+  # new file needs nothing; every shard packages the app. `test` launches the
+  # app four ways: the dev script, the built app, the packaged app and the
+  # packaged app with the environment of launchd.
+  desktop:
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+    name: desktop (${{ matrix.shard }}/3)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    env:
+      SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: bun run --cwd apps/desktop package
+      - run: bun run --cwd apps/desktop vitest run --shard=$SHARD/3
 
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.bun/install/cache
-            ~/Library/Caches/electron
-          key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bun.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-
-
-      - run: bun install --frozen-lockfile
-
-      # `test` launches the desktop app four ways: the dev script, the built app,
-      # the packaged app and the packaged app with the environment of launchd.
-      - run: bun turbo run build typecheck lint test
+  # Required by the `main` ruleset: keep the job id in sync with it. `always()`,
+  # not `!cancelled()`: a skipped required check counts as passing, so a
+  # cancelled run would be mergeable.
+  check:
+    if: always()
+    needs: [changes, lint, typecheck, repo-checks, packages, desktop]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RESULTS: ${{ join(needs.*.result, ' ') }}
+    steps:
+      - run: |
+          for result in $RESULTS; do
+            case "$result" in success | skipped) ;; *) echo "A job ended $result"; exit 1 ;; esac
+          done

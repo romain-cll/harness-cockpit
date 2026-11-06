@@ -509,27 +509,6 @@ describe('changes sidebar: built app', () => {
     rmSync(join(B.path, 'only-b.txt'));
   });
 
-  test('changes AC5 — through window.api.workspaces.changes, a workspace with no recorded base in a repository with no default base is refused with "No base branch to compare <name> with."', async () => {
-    const { page } = session;
-    const bare = makeRepo('changes-no-base');
-    try {
-      const path = join(bare.parent, 'wt-no-base');
-      gitIn(bare.root, 'worktree', 'add', '--quiet', '-b', 'no-base', path, 'main');
-      // Detached in the main working tree and without origin: nothing to default to.
-      gitIn(bare.root, 'checkout', '--quiet', '--detach');
-      await addRepository(session, bare);
-
-      expect(await changesApi(page, 'changes', bare.root, path)).toEqual({
-        status: 'refused',
-        message: 'No base branch to compare no-base with.',
-      });
-      await removeThroughMenu(page, bare.root);
-      await waitForNoEntry(page, bare.root);
-    } finally {
-      rmSync(bare.parent, { recursive: true, force: true });
-    }
-  });
-
   test('right bar AC7 — the bar opened on a workspace with no base shows "No base branch to compare no-base with." in the Diff tab', async () => {
     const { page } = session;
     const bare = makeRepo('changes-no-base-ui');

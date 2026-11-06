@@ -483,6 +483,7 @@ describe('daemon: built app, the daemon cannot start', () => {
       await page.getByTitle(worktree, { exact: true }).first().click();
       await expectFailureView();
       expect(await page.locator('[role="tablist"]').count(), 'the view replaces the panes').toBe(0);
+      expect(await page.locator('.xterm').count(), 'no terminal is drawn').toBe(0);
       await page.locator('aside').getByRole('link', { name: seeded.name }).click();
       await page.waitForURL(new RegExp(`/sessions/${seeded.id}$`));
       await page.getByRole('heading', { name: seeded.name }).waitFor();

@@ -262,7 +262,7 @@ describe('new project: built app', () => {
     expect(await dialog.getByRole('tab', { name: 'GitLab', exact: true }).getAttribute('aria-selected')).toBe('false');
     expect(await urlBox(dialog).inputValue()).toBe('');
     expect(await nameBox(dialog).inputValue()).toBe('');
-    expect(await shownIn(dialog)).toContain('~/projects');
+    await dialog.getByText('~/projects', { exact: true }).waitFor();
     expect(await cloneButton(dialog).isDisabled(), 'both fields empty').toBe(true);
 
     await nameBox(dialog).fill('named');
