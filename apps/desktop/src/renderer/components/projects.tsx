@@ -224,11 +224,12 @@ export function Projects({ projects, sessions, failedSetups }: { projects: Proje
   const collapsed = useProjectsCollapsed();
   const collapsedProjects = useCollapsedProjects();
   // The expanded projects and their branches: their pull request states are read while the sidebar shows them.
+  // A workspace still setting up is left out: its worktree is not listed yet, so a read now would skip its branch and no later change would trigger another.
   usePullRequestStates(
     collapsed
       ? []
       : projects.flatMap(({ path, workspaces }) => {
-          const branches = workspaces.flatMap(({ branch }) => (branch === null ? [] : [branch]));
+          const branches = workspaces.flatMap(({ branch, settingUp }) => (branch === null || settingUp ? [] : [branch]));
           return collapsedProjects.has(path) || branches.length === 0 ? [] : [{ project: path, branches }];
         }),
   );
