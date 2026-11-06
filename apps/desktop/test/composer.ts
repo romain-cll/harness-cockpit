@@ -20,6 +20,11 @@ export const projectSelect = (page: Page) =>
     .first();
 export const agentSelect = (page: Page) => controls(page).filter({ hasText: /^\s*(Detecting…|Claude Code|Codex|OpenCode|Terminal)\s*$/ }).first();
 export const baseSelect = (page: Page) => controls(page).filter({ has: page.locator('svg.lucide-git-branch') }).first();
+// COCKPIT-71: the switch named "Worktree", between the agent select and the base select: on, a send makes a worktree
+// from the base; off, it runs in the project's folder.
+export const worktreeSwitch = (page: Page) => page.locator('main').getByRole('switch', { name: 'Worktree', exact: true });
+// Waits until the Worktree switch is on (`true`) or off (`false`).
+export const waitForWorktree = (page: Page, on: boolean) => page.locator(`main [role="switch"][aria-checked="${on}"]`).waitFor();
 export const textOf = async (locator: Locator) => norm(await locator.innerText());
 const exactly = (text: string) => new RegExp(`^\\s*${text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`);
 
@@ -196,19 +201,24 @@ export interface Sent {
 
 // Fills the composer for `project` (`none` for no project) and sends it with Enter or the button: picks
 // `agent` ("Terminal" by default, so a real CLI of the developer's machine never starts), waits for the
-// base to be known and, with `base`, picks it. With "No project" the session's page opens (`id`); with a
+// base to be known and, with `base`, picks it (with `worktree: false` it turns the Worktree switch off instead, no base is
+// shown). With "No project" the session's page opens (`id`); with a
 // project the workspace page opens (`path`) while its worktree is still being made, and once its tab is selected
 // (the shell of "Terminal", or the agent's new session, `id`) the send is done.
 export async function sendFromComposer(
   page: Page,
   project: { root: string } | 'none',
-  { prompt, agent = 'Terminal', base, enter = false }: { prompt: string; agent?: string; base?: string; enter?: boolean },
+  { prompt, agent = 'Terminal', base, enter = false, worktree = true }: { prompt: string; agent?: string; base?: string; enter?: boolean; worktree?: boolean },
 ): Promise<Sent> {
   const previous = sessionIdIn(page);
   const known = new Set((await storedSessions(page)).map((each) => each.id));
   await openComposerFromSidebar(page, project === 'none' ? 'none' : project.root);
   await useAgent(page, agent);
-  if (project !== 'none') {
+  if (project !== 'none' && !worktree) {
+    // COCKPIT-71: the Worktree switch off, so the agent runs in the project's folder; no base to wait for or pick.
+    await worktreeSwitch(page).click();
+    await waitForWorktree(page, false);
+  } else if (project !== 'none') {
     await baseSelect(page).filter({ hasText: /\S/ }).filter({ hasNotText: exactly('Select a base') }).waitFor();
     if (base) await chooseBase(page, base);
   }

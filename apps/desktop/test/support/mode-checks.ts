@@ -8,7 +8,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 import { sendFromComposer } from '../composer';
 import { freePort, isAlive, launchEnv, MAIN_PROCESS_ERROR, packagedAppDir, type Session, versionLabel } from '../launch';
 import { makeTestDir } from '../run-root';
-import { addProject, addRepository, chooseLocation, cloneButton, cloneDialog, deleteDialog, entryTitles, linkedWorktrees, localBranches, makeRepo, nameBox, pickAddItem, projectsInState, removeThroughMenu, sidebarEntries, sidebarLines, snapshotRepo, startDeletion, stateSnapshot, type TempRepo, urlBox, waitForEntries, worktreePath, writeConfig } from './projects';
+import { addProject, addRepository, chooseLocation, cloneButton, cloneDialog, deleteDialog, entryTitles, gitState, linkedWorktrees, localBranches, makeRepo, nameBox, pickAddItem, projectsInState, removeThroughMenu, sidebarEntries, sidebarLines, snapshotRepo, startDeletion, stateSnapshot, type TempRepo, urlBox, waitForEntries, worktreePath, writeConfig } from './projects';
+import { startMainDeletion, waitForNoMainRow } from './main-workspace';
 import { clearFocusCalls, FRONT_CALLS, frontCalls, runSecondLaunch, stubFocus } from './single-instance';
 import { allConsoleErrorsOf, allPageErrorsOf, applicationType, captureRow, dropTerminalWorkspace, getShellPath, LAUNCHD_ENV, LAUNCHD_PATH, launchLaunchd, normalizeFnm, openTerminal, pidOf, ptyKill, type PtyWindow, ptyWrite, spawnShell, typeLine, unexpectedConsoleErrors, waitForOutput, waitForRow, watchFrontmost } from './terminal';
 
@@ -299,6 +300,35 @@ export const describeMode = (mode: string, launch: () => Promise<Session>) => de
       await removeThroughMenu(page, repo.root);
       await waitForEntries(page, []);
       expect(projectsInState(session.dataDir)).toEqual([]);
+    });
+
+    test('smoke path (d), COCKPIT-71 — main workspace: the composer with the Worktree switch off and "Terminal" opens a shell tab in the project\'s folder, making no branch and no worktree and marking the project; "Delete workspace…" removes the row and the mark and leaves the folder', async () => {
+      const { page } = session;
+      const repo = makeRepo('smoke-main');
+      folders.push(repo);
+      await addRepository(session, repo);
+      const before = gitState(repo);
+
+      await sendFromComposer(page, repo, { prompt: 'Smoke main', worktree: false });
+      await page.waitForURL((url) => url.pathname === '/workspace' && url.searchParams.get('path') === repo.root);
+      await typeLine(page, 'pwd -P');
+      await waitForRow(page, repo.root);
+      expect(gitState(repo)).toEqual(before);
+      expect(linkedWorktrees(repo)).toEqual([]);
+      expect(projectsInState(session.dataDir)).toEqual([{ path: repo.root, mainWorkspace: true }]);
+
+      await startMainDeletion(page, repo.root, 'main');
+      const confirm = deleteDialog(page, 'Delete main?');
+      await confirm.waitFor();
+      await confirm.getByRole('button', { name: 'Delete', exact: true }).click();
+      await confirm.waitFor({ state: 'hidden' });
+      await waitForNoMainRow(page, repo.root);
+      expect(projectsInState(session.dataDir)).toEqual([{ path: repo.root }]);
+      expect(existsSync(join(repo.root, 'README.md'))).toBe(true);
+      expect(gitState(repo)).toEqual(before);
+
+      await removeThroughMenu(page, repo.root);
+      await waitForEntries(page, []);
     });
   });
 
