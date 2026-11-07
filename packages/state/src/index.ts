@@ -174,7 +174,7 @@ export function sessionName(state: State, harness: { id: string; name: string },
   return `${harness.name} ${1 + state.sessions.filter((session) => session.harness === harness.id && here(session)).length}`;
 }
 
-function readState(file: string): string | undefined {
+function readFileIfPresent(file: string): string | undefined {
   try {
     return readFileSync(file, 'utf8');
   } catch (error) {
@@ -223,13 +223,24 @@ function keepBackup(file: string): string {
   }
 }
 
+// Reads `<dir>/state.json` and nothing else: no folder or file is created, nothing is backed up or written. A
+// missing or invalid file reads as an empty state; one from a newer version throws and is left alone.
+export function readState(dir: string): State {
+  const file = join(dir, 'state.json');
+  const content = readFileIfPresent(file);
+  const state = content === undefined ? undefined : parseState(content);
+  if (!state) return { version: STATE_VERSION, projects: [], sessions: [] };
+  if (state.version > STATE_VERSION) throw new NewerStateError(file, state.version);
+  return state;
+}
+
 // Reads `<dir>/state.json`, creating the folder and the file when missing. A
 // file that is not valid state is set aside as `state.json.corrupt-<timestamp>`
 // (see `keepBackup`) and replaced; one from a newer version throws and is left alone.
 export function loadState(dir: string): State {
   mkdirSync(dir, { recursive: true });
   const file = join(dir, 'state.json');
-  const content = readState(file);
+  const content = readFileIfPresent(file);
 
   if (content !== undefined) {
     const state = parseState(content);

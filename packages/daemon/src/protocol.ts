@@ -1,6 +1,8 @@
 /** The protocol this build speaks; a daemon's files are named after it. */
 export const PROTOCOL_VERSION = 1;
 
+import type { Session, State } from '@cockpit/state';
+
 export { SCROLLBACK } from './scrollback';
 
 /**
@@ -99,6 +101,164 @@ export interface TerminalExit {
   signal: number | null;
 }
 
+/** A refusal carries the message to show the user. */
+export interface Refused {
+  status: 'refused';
+  message: string;
+}
+
+/** A linked git worktree of a project, or its main working tree (`main`). */
+export interface Workspace {
+  path: string;
+  name: string;
+  branch: string | null;
+  main?: true;
+  /** The daemon is still setting it up (its worktree, then its session). */
+  settingUp?: true;
+}
+
+/** A project with the workspaces git tells; `error` says why git could not list them, `missing` that its folder is gone. */
+export interface Project {
+  path: string;
+  name: string;
+  workspaces: Workspace[];
+  error?: string;
+  missing?: true;
+}
+
+export type AddProjectResult =
+  | { status: 'added'; project: Project }
+  /** The folder is in no repository. */
+  | { status: 'not-a-repository'; folder: string }
+  | Refused;
+
+export type UpdatePathResult = { status: 'updated' } | Refused;
+
+export type CreateWorkspaceResult = { status: 'created'; workspace: Workspace } | Refused;
+
+/** `reserved`: the workspace exists as a row at `path` (a branch `name`) while the daemon makes it. */
+export type ComposeResult = { status: 'reserved'; path: string; name: string } | Refused;
+
+/** `dirty`: the workspace has uncommitted changes and was not removed. `branchKept`: its branch is not merged. */
+export type RemoveWorkspaceResult = { status: 'removed'; branchKept: boolean } | { status: 'dirty' } | Refused;
+
+/** A workspace the composer sent that the daemon is still making (by worktree path). */
+export interface Setup {
+  project: string;
+  path: string;
+  branch: string;
+  /** `null`: no worktree, the workspace opens the project's folder (the main workspace). */
+  base: string | null;
+  /** A harness id, or `terminal` for the setup shell. */
+  harness: string;
+  task: string;
+}
+
+/** A send whose worktree could not be created, kept until dismissed. */
+export interface FailedSetup {
+  id: string;
+  project: string;
+  path: string;
+  name: string;
+  message: string;
+  prompt: string;
+  agent: string;
+  base: string;
+}
+
+/** A workspace stopped setting up; `message` says why its agent could not start (the workspace stays). */
+export interface SettledSetup {
+  path: string;
+  message?: string;
+}
+
+/** What the daemon keeps of the app's state: `state.json`, the workspaces being set up and the sends that failed. */
+export interface StateSnapshot {
+  state: State;
+  setups: Setup[];
+  failedSetups: FailedSetup[];
+}
+
+export interface StartSessionOptions {
+  workspace?: { project: string; path: string };
+  prompt?: string;
+  /** Run `cockpit setup` in the workspace first, then the agent, then the login shell. */
+  setup?: boolean;
+  /** Name the workspace after the first title the agent derives from the prompt (with `workspace`). */
+  nameFromTitle?: boolean;
+}
+
+export interface AvailableHarness {
+  id: string;
+  name: string;
+  version: string | null;
+  /** Where detection found it. */
+  path: string;
+}
+
+/**
+ * `terminal` is the session's terminal, which the requesting connection is subscribed to when it asked. A refusal
+ * after the spawn names the terminal it killed, whose exit follows.
+ */
+export type StartSessionResult = { status: 'started'; session: Session; terminal: TerminalInfo } | (Refused & { terminal?: TerminalInfo });
+
+export interface RemoveOptions {
+  force?: boolean;
+  deleteBranch?: boolean;
+  forceBranch?: string;
+}
+
+export interface TerminalSize {
+  cols: number;
+  rows: number;
+}
+
+/**
+ * What a `call` request runs in the daemon, by method name. Reads answer from any build; a write is refused by a
+ * daemon another build superseded (`WRITES`).
+ */
+export interface Calls {
+  state: { params: Record<string, never>; result: StateSnapshot };
+  'project-list': { params: Record<string, never>; result: Project[] };
+  /** The detected harnesses. `again` detects again; `known` is the result of an earlier daemon, which the app keeps for its launch. */
+  harnesses: { params: { again?: boolean; known?: AvailableHarness[] }; result: AvailableHarness[] };
+  'project-add': { params: { folder: string }; result: AddProjectResult };
+  'project-remove': { params: { path: string }; result: void };
+  'project-update-path': { params: { from: string; folder: string }; result: UpdatePathResult };
+  'workspace-create': { params: { project: string; task: string; base?: string }; result: CreateWorkspaceResult };
+  'workspace-compose': { params: { project: string; task: string; base: string | null; harness: string }; result: ComposeResult };
+  'workspace-remove': { params: { project: string; path: string; options: RemoveOptions }; result: RemoveWorkspaceResult };
+  'dismiss-setup': { params: { id: string }; result: void };
+  'session-start': {
+    params: { harness: string; size: TerminalSize; options?: StartSessionOptions; subscribe?: boolean };
+    result: StartSessionResult;
+  };
+  'session-resume': { params: { sessionId: string; size: TerminalSize; subscribe?: boolean }; result: StartSessionResult };
+  /** Clears the open mark of a session. */
+  'session-dismiss': { params: { sessionId: string }; result: void };
+  'remember-app': { params: { kind: 'editor' | 'terminal'; id: string }; result: void };
+  /** The conversation id a session of an older build's daemon reported. */
+  'harness-session': { params: { sessionId: string; harnessSessionId: string }; result: void };
+}
+
+export type CallMethod = keyof Calls;
+
+/** The calls that change `state.json` or start something: refused by a daemon another build superseded. */
+export const WRITES: ReadonlySet<CallMethod> = new Set<CallMethod>([
+  'project-add',
+  'project-remove',
+  'project-update-path',
+  'workspace-create',
+  'workspace-compose',
+  'workspace-remove',
+  'dismiss-setup',
+  'session-start',
+  'session-resume',
+  'session-dismiss',
+  'remember-app',
+  'harness-session',
+]);
+
 /**
  * Client to daemon, one JSON object per line. `write`, `resize` and `kill` get no answer (a resize is
  * announced to the subscribers by a `resize` event). A
@@ -106,6 +266,7 @@ export interface TerminalExit {
  */
 export type Request =
   | { id: number; type: 'hello'; build: string }
+  | { id: number; type: 'call'; method: CallMethod; params: unknown }
   | { id: number; type: 'spawn'; options: SpawnOptions }
   | { id: number; type: 'list' }
   | { id: number; type: 'attach'; terminal: unknown }
@@ -113,7 +274,7 @@ export type Request =
   | { type: 'resize'; terminal: unknown; cols: number; rows: number }
   | { type: 'kill'; terminal: unknown };
 
-/** Daemon to client, one JSON object per line. */
+/** Daemon to client, one JSON object per line. `exit` goes to every connection. */
 export type Message =
   | { id: number; result: unknown }
   | { id: number; error: string }
@@ -121,7 +282,12 @@ export type Message =
   | { type: 'resize'; terminal: number; seq: number; cols: number; rows: number }
   | ({ type: 'exit'; terminal: number } & TerminalExit)
   | ({ type: 'status' } & SessionReport)
-  | { type: 'title'; sessionId: string; title: string };
+  | { type: 'title'; sessionId: string; title: string }
+  /** The state after a change, to every connection. */
+  | ({ type: 'state' } & StateSnapshot)
+  /** A terminal another connection, or the daemon, spawned. */
+  | { type: 'spawned'; terminal: TerminalInfo }
+  | ({ type: 'settled' } & SettledSetup);
 
 /** Splits a stream into its JSON lines. A line that does not parse is dropped. */
 export function lineReader(onMessage: (message: unknown) => void): (chunk: Buffer | string) => void {

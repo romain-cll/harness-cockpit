@@ -8,7 +8,6 @@ export interface Subscriber {
   data(terminal: number, seq: number, data: string): void;
   /** The pty's size changed; numbered like a chunk of output, in the same sequence. */
   resize(terminal: number, seq: number, cols: number, rows: number): void;
-  exit(terminal: number, exit: TerminalExit): void;
   /** The title a `session` terminal's program set (OSC 0 or 2), once per change. */
   title(sessionId: string, title: string): void;
 }
@@ -27,6 +26,17 @@ interface Terminal {
   killTimer?: NodeJS.Timeout;
   /** The status in `info` was recorded from the title (an interrupted turn), not reported: a busy title undoes it. */
   fromTitle?: boolean;
+  /** A client, or the end of the daemon, asked it to end: its exit is not one it chose. */
+  killed?: boolean;
+}
+
+export interface TerminalEvents {
+  /** A terminal ended (already out of the list); `killed`: a client, or the end of the daemon, asked for it. */
+  onExit(info: TerminalInfo, exit: TerminalExit, killed: boolean): void;
+  /** A session's program set a title between the agent's markers, whoever is subscribed. */
+  onTitle(sessionId: string, title: string): void;
+  /** A session's status was read from its title (an interrupted turn), not reported by a hook. */
+  onTitleStatus(report: SessionReport): void;
 }
 
 /** How long a hung-up process has to end before it is killed. */
@@ -40,7 +50,7 @@ const isSize = (value: unknown): value is number => Number.isInteger(value) && (
  * follows the pty's size, so that a client attaching later gets the screen as it is. Every chunk
  * of output carries a sequence number, per terminal.
  */
-export function createTerminals(onEnd: () => void, onTitleStatus: (report: SessionReport) => void) {
+export function createTerminals({ onExit, onTitle, onTitleStatus }: TerminalEvents) {
   const terminals = new Map<unknown, Terminal>();
   let lastId = 0;
   // Who waits for the last terminal to end.
@@ -62,6 +72,7 @@ export function createTerminals(onEnd: () => void, onTitleStatus: (report: Sessi
   // arrives during the shell's startup, and which a process may ignore: the terminal would then
   // never end. A process that has not exited after the grace period gets SIGKILL.
   const hangUp = (terminal: Terminal) => {
+    terminal.killed = true;
     terminal.killTimer ??= setTimeout(() => {
       try {
         terminal.pty.kill('SIGKILL');
@@ -77,7 +88,8 @@ export function createTerminals(onEnd: () => void, onTitleStatus: (report: Sessi
       return terminals.size;
     },
 
-    spawn(options: SpawnOptions, subscriber: Subscriber): number {
+    /** Owned by the daemon; the subscriber, when there is one, receives its output. */
+    spawn(options: SpawnOptions, subscriber?: Subscriber): number {
       const { kind, command, args, cwd, env, cols, rows, sessionId, workspace, agentTitles } = options;
       const pty = spawn(command, args, { name: env.TERM ?? 'xterm-256color', cwd, env, cols, rows });
       const headless = new Headless({ cols, rows, scrollback: SCROLLBACK, allowProposedApi: true });
@@ -92,8 +104,8 @@ export function createTerminals(onEnd: () => void, onTitleStatus: (report: Sessi
         headless,
         serializer,
         seq: 0,
-        subscribers: new Set([subscriber]),
-        ...(kind === 'commands' && { owner: subscriber }),
+        subscribers: new Set(subscriber ? [subscriber] : []),
+        ...(kind === 'commands' && subscriber && { owner: subscriber }),
       };
       terminals.set(id, terminal);
 
@@ -135,6 +147,7 @@ export function createTerminals(onEnd: () => void, onTitleStatus: (report: Sessi
           if (!forwarding || title === lastTitle) return;
           lastTitle = title;
           for (const each of terminal.subscribers) each.title(sessionId, title);
+          onTitle(sessionId, title);
         });
       }
       pty.onData((data) => {
@@ -146,14 +159,15 @@ export function createTerminals(onEnd: () => void, onTitleStatus: (report: Sessi
         clearTimeout(terminal.killTimer);
         terminals.delete(id);
         headless.dispose();
-        for (const each of terminal.subscribers) each.exit(id, { exitCode, signal: signal ?? null });
-        onEnd();
+        onExit(info, { exitCode, signal: signal ?? null }, terminal.killed === true);
         if (terminals.size === 0) for (const resolve of emptied.splice(0)) resolve();
       });
       return id;
     },
 
     list: (): TerminalInfo[] => [...terminals.values()].map(({ info }) => ({ ...info })),
+
+    info: (id: number): TerminalInfo => ({ ...terminals.get(id)!.info }),
 
     /**
      * Subscribes the connection and answers the screen as of the last chunk written before the

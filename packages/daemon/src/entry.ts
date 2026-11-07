@@ -28,7 +28,8 @@ export function reportReady(fd: number = READY_FD): void {
 
 /**
  * The logic of the daemon's entry, started as `<binary> daemon.js --cockpit-daemon <build>` with
- * `COCKPIT_HOME` set: runs the daemon of that build until it is told to stop or superseded. Without
+ * `COCKPIT_HOME` set (and `COCKPIT_STATE_DIR`, the folder of `state.json`, and `COCKPIT_CLI`, the `cockpit` binary):
+ * runs the daemon of that build until it is told to stop or superseded. Without
  * the marker and a build after it, writes the usage, exits with code 2 and creates nothing. The
  * output goes to `daemon-<protocol>-<build>.log`, whose last line is the reason a failed start shows.
  */
@@ -48,7 +49,7 @@ export async function runDaemonEntry(argv: readonly string[], env: NodeJS.Proces
   }
 
   try {
-    const daemon = await runDaemon({ home, build });
+    const daemon = await runDaemon({ home, build, stateDir: env.COCKPIT_STATE_DIR || undefined, cli: env.COCKPIT_CLI });
     stderr.write(`daemon ${build} (pid ${process.pid}) listening on ${daemon.socketPath}\n`);
     // Superseded and out of terminals: the daemon closes itself.
     void daemon.closed.then(() => exit(0));
