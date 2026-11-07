@@ -1,6 +1,8 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test } from 'vitest';
 
 // COCKPIT-17: the Developer ID signed and notarized app. Like ci-workflow.test.ts this reads the workflow,
 // the entitlements and the packaging config as text (no YAML parser in the repository). What a runner and
@@ -145,5 +147,148 @@ describe('signed-app.yml', () => {
     expect(all.indexOf(all.find((step) => step.join('\n').includes('actions/upload-artifact@v')) ?? [])).toBeGreaterThan(
       indexOfStep(all, 'ditto -c -k --keepParent'),
     );
+  });
+});
+
+// COCKPIT-98: the signing step logs every codesign call (DEBUG) and what codesign waits on (`log stream`).
+
+/** The `env:` entries of a step, trimmed. */
+function envOf(step: string[]): string[] {
+  const envAt = step.findIndex((line) => /^\s+env:\s*$/.test(line));
+  if (envAt < 0) return [];
+  const entries: string[] = [];
+  for (const line of step.slice(envAt + 1)) {
+    if (line.trim() !== '' && indentOf(line) <= indentOf(step[envAt] ?? '')) break;
+    entries.push(line.trim());
+  }
+  return entries;
+}
+
+/** The script of a step's `run: |` block (lines indented deeper than `run:`), dedented, comments dropped. */
+function scriptOf(step: string[]): string {
+  const runAt = step.findIndex((line) => /^\s+(?:- )?run:\s*\|/.test(line));
+  if (runAt < 0) return '';
+  const runIndent = indentOf(step[runAt] ?? '');
+  const body: string[] = [];
+  for (const line of step.slice(runAt + 1)) {
+    if (line.trim() !== '' && indentOf(line) <= runIndent) break;
+    body.push(line);
+  }
+  const first = body.find((line) => line.trim() !== '');
+  const dedent = indentOf(first ?? '');
+  return body.map((line) => line.slice(Math.min(dedent, indentOf(line)))).join('\n');
+}
+
+const signingStep = () => steps(signedApp).find((step) => step.join('\n').includes('package:signed')) ?? [];
+const signingScript = () => scriptOf(signingStep());
+
+/** The script's logical lines: a trailing backslash joins the next line. */
+const logicalLines = (script: string) => script.replace(/\\\n\s*/g, ' ').split('\n');
+
+describe('signed-app.yml — codesign and keychain logs (COCKPIT-98)', () => {
+  test('AC1 — the signing step sets DEBUG to electron-builder,electron-osx-sign* in its env', () => {
+    const debug = envOf(signingStep()).find((entry) => entry.startsWith('DEBUG:'));
+    expect(debug?.replace(/^DEBUG:\s*/, '').replace(/^(["'])(.*)\1$/, '$2')).toBe('electron-builder,electron-osx-sign*');
+  });
+
+  test('AC2 — the script starts `log stream --style compact --level info` on codesign, SecurityAgent and securityd in the background, before package:signed', () => {
+    const lines = logicalLines(signingScript());
+    const streamAt = lines.findIndex((line) => /\blog\s+stream\b/.test(line));
+    const bunAt = lines.findIndex((line) => line.includes('bun run --cwd apps/desktop package:signed'));
+    expect(streamAt).toBeGreaterThanOrEqual(0);
+    expect(bunAt).toBeGreaterThan(streamAt);
+    const stream = lines[streamAt] ?? '';
+    expect(stream).toMatch(/--style\s+compact\b/);
+    expect(stream).toMatch(/--level\s+info\b/);
+    expect(stream.trim()).toMatch(/&$/);
+    // The step's own output: no redirection to a file.
+    expect(stream.replace(/\d?>&\d/g, '')).not.toMatch(/>/);
+    const predicate = stream.split('--predicate')[1] ?? '';
+    const names = [...predicate.matchAll(/["']([A-Za-z]+)["']/g)].map((match) => match[1]).sort();
+    expect(names).toEqual(['SecurityAgent', 'codesign', 'securityd']);
+  });
+
+  test('AC2 — an EXIT trap set before package:signed kills the background log stream and waits for it', () => {
+    const lines = logicalLines(signingScript());
+    const trapAt = lines.findIndex((line) => /^\s*trap\b/.test(line));
+    const bunAt = lines.findIndex((line) => line.includes('bun run --cwd apps/desktop package:signed'));
+    expect(trapAt).toBeGreaterThanOrEqual(0);
+    expect(bunAt).toBeGreaterThan(trapAt);
+    const trap = lines[trapAt] ?? '';
+    expect(trap).toMatch(/\bkill\b/);
+    expect(trap).toMatch(/\bwait\b/);
+    expect(trap).toMatch(/\bEXIT\s*$/);
+  });
+});
+
+describe('signing step script under bash -e with stubs (COCKPIT-98)', () => {
+  const running: ChildProcess[] = [];
+  const folders: string[] = [];
+
+  afterEach(() => {
+    // A failing run may leave stubs holding the output: end their whole group.
+    for (const child of running.splice(0)) {
+      try {
+        if (child.pid) process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        // already gone
+      }
+    }
+    for (const folder of folders.splice(0)) rmSync(folder, { recursive: true, force: true });
+  });
+
+  /**
+   * Runs the step's script with a `log` that blocks until killed while holding the script's stdout, and a
+   * `bun` exiting with `status`. The `bun` stub fails (97) if the script started no background process, and
+   * otherwise waits for the `log` stub to be running, so the trap never races its start-up.
+   */
+  async function run(status: number): Promise<{ code: number | null; stdout: string }> {
+    const folder = mkdtempSync(join(tmpdir(), 'ck-'));
+    folders.push(folder);
+    const stubs = join(folder, 'stubs');
+    mkdirSync(stubs);
+    const ready = join(folder, 'ready');
+    execFileSync('mkfifo', [ready]);
+    const stub = (name: string, body: string) => {
+      writeFileSync(join(stubs, name), `#!/bin/sh\n${body}\n`);
+      chmodSync(join(stubs, name), 0o755);
+    };
+    stub('log', 'printf started > "$READY"\nexec tail -f /dev/null');
+    stub(
+      'bun',
+      [
+        'others=$(pgrep -P "$PPID" | grep -vx "$$")',
+        '[ -n "$others" ] || exit 97',
+        'cat "$READY" > /dev/null',
+        'exit "$BUN_STATUS"',
+      ].join('\n'),
+    );
+    const child = spawn('bash', ['-e', '-c', signingScript()], {
+      cwd: folder,
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        PATH: `${stubs}:${process.env.PATH ?? ''}`,
+        RUNNER_TEMP: folder,
+        APPLE_API_KEY_P8: 'not-a-key',
+        READY: ready,
+        BUN_STATUS: String(status),
+      },
+    });
+    running.push(child);
+    let stdout = '';
+    child.stdout?.on('data', (chunk: Buffer) => (stdout += chunk.toString()));
+    child.stderr?.resume();
+    // `close` fires once every process holding the script's stdout is gone.
+    const code = await new Promise<number | null>((resolve) => child.on('close', resolve));
+    return { code, stdout };
+  }
+
+  test('AC3 — bun exits 0: the script exits 0 and no process is left holding its stdout', async () => {
+    expect((await run(0)).code).toBe(0);
+  });
+
+  test('AC3 — bun exits 1: the script exits 1 and no process is left holding its stdout', async () => {
+    expect((await run(1)).code).toBe(1);
   });
 });
