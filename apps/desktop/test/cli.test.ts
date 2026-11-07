@@ -27,11 +27,14 @@ describe('cockpit command: built app', () => {
     home = join(dataDir, 'h');
     build = uniqueBuild();
     writeFileSync(join(dataDir, 'state.json'), JSON.stringify({ version: 1, projects: [{ path: repo.root }] }));
+    // The fake login shell is interactive (as in sessions.test.ts): a command typed in an app terminal runs.
+    writeFileSync(join(fx.root, 'interactive'), '');
   });
 
   afterAll(async () => {
     await session?.close().catch(() => {});
     await killDaemonsIn(home);
+    rmSync(join(fx.root, 'interactive'), { force: true });
     rmSync(fx.root, { recursive: true, force: true });
     rmSync(repo.parent, { recursive: true, force: true });
     rmSync(dataDir, { recursive: true, force: true });

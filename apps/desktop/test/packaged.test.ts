@@ -189,7 +189,10 @@ describe('packaged app state file', () => {
       expect(backups).toHaveLength(1);
       expect(readFileSync(join(dataDir, backups[0]!), 'utf8')).toBe(corrupt);
       expect(JSON.parse(readFileSync(stateFileIn(dataDir), 'utf8'))).toEqual({ version: 1 });
-      expect(session.output()).toContain(backups[0]!);
+      // The daemon sets the file aside and writes the warning to its log, not to the app's stderr.
+      const logs = readdirSync(session.cockpitHome).filter((name) => /^daemon-1-.+\.log$/.test(name));
+      expect(logs).toHaveLength(1);
+      expect(readFileSync(join(session.cockpitHome, logs[0]!), 'utf8')).toContain(backups[0]!);
     } finally {
       await session.close();
     }
