@@ -23,6 +23,8 @@ interface Terminal {
   owner?: Subscriber;
   /** The pending SIGKILL of a terminal that was hung up, cleared when it exits. */
   killTimer?: NodeJS.Timeout;
+  /** The status in `info` was recorded from the title (an interrupted turn), not reported: a busy title undoes it. */
+  fromTitle?: boolean;
 }
 
 /** How long a hung-up process has to end before it is killed. */
@@ -33,7 +35,7 @@ const HANGUP_GRACE_MS = 1000;
  * follows the pty's size, so that a client attaching later gets the screen as it is. Every chunk
  * of output carries a sequence number, per terminal.
  */
-export function createTerminals(onEnd: () => void) {
+export function createTerminals(onEnd: () => void, onTitleStatus: (report: SessionReport) => void) {
   const terminals = new Map<unknown, Terminal>();
   let lastId = 0;
   // Who waits for the last terminal to end.
@@ -71,7 +73,7 @@ export function createTerminals(onEnd: () => void) {
     },
 
     spawn(options: SpawnOptions, subscriber: Subscriber): number {
-      const { kind, command, args, cwd, env, cols, rows, sessionId, workspace } = options;
+      const { kind, command, args, cwd, env, cols, rows, sessionId, workspace, agentTitles } = options;
       const pty = spawn(command, args, { name: env.TERM ?? 'xterm-256color', cwd, env, cols, rows });
       const headless = new Headless({ cols, rows, scrollback: SCROLLBACK, allowProposedApi: true });
       const serializer = new SerializeAddon();
@@ -96,12 +98,35 @@ export function createTerminals(onEnd: () => void) {
         // never name a workspace.
         let forwarding = false;
         let lastTitle: string | undefined;
+        // The turn titles of a harness that fires no hook on an interrupt (COCKPIT-50), read in the same
+        // window as the markers; with no markers the agent is the whole terminal. `busySeen`: a busy title
+        // came since the last idle one.
+        const turn = agentTitles && { busy: new RegExp(agentTitles.busy), idle: new RegExp(agentTitles.idle) };
+        let inAgent = !agentTitles?.marked;
+        let busySeen = false;
         headless.parser.registerOscHandler(AGENT_MARKER_OSC, (data) => {
           forwarding = data === 'agent-started';
           lastTitle = undefined;
+          inAgent = forwarding;
+          busySeen = false;
           return true;
         });
+        const setStatusFromTitle = (event: SessionEventName, fromTitle: boolean) => {
+          info.status = event;
+          terminal.fromTitle = fromTitle;
+          onTitleStatus({ sessionId, event, ...(fromTitle && { fromTitle: true as const }) });
+        };
         headless.onTitleChange((title) => {
+          if (turn && inAgent) {
+            // Busy then idle while working is a turn that ended with no `Stop`; a busy title after that is a new turn.
+            if (turn.busy.test(title)) {
+              busySeen = true;
+              if (terminal.fromTitle) setStatusFromTitle('working', false);
+            } else if (turn.idle.test(title)) {
+              if (busySeen && info.status === 'working') setStatusFromTitle('finished', true);
+              busySeen = false;
+            }
+          }
           if (!forwarding || title === lastTitle) return;
           lastTitle = title;
           for (const each of terminal.subscribers) each.title(sessionId, title);
@@ -166,8 +191,10 @@ export function createTerminals(onEnd: () => void) {
 
     /** Records what a session reported; `false` when no terminal runs that session. */
     report(report: SessionReport): boolean {
-      for (const { info } of terminals.values()) {
+      for (const terminal of terminals.values()) {
+        const { info } = terminal;
         if (info.sessionId !== report.sessionId) continue;
+        terminal.fromTitle = false;
         if (report.event === 'exited') info.exitCode = report.exitCode;
         else if (report.event === 'harness-session') info.harnessSessionId = report.harnessSessionId;
         else if (report.event.startsWith('setup-')) info.setup = report.event.slice('setup-'.length) as SetupState;

@@ -55,7 +55,7 @@ export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon>
   function onTerminalEnd(): void {
     if (superseded && terminals.size === 0) void close();
   }
-  const terminals = createTerminals(onTerminalEnd);
+  const terminals = createTerminals(onTerminalEnd, (report) => broadcast({ type: 'status', ...report }));
 
   const broadcast = (message: Message) => {
     for (const { socket } of connections) if (!socket.destroyed) socket.write(encode(message));

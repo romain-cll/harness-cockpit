@@ -196,7 +196,7 @@ function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutM
             ? { sessionId, event: 'exited', exitCode: message.exitCode }
             : message.event === 'harness-session'
               ? { sessionId, event: 'harness-session', harnessSessionId: message.harnessSessionId }
-              : { sessionId, event: message.event };
+              : { sessionId, event: message.event, ...(message.fromTitle && { fromTitle: true as const }) };
         statusListeners.forEach((listener) => listener(report));
         break;
       }

@@ -74,8 +74,11 @@ const sessionIdCommand = (cli: string, harnessId: HarnessId) => `${quoted(cli)} 
 // - Working: `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`, `ElicitationResult`.
 // - Waiting: `PermissionRequest`, `Elicitation`.
 // - Finished: `Stop`, `StopFailure`.
-// Not reported (same page): Esc and a rejected permission fire no hook, so the dot stays as
-// it was until the next report; an approved tool keeps "waiting" until it ends.
+// Not reported (same page; Claude Code 2.1.319, every hook logged in a pty on 2026-11-07): Esc fires no
+// hook, before any output, mid-stream or during an auto-allowed tool, and `Stop` does not run on a user
+// interrupt; Esc or "No" at a permission prompt fires none after `PermissionRequest`, which stays true
+// ("waiting"); an approved tool keeps "waiting" until it ends. The title is the only signal of an Esc
+// before any output (the transcript shows nothing): `turnTitles` in `catalogue.ts`, read by the daemon.
 // The session id is reported by the second hook of the `UserPromptSubmit` group: every hook gets
 // the JSON input with `session_id` on stdin (same page), and a prompt is sent only to a
 // conversation that exists, unlike `SessionStart`, which also fires for `/clear` and `/resume`

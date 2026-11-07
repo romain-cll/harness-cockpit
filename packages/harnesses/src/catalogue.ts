@@ -27,6 +27,11 @@ export interface Harness {
    */
   promptTitle(title: string): string | null;
   /**
+   * The titles the harness shows while a turn runs and between turns, as regular expression sources. A harness
+   * that fires no hook on an interrupt declares them, so the daemon reads the end of a turn from the title.
+   */
+  turnTitles?: { busy: string; idle: string };
+  /**
    * The conversation id in what the harness's hook (or plugin) pipes to `cockpit session-id <harness>`, or
    * `null` when the input holds none. The id is an opaque string to everything but this adapter.
    */
@@ -86,6 +91,11 @@ const catalogue: Harness[] = [
       const name = /^[◐◑✳] (.+)$/.exec(title)?.[1];
       return name === undefined || name === 'Claude Code' ? null : name;
     },
+    // The same glyphs tell a turn from the wait between turns: `◐`/`◑` while it runs, `✳` otherwise (shipped
+    // binary, 2.1.319, checked 2026-11-07). An Esc fires no hook but turns the title busy to idle in under
+    // 100 ms (real Claude Code in a pty); `Stop` is followed by a busy title for about 2 s (Stop hooks).
+    // Under a multiplexer the title is a static `✳`: no busy title, no change.
+    turnTitles: { busy: '^[◐◑] ', idle: '^✳ ' },
     // A subagent's hook carries the main session's id plus `agent_id` (same docs page), so the id read is
     // always the main conversation's.
     sessionIdFrom: hookSessionId,
@@ -169,6 +179,7 @@ const catalogue: Harness[] = [
 
 for (const harness of catalogue) {
   Object.freeze(harness.continueLast);
+  if (harness.turnTitles) Object.freeze(harness.turnTitles);
   Object.freeze(harness);
 }
 

@@ -32,6 +32,11 @@ export interface SpawnOptions {
   sessionId?: string;
   /** The worktree a terminal runs in, when it runs in a workspace. */
   workspace?: string;
+  /**
+   * The titles a harness shows while a turn runs and between turns (regular expression sources), for a harness that
+   * fires no hook on an interrupt. `marked`: the agent runs between the private markers `cockpit setup` writes.
+   */
+  agentTitles?: { busy: string; idle: string; marked: boolean };
 }
 
 export type SessionEventName = 'working' | 'waiting' | 'finished';
@@ -47,7 +52,7 @@ export type SetupState = 'running' | 'done' | 'failed';
  * harness's own id for the conversation, an opaque string to the daemon.
  */
 export type SessionReport =
-  | { sessionId: string; event: SessionEventName | SetupEventName }
+  | { sessionId: string; event: SessionEventName | SetupEventName; fromTitle?: true }
   | { sessionId: string; event: 'exited'; exitCode: number | null }
   | { sessionId: string; event: 'harness-session'; harnessSessionId: string };
 
