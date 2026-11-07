@@ -27,13 +27,19 @@ jobs:
       # No secret reaches the build.
       - run: bun run --filter @cockpit/cli build && bun run --cwd apps/desktop build
       # The only step with the secrets, through `env:` alone. electron-builder notarizes and staples
-      # once the APPLE_API_* variables are set.
+      # once the APPLE_API_* variables are set. COCKPIT-98: `DEBUG` makes electron-builder log each `security`
+      # call and electron-osx-sign each `codesign` command and failed attempt; `log stream` shows what
+      # `codesign` waits on (a keychain prompt from SecurityAgent, securityd events), in this step's output.
       - name: Sign and notarize
         run: |
           printf '%s' "$APPLE_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
           export APPLE_API_KEY="$RUNNER_TEMP/AuthKey.p8"
+          log stream --style compact --level info --predicate 'process == "codesign" OR process == "SecurityAgent" OR process == "securityd"' &
+          events=$!
+          trap 'kill "$events" 2>/dev/null; wait "$events" 2>/dev/null || true' EXIT
           bun run --cwd apps/desktop package:signed
         env:
+          DEBUG: electron-builder,electron-osx-sign*
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
