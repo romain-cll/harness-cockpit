@@ -13,7 +13,7 @@ const UNREADABLE = /unreadable|unavailable|could not be read|cannot be read|not 
 function fakeFrame(reads: 'answer' | 'reject') {
   let release = () => {};
   const calls: unknown[] = [];
-  const evaluate = (script: unknown, ...rest: unknown[]) => {
+  const evaluate = (script: unknown) => {
     calls.push(script);
     if (calls.length === 1) return new Promise<void>((resolve) => (release = resolve));
     return reads === 'reject' ? Promise.reject(new Error('Target page, context or browser has been closed')) : Promise.resolve(undefined);
