@@ -1,17 +1,18 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { existsSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { type Page } from 'playwright-core';
+import { type ElementHandle, type Page } from 'playwright-core';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest';
 import { sendFromComposer } from '../composer';
-import { freePort, isAlive, launchEnv, MAIN_PROCESS_ERROR, packagedAppDir, type Session, versionLabel } from '../launch';
+import { freePort, isAlive, launchEnv, MAIN_PROCESS_ERROR, packagedAppDir, reportFailedWaits, type Session, truthy, untilDom, untilIn, versionLabel } from '../launch';
 import { makeTestDir } from '../run-root';
 import { addProject, addRepository, chooseLocation, cloneButton, cloneDialog, deleteDialog, entryTitles, gitState, linkedWorktrees, localBranches, makeRepo, nameBox, pickAddItem, projectsInState, removeThroughMenu, sidebarEntries, sidebarLines, snapshotRepo, startDeletion, stateSnapshot, type TempRepo, urlBox, waitForEntries, worktreePath, writeConfig } from './projects';
 import { startMainDeletion, waitForNoMainRow } from './main-workspace';
 import { clearFocusCalls, FRONT_CALLS, frontCalls, runSecondLaunch, stubFocus } from './single-instance';
-import { allConsoleErrorsOf, allPageErrorsOf, applicationType, captureRow, dropTerminalWorkspace, getShellPath, LAUNCHD_ENV, LAUNCHD_PATH, launchLaunchd, normalizeFnm, openTerminal, pidOf, ptyKill, type PtyWindow, ptyWrite, spawnShell, typeLine, unexpectedConsoleErrors, waitForOutput, waitForRow, watchFrontmost } from './terminal';
+import { allConsoleErrorsOf, allPageErrorsOf, applicationType, captureRow, dropTerminalWorkspace, focusedPane, focusTerminal, getShellPath, LAUNCHD_ENV, LAUNCHD_PATH, launchLaunchd, normalizeFnm, openTerminal, pidOf, ptyKill, type PtyWindow, ptyWrite, rowsOf, spawnShell, terminalWorkspaces, typeLine, unexpectedConsoleErrors, waitForOutput, waitForPrompt, waitForRow, watchFrontmost } from './terminal';
 
 // Launches the app the four ways it runs: the dev server, the built app, the
 // packaged app and the packaged app with the minimal environment launchd gives
@@ -329,6 +330,109 @@ export const describeMode = (mode: string, launch: () => Promise<Session>) => de
       await removeThroughMenu(page, repo.root);
       await waitForEntries(page, []);
     });
+  });
+
+  // COCKPIT-90: the dump a hung wait leaves in the test's error. The dev server is the mode it exists for (smoke
+  // path (b) hangs there), the built app the full block; packaged and launchd share `launchSpawned`.
+  test.runIf(full || mode === 'dev server')('COCKPIT-90 AC1, AC2, AC3, AC4 — failure dump: a failed test with a wait running names the files of the project\'s folder, the line the daemon holds that the DOM rows lost, the tabs and the rows of each terminal with the waited one marked, and whether the waited element is connected', async () => {
+    const { page } = session;
+    await openTerminal(session);
+    const root = terminalWorkspaces.get(session)!.root;
+    // The folder holds a file the dump must name; `setup-ran` is not there, and must not be named.
+    writeFileSync(join(root, 'dump-probe.txt'), '');
+
+    // First tab: a line the shell prints, which stays in its rows. The command text differs from the output, so
+    // the line appears only where the output is.
+    const first = await focusedPane(page);
+    await waitForPrompt(page, first);
+    await typeLine(page, 'echo other-term-$((20+22))');
+    await waitForRow(page, 'other-term-42', first);
+
+    // Second tab, the waited one: a line then enough output to scroll it out of the rows, into the daemon's scrollback.
+    await page.getByRole('button', { name: 'New tab', exact: true }).first().click();
+    await page.getByRole('menuitem', { name: 'Terminal', exact: true }).click();
+    await focusTerminal(page);
+    const waited = await focusedPane(page);
+    await waitForPrompt(page, waited);
+    await typeLine(page, 'echo gone-line-$((20+22)); seq 1 120');
+    await waitForRow(page, '120', waited);
+    expect((await rowsOf(waited)).join('\n'), 'the line left the rows of the DOM').not.toContain('gone-line-42');
+    const tabs = await page.getByRole('tab').evaluateAll((all) => all.map((tab) => tab.getAttribute('title') ?? ''));
+    expect(tabs).toHaveLength(2);
+
+    // A wait on the second terminal, held until the test releases it. `read` runs in the page once the wait is
+    // registered, and says so on the document, so the test reports its failure after that event.
+    const hold = async (target: ElementHandle<HTMLElement>) => {
+      const key = randomUUID();
+      const wait = untilIn(
+        target,
+        (_element, key: string) => {
+          document.documentElement.setAttribute('data-wait-started', key);
+          return ((window as unknown as { __released?: string[] }).__released ?? []).includes(key);
+        },
+        truthy,
+        key,
+      );
+      wait.catch(() => {});
+      await untilDom(page, (key: string) => document.documentElement.getAttribute('data-wait-started') === key, key);
+      return async () => {
+        await page.evaluate((key) => {
+          ((window as unknown as { __released?: string[] }).__released ??= []).push(key);
+          window.dispatchEvent(new Event('resize'));
+        }, key);
+        await wait;
+      };
+    };
+    const fail = () => {
+      const error = { message: 'boom' };
+      return { task: { result: { state: 'fail', errors: [error] } } as never, error };
+    };
+
+    // The element is in the document.
+    const releaseFirst = await hold(waited);
+    const inDocument = fail();
+    await reportFailedWaits(inDocument.task);
+    const message = inDocument.error.message;
+    expect(message.startsWith('boom'), 'the test\'s own error stays first').toBe(true);
+    // AC1: the project's folder is listed from state.json.
+    expect(message).toContain(root);
+    expect(message).toContain('dump-probe.txt');
+    expect(message).not.toContain('setup-ran');
+    // AC2: the daemon's screen holds the line, once: the rows of the DOM do not.
+    expect(message.split('gone-line-42')).toHaveLength(2);
+    // AC3: the tabs with the selected one, and the rows of each terminal with the waited one marked.
+    for (const tab of tabs) expect(message).toContain(tab);
+    expect(message).toMatch(/selected/i);
+    // The page's terminals: the entry headers (`#0`, `#1`) carry `(waited)` and `(visible)`, their rows follow.
+    const section = message.slice(message.indexOf('  terminals (.xterm):'), message.indexOf('  waited elements:'));
+    const entries = section.split(/\n(?=    #\d+)/).slice(1);
+    expect(entries, 'one entry per terminal').toHaveLength(2);
+    const header = (entry: string) => entry.split('\n')[0]!;
+    const waitedEntries = entries.filter((entry) => header(entry).includes('(waited)'));
+    expect(waitedEntries, 'exactly one entry is marked waited').toHaveLength(1);
+    const otherEntries = entries.filter((entry) => entry.includes('other-term-42'));
+    expect(otherEntries, 'the other terminal\'s row sits under one entry').toHaveLength(1);
+    expect(header(otherEntries[0]!), 'that entry is not the waited one').not.toContain('(waited)');
+    expect(waitedEntries[0], 'the waited terminal does not hold it').not.toContain('other-term-42');
+    // Only the selected terminal (the waited one) is on screen.
+    const visibleEntries = entries.filter((entry) => header(entry).includes('(visible)'));
+    expect(visibleEntries, 'exactly one entry is marked visible').toHaveLength(1);
+    expect(visibleEntries[0]).toBe(waitedEntries[0]);
+    // AC4: connected while in the document.
+    expect(message).toMatch(/(?<!not |dis)connected/);
+    expect(message).not.toMatch(/not connected/);
+    await releaseFirst();
+
+    // AC4: not connected once it left the document.
+    const gone = (await page.evaluateHandle(() => document.body.appendChild(document.createElement('div')))) as ElementHandle<HTMLElement>;
+    const releaseSecond = await hold(gone);
+    await gone.evaluate((element) => element.remove());
+    const left = fail();
+    await reportFailedWaits(left.task);
+    expect(left.error.message.startsWith('boom')).toBe(true);
+    expect(left.error.message).toMatch(/not connected/);
+    await releaseSecond();
+    await gone.dispose();
   });
 
   test('logs no error and keeps running', async () => {

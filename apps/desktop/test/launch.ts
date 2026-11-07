@@ -460,12 +460,13 @@ export const untilScript = (read: object, done: object, arg: unknown, call: stri
 
 // The waits running in a page, for the diagnostic below: a wait that never ends is ended by the test's own guard
 // and says nothing, so the page keeps the last value each one read.
-type PendingWait = { frame: Frame; id: string; label: string };
+// `mark` is the `data-waiting` value of the element a wait watches (`untilIn`).
+type PendingWait = { frame: Frame; id: string; label: string; mark?: string };
 const pendingWaits = new Set<PendingWait>();
 
-export async function evaluateUntil<R>(frame: Frame, read: object, arg: unknown, script: (id: string) => string): Promise<R> {
+export async function evaluateUntil<R>(frame: Frame, read: object, arg: unknown, script: (id: string) => string, mark?: string): Promise<R> {
   const label = `${read.toString().replace(/\s+/g, ' ').slice(0, 100)} waiting for ${JSON.stringify(arg)?.slice(0, 200)}`;
-  const pending: PendingWait = { frame, id: randomUUID(), label };
+  const pending: PendingWait = { frame, id: randomUUID(), label, mark };
   pendingWaits.add(pending);
   try {
     return (await frame.evaluate(script(pending.id))) as R;
@@ -474,8 +475,95 @@ export async function evaluateUntil<R>(frame: Frame, read: object, arg: unknown,
   }
 }
 
-// A test the guard ended while a wait ran names what that wait last read, in the test's error.
-afterEach(async ({ task }) => {
+// COCKPIT-90: where a launch keeps its state and its daemon, by page, for the failure report.
+const launchFolders = new WeakMap<Page, { dataDir: string; cockpitHome: string }>();
+
+interface PageDump {
+  tabs: Array<{ title: string; selected: boolean }>;
+  terminals: Array<{ waited: boolean; visible: boolean; rows: string[] }>;
+  connected: boolean[];
+}
+
+// What the page holds: the tabs, the rows of each `.xterm` (the waited one marked), and whether each waited element
+// is in the document. Runs in the page: self-contained.
+function readPage(marks: string[]): PageDump {
+  const targets = marks.map((mark) => document.querySelector(`[data-waiting="${mark}"]`));
+  return {
+    tabs: [...document.querySelectorAll('[role="tab"]')].map((tab) => ({ title: tab.getAttribute('title') ?? '', selected: tab.getAttribute('aria-selected') === 'true' })),
+    terminals: [...document.querySelectorAll('.xterm')].map((terminal) => {
+      const { width, height } = terminal.getBoundingClientRect();
+      return {
+        waited: targets.some((target) => target !== null && (terminal.contains(target) || target.contains(terminal))),
+        visible: width > 0 && height > 0 && getComputedStyle(terminal).visibility === 'visible',
+        rows: [...terminal.querySelectorAll('.xterm-rows > div')].map((row) => (row.textContent ?? '').replace(/\u00a0/g, ' ').trimEnd()).filter((row) => row !== ''),
+      };
+    }),
+    connected: targets.map((target) => target !== null),
+  };
+}
+
+// A source of the dump that cannot be read says so, in its own line.
+const unreadable = (what: string, error: unknown) => `  ${what}: unreadable (${error instanceof Error ? error.message : String(error)})`;
+
+async function dumpPage(page: Page, waits: PendingWait[]): Promise<string[]> {
+  const lines: string[] = [];
+  const marks = waits.flatMap(({ mark }) => (mark ? [mark] : []));
+  const labels = waits.filter(({ mark }) => mark).map(({ label }) => label);
+  try {
+    const dump = await page.evaluate(readPage, marks);
+    lines.push('  tabs:', ...dump.tabs.map((tab) => `    ${JSON.stringify(tab.title)}${tab.selected ? ' (selected)' : ''}`));
+    lines.push('  terminals (.xterm):');
+    dump.terminals.forEach((terminal, index) => {
+      lines.push(`    #${index}${terminal.waited ? ' (waited)' : ''}${terminal.visible ? ' (visible)' : ''}`, ...terminal.rows.map((row) => `      ${row}`));
+    });
+    lines.push('  waited elements:', ...dump.connected.map((connected, index) => `    ${labels[index]}: ${connected ? 'connected' : 'not connected'}`));
+  } catch (error) {
+    lines.push(unreadable('tabs, terminals and waited elements', error));
+  }
+
+  const folders = launchFolders.get(page);
+  try {
+    if (!folders?.cockpitHome) throw new Error('no daemon socket known for this page');
+    const { connectDaemon } = await import('@cockpit/daemon');
+    // No `hello`: it would supersede the daemons of other builds. Closed after reading.
+    const daemon = await connectDaemon(daemonSocketIn(folders.cockpitHome));
+    try {
+      lines.push("  daemon's screens:");
+      for (const { id, kind, cwd } of await daemon.list()) {
+        try {
+          const { screen } = await daemon.attach(id);
+          lines.push(`    terminal ${id} (${kind}, ${cwd}): ${JSON.stringify(screen.slice(-2000))}`);
+        } catch (error) {
+          lines.push(unreadable(`terminal ${id}`, error));
+        }
+      }
+    } finally {
+      daemon.close();
+    }
+  } catch (error) {
+    lines.push(unreadable("daemon's screens", error));
+  }
+
+  try {
+    if (!folders) throw new Error('no data folder known for this page');
+    const state = JSON.parse(readFileSync(join(folders.dataDir, 'state.json'), 'utf8')) as { projects?: Array<{ path: string }> };
+    lines.push('  project folders:');
+    for (const { path } of state.projects ?? []) {
+      try {
+        lines.push(`    ${path}: ${readdirSync(path).join(', ')}`);
+      } catch (error) {
+        lines.push(unreadable(path, error));
+      }
+    }
+  } catch (error) {
+    lines.push(unreadable('project folders', error));
+  }
+  return lines;
+}
+
+// A test the guard ended while a wait ran names what that wait last read, in the test's error, then what its page,
+// the daemon and the disk held.
+export async function reportFailedWaits(task: { result?: { state?: string; errors?: Array<{ message: string }> } }): Promise<void> {
   const waiting = [...pendingWaits];
   pendingWaits.clear();
   const error = task.result?.errors?.[0];
@@ -487,6 +575,16 @@ afterEach(async ({ task }) => {
     }),
   );
   error.message += `\nWaits still running when the test ended:\n${lines.join('\n')}`;
+  const byPage = new Map<Page, PendingWait[]>();
+  for (const wait of waiting) {
+    const page = wait.frame.page();
+    byPage.set(page, [...(byPage.get(page) ?? []), wait]);
+  }
+  for (const [page, waits] of byPage) error.message += `\nWhat the page, the daemon and the disk held:\n${(await dumpPage(page, waits)).join('\n')}`;
+}
+
+afterEach(async ({ task }) => {
+  await reportFailedWaits(task);
 });
 
 export async function untilRead<A, R>(page: Page, read: (arg: A) => R, done: (value: R, arg: A) => boolean, arg?: A): Promise<R> {
@@ -505,6 +603,7 @@ export async function untilIn<A, R>(element: ElementHandle<HTMLElement>, read: (
       read,
       arg,
       (id) => `(() => { const element = document.querySelector('[data-waiting="${mark}"]'); return ${untilScript(read, done, arg, 'read(element, arg)', 'element', id)}; })()`,
+      mark,
     );
   } finally {
     await element.evaluate((target) => target.removeAttribute('data-waiting')).catch(() => {});
@@ -635,6 +734,7 @@ export async function launchSpawned(
     const [, port] = await watch.match(/DevTools listening on ws:\/\/127\.0\.0\.1:(\d+)/);
     const { browser, page } = await attach(`http://127.0.0.1:${port}`);
     const inspector = mainInspector(watch);
+    launchFolders.set(page, { dataDir, cockpitHome });
     return {
       page,
       pid: child.pid!,
@@ -726,6 +826,7 @@ export async function launchDev(
     const pid = Number(execFileSync('pgrep', ['-g', String(dev.pid), '-x', 'Electron'], { encoding: 'utf8' }).split('\n')[0]);
     closedByPid.set(pid, closedByPid.get(dev.pid!)!);
     const inspector = mainInspector(watch);
+    launchFolders.set(page, { dataDir, cockpitHome });
     return {
       page,
       pid,
