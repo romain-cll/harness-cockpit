@@ -216,6 +216,28 @@ describe('session status: built app', () => {
     expect(calls).toContain('focus');
   });
 
+  test('COCKPIT-50 AC1, AC2 — an interrupted Claude Code turn (busy title, then idle title, no hook) turns the row from "Working" to "Ready" and raises no notification with no window focused', async () => {
+    const { page } = session;
+    const id = await startSession(page, 'Claude Code', 'Claude Code 4');
+    await readStub(page);
+    await focusTerminal(page);
+    await setWindowFocused(session, false);
+    await clearNotifications(session);
+
+    await typeLine(page, 'hook UserPromptSubmit');
+    await waitForRow(page, 'hooked:UserPromptSubmit');
+    await expectDot(page, id, 'Working');
+    await typeLine(page, 'title ◐ Greeting');
+    await waitForRow(page, 'titled:◐ Greeting');
+    await expectDot(page, id, 'Working', 'now');
+
+    await typeLine(page, 'title ✳ Greeting');
+    await waitForRow(page, 'titled:✳ Greeting');
+
+    await expectDot(page, id, 'Ready');
+    expect(await notifications(session)).toEqual([]);
+  });
+
   test('AC13 — a harness whose binary was removed after detection is refused under the Sessions header: "Could not start Claude Code: <path> not found.", no folder, nothing spawned, state.json unchanged', async () => {
     const { page } = session;
     const binary = join(fx.bin, 'claude');

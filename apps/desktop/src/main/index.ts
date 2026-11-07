@@ -18,6 +18,7 @@ import {
   type DaemonClient,
   type SessionReport,
   type SetupState,
+  type SpawnOptions,
   type TerminalExit,
   type TerminalInfo,
   type TerminalKind,
@@ -336,7 +337,8 @@ function reportSessionStatus(report: SessionReport): void {
   if (sessionStatuses.get(sessionId) === event) return;
   sessionStatuses.set(sessionId, event as SessionStatus);
   owner?.send('sessions:status', sessionId, event);
-  if (event === 'working' || BrowserWindow.getFocusedWindow()) return;
+  // A status read from the title (an interrupted turn) is no news to push a notification for.
+  if (event === 'working' || report.fromTitle || BrowserWindow.getFocusedWindow()) return;
 
   const notification = new Notification({ title: session.name, body: event === 'waiting' ? 'Needs input' : 'Ready' });
   notification.on('click', () => {
@@ -616,7 +618,7 @@ function startTerminals() {
   const spawnFor = async (
     contents: WebContents | undefined,
     request: PtySpawnRequest,
-    { kind, sessionId, workspace, before = contents && endingsOf(contents) }: { kind: TerminalKind; sessionId?: string; workspace?: string; before?: number },
+    { kind, sessionId, workspace, agentTitles, before = contents && endingsOf(contents) }: { kind: TerminalKind; sessionId?: string; workspace?: string; agentTitles?: SpawnOptions['agentTitles']; before?: number },
   ) => {
     const daemon = await ensureOwnDaemon();
     const options = await withSpawnDefaults(request);
@@ -626,6 +628,7 @@ function startTerminals() {
       ...options,
       ...(sessionId !== undefined && { sessionId }),
       ...(workspace !== undefined && { workspace }),
+      ...(agentTitles && { agentTitles }),
     });
     const terminal = register(
       daemon,
@@ -1634,7 +1637,14 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
       ptyId = await spawnFor(
         contents,
         { ...size, ...command, cwd: directory, env },
-        { kind: 'session', sessionId: id, workspace: workspace?.path, before: endings },
+        {
+          kind: 'session',
+          sessionId: id,
+          workspace: workspace?.path,
+          // A harness with no hook on an interrupt: the daemon reads the end of a turn from the title.
+          ...(catalogued?.turnTitles && { agentTitles: { ...catalogued.turnTitles, marked: Boolean(viaSetup) } }),
+          before: endings,
+        },
       );
       if (resume) return { status: 'started', session: resume, ptyId };
       const session = {

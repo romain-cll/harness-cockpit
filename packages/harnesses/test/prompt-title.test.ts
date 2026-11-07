@@ -65,3 +65,29 @@ describe('OpenCode', () => {
     expect(titleOf('opencode', title)).toBeNull();
   });
 });
+
+// COCKPIT-50: the titles Claude Code animates while a turn runs and the one it shows between turns, as
+// regular expression sources the daemon reads from the spawn options. Codex and OpenCode declare none.
+describe('turn titles (COCKPIT-50 AC10)', () => {
+  const turnTitlesOf = (id: string) => (harnesses.find((candidate) => candidate.id === id) as { turnTitles?: { busy: string; idle: string } } | undefined)?.turnTitles;
+
+  test('AC10 — Claude Code: ◐ Claude Code and ◑ Greeting are busy, ✳ Greeting is idle, and neither pattern matches Greeting', () => {
+    const turnTitles = turnTitlesOf('claude-code');
+    expect(turnTitles).toBeDefined();
+    const busy = new RegExp(turnTitles!.busy);
+    const idle = new RegExp(turnTitles!.idle);
+
+    expect(busy.test('◐ Claude Code')).toBe(true);
+    expect(busy.test('◑ Greeting')).toBe(true);
+    expect(idle.test('✳ Greeting')).toBe(true);
+    expect(idle.test('✳ Claude Code')).toBe(true);
+    expect(busy.test('✳ Greeting')).toBe(false);
+    expect(idle.test('◐ Claude Code')).toBe(false);
+    expect(busy.test('Greeting')).toBe(false);
+    expect(idle.test('Greeting')).toBe(false);
+  });
+
+  test.each(['codex', 'opencode'])('AC10 — %s declares no turn titles', (id) => {
+    expect(turnTitlesOf(id)).toBeUndefined();
+  });
+});

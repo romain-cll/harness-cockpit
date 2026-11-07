@@ -58,6 +58,12 @@ while IFS= read -r line; do
       command=$(printf '%s' "$SETTINGS" | /usr/bin/plutil -extract "hooks.$event.0.hooks.0.command" raw -o - - 2>/dev/null)
       [ -n "$command" ] && /bin/sh -c "$command"
       echo "hooked:$event" ;;
+    "title "*)
+      # Sets the terminal title (OSC 0), as Claude Code does while a turn runs and when it ends (COCKPIT-50), then
+      # says so, so a test waits for the line rather than for a delay.
+      text="\${line#title }"
+      printf '\\033]0;%s\\007' "$text"
+      echo "titled:$text" ;;
     "session-hook "*)
       # Runs the second hook of UserPromptSubmit (the one that reports the conversation id) with the hook JSON a
       # harness gives it on stdin, {"session_id":"<id>"}: the stub's hook line above runs index 0, with the pty as
