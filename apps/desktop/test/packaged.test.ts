@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 import { daemonSocketIn, isAlive, launchEnv, launchPackaged, launchSpawned, MAIN_PROCESS_ERROR, packagedAppDir, type Session, stopGroup, versionLabel } from './launch';
 import { makeTestDir } from './run-root';
+import { describeCliPackagedSmoke } from './support/cli';
 import { describeDaemonPackagedSmoke } from './support/daemon';
 import { describeMode } from './support/mode-checks';
 import { describePanesPackagedSmoke } from './support/panes';
@@ -450,5 +451,6 @@ describe.runIf(process.env.CI)('packaged app without the background switch', () 
 
 describePanesPackagedSmoke();
 describeDaemonPackagedSmoke();
+describeCliPackagedSmoke();
 
 describeResumeSmoke('packaged app', (fx) => launchPackagedWith(fx.env()), PACKAGED_CLI);

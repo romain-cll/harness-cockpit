@@ -450,20 +450,30 @@ describe('daemon: built app, the daemon cannot start', () => {
   const failureView = (page: Page) => page.getByText("Cockpit's background service could not start", { exact: true });
   const SUBTITLE = 'Terminals and agents run in this service. Your projects and workspaces are untouched.';
 
-  test('AC10 — COCKPIT_HOME a regular file: the window opens; stderr names the path; a workspace page and a session page show the failure view; the Sessions section says so; spawn and sessions.start are refused with the reason; projects can still be added and removed', async () => {
+  test('AC10, COCKPIT-37 AC8 — COCKPIT_HOME a regular file: the window opens; stderr names the path; the sidebar lists the project, its workspace and the session of state.json; a workspace page and a session page show the failure view; the Sessions section says so; adding a project, removing it, creating a workspace and starting a session are each refused with the reason; state.json is unchanged', async () => {
     const fx = makeFixture();
     const home = join(dataDir, 'h');
     writeFileSync(home, 'a file, not a folder');
     repo = makeRepoWithSetup();
+    const other = makeRepoWithSetup();
+    const worktree = join(fx.root, 'wt-view');
+    addWorktree(repo.root, 'view', worktree);
     // A session of an earlier launch, so its page can be opened while the daemon is down.
     const seeded = { id: randomUUID(), name: 'Claude Code 1', harness: 'claude-code', directory: join(fx.root, 'earlier'), createdAt: new Date().toISOString() };
-    writeFileSync(join(dataDir, 'state.json'), JSON.stringify({ version: 1, sessions: [seeded] }));
+    const stateFile = join(dataDir, 'state.json');
+    writeFileSync(stateFile, JSON.stringify({ version: 1, projects: [{ path: repo.root }], sessions: [seeded] }));
+    const stateBefore = readFileSync(stateFile, 'utf8');
     try {
       session = await launchBuiltOn(fx.env({ COCKPIT_TEST_DAEMON_BUILD: build }), dataDir, home);
       const { page } = session;
       await page.getByText(versionLabel).waitFor();
       const reason = reasonOf(session.output());
       expect(reason).toContain(home);
+
+      // The state is read from state.json: the project, its workspace and the session are listed with no daemon.
+      await page.getByTitle(repo.root, { exact: true }).first().waitFor();
+      await page.getByTitle(worktree, { exact: true }).first().waitFor();
+      await page.locator('aside').getByRole('link', { name: seeded.name }).waitFor();
 
       // The failure view: title, subtitle, the reason in monospace and "Try again", on a workspace page and on a session page.
       const expectFailureView = async () => {
@@ -473,13 +483,6 @@ describe('daemon: built app, the daemon cannot start', () => {
         await page.getByRole('button', { name: 'Try again', exact: true }).waitFor();
         expect(await page.getByRole('button', { name: 'Show log', exact: true }).count(), 'no log file exists').toBe(0);
       };
-      // Projects can be added though the daemon is down (worktrees need the home folder: this one is made with git).
-      await stubPicker(session, repo.root);
-      expect((await page.evaluate(() => (window as unknown as ApiWindow).api.projects!.add!())).status).toBe('added');
-      expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).projects.map((p: { path: string }) => p.path)).toEqual([repo.root]);
-      const worktree = join(fx.root, 'wt-view');
-      addWorktree(repo.root, 'view', worktree);
-      await page.evaluate(() => window.dispatchEvent(new Event('focus')));
       await page.getByTitle(worktree, { exact: true }).first().click();
       await expectFailureView();
       expect(await page.locator('[role="tablist"]').count(), 'the view replaces the panes').toBe(0);
@@ -494,17 +497,32 @@ describe('daemon: built app, the daemon cannot start', () => {
 
       const spawned = await page.evaluate(() => (window as unknown as ApiWindow).api.pty!.spawn!({ cols: 80, rows: 24 }).then(() => 'spawned', (error: Error) => error.message));
       expect(spawned).toContain(reason);
-      const started = await page.evaluate(() => (window as unknown as ApiWindow).api.sessions!.start!('claude-code', { cols: 80, rows: 24 }, {}));
-      expect(started.status).toBe('refused');
-      expect(started.message).toContain(reason);
-      expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).sessions, 'only the seeded session').toEqual([seeded]);
 
-      // Projects can still be removed.
-      await page.evaluate((root) => (window as unknown as ApiWindow).api.projects!.remove!(root), repo.root);
-      expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).projects ?? []).toEqual([]);
+      // Every write is refused with the reason, as a refusal or as an error: nothing is accepted.
+      await stubPicker(session, other.root);
+      const outcomes = await page.evaluate(async (root) => {
+        const api = (window as unknown as ApiWindow).api;
+        const settle = async (call: () => Promise<unknown>) => {
+          try {
+            const result = (await call()) as { status?: string; message?: string } | undefined;
+            return result?.status === 'refused' ? (result.message ?? '') : `accepted: ${JSON.stringify(result)}`;
+          } catch (error) {
+            return (error as Error).message;
+          }
+        };
+        return {
+          add: await settle(() => api.projects!.add!()),
+          remove: await settle(() => api.projects!.remove!(root)),
+          create: await settle(() => api.workspaces!.create!(root, 'refused-task', 'main')),
+          start: await settle(() => api.sessions!.start!('claude-code', { cols: 80, rows: 24 }, {})),
+        };
+      }, repo.root);
+      for (const [what, message] of Object.entries(outcomes)) expect(message, `${what} is refused with the daemon's reason`).toContain(reason);
+      expect(readFileSync(stateFile, 'utf8'), 'state.json is unchanged').toBe(stateBefore);
       expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
     } finally {
       rmSync(fx.root, { recursive: true, force: true });
+      rmSync(other.parent, { recursive: true, force: true });
     }
   });
 
