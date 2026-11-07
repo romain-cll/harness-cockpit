@@ -15,6 +15,11 @@ npmRebuild: false
 asarUnpack:
   - node_modules/node-pty/**
 mac:
-  # Ad-hoc signed until a Developer ID certificate is set up for distribution.
+  # Test-build defaults: ad-hoc signed, no hardened runtime. `package:signed` overrides both
+  # (Developer ID, hardened runtime, notarization) in signed-app.yml.
   identity: '-'
   hardenedRuntime: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.inherit.plist
+  extendInfo:
+    NSAppleEventsUsageDescription: A program run in a Cockpit terminal wants to control another app.
