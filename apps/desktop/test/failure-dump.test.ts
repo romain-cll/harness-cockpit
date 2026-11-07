@@ -7,16 +7,14 @@ import { evaluateUntil, reportFailedWaits } from './launch';
 // reads the report makes. `reportFailedWaits(task)` is the body of the `afterEach` of `launch.ts`: it appends to
 // `task.result.errors[0].message` and resolves.
 
-// How a source of the dump reads as unavailable.
-const UNREADABLE = /unreadable|unavailable|could not be read|cannot be read|not readable/i;
-
 function fakeFrame(reads: 'answer' | 'reject') {
   let release = () => {};
   const calls: unknown[] = [];
   const evaluate = (script: unknown) => {
     calls.push(script);
     if (calls.length === 1) return new Promise<void>((resolve) => (release = resolve));
-    return reads === 'reject' ? Promise.reject(new Error('Target page, context or browser has been closed')) : Promise.resolve(undefined);
+    // 'answer': the page reads fine, whatever the report asks (an empty page dump).
+    return reads === 'reject' ? Promise.reject(new Error('Target page, context or browser has been closed')) : Promise.resolve({ tabs: [], terminals: [], connected: [false] });
   };
   const frame: { evaluate: typeof evaluate; page(): unknown } = { evaluate, page: () => page };
   const page = { evaluate, mainFrame: () => frame, isClosed: () => reads === 'reject' };
@@ -55,7 +53,7 @@ describe('reportFailedWaits', () => {
     const failed = task('fail', 'boom');
     await reportFailedWaits(failed.task);
     expect(failed.error!.message.startsWith('boom')).toBe(true);
-    expect(failed.error!.message).toMatch(UNREADABLE);
+    expect(failed.error!.message).toContain('  tabs, terminals and waited elements: unreadable');
     fake.release();
     await wait;
   });
@@ -65,8 +63,12 @@ describe('reportFailedWaits', () => {
     const wait = startWait(fake.frame);
     const failed = task('fail', 'boom');
     await reportFailedWaits(failed.task);
-    expect(failed.error!.message.startsWith('boom')).toBe(true);
-    expect(failed.error!.message).toMatch(UNREADABLE);
+    const message = failed.error!.message;
+    expect(message.startsWith('boom')).toBe(true);
+    expect(message).toContain("  daemon's screens: unreadable");
+    // The page answered: only the daemon is reported unreadable.
+    expect(message).toContain('  terminals (.xterm):');
+    expect(message).not.toContain('tabs, terminals and waited elements: unreadable');
     fake.release();
     await wait;
   });

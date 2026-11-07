@@ -400,12 +400,24 @@ export const describeMode = (mode: string, launch: () => Promise<Session>) => de
     expect(message).not.toContain('setup-ran');
     // AC2: the daemon's screen holds the line, once: the rows of the DOM do not.
     expect(message.split('gone-line-42')).toHaveLength(2);
-    // AC3: the tabs with the selected one, and the rows of the terminal that is not waited (the daemon's screen of
-    // that terminal holds the line too, so it appears twice).
+    // AC3: the tabs with the selected one, and the rows of each terminal with the waited one marked.
     for (const tab of tabs) expect(message).toContain(tab);
     expect(message).toMatch(/selected/i);
-    expect(message).toMatch(/waited/i);
-    expect(message.split('other-term-42').length - 1).toBeGreaterThanOrEqual(2);
+    // The page's terminals: the entry headers (`#0`, `#1`) carry `(waited)` and `(visible)`, their rows follow.
+    const section = message.slice(message.indexOf('  terminals (.xterm):'), message.indexOf('  waited elements:'));
+    const entries = section.split(/\n(?=    #\d+)/).slice(1);
+    expect(entries, 'one entry per terminal').toHaveLength(2);
+    const header = (entry: string) => entry.split('\n')[0]!;
+    const waitedEntries = entries.filter((entry) => header(entry).includes('(waited)'));
+    expect(waitedEntries, 'exactly one entry is marked waited').toHaveLength(1);
+    const otherEntries = entries.filter((entry) => entry.includes('other-term-42'));
+    expect(otherEntries, 'the other terminal\'s row sits under one entry').toHaveLength(1);
+    expect(header(otherEntries[0]!), 'that entry is not the waited one').not.toContain('(waited)');
+    expect(waitedEntries[0], 'the waited terminal does not hold it').not.toContain('other-term-42');
+    // Only the selected terminal (the waited one) is on screen.
+    const visibleEntries = entries.filter((entry) => header(entry).includes('(visible)'));
+    expect(visibleEntries, 'exactly one entry is marked visible').toHaveLength(1);
+    expect(visibleEntries[0]).toBe(waitedEntries[0]);
     // AC4: connected while in the document.
     expect(message).toMatch(/(?<!not |dis)connected/);
     expect(message).not.toMatch(/not connected/);
