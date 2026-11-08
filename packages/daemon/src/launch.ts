@@ -38,11 +38,17 @@ export function readLaunch(home: string): Launch | undefined {
   }
 }
 
+// What an app started from the Dock gives its daemon (launchd's base). The caller's other variables (a tmux, a
+// virtualenv, a Claude Code session) are not the daemon's to hand to the sessions it starts.
+const BASE_VARIABLES = ['HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'LANG'] as const;
+const BASE_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+
 /**
  * Starts the daemon of `launch`: the app's own Electron binary as Node, detached into its own session so it
- * outlives whoever started it, with its output in the log. `stdio[3]` is the pipe it says it is ready on.
+ * outlives whoever started it, with its output in the log. `stdio[3]` is the pipe it says it is ready on. Its
+ * environment is launchd's base (from `env`, the caller's) plus the Cockpit variables.
  */
-export function startDaemonProcess(home: string, launch: Launch): ChildProcess {
+export function startDaemonProcess(home: string, launch: Launch, env: NodeJS.ProcessEnv = process.env): ChildProcess {
   mkdirSync(home, { recursive: true });
   const { log: logPath } = daemonFiles(home, PROTOCOL_VERSION, launch.build);
   const log = openSync(logPath, 'a');
@@ -50,7 +56,14 @@ export function startDaemonProcess(home: string, launch: Launch): ChildProcess {
     const child = spawn(launch.executable, [launch.bundle, '--cockpit-daemon', launch.build], {
       detached: true,
       stdio: ['ignore', log, log, 'pipe'],
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', COCKPIT_HOME: home, COCKPIT_STATE_DIR: launch.stateDir, COCKPIT_CLI: launch.cli },
+      env: {
+        ...Object.fromEntries(BASE_VARIABLES.flatMap((name) => (env[name] === undefined ? [] : [[name, env[name]]]))),
+        PATH: BASE_PATH,
+        ELECTRON_RUN_AS_NODE: '1',
+        COCKPIT_HOME: home,
+        COCKPIT_STATE_DIR: launch.stateDir,
+        COCKPIT_CLI: launch.cli,
+      },
     });
     child.on('error', (error) => {
       appendFileSync(logPath, `${error.message}\n`);

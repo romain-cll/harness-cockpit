@@ -1,6 +1,9 @@
 /** The protocol this build speaks; a daemon's files are named after it. */
 export const PROTOCOL_VERSION = 1;
 
+/** What a daemon another build superseded answers to a write. */
+export const WRONG_BUILD = 'this background service belongs to another build of Cockpit';
+
 import type { Session, State } from '@cockpit/state';
 
 export { SCROLLBACK } from './scrollback';
@@ -203,6 +206,8 @@ export interface AvailableHarness {
 export type StartSessionResult = { status: 'started'; session: Session; terminal: TerminalInfo } | (Refused & { terminal?: TerminalInfo });
 
 export interface RemoveOptions {
+  /** Run the repository's teardown first, as the app's dialog does in a terminal; one that fails refuses, unless `force`. */
+  teardown?: boolean;
   force?: boolean;
   deleteBranch?: boolean;
   forceBranch?: string;
@@ -220,7 +225,7 @@ export interface TerminalSize {
 export interface Calls {
   state: { params: Record<string, never>; result: StateSnapshot };
   'project-list': { params: Record<string, never>; result: Project[] };
-  /** The detected harnesses. `again` detects again; `known` is the result of an earlier daemon, which the app keeps for its launch. */
+  /** The detected harnesses. `again` detects again; `known` is the app's own detection, which the daemon then uses. */
   harnesses: { params: { again?: boolean; known?: AvailableHarness[] }; result: AvailableHarness[] };
   'project-add': { params: { folder: string }; result: AddProjectResult };
   'project-remove': { params: { path: string }; result: void };

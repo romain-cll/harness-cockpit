@@ -1,4 +1,4 @@
-import { rootRouteId, useLoaderData, useNavigate, useRouter, useSearch } from '@tanstack/react-router';
+import { rootRouteId, useLoaderData, useNavigate, useRouter, useRouterState, useSearch } from '@tanstack/react-router';
 import { ArrowUpIcon, ChevronDownIcon, GitBranchIcon, LoaderCircleIcon, RefreshCwIcon } from 'lucide-react';
 import { useEffect, useId, useState, useSyncExternalStore, type KeyboardEvent } from 'react';
 import type { AvailableHarness, BranchesResult, Project } from '../../shared/api';
@@ -251,6 +251,9 @@ function Composer() {
   // The project whose Worktree switch is off (the agent then runs in its folder); the switch is on again once the project changes or the composer is left.
   const [withoutWorktree, setWithoutWorktree] = useState<string>();
   const [sending, setSending] = useState(false);
+  // Another project was asked for (the page is changing, behind a reload under way): this form is about to be replaced, and
+  // what it would send is not what the user chose.
+  const changing = useRouterState({ select: (state) => state.location.href !== state.resolvedLocation?.href });
   // Why the last send was refused, cleared when the next one starts.
   const [message, setMessage] = useState<string>();
 
@@ -277,7 +280,7 @@ function Composer() {
         ? choice
         : (harnesses[0]?.id ?? TERMINAL);
   const task = prompt.trim();
-  const canSend = task !== '' && agent !== undefined && (project === undefined || !worktree || (branches?.status === 'listed' && base !== null)) && !sending;
+  const canSend = task !== '' && agent !== undefined && (project === undefined || !worktree || (branches?.status === 'listed' && base !== null)) && !sending && !changing;
 
   async function send() {
     if (!canSend || agent === undefined) return;

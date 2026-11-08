@@ -39,7 +39,7 @@ import {
   type TerminalKind,
 } from '@cockpit/daemon';
 import { createPullRequest, findPullRequest, GitHubError, mergePullRequest, pullRequestStates } from '@cockpit/github';
-import { harnesses } from '@cockpit/harnesses';
+import { detectHarnesses, harnesses } from '@cockpit/harnesses';
 import { apps, defaultApplicationDirs, detectApps, LaunchError, openIn, reveal, type App } from '@cockpit/launchers';
 import { NewerStateError, readState, type State } from '@cockpit/state';
 import {
@@ -424,6 +424,14 @@ async function adopt(client: DaemonClient, own: boolean): Promise<Daemon> {
     lostTerminals += [...daemon.terminals.values()].filter(({ kind, closing }) => kind !== 'commands' && !closing).length;
     for (const remote of daemon.terminals.keys()) end(daemon, remote, { exitCode: null, signal: null });
     if (ownDaemon === daemon) ownDaemon = undefined;
+    // The file is the truth: a daemon killed after it saved, before its `state` event was sent, left the replica behind.
+    if (own) {
+      try {
+        applySnapshot({ state: readState(app.getPath('userData')), setups, failedSetups });
+      } catch {
+        // Unreadable: the replica stays as it was.
+      }
+    }
     announceDaemonChange();
   });
   if (own) {
@@ -470,18 +478,21 @@ async function writable(): Promise<Daemon> {
   }
 }
 
-// The harnesses the daemon detected, once per launch: kept here, and given to a daemon that starts again, which does
-// not detect again for this app. Never at startup: detecting runs each CLI's `--version`. `again` replaces the result
-// every later caller shares.
+// The harnesses, detected here once per launch (the composer and the "+" menu list them with no daemon): given to the
+// daemon, which starts the sessions, when they are detected and when one is adopted. Never at startup: detecting runs each
+// CLI's `--version`. `again` replaces the result every later caller shares.
 let detection: Promise<AvailableHarness[]> | undefined;
 let detectedList: AvailableHarness[] | undefined;
 function detected(again = false): Promise<AvailableHarness[]> {
   if (again) detectedList = detection = undefined;
-  const current = (detection ??= writable().then((daemon) => daemon.client.call('harnesses', { again })));
-  current.then(
-    (list) => void (detection === current && (detectedList = list)),
-    () => void (detection === current && (detection = undefined)),
-  );
+  const current = (detection ??= shellEnv
+    .then((env) => detectHarnesses(env))
+    .then((list) => list.map(({ id, version, path }) => ({ id, name: harnesses.find((harness) => harness.id === id)!.name, version, path }))));
+  void current.then((list) => {
+    if (detection !== current) return;
+    detectedList = list;
+    if (ownDaemon?.alive) void ownDaemon.client.call('harnesses', { known: list }).catch(() => {});
+  });
   return current;
 }
 
@@ -794,6 +805,7 @@ function startProjects({ spawnFor, endingsOf }: ReturnType<typeof startTerminals
   ipcMain.handle('projects:init', (event, folder: string): Promise<AddProjectResult> => {
     if (!isFromApp(event)) throw new Error('projects:init refused: unexpected origin');
     return refusing(async () => {
+      await writable();
       await initRepository({ path: folder, env: await shellEnv });
       return addMade(folder);
     });
@@ -828,6 +840,8 @@ function startProjects({ spawnFor, endingsOf }: ReturnType<typeof startTerminals
     event.sender.once('did-navigate', abort);
     event.sender.once('destroyed', abort);
     try {
+      // Refused before any git work when the daemon that will add the project is down.
+      await writable();
       const env = await shellEnv;
       await cloneRepository({ url: request.url, path, env, signal: controller.signal });
       return await addMade(path);
@@ -855,6 +869,7 @@ function startProjects({ spawnFor, endingsOf }: ReturnType<typeof startTerminals
     const path = join(request.location, request.name);
     if (existsSync(path)) return { status: 'refused', message: `${path} already exists.` };
     return refusing(async () => {
+      await writable();
       try {
         await mkdir(request.location, { recursive: true });
         await mkdir(path);
@@ -871,9 +886,12 @@ function startProjects({ spawnFor, endingsOf }: ReturnType<typeof startTerminals
     });
   });
 
-  ipcMain.handle('projects:remove', async (event, path: string) => {
+  ipcMain.handle('projects:remove', async (event, path: string): Promise<Refused | undefined> => {
     if (!isFromApp(event)) throw new Error('projects:remove refused: unexpected origin');
-    await (await writable()).client.call('project-remove', { path });
+    return refusing(async () => {
+      await (await writable()).client.call('project-remove', { path });
+      return undefined;
+    });
   });
 
   // The project at `from` moved: the user picks its repository again.
@@ -988,15 +1006,18 @@ function startProjects({ spawnFor, endingsOf }: ReturnType<typeof startTerminals
     const entry = apps.find(({ id }) => id === appId);
     const bundle = entry && (await detectApps(applicationDirs)).find(({ id }) => id === entry.id);
     if (!entry || !bundle) return { status: 'refused', message: `${entry?.name ?? appId} is not installed.` };
+    // Remembering the app is a write: with the daemon down it is refused before the app is opened.
+    const daemon = state[entry.kind] === entry.id ? undefined : await refusing(writable);
+    if (daemon && 'status' in daemon) return daemon;
     try {
       await openIn(bundle.path, path, { env: await shellEnv });
     } catch (error) {
       if (!(error instanceof LaunchError)) throw error;
       return { status: 'refused', message: `Could not open ${path} in ${entry.name}: ${error.message}` };
     }
-    if (state[entry.kind] === entry.id) return { status: 'opened' };
+    if (!daemon) return { status: 'opened' };
     try {
-      await (await writable()).client.call('remember-app', { kind: entry.kind, id: entry.id });
+      await daemon.client.call('remember-app', { kind: entry.kind, id: entry.id });
     } catch (error) {
       return { status: 'refused', message: error instanceof Error ? error.message : String(error) };
     }

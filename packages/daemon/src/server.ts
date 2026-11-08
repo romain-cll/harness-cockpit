@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { Socket } from 'node:net';
 import { createActions } from './actions';
 import { clearStaleSocket, daemonFiles } from './paths';
-import { encode, lineReader, PROTOCOL_VERSION, RESIZE_EVENTS_HEADER, UPGRADE, WRITES, type Hello, type Message, type Request, type SessionEventName, type SessionReport, type SetupEventName, type TerminalInfo } from './protocol';
+import { encode, lineReader, PROTOCOL_VERSION, RESIZE_EVENTS_HEADER, UPGRADE, WRITES, WRONG_BUILD, type Hello, type Message, type Request, type SessionEventName, type SessionReport, type SetupEventName, type TerminalInfo } from './protocol';
 import { SESSION_EVENTS, SETUP_EVENTS } from './status';
 import { createTerminals, type Subscriber } from './terminals';
 
@@ -28,7 +28,6 @@ export interface Daemon {
 }
 
 const MAX_BODY_BYTES = 64 * 1024;
-const WRONG_BUILD = 'this background service belongs to another build of Cockpit';
 
 interface Connection extends Subscriber {
   socket: Socket;
@@ -77,6 +76,7 @@ export async function runDaemon({ home, build, stateDir, cli = '' }: DaemonOptio
           cli,
           socket: files.socket,
           terminals,
+          superseded: () => superseded,
           announceState: (snapshot) => broadcast({ type: 'state', ...snapshot }),
           announceSettled: (settled) => broadcast({ type: 'settled', ...settled }),
           announceSpawned: (terminal, requester) => broadcast({ type: 'spawned', terminal }, requester as Connection | undefined),
@@ -88,8 +88,7 @@ export async function runDaemon({ home, build, stateDir, cli = '' }: DaemonOptio
   const server = createServer((req, res) => handle(req, res, token, {
     onSessionEvent: (report) => {
       if (!terminals.report(report)) return false;
-      // A daemon another build superseded stores nothing: the app forwards the report to the daemon of its build.
-      if (!superseded) actions?.report(report);
+      actions?.report(report);
       broadcast({ type: 'status', ...report });
       return true;
     },

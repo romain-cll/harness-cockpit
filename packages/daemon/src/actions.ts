@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { mkdirSync, rmSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { detectHarnesses, harnesses, statusLaunch, type DetectedHarness, type Harness } from '@cockpit/harnesses';
@@ -26,6 +27,7 @@ import {
   listBranches,
   listWorktrees,
   nameWorkspace,
+  readWorkspaceConfig,
   removeWorktree,
   repairWorktrees,
   reservedPath,
@@ -52,6 +54,7 @@ import type {
   TerminalKind,
   TerminalSize,
 } from './protocol';
+import { WRONG_BUILD } from './protocol';
 import type { createTerminals, Subscriber } from './terminals';
 
 export interface ActionsOptions {
@@ -63,6 +66,8 @@ export interface ActionsOptions {
   /** This daemon's socket: the `cockpit` commands of a terminal report to it. */
   socket: string;
   terminals: ReturnType<typeof createTerminals>;
+  /** Another build's daemon took over: this one writes nothing to `state.json`. */
+  superseded(): boolean;
   /** Tells every connection the state after a change. */
   announceState(snapshot: StateSnapshot): void;
   announceSettled(settled: SettledSetup): void;
@@ -81,7 +86,7 @@ const isFile = (path: string) => statSync(path, { throwIfNoEntry: false })?.isFi
  * The state of the app and what changes it: `state.json` is loaded here and written only here. Everything a
  * `call` request runs lives in this closure, which the server dispatches to.
  */
-export function createActions({ home, stateDir, cli, socket, terminals, announceState, announceSettled, announceSpawned }: ActionsOptions) {
+export function createActions({ home, stateDir, cli, socket, terminals, superseded, announceState, announceSettled, announceSpawned }: ActionsOptions) {
   const worktreesRoot = join(home, 'worktrees');
   // Throws when the file cannot be loaded (a newer version): the daemon does not start.
   let state: State = loadState(stateDir);
@@ -105,8 +110,10 @@ export function createActions({ home, stateDir, cli, socket, terminals, announce
   const snapshot = (): StateSnapshot => ({ state, setups: [...setups.values()], failedSetups });
   const announce = () => announceState(snapshot());
 
-  // Saves `next` and makes it the state; a refusal when the save fails leaves the state as it was.
+  // Saves `next` and makes it the state; a refusal when the save fails leaves the state as it was. The one way
+  // to the file: a superseded daemon's copy is stale, and what the newer build wrote since must stay.
   function commit(next: State): Refused | undefined {
+    if (superseded()) return refuse(WRONG_BUILD);
     try {
       saveState(stateDir, next);
     } catch (error) {
@@ -128,6 +135,26 @@ export function createActions({ home, stateDir, cli, socket, terminals, announce
   function markClosed(match: (session: Session) => boolean): void {
     const open = state.sessions.filter((session) => session.open && match(session));
     if (open.length > 0) commit(open.reduce((current, { id }) => closeSession(current, id), state));
+  }
+
+  // A removed workspace keeps no session: its terminals end (the answer waits for their exits), then its marks close.
+  async function endWorkspace(path: string): Promise<void> {
+    await terminals.end(({ workspace }) => workspace === path);
+    markClosedAfterAnswer(({ directory }) => directory === path);
+  }
+
+  // The repository's teardown, as the app's dialog runs it: `cockpit teardown` in the worktree with the sessions'
+  // environment. A refusal says how it failed, `undefined` when it passed or there was none.
+  async function runTeardown(project: string, path: string): Promise<string | undefined> {
+    const env = await loginEnv();
+    if ((await readWorkspaceConfig({ repo: project, path, env })).teardown.length === 0) return undefined;
+    const sessionEnv = terminalEnv(await context());
+    const code = await new Promise<number | null>((resolve, reject) => {
+      const child = spawn(cli, ['teardown'], { cwd: path, env: sessionEnv, stdio: 'ignore' });
+      child.on('error', reject);
+      child.on('close', resolve);
+    });
+    return code === 0 ? undefined : `The teardown of ${basename(path)} failed (${code === null ? 'killed' : `exit ${code}`}).`;
   }
 
   // Once the answer is on its way: closing the marks is no part of what a removal answers, and the `state` event that
@@ -155,15 +182,15 @@ export function createActions({ home, stateDir, cli, socket, terminals, announce
   // Runs `action` for a project of the state, turning a git failure into a refusal (or into what `handle` makes of it).
   async function forProject<Result extends { status: string }>(
     project: string,
-    action: () => Promise<Result>,
-    handle: (error: WorkspaceError) => Result | undefined = () => undefined,
+    action: () => Promise<Result | Refused>,
+    handle: (error: WorkspaceError) => Result | Refused | undefined | Promise<Result | Refused | undefined> = () => undefined,
   ): Promise<Result | Refused> {
     if (!state.projects.some((entry) => entry.path === project)) return refuse(`${project} is not a project in Cockpit.`);
     try {
       return await action();
     } catch (error) {
       if (!(error instanceof WorkspaceError)) throw error;
-      return handle(error) ?? refuse(describeFailure(error, project));
+      return (await handle(error)) ?? refuse(describeFailure(error, project));
     }
   }
 
@@ -341,8 +368,8 @@ export function createActions({ home, stateDir, cli, socket, terminals, announce
     },
 
     harnesses: async ({ again, known }) => {
-      if (again) detection = undefined;
-      else if (known && detection === undefined) detection = Promise.resolve(known as DetectedHarness[]);
+      if (known) detection = Promise.resolve(known as DetectedHarness[]);
+      else if (again) detection = undefined;
       return (await detected()).map(({ id, version, path }) => ({ id, name: harnesses.find((harness) => harness.id === id)!.name, version, path }));
     },
 
@@ -444,13 +471,15 @@ export function createActions({ home, stateDir, cli, socket, terminals, announce
       forProject<Exclude<RemoveWorkspaceResult, Refused>>(
         project,
         async () => {
-          // The folder is the user's: only the mark goes, and the sessions close.
+          // The folder is the user's: only the mark goes, and the sessions end.
           if (isMainWorkspace(state, project, path)) {
             const refused = commit(setMainWorkspace(state, project, false));
             if (refused) throw new Error(refused.message);
-            markClosedAfterAnswer(({ directory }) => directory === path);
+            await endWorkspace(path);
             return { status: 'removed', branchKept: false };
           }
+          const failed = options.teardown ? await runTeardown(project, path) : undefined;
+          if (failed && !options.force) return refuse(failed);
           await removeWorktree({
             repo: project,
             path,
@@ -460,13 +489,13 @@ export function createActions({ home, stateDir, cli, socket, terminals, announce
             env: await loginEnv(),
           });
           announce();
-          markClosedAfterAnswer(({ directory }) => directory === path);
+          await endWorkspace(path);
           return { status: 'removed', branchKept: false };
         },
-        (error) => {
+        async (error) => {
           if (error.code === 'BRANCH_NOT_MERGED') {
             announce();
-            markClosedAfterAnswer(({ directory }) => directory === path);
+            await endWorkspace(path);
             return { status: 'removed', branchKept: true };
           }
           if (error.code === 'DIRTY_WORKTREE') return { status: 'dirty' };

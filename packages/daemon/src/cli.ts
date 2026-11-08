@@ -99,7 +99,7 @@ async function connectToDaemon(env: NodeJS.ProcessEnv): Promise<DaemonClient> {
   const home = homeOf(env);
   const launch = readLaunch(home);
   if (!launch) throw new Error(OPEN_COCKPIT);
-  return ensureDaemon({ home, build: launch.build, spawn: () => startDaemonProcess(home, launch) });
+  return ensureDaemon({ home, build: launch.build, spawn: () => startDaemonProcess(home, launch, env) });
 }
 
 /**
@@ -155,8 +155,8 @@ function stateCommand(command: string | undefined, args: readonly string[]): ((c
     const workspace = text('workspace');
     if (subcommand === 'delete' && workspace !== undefined && only('project', 'workspace', 'force', 'delete-branch', 'force-branch')) {
       const forceBranch = text('force-branch');
-      // Forcing a branch's deletion is deleting it.
-      const removal: RemoveOptions = { force: options!.has('force'), deleteBranch: options!.has('delete-branch') || forceBranch !== undefined, forceBranch };
+      // Forcing a branch's deletion is deleting it. The teardown the app's dialog runs first runs here.
+      const removal: RemoveOptions = { teardown: true, force: options!.has('force'), deleteBranch: options!.has('delete-branch') || forceBranch !== undefined, forceBranch };
       return async (client) => {
         const result = await client.call('workspace-remove', { project, path: workspace, options: removal });
         return { value: result, ok: result.status === 'removed' };

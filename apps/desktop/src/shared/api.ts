@@ -365,8 +365,8 @@ export interface Api {
     home(): Promise<string>;
     /** Opens the folder picker for the project whose folder moved and points the project at the repository picked. */
     updatePath(from: string): Promise<UpdatePathResult>;
-    /** Forgets the project; its files stay on disk. */
-    remove(path: string): Promise<void>;
+    /** Forgets the project; its files stay on disk. Refused when Cockpit cannot save its data. */
+    remove(path: string): Promise<Refused | undefined>;
     /** Shows the project's folder in the Finder. Refused when the path is not a project of Cockpit. */
     reveal(path: string): Promise<OpenWorkspaceResult>;
     /** Opens the project's folder in the detected app `app`, and remembers it. Refused when the path is not a project of Cockpit. */

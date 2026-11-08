@@ -28,6 +28,9 @@ interface Terminal {
   fromTitle?: boolean;
   /** A client, or the end of the daemon, asked it to end: its exit is not one it chose. */
   killed?: boolean;
+  /** Settles once it has exited. */
+  gone: Promise<void>;
+  exited(): void;
 }
 
 export interface TerminalEvents {
@@ -98,7 +101,11 @@ export function createTerminals({ onExit, onTitle, onTitleStatus }: TerminalEven
 
       const id = ++lastId;
       const info: TerminalInfo = { id, kind, command, cwd, cols, rows, ...(sessionId !== undefined && { sessionId }), ...(workspace !== undefined && { workspace }) };
+      let exited!: () => void;
+      const gone = new Promise<void>((resolve) => (exited = resolve));
       const terminal: Terminal = {
+        gone,
+        exited,
         info,
         pty,
         headless,
@@ -160,6 +167,7 @@ export function createTerminals({ onExit, onTitle, onTitleStatus }: TerminalEven
         terminals.delete(id);
         headless.dispose();
         onExit(info, { exitCode, signal: signal ?? null }, terminal.killed === true);
+        terminal.exited();
         if (terminals.size === 0) for (const resolve of emptied.splice(0)) resolve();
       });
       return id;
@@ -208,6 +216,13 @@ export function createTerminals({ onExit, onTitle, onTitleStatus }: TerminalEven
     },
 
     kill: (id: unknown) => withTerminal(id, hangUp),
+
+    /** Ends the terminals `match` picks; settles once each has exited (a hang-up ignored is followed by SIGKILL). */
+    async end(match: (info: TerminalInfo) => boolean): Promise<void> {
+      const ending = [...terminals.entries()].filter(([, { info }]) => match(info));
+      for (const [id] of ending) withTerminal(id, hangUp);
+      await Promise.all(ending.map(([, { gone }]) => gone));
+    },
 
     /** Stops sending to a connection that closed, and ends the `commands` terminals it owns. */
     release(subscriber: Subscriber): void {
