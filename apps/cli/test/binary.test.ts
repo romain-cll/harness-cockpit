@@ -19,8 +19,10 @@ afterEach(() => {
   for (const cleanup of cleanups.splice(0).reverse()) cleanup();
 });
 
-beforeAll(() => {
+beforeAll(async () => {
   if (!existsSync(BINARY)) throw new Error(`${BINARY} is missing: run bun run build in apps/cli first`);
+  // macOS assesses a newly built executable on its first launch (about 0.5 s): absorb it here, with a usage error that touches no daemon, so the timed tests measure the binary only.
+  await run([], {});
 });
 
 /** A short folder: macOS limits a socket path to 103 bytes. */
