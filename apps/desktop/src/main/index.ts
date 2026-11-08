@@ -490,6 +490,13 @@ async function adopt(client: DaemonClient): Promise<Daemon> {
     const terminal = daemon.terminals.get(id);
     if (terminal?.owner && !terminal.owner.isDestroyed()) terminal.owner.send('pty:data', terminal.appId, data, seq);
   });
+  client.onResize(({ id, seq, cols, rows }) => {
+    const terminal = daemon.terminals.get(id);
+    if (!terminal) return;
+    terminal.cols = cols;
+    terminal.rows = rows;
+    if (terminal.owner && !terminal.owner.isDestroyed()) terminal.owner.send('pty:resized', terminal.appId, cols, rows, seq);
+  });
   client.onExit(({ id, exitCode, signal }) => end(daemon, id, { exitCode, signal }));
   client.onStatus(reportSessionStatus);
   client.onTitle((event) => void nameFromTitle(event));
@@ -659,10 +666,7 @@ function startTerminals() {
   });
   ipcMain.on('pty:resize', (event, id: number, cols: number, rows: number) => {
     const terminal = isFromApp(event) ? terminals.get(id) : undefined;
-    if (!terminal) return;
-    terminal.cols = cols;
-    terminal.rows = rows;
-    terminal.daemon.client.resize(terminal.id, cols, rows);
+    if (terminal) terminal.daemon.client.resize(terminal.id, cols, rows);
   });
   ipcMain.on('pty:kill', (event, id: number) => {
     if (isFromApp(event)) kill(id);

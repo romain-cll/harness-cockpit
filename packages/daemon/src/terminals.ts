@@ -6,6 +6,8 @@ import { AGENT_MARKER_OSC, SCROLLBACK, type Attached, type SessionEventName, typ
 /** Who receives what a terminal produces: one connection. */
 export interface Subscriber {
   data(terminal: number, seq: number, data: string): void;
+  /** The pty's size changed; numbered like a chunk of output, in the same sequence. */
+  resize(terminal: number, seq: number, cols: number, rows: number): void;
   exit(terminal: number, exit: TerminalExit): void;
   /** The title a `session` terminal's program set (OSC 0 or 2), once per change. */
   title(sessionId: string, title: string): void;
@@ -16,7 +18,7 @@ interface Terminal {
   pty: IPty;
   headless: Headless;
   serializer: SerializeAddon;
-  /** The sequence number of the last chunk the pty produced. */
+  /** The sequence number of the last chunk the pty produced or size change it took. */
   seq: number;
   subscribers: Set<Subscriber>;
   /** The connection a `commands` terminal ends with. */
@@ -29,6 +31,9 @@ interface Terminal {
 
 /** How long a hung-up process has to end before it is killed. */
 const HANGUP_GRACE_MS = 1000;
+
+/** A size the headless terminal accepts: a positive integer (a request's size comes from JSON, unchecked). */
+const isSize = (value: unknown): value is number => Number.isInteger(value) && (value as number) > 0;
 
 /**
  * The terminals the daemon owns: node-pty sessions, each mirrored by a headless terminal that
@@ -163,7 +168,8 @@ export function createTerminals(onEnd: () => void, onTitleStatus: (report: Sessi
       const seq = terminal.seq;
       return new Promise((resolve) => {
         terminal.headless.write('', () => {
-          const { cols, rows } = terminal.info;
+          // The headless size, not the pty's: a resize queued after this write is not applied yet.
+          const { cols, rows } = terminal.headless;
           resolve({ cols, rows, seq, screen: terminal.serializer.serialize() });
         });
       });
@@ -171,13 +177,21 @@ export function createTerminals(onEnd: () => void, onTitleStatus: (report: Sessi
 
     write: (id: unknown, data: string) => withTerminal(id, ({ pty }) => pty.write(data)),
 
-    resize: (id: unknown, cols: number, rows: number) =>
+    resize: (id: unknown, cols: number, rows: number) => {
+      // The headless resize below runs in a write callback, outside `withTerminal`: a size it refuses would throw there and end the daemon.
+      if (!isSize(cols) || !isSize(rows)) return;
       withTerminal(id, (terminal) => {
+        const { info, headless } = terminal;
+        if (cols === info.cols && rows === info.rows) return;
         terminal.pty.resize(cols, rows);
-        terminal.headless.resize(cols, rows);
-        terminal.info.cols = cols;
-        terminal.info.rows = rows;
-      }),
+        info.cols = cols;
+        info.rows = rows;
+        const seq = ++terminal.seq;
+        // After the chunks written before: the headless terminal takes the size at the place of the event.
+        headless.write('', () => headless.resize(cols, rows));
+        for (const each of terminal.subscribers) each.resize(info.id, seq, cols, rows);
+      });
+    },
 
     kill: (id: unknown) => withTerminal(id, hangUp),
 

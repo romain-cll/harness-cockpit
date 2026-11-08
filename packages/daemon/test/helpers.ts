@@ -96,14 +96,29 @@ export function conditions(): { fire: () => void; when: (condition: () => boolea
   };
 }
 
+/** A size change a client heard of (`onResize`); `seq` is absent for a daemon that announces none. */
+export interface ResizeEvent {
+  id: unknown;
+  seq?: number;
+  cols: number;
+  rows: number;
+}
+
+/** `onResize` is optional here so that a client without it (before the feature) leaves the other tests running. */
+type ClientWithResize = DaemonClient & { onResize?(listener: (event: ResizeEvent) => void): void };
+
 export interface Connection {
   client: DaemonClient;
   data: Array<{ id: unknown; seq: number; data: string }>;
+  /** The size changes the client heard of, in order. */
+  resizes: ResizeEvent[];
+  /** The data and size events together, in the order the client got them. */
+  stream: Array<({ type: 'data' } & { id: unknown; seq: number; data: string }) | ({ type: 'resize' } & ResizeEvent)>;
   exits: Array<{ id: unknown; exitCode: number | null; signal: number | null }>;
   statuses: Array<{ sessionId: string; event: string; exitCode?: number | null; harnessSessionId?: string }>;
   closed: () => boolean;
   output: (id: unknown) => string;
-  /** Resolves once `condition()` holds, checked at once and at each data, exit, status or close event of this connection. */
+  /** Resolves once `condition()` holds, checked at once and at each data, resize, exit, status or close event of this connection. */
   when: (condition: () => boolean) => Promise<void>;
 }
 
@@ -115,6 +130,8 @@ export async function connectTo(socketPath: string, build = BUILD): Promise<Conn
     client,
     when,
     data: [],
+    resizes: [],
+    stream: [],
     exits: [],
     statuses: [],
     closed: () => closed,
@@ -125,7 +142,8 @@ export async function connectTo(socketPath: string, build = BUILD): Promise<Conn
         .join(''),
   };
   let closed = false;
-  client.onData((event) => void (connection.data.push(event), fire()));
+  client.onData((event) => void (connection.data.push(event), connection.stream.push({ type: 'data', ...event }), fire()));
+  (client as ClientWithResize).onResize?.((event) => void (connection.resizes.push(event), connection.stream.push({ type: 'resize', ...event }), fire()));
   client.onExit((event) => void (connection.exits.push(event), fire()));
   client.onStatus((event) => void (connection.statuses.push(event), fire()));
   client.onClose(() => void ((closed = true), fire()));

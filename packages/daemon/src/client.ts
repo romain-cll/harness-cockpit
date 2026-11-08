@@ -7,6 +7,7 @@ import {
   encode,
   lineReader,
   PROTOCOL_VERSION,
+  RESIZE_EVENTS_HEADER,
   UPGRADE,
   type Attached,
   type Hello,
@@ -31,10 +32,13 @@ export interface DaemonClient {
   /** Subscribes to the terminal's output and answers its screen; later data events have a higher `seq`. */
   attach(id: unknown): Promise<Attached>;
   write(id: unknown, data: string): void;
+  /** Asks for a size; the terminal takes it, and a client hears of it, through `onResize`. */
   resize(id: unknown, cols: number, rows: number): void;
   kill(id: unknown): void;
   /** A client receives the events of the terminals it spawned or attached. */
   onData(listener: (event: { id: number; seq: number; data: string }) => void): void;
+  /** A terminal's size changed; `seq` numbers it with the chunks of output. Absent from a daemon that sends no such event: the listeners then get the size at the `resize` call. */
+  onResize(listener: (event: { id: number; seq?: number; cols: number; rows: number }) => void): void;
   onExit(listener: (event: { id: number } & TerminalExit) => void): void;
   /** Everything a session reported (a hook, `cockpit setup`), for any session of the daemon. */
   onStatus(listener: (report: SessionReport) => void): void;
@@ -103,10 +107,10 @@ export function connectDaemon(socketPath: string, { timeoutMs = DEFAULT_TIMEOUT_
       res.resume();
       settle(() => reject(new Error(`the background service refused the connection (HTTP ${res.statusCode})`)));
     });
-    req.once('upgrade', (_res, socket: Socket, head) => {
+    req.once('upgrade', (res, socket: Socket, head) => {
       answered = true;
       if (settled) return socket.destroy();
-      settle(() => resolve(createClient(socket, head, socketPath, timeoutMs)));
+      settle(() => resolve(createClient(socket, head, socketPath, timeoutMs, res.headers[RESIZE_EVENTS_HEADER] === '1')));
     });
     req.end();
   });
@@ -149,10 +153,11 @@ export async function shutdownDaemon(socketPath: string): Promise<void> {
   if (status !== 202) throw new Error(`the background service refused to stop (HTTP ${status})`);
 }
 
-function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutMs: number): DaemonClient {
+function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutMs: number, resizeEvents: boolean): DaemonClient {
   let lastId = 0;
   const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();
   const dataListeners: Array<Parameters<DaemonClient['onData']>[0]> = [];
+  const resizeListeners: Array<Parameters<DaemonClient['onResize']>[0]> = [];
   const exitListeners: Array<Parameters<DaemonClient['onExit']>[0]> = [];
   const statusListeners: Array<Parameters<DaemonClient['onStatus']>[0]> = [];
   const titleListeners: Array<Parameters<DaemonClient['onTitle']>[0]> = [];
@@ -185,6 +190,9 @@ function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutM
     switch (message.type) {
       case 'data':
         dataListeners.forEach((listener) => listener({ id: message.terminal, seq: message.seq, data: message.data }));
+        break;
+      case 'resize':
+        resizeListeners.forEach((listener) => listener({ id: message.terminal, seq: message.seq, cols: message.cols, rows: message.rows }));
         break;
       case 'exit':
         exitListeners.forEach((listener) => listener({ id: message.terminal, exitCode: message.exitCode, signal: message.signal }));
@@ -240,9 +248,13 @@ function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutM
     list: () => call({ type: 'list' }),
     attach: (terminal) => call({ type: 'attach', terminal }),
     write: (terminal, data) => send({ type: 'write', terminal, data }),
-    resize: (terminal, cols, rows) => send({ type: 'resize', terminal, cols, rows }),
+    resize: (terminal, cols, rows) => {
+      send({ type: 'resize', terminal, cols, rows });
+      if (!resizeEvents) resizeListeners.forEach((listener) => listener({ id: terminal as number, cols, rows }));
+    },
     kill: (terminal) => send({ type: 'kill', terminal }),
     onData: (listener) => void dataListeners.push(listener),
+    onResize: (listener) => void resizeListeners.push(listener),
     onExit: (listener) => void exitListeners.push(listener),
     onStatus: (listener) => void statusListeners.push(listener),
     onTitle: (listener) => void titleListeners.push(listener),

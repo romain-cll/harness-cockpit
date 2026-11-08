@@ -357,3 +357,38 @@ describe('connectDaemon against a server that is not a daemon', () => {
     expect(refused).toEqual([`Bearer ${'a'.repeat(64)}`]);
   });
 });
+
+// COCKPIT-91: a daemon of an earlier protocol 1 build sends no `resize` event and its `hello` answer announces none.
+describe('a daemon that announces no size events (AC7)', () => {
+  test('AC7 — resize hands the new size to the resize listeners at once, with no sequence number, and still reaches the daemon', async () => {
+    const home = makeHome();
+    const files = daemonFiles(home, 1, BUILD);
+    writeFileSync(files.token, TOKEN);
+    let resizeRequested!: (request: unknown) => void;
+    const reachedDaemon = new Promise<unknown>((resolve) => (resizeRequested = resolve));
+    await listenFake(files.socket, ({ socket }) => {
+      socket.write(UPGRADED);
+      socket.on(
+        'data',
+        lineReader((message) => {
+          const { id, type } = message as { id: number; type: string };
+          // The answer of a daemon before the feature: protocol, build and pid, nothing else.
+          if (type === 'hello') socket.write(encode({ id, result: { protocol: 1, build: BUILD, pid: 4242 } }));
+          if (type === 'resize') resizeRequested(message);
+        }),
+      );
+    });
+    const client = await connectDaemon(files.socket);
+    onCleanup(() => client.close());
+    await client.hello(BUILD);
+    const heard: unknown[] = [];
+    // `onResize` does not exist before the feature.
+    (client as unknown as { onResize(listener: (event: unknown) => void): void }).onResize((event) => heard.push(event));
+
+    client.resize(7, 100, 30);
+
+    // At once: before the daemon could have answered anything.
+    expect(heard).toEqual([{ id: 7, cols: 100, rows: 30 }]);
+    expect(await reachedDaemon).toMatchObject({ type: 'resize', terminal: 7, cols: 100, rows: 30 });
+  });
+});

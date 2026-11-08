@@ -2,7 +2,7 @@ import type { ITheme, Terminal as XTerm } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import { useEffect, useRef } from 'react';
 import type { PtyExit } from '../../shared/api';
-import type { LiveTerminal } from './live-terminals';
+import { fitLiveTerminal, type LiveTerminal } from './live-terminals';
 
 const ANSI_COLORS = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'] as const;
 
@@ -56,11 +56,11 @@ export function Terminal({ live, focused, request }: { live: LiveTerminal; focus
   const container = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const { term, fit } = live;
+    const { term } = live;
     const element = container.current!;
     // A terminal in a hidden area has no size to fit to.
     const fitToArea = () => {
-      if (element.clientWidth > 0 && element.clientHeight > 0) fit.fit();
+      if (element.clientWidth > 0 && element.clientHeight > 0) fitLiveTerminal(live);
     };
     let observer: ResizeObserver | undefined;
     let cleanup: (() => void) | undefined;

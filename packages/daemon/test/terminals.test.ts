@@ -321,3 +321,143 @@ describe('authentication (AC14)', () => {
     expect(answer).toEqual({ status: 401, text: '' });
   });
 });
+
+// COCKPIT-91: a size change is numbered like a chunk of output and reaches a client in order with it.
+// The programs are `/bin/sh -c` scripts that print fixed bytes and wait on `read` for a line the test
+// writes after its resize: the output after the resize is the program's reaction to it, not a matter of time.
+describe('size changes in order with the output (COCKPIT-91)', () => {
+  const SIZE_FROM = { cols: 80, rows: 24 };
+  const SIZE_TO = { cols: 140, rows: 35 };
+  // 80 characters, as the CI runner's bash prompt.
+  const PROMPT = 'smoke-prompt-'.padEnd(78, 'x') + '$ ';
+  const LINES = ['cockpit setup · smoke-ws · .cockpit/config.json', '$ touch "$COCKPIT_ROOT_PATH/setup-ran"', '✓ Setup done'];
+
+  const program = (script: string) => ({ ...shellOptions, command: '/bin/sh', args: ['-c', script], ...SIZE_FROM });
+
+  // The terminal's rows holding text, scrollback included.
+  async function textRows(screen: string, cols: number, rows: number): Promise<string[]> {
+    const replay = new Headless({ cols, rows, scrollback: SCROLLBACK, allowProposedApi: true });
+    await new Promise<void>((resolve) => replay.write(screen, resolve));
+    const rowsOf = nonEmptyRows(replay);
+    replay.dispose();
+    return rowsOf;
+  }
+  function nonEmptyRows(terminal: Headless): string[] {
+    const buffer = terminal.buffer.active;
+    return Array.from({ length: buffer.length }, (_, index) => buffer.getLine(index)?.translateToString(true).trimEnd() ?? '').filter((line) => line !== '');
+  }
+
+  // The terminal of the CI dump: three lines, an 80-column prompt, then (after the resize) bash's redraw. Resolves once the redraw is out.
+  async function setupThenResize() {
+    const { client, connection } = await start();
+    // stty -echo: the line written below to release the program is not echoed into the output.
+    const id = await client.spawn(
+      program(String.raw`stty -echo
+printf '%s\r\n' '${LINES[0]}'
+printf '%s\r\n' '${LINES[1]}'
+printf '%s\r\n' '${LINES[2]}'
+printf '%s \r' '${PROMPT}'
+read go
+printf '\r\033[K\033[A%s' '${PROMPT}'
+read end`),
+    );
+    await waitForOutput(connection, id, `${PROMPT} \r`);
+
+    client.resize(id, SIZE_TO.cols, SIZE_TO.rows);
+    client.write(id, 'go\n');
+    await waitForOutput(connection, id, `\u001b[A${PROMPT}`);
+    return { client, connection, id };
+  }
+
+  test('AC1 (a) — a mirror that applies the data and resize events in the order the client gets them holds the rows of the daemon\'s attach screen at 140 x 35, "✓ Setup done" included', async () => {
+    const { client, connection, id } = await setupThenResize();
+    const attached = await client.attach(id);
+
+    const mirror = new Headless({ ...SIZE_FROM, scrollback: SCROLLBACK, allowProposedApi: true });
+    for (const event of connection.stream) {
+      if (event.type === 'data') mirror.write(event.data);
+      else mirror.write('', () => mirror.resize(event.cols, event.rows));
+    }
+    await new Promise<void>((resolve) => mirror.write('', resolve));
+    const daemonRows = await textRows(attached.screen, attached.cols, attached.rows);
+
+    expect({ cols: attached.cols, rows: attached.rows }).toEqual(SIZE_TO);
+    expect({ cols: mirror.cols, rows: mirror.rows }, 'the size of the mirror').toEqual(SIZE_TO);
+    expect(nonEmptyRows(mirror)).toEqual(daemonRows);
+    expect(daemonRows).toContain(LINES[2]);
+    mirror.dispose();
+  });
+
+  test('AC1 (b) — fixture: the same bytes with the size taken at the request, before the prompt reaches the view, give the CI dump\'s rows without "✓ Setup done"', async () => {
+    const { connection, id } = await setupThenResize();
+
+    const bytes = connection.output(id);
+    const promptAt = bytes.indexOf(PROMPT);
+    const today = new Headless({ ...SIZE_FROM, scrollback: SCROLLBACK, allowProposedApi: true });
+    today.write(bytes.slice(0, promptAt));
+    today.write('', () => today.resize(SIZE_TO.cols, SIZE_TO.rows));
+    today.write(bytes.slice(promptAt));
+    await new Promise<void>((resolve) => today.write('', resolve));
+
+    expect(nonEmptyRows(today)).toEqual([LINES[0], LINES[1], PROMPT.trimEnd()]);
+    today.dispose();
+  });
+
+  test('AC2 — a resize right after the attach request: the answer holds the size its screen was serialized at, the resize event has a higher sequence number, and the screen then resized by it equals the daemon\'s after it', async () => {
+    const { client, connection } = await start();
+    // 90 characters: one row at 100 columns, two at 80.
+    const id = await client.spawn(program(String.raw`printf '%090d\r\n' 0
+read end`));
+    await waitForOutput(connection, id, '0'.repeat(90));
+
+    const attaching = client.attach(id);
+    client.resize(id, 100, 30);
+    const attached = await attaching;
+    // Answered after the resize: everything the daemon sent about it has reached the client, and its headless terminal took it.
+    const after = await client.attach(id);
+
+    expect({ cols: attached.cols, rows: attached.rows }).toEqual(SIZE_FROM);
+    expect(connection.resizes).toHaveLength(1);
+    expect(connection.resizes[0]).toMatchObject({ id, cols: 100, rows: 30 });
+    expect(connection.resizes[0]!.seq).toBeGreaterThan(attached.seq);
+    expect({ cols: after.cols, rows: after.rows }).toEqual({ cols: 100, rows: 30 });
+
+    const replay = new Headless({ ...SIZE_FROM, scrollback: SCROLLBACK, allowProposedApi: true });
+    await new Promise<void>((resolve) => replay.write(attached.screen, resolve));
+    replay.resize(100, 30);
+    expect(nonEmptyRows(replay)).toEqual(await textRows(after.screen, after.cols, after.rows));
+    replay.dispose();
+  });
+
+  test('AC3 — a resize to the size the terminal already has sends no resize event; a real change sends one', async () => {
+    const { client, connection } = await start();
+    const id = await client.spawn(program('read end'));
+
+    client.resize(id, SIZE_FROM.cols, SIZE_FROM.rows);
+    client.resize(id, 100, 30);
+    client.resize(id, 100, 30);
+    // Answered after the three resizes were handled.
+    await client.attach(id);
+
+    expect(connection.resizes).toHaveLength(1);
+    expect(connection.resizes[0]).toMatchObject({ id, cols: 100, rows: 30 });
+  });
+
+  // The headless resize runs in a write callback, outside any try/catch: a size it refuses would
+  // throw there and end the daemon (here, the test's own process) with every terminal it holds.
+  test.each([
+    { cols: 80.5, rows: 24 },
+    { cols: 100, rows: 0 },
+  ])('a resize to $cols x $rows is ignored: no event, the terminal keeps its size, the daemon keeps answering', async ({ cols, rows }) => {
+    const { client, connection } = await start();
+    const id = await client.spawn(program('read end'));
+
+    client.resize(id, cols, rows);
+    // Answered after the resize was handled, and after any write callback it queued.
+    const attached = await client.attach(id);
+
+    expect(connection.resizes).toEqual([]);
+    expect(attached).toMatchObject(SIZE_FROM);
+    expect((await client.list()).find((entry) => entry.id === id)).toMatchObject(SIZE_FROM);
+  });
+});

@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import { clearStaleSocket, daemonFiles } from './paths';
-import { encode, lineReader, PROTOCOL_VERSION, UPGRADE, type Hello, type Message, type Request, type SessionEventName, type SessionReport, type SetupEventName, type TerminalInfo } from './protocol';
+import { encode, lineReader, PROTOCOL_VERSION, RESIZE_EVENTS_HEADER, UPGRADE, type Hello, type Message, type Request, type SessionEventName, type SessionReport, type SetupEventName, type TerminalInfo } from './protocol';
 import { SESSION_EVENTS, SETUP_EVENTS } from './status';
 import { createTerminals, type Subscriber } from './terminals';
 
@@ -75,7 +75,7 @@ export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon>
     if (!authorized(req.headers.authorization, token)) return refuse(socket, 401);
     if (req.method !== 'GET' || req.url !== '/attach') return refuse(socket, 404);
     if (req.headers.upgrade !== UPGRADE) return refuse(socket, 400);
-    socket.write(`HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: ${UPGRADE}\r\n\r\n`);
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: ${UPGRADE}\r\n${RESIZE_EVENTS_HEADER}: 1\r\n\r\n`);
     serve(socket);
   });
 
@@ -86,6 +86,7 @@ export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon>
     const connection: Connection = {
       socket,
       data: (terminal, seq, data) => send({ type: 'data', terminal, seq, data }),
+      resize: (terminal, seq, cols, rows) => send({ type: 'resize', terminal, seq, cols, rows }),
       exit: (terminal, exit) => send({ type: 'exit', terminal, ...exit }),
       title: (sessionId, title) => send({ type: 'title', sessionId, title }),
     };

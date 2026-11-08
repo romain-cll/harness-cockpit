@@ -21,6 +21,7 @@ const api: Api = {
     list: () => ipcRenderer.invoke('pty:list'),
     attach: (id) => ipcRenderer.invoke('pty:attach', id),
     onData: (listener) => subscribe('pty:data', listener),
+    onResized: (listener) => subscribe('pty:resized', listener),
     onExit: (listener) => subscribe('pty:exit', listener),
   },
   projects: {

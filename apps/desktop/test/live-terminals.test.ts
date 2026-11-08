@@ -5,6 +5,20 @@ import { beforeEach, describe, expect, test, vi } from 'vitest';
 // The listeners a live terminal registers live in the preload's isolated world, which
 // no end-to-end test can count, so this one does.
 
+// COCKPIT-91: what xterm.js does, in the order it does it. A write is parsed in the order it was made and its
+// callback runs right after it; `hold` keeps the writes queued (a parser that has not got to them yet) until
+// `drain()`. `log` lists the chunks parsed (an empty write is no chunk) and the sizes taken, in order.
+const xterm = vi.hoisted(() => ({
+  hold: false,
+  queue: [] as Array<() => void>,
+  log: [] as string[],
+  drain() {
+    for (const run of this.queue.splice(0)) run();
+  },
+}));
+// The size the view's fit addon proposes.
+const fitState = vi.hoisted(() => ({ proposed: undefined as { cols: number; rows: number } | undefined }));
+
 vi.mock('@xterm/xterm', () => ({
   Terminal: class {
     cols = 80;
@@ -13,8 +27,14 @@ vi.mock('@xterm/xterm', () => ({
     written: string[] = [];
     private resized: Array<(size: { cols: number; rows: number }) => void> = [];
     loadAddon() {}
-    write(data: string) {
-      this.written.push(data);
+    write(data: string, callback?: () => void) {
+      const parse = () => {
+        this.written.push(data);
+        if (data !== '') xterm.log.push(data);
+        callback?.();
+      };
+      if (xterm.hold || xterm.queue.length > 0) xterm.queue.push(parse);
+      else parse();
     }
     onData() {}
     onResize(listener: (size: { cols: number; rows: number }) => void) {
@@ -25,18 +45,20 @@ vi.mock('@xterm/xterm', () => ({
       if (cols === this.cols && rows === this.rows) return;
       this.cols = cols;
       this.rows = rows;
+      xterm.log.push(`resize ${cols}x${rows}`);
       for (const listener of this.resized) listener({ cols, rows });
     }
     dispose() {}
   },
 }));
-vi.mock('@xterm/addon-fit', () => ({ FitAddon: class {} }));
+vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { proposeDimensions = () => fitState.proposed; } }));
 vi.mock('../src/renderer/components/terminal', () => ({
   readTheme: () => ({}),
   exitMessage: () => '[Process exited with code 3]',
 }));
 
-type DataListener = (id: number, data: string) => void;
+type DataListener = (id: number, data: string, seq?: number) => void;
+type ResizedListener = (id: number, cols: number, rows: number, seq?: number) => void;
 type ExitListener = (id: number, exit: { exitCode: number | null; signal: number | null }) => void;
 // COCKPIT-57: the status event also carries the setup states and the agent's exit.
 type StatusEvent = 'working' | 'waiting' | 'finished' | 'setup-running' | 'setup-done' | 'setup-failed' | 'exited';
@@ -56,6 +78,7 @@ interface ListedTerminal {
 
 const dataListeners: DataListener[] = [];
 const exitListeners: ExitListener[] = [];
+const resizedListeners: ResizedListener[] = [];
 const statusListeners: StatusListener[] = [];
 const offData = vi.fn();
 const offExit = vi.fn();
@@ -63,28 +86,36 @@ const kill = vi.fn();
 const start = vi.fn();
 let listed: ListedTerminal[] = [];
 const resize = vi.fn();
+let attachAnswer = { cols: 80, rows: 24, screen: '', seq: 0 };
 
 beforeEach(() => {
   dataListeners.length = 0;
   exitListeners.length = 0;
+  resizedListeners.length = 0;
   statusListeners.length = 0;
+  xterm.hold = false;
+  xterm.queue.length = 0;
+  xterm.log.length = 0;
+  fitState.proposed = undefined;
   offData.mockClear();
   offExit.mockClear();
   kill.mockClear();
   start.mockReset();
   listed = [];
   resize.mockReset();
+  attachAnswer = { cols: 80, rows: 24, screen: '', seq: 0 };
   vi.stubGlobal('matchMedia', () => ({ addEventListener() {} }));
   vi.stubGlobal('window', {
     api: {
       pty: {
         onData: (listener: DataListener) => (dataListeners.push(listener), offData),
         onExit: (listener: ExitListener) => (exitListeners.push(listener), offExit),
+        onResized: (listener: ResizedListener) => (resizedListeners.push(listener), () => {}),
         write() {},
         resize,
         kill,
         list: async () => listed,
-        attach: async () => ({ cols: 80, rows: 24, screen: '', seq: 0 }),
+        attach: async () => attachAnswer,
       },
       sessions: { start, onStatus: (listener: StatusListener) => (statusListeners.push(listener), () => {}) },
     },
@@ -92,12 +123,14 @@ beforeEach(() => {
 });
 
 interface Store {
-  createLiveTerminal(start: (size: { cols: number; rows: number }) => Promise<number>): {
+  createLiveTerminal(start: (size: { cols: number; rows: number }) => Promise<number | { id: number; attached: typeof attachAnswer }>): {
     entry: { term: { cols: number; rows: number; resize(cols: number, rows: number): void } };
     started: Promise<void>;
     exit: Promise<{ exitCode: number | null; signal: number | null }>;
   };
   closeLiveTerminal(entry: unknown): void;
+  /** The view asks for the size its fit addon proposes (COCKPIT-91). */
+  fitLiveTerminal(entry: unknown): void;
   startSession(harness: string, options?: unknown): Promise<unknown>;
   getSessionTerminal(id: string): unknown;
   subscribe(listener: () => void): () => void;
@@ -440,33 +473,106 @@ describe('restoreTerminals — the terminals of a workspace', () => {
   });
 });
 
-// The size a live terminal's pty ends up with, whatever the order in which the view fits the
-// terminal (on mount, then from its ResizeObserver) and the spawn resolves (COCKPIT-76). The fake
-// terminal's `resize` fires its `onResize` listeners, as xterm.js does.
-describe('size of a live terminal’s pty', () => {
-  type Step = 'fit 63x26' | 'fit 60x25' | 'fit 80x24' | 'resolve';
+// COCKPIT-91: the view asks for a size (`fitLiveTerminal`, from the fit addon's proposal); a running pty is
+// resized through `pty.resize` and the xterm takes the size from the `resized` event, in order with the output.
+describe('size of a live terminal (COCKPIT-91)', () => {
+  const ask = (entry: unknown, cols: number, rows: number, fit: (entry: unknown) => void) => {
+    fitState.proposed = { cols, rows };
+    fit(entry);
+  };
+
+  test('AC4 — the view asks for a size: pty.resize gets it and the xterm keeps its size until the resized event, which it takes after every chunk written before it and before any chunk after it', async () => {
+    const { createLiveTerminal, fitLiveTerminal } = await loadStore();
+    const { entry, started } = createLiveTerminal(async () => 7);
+    await started;
+
+    ask(entry, 100, 30, fitLiveTerminal);
+
+    expect(resize).toHaveBeenCalledTimes(1);
+    expect(resize).toHaveBeenCalledWith(7, 100, 30);
+    expect({ cols: entry.term.cols, rows: entry.term.rows }).toEqual({ cols: 80, rows: 24 });
+
+    // Two chunks the parser has not got to, the event, a chunk after it.
+    xterm.hold = true;
+    expect(resizedListeners).toHaveLength(1);
+    dataListeners[0]!(7, 'before-1', 1);
+    dataListeners[0]!(7, 'before-2', 2);
+    resizedListeners[0]!(7, 100, 30, 3);
+    dataListeners[0]!(7, 'after-1', 4);
+    expect(xterm.log, 'nothing is taken before the parser got to it').toEqual([]);
+    xterm.drain();
+
+    expect(xterm.log).toEqual(['before-1', 'before-2', 'resize 100x30', 'after-1']);
+    expect({ cols: entry.term.cols, rows: entry.term.rows }).toEqual({ cols: 100, rows: 30 });
+  });
+
+  test('AC5 — a resized event at or below the sequence number of the screen shown is ignored, one above is applied', async () => {
+    attachAnswer = { cols: 80, rows: 24, screen: 'screen', seq: 5 };
+    const { createLiveTerminal } = await loadStore();
+    const { entry, started } = createLiveTerminal(async () => ({ id: 7, attached: attachAnswer }));
+    await started;
+    expect(resizedListeners).toHaveLength(1);
+
+    resizedListeners[0]!(7, 100, 30, 5);
+    expect({ cols: entry.term.cols, rows: entry.term.rows }, 'at the screen\'s sequence number').toEqual({ cols: 80, rows: 24 });
+    resizedListeners[0]!(7, 100, 30, 3);
+    expect({ cols: entry.term.cols, rows: entry.term.rows }, 'below it').toEqual({ cols: 80, rows: 24 });
+
+    resizedListeners[0]!(7, 120, 40, 6);
+    expect({ cols: entry.term.cols, rows: entry.term.rows }, 'above it').toEqual({ cols: 120, rows: 40 });
+  });
+
+  test('AC6 — a size asked before the start resolves is not taken by the xterm; once it resolves pty.resize gets it and the xterm takes it on the resized event', async () => {
+    const { createLiveTerminal, fitLiveTerminal } = await loadStore();
+    let resolveStart!: (id: number) => void;
+    const { entry, started } = createLiveTerminal(() => new Promise<number>((resolve) => (resolveStart = resolve)));
+
+    ask(entry, 100, 30, fitLiveTerminal);
+
+    expect({ cols: entry.term.cols, rows: entry.term.rows }).toEqual({ cols: 80, rows: 24 });
+    expect(resize).not.toHaveBeenCalled();
+
+    resolveStart(7);
+    await started;
+
+    expect(resize).toHaveBeenCalledTimes(1);
+    expect(resize).toHaveBeenCalledWith(7, 100, 30);
+    expect({ cols: entry.term.cols, rows: entry.term.rows }).toEqual({ cols: 80, rows: 24 });
+    resizedListeners[0]!(7, 100, 30, 1);
+    expect({ cols: entry.term.cols, rows: entry.term.rows }).toEqual({ cols: 100, rows: 30 });
+  });
+
+  test('AC6 — a terminal whose pty exited takes a size the view asks for at once, and sends nothing', async () => {
+    const { createLiveTerminal, fitLiveTerminal } = await loadStore();
+    const { entry, started } = createLiveTerminal(async () => 7);
+    await started;
+    exitListeners[0]!(7, { exitCode: 3, signal: null });
+
+    ask(entry, 100, 30, fitLiveTerminal);
+
+    expect({ cols: entry.term.cols, rows: entry.term.rows }).toEqual({ cols: 100, rows: 30 });
+    expect(resize).not.toHaveBeenCalled();
+  });
+
+  // Every order of two asks and the start resolving (COCKPIT-76), each step followed or not by the microtasks
+  // it queues (an ask can land between the start resolving and the code that reads its id): the pty ends at the
+  // last size asked, even when it is the size the xterm already has.
+  type Step = 'ask 63x26' | 'ask 80x24' | 'resolve';
 
   const permutations = <T,>(items: T[]): T[][] =>
     items.length <= 1
       ? [items]
       : items.flatMap((item, i) => permutations([...items.slice(0, i), ...items.slice(i + 1)]).map((rest) => [item, ...rest]));
 
-  // Every order of two fits and the spawn resolving, each step followed or not by the microtasks
-  // it queues (a fit can land between the spawn resolving and the code that reads its id).
-  const cases = [
-    ['fit 63x26', 'fit 60x25'],
-    ['fit 63x26', 'fit 80x24'],
-  ].flatMap((fits) =>
-    permutations<Step>([...(fits as Step[]), 'resolve']).flatMap((order) =>
-      [0, 1, 2, 3, 4, 5, 6, 7].map((flushes) => order.map((step, i) => ({ step, flush: Boolean(flushes & (1 << i)) }))),
-    ),
+  const cases = permutations<Step>(['ask 63x26', 'ask 80x24', 'resolve']).flatMap((order) =>
+    [0, 1, 2, 3, 4, 5, 6, 7].map((flushes) => order.map((step, i) => ({ step, flush: Boolean(flushes & (1 << i)) }))),
   );
 
   const label = (steps: Array<{ step: Step; flush: boolean }>) =>
     steps.map(({ step, flush }) => (flush ? `${step}, flush` : step)).join(' → ');
 
-  test.each(cases.map((steps) => [label(steps), steps] as const))('AC4 — %s: the pty ends at the size the terminal has', async (_label, steps) => {
-    const { createLiveTerminal } = await loadStore();
+  test.each(cases.map((steps) => [label(steps), steps] as const))('AC6 — %s: the pty ends at the last size asked', async (_label, steps) => {
+    const { createLiveTerminal, fitLiveTerminal } = await loadStore();
     let resolveSpawn!: (id: number) => void;
     let spawnedAt: { cols: number; rows: number } | undefined;
     const { entry, started } = createLiveTerminal((size) => {
@@ -474,9 +580,14 @@ describe('size of a live terminal’s pty', () => {
       return new Promise<number>((resolve) => (resolveSpawn = resolve));
     });
 
+    let asked: { cols: number; rows: number } | undefined;
     for (const { step, flush } of steps) {
       if (step === 'resolve') resolveSpawn(7);
-      else entry.term.resize(...(step.slice(4).split('x').map(Number) as [number, number]));
+      else {
+        const [cols, rows] = step.slice(4).split('x').map(Number) as [number, number];
+        asked = { cols, rows };
+        ask(entry, cols, rows, fitLiveTerminal);
+      }
       if (flush) await Promise.resolve();
     }
     await started;
@@ -484,7 +595,6 @@ describe('size of a live terminal’s pty', () => {
     // No resize reaches a pty before the spawn told its id, nor another pty.
     for (const [id] of resize.mock.calls) expect(id).toBe(7);
     const last = resize.mock.calls.at(-1);
-    const ptySize = last ? { cols: last[1], rows: last[2] } : spawnedAt;
-    expect(ptySize).toEqual({ cols: entry.term.cols, rows: entry.term.rows });
+    expect(last ? { cols: last[1], rows: last[2] } : spawnedAt).toEqual(asked);
   });
 });

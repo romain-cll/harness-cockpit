@@ -30,6 +30,7 @@ export interface LiveTerminal {
 
 const live = new Set<LiveTerminal>();
 const closers = new WeakMap<LiveTerminal, () => void>();
+const fitters = new WeakMap<LiveTerminal, () => void>();
 
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   for (const { term } of live) term.options.theme = readTheme();
@@ -125,12 +126,15 @@ export function createLiveTerminal(start: (size: { cols: number; rows: number })
     else if (id === ptyId && (seq === undefined || seq > covered)) apply();
   };
   const offData = pty.onData((id, data, seq) => onPty(id, () => term.write(data), seq));
+  // A size change comes in the stream of the output: the xterm takes it once the chunks written before it are parsed.
+  const offResized = pty.onResized((id, cols, rows, seq) => onPty(id, () => term.write('', () => term.resize(cols, rows)), seq));
   const offExit = pty.onExit((id, ptyExit) =>
     onPty(id, () => {
       entry.exited = true;
       entry.exit = ptyExit;
       term.write(`\r\n${exitMessage(ptyExit)}`);
       offData();
+      offResized();
       offExit();
       publish();
       resolveExit(ptyExit);
@@ -146,11 +150,22 @@ export function createLiveTerminal(start: (size: { cols: number; rows: number })
       pty.write(ptyId, data);
     }
   });
-  term.onResize(({ cols, rows }) => {
-    if (ptyId !== undefined && !entry.exited) pty.resize(ptyId, cols, rows);
-  });
 
   const requested = { cols: term.cols, rows: term.rows };
+  // The last size the view asked for, when it did.
+  let asked: { cols: number; rows: number } | undefined;
+  fitters.set(entry, () => {
+    const size = entry.fit.proposeDimensions();
+    if (!size) return;
+    if (entry.exited || failed) term.resize(size.cols, size.rows);
+    else if (ptyId === undefined) asked = size;
+    else {
+      const { cols, rows } = asked ?? requested;
+      if (size.cols === cols && size.rows === rows) return;
+      asked = size;
+      pty.resize(ptyId, size.cols, size.rows);
+    }
+  });
   const started = start(requested).then(
     (result) => {
       const id = typeof result === 'number' ? result : result.id;
@@ -169,8 +184,8 @@ export function createLiveTerminal(start: (size: { cols: number; rows: number })
       }
       ptyId = id;
       restored.add(id);
-      // The terminal may have been resized while the pty was starting, when there was none to resize yet.
-      if (term.cols !== requested.cols || term.rows !== requested.rows) pty.resize(id, term.cols, term.rows);
+      // The view may have asked for a size while the pty was starting, when there was none to resize yet.
+      if (asked && (asked.cols !== requested.cols || asked.rows !== requested.rows)) pty.resize(id, asked.cols, asked.rows);
       for (const event of early) if (event.id === id && (event.seq === undefined || event.seq > covered)) event.apply();
       early.length = 0;
       if (pending.length > 0 && !entry.exited) pty.write(id, pending.join(''));
@@ -178,6 +193,8 @@ export function createLiveTerminal(start: (size: { cols: number; rows: number })
     },
     (error: unknown) => {
       failed = true;
+      // No pty will resize: the view takes the size it asked for while it started.
+      if (asked) term.resize(asked.cols, asked.rows);
       pending.length = 0;
       throw error;
     },
@@ -187,6 +204,7 @@ export function createLiveTerminal(start: (size: { cols: number; rows: number })
     closed = true;
     if (ptyId !== undefined && !entry.exited) pty.kill(ptyId);
     offData();
+    offResized();
     offExit();
     live.delete(entry);
     term.dispose();
@@ -264,6 +282,15 @@ async function adoptSession(sessionId: string): Promise<void> {
 /** Ends the terminal's process, or the one a pending start will resolve with, and disposes it. */
 export function closeLiveTerminal(entry: LiveTerminal): void {
   closers.get(entry)?.();
+}
+
+/**
+ * The view asks for the size that fits its area. A running pty is resized and the xterm takes the size
+ * from the `resized` event, in order with the output; one not started yet is resized once it is, one
+ * that exited has no output left to keep in order.
+ */
+export function fitLiveTerminal(entry: LiveTerminal): void {
+  fitters.get(entry)?.();
 }
 
 export function subscribe(listener: () => void): () => void {
