@@ -17,6 +17,9 @@ export const READY_FD = 3;
 /** Upgrade token of the stream: `cockpit-<protocol>`. */
 export const UPGRADE = `cockpit-${PROTOCOL_VERSION}`;
 
+/** The header of the upgrade answer that says the daemon sends `resize` events; an earlier build of protocol 1 sends none. */
+export const RESIZE_EVENTS_HEADER = 'cockpit-resize-events';
+
 /** `shell`: the terminal page. `session`: an agent. `commands`: setup or teardown, bound to the connection that spawned it. */
 export type TerminalKind = 'shell' | 'session' | 'commands';
 
@@ -82,7 +85,7 @@ export interface Hello {
   pid: number;
 }
 
-/** `screen` is the serialized terminal (scrollback included) up to and including the chunk `seq`. */
+/** `screen` is the serialized terminal (scrollback included) up to and including the chunk or size change `seq`, at `cols` x `rows`. */
 export interface Attached {
   cols: number;
   rows: number;
@@ -97,7 +100,8 @@ export interface TerminalExit {
 }
 
 /**
- * Client to daemon, one JSON object per line. `write`, `resize` and `kill` get no answer. A
+ * Client to daemon, one JSON object per line. `write`, `resize` and `kill` get no answer (a resize is
+ * announced to the subscribers by a `resize` event). A
  * `terminal` is an id `spawn` answered; the daemon ignores one it does not hold.
  */
 export type Request =
@@ -114,6 +118,7 @@ export type Message =
   | { id: number; result: unknown }
   | { id: number; error: string }
   | { type: 'data'; terminal: number; seq: number; data: string }
+  | { type: 'resize'; terminal: number; seq: number; cols: number; rows: number }
   | ({ type: 'exit'; terminal: number } & TerminalExit)
   | ({ type: 'status' } & SessionReport)
   | { type: 'title'; sessionId: string; title: string };

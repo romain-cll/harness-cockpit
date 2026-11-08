@@ -332,10 +332,13 @@ export interface Api {
     /** Makes the calling window the terminal's owner and answers its screen. */
     attach(id: number): Promise<AttachedTerminal>;
     write(id: number, data: string): void;
+    /** Asks for a size; the terminal's view takes it from the `onResized` event. */
     resize(id: number, cols: number, rows: number): void;
     kill(id: number): void;
     /** Each listener registration returns its unsubscribe function. `seq` numbers a terminal's chunks of output. */
     onData(listener: (id: number, data: string, seq: number) => void): () => void;
+    /** The pty's size changed; `seq` numbers it with the chunks of output (absent from a daemon that sends no such event). */
+    onResized(listener: (id: number, cols: number, rows: number, seq?: number) => void): () => void;
     onExit(listener: (id: number, exit: PtyExit) => void): () => void;
   };
   /** Git repositories the user works in, kept in the app state. */

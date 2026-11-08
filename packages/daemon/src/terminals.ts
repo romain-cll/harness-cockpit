@@ -6,6 +6,8 @@ import { AGENT_MARKER_OSC, SCROLLBACK, type Attached, type SessionEventName, typ
 /** Who receives what a terminal produces: one connection. */
 export interface Subscriber {
   data(terminal: number, seq: number, data: string): void;
+  /** The pty's size changed; numbered like a chunk of output, in the same sequence. */
+  resize(terminal: number, seq: number, cols: number, rows: number): void;
   exit(terminal: number, exit: TerminalExit): void;
   /** The title a `session` terminal's program set (OSC 0 or 2), once per change. */
   title(sessionId: string, title: string): void;
@@ -16,7 +18,7 @@ interface Terminal {
   pty: IPty;
   headless: Headless;
   serializer: SerializeAddon;
-  /** The sequence number of the last chunk the pty produced. */
+  /** The sequence number of the last chunk the pty produced or size change it took. */
   seq: number;
   subscribers: Set<Subscriber>;
   /** The connection a `commands` terminal ends with. */
@@ -163,7 +165,8 @@ export function createTerminals(onEnd: () => void, onTitleStatus: (report: Sessi
       const seq = terminal.seq;
       return new Promise((resolve) => {
         terminal.headless.write('', () => {
-          const { cols, rows } = terminal.info;
+          // The headless size, not the pty's: a resize queued after this write is not applied yet.
+          const { cols, rows } = terminal.headless;
           resolve({ cols, rows, seq, screen: terminal.serializer.serialize() });
         });
       });
@@ -173,10 +176,15 @@ export function createTerminals(onEnd: () => void, onTitleStatus: (report: Sessi
 
     resize: (id: unknown, cols: number, rows: number) =>
       withTerminal(id, (terminal) => {
+        const { info, headless } = terminal;
+        if (cols === info.cols && rows === info.rows) return;
         terminal.pty.resize(cols, rows);
-        terminal.headless.resize(cols, rows);
-        terminal.info.cols = cols;
-        terminal.info.rows = rows;
+        info.cols = cols;
+        info.rows = rows;
+        const seq = ++terminal.seq;
+        // After the chunks written before: the headless terminal takes the size at the place of the event.
+        headless.write('', () => headless.resize(cols, rows));
+        for (const each of terminal.subscribers) each.resize(info.id, seq, cols, rows);
       }),
 
     kill: (id: unknown) => withTerminal(id, hangUp),
