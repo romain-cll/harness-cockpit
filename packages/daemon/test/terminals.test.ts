@@ -442,4 +442,22 @@ read end`));
     expect(connection.resizes).toHaveLength(1);
     expect(connection.resizes[0]).toMatchObject({ id, cols: 100, rows: 30 });
   });
+
+  // The headless resize runs in a write callback, outside any try/catch: a size it refuses would
+  // throw there and end the daemon (here, the test's own process) with every terminal it holds.
+  test.each([
+    { cols: 80.5, rows: 24 },
+    { cols: 100, rows: 0 },
+  ])('a resize to $cols x $rows is ignored: no event, the terminal keeps its size, the daemon keeps answering', async ({ cols, rows }) => {
+    const { client, connection } = await start();
+    const id = await client.spawn(program('read end'));
+
+    client.resize(id, cols, rows);
+    // Answered after the resize was handled, and after any write callback it queued.
+    const attached = await client.attach(id);
+
+    expect(connection.resizes).toEqual([]);
+    expect(attached).toMatchObject(SIZE_FROM);
+    expect((await client.list()).find((entry) => entry.id === id)).toMatchObject(SIZE_FROM);
+  });
 });
