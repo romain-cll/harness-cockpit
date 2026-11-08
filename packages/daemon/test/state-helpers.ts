@@ -297,9 +297,9 @@ export function endDaemonIn(home: string, build = BUILD): void {
   });
 }
 
-/** Waits until the session's terminal has printed `text`, whether before or after the call. */
-export async function untilSessionPrints(socket: string, sessionId: string, text: string): Promise<void> {
-  const connection = await connectTo(socket);
+/** Waits until the session's terminal has printed `text`, whether before or after the call. `build` is the daemon's own: another one would supersede it. */
+export async function untilSessionPrints(socket: string, sessionId: string, text: string, build = BUILD): Promise<void> {
+  const connection = await connectTo(socket, build);
   const terminal = (await connection.client.list()).find((entry) => entry.sessionId === sessionId);
   expect(terminal, `a terminal for session ${sessionId}`).toBeDefined();
   const attached = await connection.client.attach(terminal!.id);
@@ -308,10 +308,10 @@ export async function untilSessionPrints(socket: string, sessionId: string, text
 }
 
 /** A daemon whose state holds a repository as a project, with `run` for CLI commands and `create` for a workspace. */
-export async function startProjectDaemon() {
+export async function startProjectDaemon(build = BUILD) {
   const fixture = makeAgentFixture();
   const repo = makeRepo();
-  const daemon = await startStateDaemon({ fixture, state: { version: 1, projects: [{ path: repo.root }] } });
+  const daemon = await startStateDaemon({ fixture, state: { version: 1, projects: [{ path: repo.root }] }, build });
   const run = (argv: string[]) => cockpit(argv, { home: daemon.home });
   const create = async (task: string) => {
     const result = await run(['ws', 'create', '--project', repo.root, '--task', task]);
@@ -323,7 +323,7 @@ export async function startProjectDaemon() {
     const result = await run(['session', 'start', '--project', repo.root, '--workspace', workspace.path, '--harness', 'claude-code', '--prompt', 'hello', ...more]);
     expect(result.exits).toEqual([0]);
     const id = jsonLine(result.out).session.id as string;
-    await untilSessionPrints(daemon.socket, id, 'agent-ready');
+    await untilSessionPrints(daemon.socket, id, 'agent-ready', build);
     return id;
   };
   return { fixture, repo, ...daemon, run, create, startAgent };

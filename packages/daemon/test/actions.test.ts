@@ -1,8 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, test } from 'vitest';
 import { runDaemon } from '../src/index';
-import { connectTo, OTHER_BUILD, onCleanup, registerCleanup, shellOptions } from './helpers';
-import { cockpit, makeAgentFixture, makeRepo, startProjectDaemon, startStateDaemon, stateFileIn, stateIn, untilState } from './state-helpers';
+import { BUILD, connectTo, OTHER_BUILD, onCleanup, registerCleanup, shellOptions } from './helpers';
+import { cockpit, endDaemonIn, jsonLine, makeAgentFixture, makeRepo, nodeLaunchOf, startProjectDaemon, startStateDaemon, stateFileIn, stateIn, untilState, writeLaunchFile } from './state-helpers';
 
 // COCKPIT-37: the daemon owns `state.json`: what it refuses, what it stores with no app connected. Real
 // sockets, git and a stub agent; `state-helpers.ts` lists what is assumed of the API.
@@ -91,6 +91,34 @@ describe('a superseded daemon', () => {
     const terminal = (await connection.client.list()).find((entry) => entry.sessionId === id)!;
     connection.client.write(terminal.id, 'quit\n');
     await daemon.closed;
+
+    const state = stateIn(stateDir);
+    expect(state.projects?.map(({ path }) => path).sort()).toEqual([repo.root, second.root].sort());
+    expect(state.sessions).toEqual([expect.objectContaining({ id, open: true })]);
+  });
+
+  test('AC14 — with no app, a daemon of an older build with a running session, then a CLI command starting the new build\'s daemon and writing: no client says hello to the old one, yet when its session exits on its own state.json keeps the new daemon\'s writes', async () => {
+    const { fixture, repo, home, stateDir, socket, daemon, run, create, startAgent } = await startProjectDaemon(OTHER_BUILD);
+    const id = await startAgent(await create('older'));
+    // The next launch: the launch file names the new build, which the CLI starts on its first command.
+    writeLaunchFile(home, nodeLaunchOf(fixture, stateDir, BUILD));
+    endDaemonIn(home, BUILD);
+    const second = makeRepo('second');
+
+    const added = await run(['project', 'add', second.root]);
+
+    expect(added.exits).toEqual([0]);
+    expect(jsonLine(added.out).status).toBe('added');
+    expect(stateIn(stateDir).projects?.map(({ path }) => path).sort()).toEqual([repo.root, second.root].sort());
+
+    // The old session's agent ends by itself (this client is of the old daemon's own build: it supersedes nothing).
+    // Superseded, its daemon closes once the terminal is gone and writes nothing; not superseded, it writes its stale
+    // copy, which is the change waited for.
+    const connection = await connectTo(socket, OTHER_BUILD);
+    const terminal = (await connection.client.list()).find((entry) => entry.sessionId === id)!;
+    const written = untilState(stateDir, (state) => state.sessions?.[0]?.open === false || state.projects?.length === 1);
+    connection.client.write(terminal.id, 'quit\n');
+    await Promise.race([daemon.closed, written]);
 
     const state = stateIn(stateDir);
     expect(state.projects?.map(({ path }) => path).sort()).toEqual([repo.root, second.root].sort());

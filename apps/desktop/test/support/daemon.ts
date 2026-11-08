@@ -157,12 +157,13 @@ export const aliveOf = (pids: number[]) => pids.map(isAlive);
 
 // Resolves once a daemon, which is no child of the test, has exited: `caffeinate -w <pid>` (macOS) waits for any
 // process to exit, a child or not, and returns at once for a pid already gone. It fires on the exit itself, before
-// the parent has reaped the process, so a zombie (state `Z`) counts as gone.
+// the parent has reaped the process, so a zombie (state `Z`) counts as gone, and so does one still exiting (state `E`):
+// a large address space is torn down after the notification.
 export async function daemonEnded(pid: number): Promise<void> {
   const [code] = await once(spawn('/usr/bin/caffeinate', ['-w', String(pid)], { stdio: 'ignore' }), 'exit');
   expect(code, `caffeinate -w ${pid}`).toBe(0);
   const state = spawnSync('ps', ['-p', String(pid), '-o', 'stat='], { encoding: 'utf8' }).stdout.trim();
-  expect(state === '' || state.startsWith('Z'), `process ${pid} state "${state}" after caffeinate -w`).toBe(true);
+  expect(state === '' || /^\??[ZE]/.test(state), `process ${pid} state "${state}" after caffeinate -w`).toBe(true);
 }
 
 // --- The page ----------------------------------------------------------------
