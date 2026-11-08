@@ -138,6 +138,31 @@ describe('cockpit ws', () => {
     expect(existsSync(workspace.path)).toBe(false);
   });
 
+  test('AC6 — a dirty worktree without --force runs no teardown and ends no session (it answers dirty before touching anything); with --force the teardown runs once and the delete succeeds', async () => {
+    const { fixture, repo, socket, run, create, startAgent } = await startProjectDaemon();
+    const config = join(repo.root, '.cockpit');
+    mkdirSync(config);
+    writeFileSync(join(config, 'config.json'), JSON.stringify({ setup: [], teardown: [`echo teardown >> '${fixture.runs}'`] }));
+    const workspace = await create('dirty-teardown');
+    const id = await startAgent(workspace);
+    appendFileSync(join(workspace.path, 'README.md'), 'uncommitted\n');
+    expect(runsOf(fixture)).toEqual(['agent']);
+
+    const refused = await run(['ws', 'delete', '--project', repo.root, '--workspace', workspace.path]);
+    expect(refused.exits).toEqual([1]);
+    expect(jsonLine(refused.out)).toEqual({ status: 'dirty' });
+    expect(runsOf(fixture)).toEqual(['agent']);
+    expect(existsSync(workspace.path)).toBe(true);
+    expect(worktreesOf(repo)).toEqual([workspace.path]);
+    expect((await readTerminals(socket)).filter(({ sessionId }) => sessionId === id)).toHaveLength(1);
+
+    const forced = await run(['ws', 'delete', '--project', repo.root, '--workspace', workspace.path, '--force']);
+    expect(forced.exits).toEqual([0]);
+    expect(jsonLine(forced.out)).toMatchObject({ status: 'removed' });
+    expect(runsOf(fixture)).toEqual(['agent', 'teardown']);
+    expect(existsSync(workspace.path)).toBe(false);
+  });
+
   test('AC6 — --delete-branch deletes a merged branch and keeps an unmerged one (branchKept); --force-branch <name> deletes an unmerged one', async () => {
     const { repo, run, create } = await startProjectDaemon();
     const merged = await create('merged');
