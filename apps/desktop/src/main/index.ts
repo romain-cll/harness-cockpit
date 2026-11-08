@@ -451,10 +451,28 @@ async function adopt(client: DaemonClient, own: boolean): Promise<Daemon> {
   return daemon;
 }
 
-// Makes the daemon's snapshot the replica; the windows list again.
+// Makes the daemon's snapshot the replica; the windows list again, except one whose flow awaits its own write.
 function applySnapshot(snapshot: StateSnapshot): void {
   ({ state, setups, failedSetups } = snapshot);
-  for (const window of BrowserWindow.getAllWindows()) window.webContents.send('projects:changed');
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!awaitingOwnWrite.has(window.webContents.id)) window.webContents.send('projects:changed');
+  }
+}
+
+// The windows whose flow awaits a write it follows with its own `router.invalidate()`, then navigates if its
+// `claimNavigation` check holds (COCKPIT-86). The `state` that write causes must not invalidate them too: a second
+// invalidate aborts the in-flight load, so the flow's would resolve before or after the user's action by timing alone.
+const awaitingOwnWrite = new Map<number, number>();
+async function asOwnWrite<T>(sender: WebContents, write: () => Promise<T>): Promise<T> {
+  const { id } = sender;
+  awaitingOwnWrite.set(id, (awaitingOwnWrite.get(id) ?? 0) + 1);
+  try {
+    return await write();
+  } finally {
+    const left = awaitingOwnWrite.get(id)! - 1;
+    if (left === 0) awaitingOwnWrite.delete(id);
+    else awaitingOwnWrite.set(id, left);
+  }
 }
 
 // Tells every window that a workspace stopped setting up.
@@ -950,7 +968,7 @@ function startProjects({ spawnFor, endingsOf }: ReturnType<typeof startTerminals
   // Reserves the branch and the worktree's path, answers, and the daemon sets the workspace up in the background
   // (`workspaces:settled` tells the end). A `null` base is the main workspace.
   ipcMain.handle('workspaces:compose', (event, project: string, task: string, base: string | null, harness: string) =>
-    forward(event, 'workspaces:compose', 'workspace-compose', { project, task, base, harness }),
+    asOwnWrite(event.sender, () => forward(event, 'workspaces:compose', 'workspace-compose', { project, task, base, harness })),
   );
 
   ipcMain.handle('workspaces:failed-setups', (event): FailedSetup[] => {
@@ -959,7 +977,7 @@ function startProjects({ spawnFor, endingsOf }: ReturnType<typeof startTerminals
   });
   ipcMain.handle('workspaces:dismiss-setup', async (event, id: string): Promise<void> => {
     if (!isFromApp(event)) throw new Error('workspaces:dismiss-setup refused: unexpected origin');
-    await (await writable()).client.call('dismiss-setup', { id });
+    await asOwnWrite(event.sender, async () => (await writable()).client.call('dismiss-setup', { id }));
   });
 
   ipcMain.handle('workspaces:removal', (event, project: string, path: string): Promise<RemovalResult> =>
@@ -1375,7 +1393,9 @@ function startSessions({ endingsOf, kill }: ReturnType<typeof startTerminals>) {
   });
   ipcMain.handle('sessions:start', (event, harness: string, size: { cols: number; rows: number }, options?: StartSessionOptions) => {
     if (!isFromApp(event)) throw new Error('sessions:start refused: unexpected origin');
-    return startSession(event.sender, harness, (daemon) => daemon.client.call('session-start', { harness, size, options, subscribe: true }));
+    return asOwnWrite(event.sender, () =>
+      startSession(event.sender, harness, (daemon) => daemon.client.call('session-start', { harness, size, options, subscribe: true })),
+    );
   });
 }
 
