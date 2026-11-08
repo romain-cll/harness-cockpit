@@ -6,7 +6,11 @@ import { join } from 'node:path';
 import { connectDaemon } from '@cockpit/daemon';
 import { type Page } from 'playwright-core';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { agentSelect, baseSelect, createButton, openComposer, promptBox, waitForMessage } from './composer';
 import { heldProcess, isAlive, killDaemonsIn, MAIN_PROCESS_ERROR, quitApp, type Session, startClock, untilRead, versionLabel, watchTerminalEnd } from './launch';
+import { readSidebarLines, startProjectRemoval } from './support/projects';
+import { openWorkspaceStartMenu } from './support/sessions';
+import { allPageErrorsOf } from './support/terminal';
 import { addWorktree, aliveOf, type ApiWindow, beginSetup, commandOf, daemonEnded, daemonFile, daemonPid, daemonProcessesOf, daemonSettled, destroyWindows, dotOf, environmentOf, escapeRegExp, expectDot, expectScreen, expectTabCount, factsOf, type Fixture, goToWorkspacePage, hasEnded, killApp, launchBuiltOn, makeDataDir, makeFixture, makeRepoWithSetup, makeWorkspace, must, newShellTab, notificationShown, pagesOf, postEvent, selectTab, SETUP_PID, shellPid, startSession, startSetup, stubPicker, tabNames, tokenFor, typeLine, uniqueBuild, untilWindows, watchTerminal } from './support/daemon';
 
 describe('daemon: built app', () => {
@@ -450,20 +454,30 @@ describe('daemon: built app, the daemon cannot start', () => {
   const failureView = (page: Page) => page.getByText("Cockpit's background service could not start", { exact: true });
   const SUBTITLE = 'Terminals and agents run in this service. Your projects and workspaces are untouched.';
 
-  test('AC10 — COCKPIT_HOME a regular file: the window opens; stderr names the path; a workspace page and a session page show the failure view; the Sessions section says so; spawn and sessions.start are refused with the reason; projects can still be added and removed', async () => {
+  test('AC10, COCKPIT-37 AC8 — COCKPIT_HOME a regular file: the window opens; stderr names the path; the sidebar lists the project, its workspace and the session of state.json; a workspace page and a session page show the failure view; the Sessions section says so; adding a project, removing it, creating a workspace and starting a session are each refused with the reason; the remove dialog, the composer and the workspace "+" menu show it (detection settles, no uncaught rejection); state.json is unchanged', async () => {
     const fx = makeFixture();
     const home = join(dataDir, 'h');
     writeFileSync(home, 'a file, not a folder');
     repo = makeRepoWithSetup();
+    const other = makeRepoWithSetup();
+    const worktree = join(fx.root, 'wt-view');
+    addWorktree(repo.root, 'view', worktree);
     // A session of an earlier launch, so its page can be opened while the daemon is down.
     const seeded = { id: randomUUID(), name: 'Claude Code 1', harness: 'claude-code', directory: join(fx.root, 'earlier'), createdAt: new Date().toISOString() };
-    writeFileSync(join(dataDir, 'state.json'), JSON.stringify({ version: 1, sessions: [seeded] }));
+    const stateFile = join(dataDir, 'state.json');
+    writeFileSync(stateFile, JSON.stringify({ version: 1, projects: [{ path: repo.root }], sessions: [seeded] }));
+    const stateBefore = readFileSync(stateFile, 'utf8');
     try {
       session = await launchBuiltOn(fx.env({ COCKPIT_TEST_DAEMON_BUILD: build }), dataDir, home);
       const { page } = session;
       await page.getByText(versionLabel).waitFor();
       const reason = reasonOf(session.output());
       expect(reason).toContain(home);
+
+      // The state is read from state.json: the project, its workspace and the session are listed with no daemon.
+      await page.getByTitle(repo.root, { exact: true }).first().waitFor();
+      await page.getByTitle(worktree, { exact: true }).first().waitFor();
+      await page.locator('aside').getByRole('link', { name: seeded.name }).waitFor();
 
       // The failure view: title, subtitle, the reason in monospace and "Try again", on a workspace page and on a session page.
       const expectFailureView = async () => {
@@ -473,13 +487,6 @@ describe('daemon: built app, the daemon cannot start', () => {
         await page.getByRole('button', { name: 'Try again', exact: true }).waitFor();
         expect(await page.getByRole('button', { name: 'Show log', exact: true }).count(), 'no log file exists').toBe(0);
       };
-      // Projects can be added though the daemon is down (worktrees need the home folder: this one is made with git).
-      await stubPicker(session, repo.root);
-      expect((await page.evaluate(() => (window as unknown as ApiWindow).api.projects!.add!())).status).toBe('added');
-      expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).projects.map((p: { path: string }) => p.path)).toEqual([repo.root]);
-      const worktree = join(fx.root, 'wt-view');
-      addWorktree(repo.root, 'view', worktree);
-      await page.evaluate(() => window.dispatchEvent(new Event('focus')));
       await page.getByTitle(worktree, { exact: true }).first().click();
       await expectFailureView();
       expect(await page.locator('[role="tablist"]').count(), 'the view replaces the panes').toBe(0);
@@ -494,17 +501,58 @@ describe('daemon: built app, the daemon cannot start', () => {
 
       const spawned = await page.evaluate(() => (window as unknown as ApiWindow).api.pty!.spawn!({ cols: 80, rows: 24 }).then(() => 'spawned', (error: Error) => error.message));
       expect(spawned).toContain(reason);
-      const started = await page.evaluate(() => (window as unknown as ApiWindow).api.sessions!.start!('claude-code', { cols: 80, rows: 24 }, {}));
-      expect(started.status).toBe('refused');
-      expect(started.message).toContain(reason);
-      expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).sessions, 'only the seeded session').toEqual([seeded]);
 
-      // Projects can still be removed.
-      await page.evaluate((root) => (window as unknown as ApiWindow).api.projects!.remove!(root), repo.root);
-      expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).projects ?? []).toEqual([]);
+      // Every write is refused with the reason, as a refusal or as an error: nothing is accepted.
+      await stubPicker(session, other.root);
+      const outcomes = await page.evaluate(async (root) => {
+        const api = (window as unknown as ApiWindow).api;
+        const settle = async (call: () => Promise<unknown>) => {
+          try {
+            const result = (await call()) as { status?: string; message?: string } | undefined;
+            return result?.status === 'refused' ? (result.message ?? '') : `accepted: ${JSON.stringify(result)}`;
+          } catch (error) {
+            return (error as Error).message;
+          }
+        };
+        return {
+          add: await settle(() => api.projects!.add!()),
+          remove: await settle(() => api.projects!.remove!(root)),
+          create: await settle(() => api.workspaces!.create!(root, 'refused-task', 'main')),
+          start: await settle(() => api.sessions!.start!('claude-code', { cols: 80, rows: 24 }, {})),
+        };
+      }, repo.root);
+      for (const [what, message] of Object.entries(outcomes)) expect(message, `${what} is refused with the daemon's reason`).toContain(reason);
+
+      // The refusals as the UI shows them. The remove dialog says why, with no uncaught rejection in the page.
+      const dialog = await startProjectRemoval(page, repo.root);
+      await dialog.getByRole('button', { name: 'Remove', exact: true }).click();
+      await dialog.filter({ hasText: reason }).waitFor();
+      await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await dialog.waitFor({ state: 'hidden' });
+      expect(await allPageErrorsOf(page), 'no uncaught rejection').toEqual([]);
+
+      // Harness detection settles with no daemon: the composer leaves "Detecting…" and its send is refused with the reason.
+      await openComposer(page, repo.root);
+      await agentSelect(page).filter({ hasNotText: 'Detecting…' }).waitFor();
+      await baseSelect(page).filter({ hasText: /\S/ }).filter({ hasNotText: /^\s*Select a base\s*$/ }).waitFor();
+      await promptBox(page).fill('refused task');
+      await createButton(page).click();
+      expect(await waitForMessage(page)).toContain(reason);
+
+      // So does the "+" menu of a workspace: it lists the agent found, and starting it is refused with the reason.
+      await openWorkspaceStartMenu(page, worktree, 'view');
+      await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).click();
+      await untilRead(
+        page,
+        readSidebarLines,
+        (lines, why: string) => lines.some((line) => line.includes(why) && !line.startsWith("Cockpit's background service could not start")),
+        reason,
+      );
+      expect(readFileSync(stateFile, 'utf8'), 'state.json is unchanged').toBe(stateBefore);
       expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
     } finally {
       rmSync(fx.root, { recursive: true, force: true });
+      rmSync(other.parent, { recursive: true, force: true });
     }
   });
 
@@ -516,17 +564,20 @@ describe('daemon: built app, the daemon cannot start', () => {
     const home = join(dataDir, 'h');
     const socket = join(home, `daemon-1-${build}.sock`);
     mkdirSync(socket, { recursive: true });
+    // Writes are refused while the daemon is down: the project and its workspace come from state.json and git.
+    repo ??= makeRepoWithSetup();
+    const root = repo.root;
+    const viewPath = join(fx.root, 'wt-view');
+    addWorktree(root, 'view-ws', viewPath);
+    writeFileSync(join(dataDir, 'state.json'), JSON.stringify({ version: 1, projects: [{ path: root }] }));
     try {
       session = await launchBuiltOn(fx.env({ COCKPIT_TEST_DAEMON_BUILD: build }), dataDir, home);
       const { page } = session;
       await page.getByText(versionLabel).waitFor();
       const reason = reasonOf(session.output());
       expect(reason).toContain(socket);
-      // The home folder exists, so a workspace can be made: its page shows the failure view.
-      repo ??= makeRepoWithSetup();
-      const root = repo.root;
-      const view = await makeWorkspace(session, 'view-ws', root);
-      await page.getByTitle(view.path, { exact: true }).first().click();
+      // The workspace page shows the failure view.
+      await page.getByTitle(viewPath, { exact: true }).first().click();
       await failureView(page).waitFor();
 
       // COCKPIT-69 AC1: the look of the view, in computed colours. Self-contained: it runs in the page.
@@ -567,23 +618,6 @@ describe('daemon: built app, the daemon cannot start', () => {
       await session.evaluateInMain(`(() => { globalThis.__opened = []; require('electron').shell.openPath = async (path) => { globalThis.__opened.push(path); globalThis.__onOpened?.(); return ''; }; })()`);
       await page.getByRole('button', { name: 'Show log', exact: true }).click();
       expect(await session.evaluateInMain<string[]>(`new Promise((resolve) => { globalThis.__onOpened = () => resolve(globalThis.__opened); if (globalThis.__opened.length > 0) resolve(globalThis.__opened); })`)).toEqual([join(home, `daemon-1-${build}.log`)]);
-
-      // Projects and workspaces are untouched: the home folder exists, so a worktree can be made and deleted.
-      const created = await page.evaluate((root) => (window as unknown as ApiWindow).api.workspaces!.create!(root, 'still-works', 'main'), root);
-      expect(created.status).toBe('created');
-      // The worktree is made when `create` answers: the list shows it at once.
-      const worktree = await page.evaluate(
-        async (root) =>
-          ((await (window as unknown as ApiWindow).api.projects!.list!()) as Array<{ path: string; workspaces: Array<{ path: string; name: string }> }>)
-            .find((project) => project.path === root)
-            ?.workspaces.find((workspace) => workspace.name === 'still-works')?.path,
-        root,
-      );
-      expect(worktree, 'the workspace is listed').toBeDefined();
-      expect(existsSync(worktree!)).toBe(true);
-      const removed = await page.evaluate(([root, path]) => (window as unknown as ApiWindow).api.workspaces!.remove!(root, path, {}), [root, worktree!] as const);
-      expect(removed.status).toBe('removed');
-      expect(existsSync(worktree!)).toBe(false);
 
       // The cause remains: the view stays.
       await page.getByRole('button', { name: 'Try again', exact: true }).click();
@@ -701,9 +735,13 @@ describe('daemon: built app, a daemon that does not answer', () => {
 describe('daemon: built app, requests from another origin', () => {
   let dataDir: string;
   let session: Session | undefined;
+  const seeded = { id: randomUUID(), name: 'Claude Code 1', harness: 'claude-code', directory: '/', createdAt: new Date().toISOString() };
 
   beforeAll(() => {
     dataDir = makeDataDir();
+    // A session of an earlier launch, from state.json: a write would start the daemon, and the failure view must show.
+    // No project: a project's home page asks for the harnesses at load, which would start the daemon again.
+    writeFileSync(join(dataDir, 'state.json'), JSON.stringify({ version: 1, sessions: [seeded] }));
   });
 
   afterAll(async () => {
@@ -765,12 +803,13 @@ describe('daemon: built app, requests from another origin', () => {
     expect(daemonFile(home, 'pid', build)).toBeUndefined();
     expect(session.output().slice(outputBefore.length)).not.toMatch(MAIN_PROCESS_ERROR);
 
-    // The app's own "Try again" does start it (on the page of a workspace, made now that the cause is gone).
-    const workspace = await makeWorkspace(session, 'origin-ws');
-    await page.getByTitle(workspace.path, { exact: true }).first().click();
+    // The app's own "Try again" does start it (on the page of the session of state.json, now that the cause is gone).
+    await page.locator('aside').getByRole('link', { name: seeded.name }).click();
+    const failureView = page.getByText("Cockpit's background service could not start", { exact: true });
+    await failureView.waitFor();
     await page.getByRole('button', { name: 'Try again', exact: true }).click();
-    // The panes show once the daemon answers, and its files are written before it can.
-    await page.getByRole('tablist').first().waitFor();
+    // The page shows the session once the daemon answers, and its files are written before it can.
+    await page.getByText('This session has ended.').waitFor();
     expect(daemonPid(home, build)).toBeDefined();
     expect(daemonProcessesOf(build)).toHaveLength(1);
 

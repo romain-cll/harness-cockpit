@@ -267,11 +267,14 @@ export function Projects({ projects, sessions, failedSetups }: { projects: Proje
   const sessionsIn = (project: Project, directory?: string) =>
     sessions.filter((session) => session.project === project.path && (directory === undefined || session.directory === directory));
 
-  async function remove(project: Project) {
-    await window.api.projects.remove(project.path);
+  // The reason it was refused, if it was.
+  async function remove(project: Project): Promise<string | undefined> {
+    const refused = await window.api.projects.remove(project.path);
+    if (refused) return refused.message;
     endSessions(sessionsIn(project).map(({ id }) => id));
     for (const { path } of project.workspaces) closeWorkspace(path);
     await router.invalidate();
+    return undefined;
   }
 
   // Shows what starting a session came to: its tab on the workspace's page, or why it was refused.

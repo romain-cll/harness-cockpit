@@ -18,15 +18,17 @@ export function RemoveProjectDialog({
 }: {
   project: Project;
   onClose: () => void;
-  /** Removes the project from Cockpit and ends its sessions. */
-  onRemove: () => Promise<void>;
+  /** Removes the project from Cockpit and ends its sessions; resolves to why it could not, if it could not. */
+  onRemove: () => Promise<string | undefined>;
 }) {
   const [busy, setBusy] = useState(false);
+  const [refusal, setRefusal] = useState<string>();
 
   async function remove() {
     setBusy(true);
     try {
-      await onRemove();
+      const refused = await onRemove();
+      if (refused) return setRefusal(refused);
     } finally {
       setBusy(false);
     }
@@ -41,6 +43,11 @@ export function RemoveProjectDialog({
           <AlertDialogDescription>
             This removes the project from Cockpit. The repository stays on disk, and the sessions running in its workspaces end.
           </AlertDialogDescription>
+          {refusal && (
+            <p role="alert" className="text-xs break-words text-destructive">
+              {refusal}
+            </p>
+          )}
         </AlertDialogHeader>
         <AlertDialogFooter>
           <AlertDialogCancel>Cancel</AlertDialogCancel>

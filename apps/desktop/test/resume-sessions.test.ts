@@ -318,7 +318,7 @@ describe('resume sessions: built app', () => {
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
   });
 
-  test('AC8 — an id a session reports while no app is connected is in state.json once the app is launched again', async () => {
+  test('AC8 — an id a session reports while no app is connected is stored by the daemon at once, and still there when the app is launched again', async () => {
     expect(storedIdOf(ids.withId)).toBe(AFTER_RESUME_ID);
     await quitApp(session);
     expect(storedIdOf(ids.withId)).toBe(AFTER_RESUME_ID);
@@ -328,17 +328,10 @@ describe('resume sessions: built app', () => {
       body: { sessionId: ids.withId, event: 'harness-session', harnessSessionId: UNSEEN_ID },
     });
     expect(answer.status).toBe(204);
-    // Nothing was connected to hear it.
-    expect(storedIdOf(ids.withId)).toBe(AFTER_RESUME_ID);
+    // The daemon writes state.json itself: nothing needs to be connected to hear it.
+    expect(storedIdOf(ids.withId)).toBe(UNSEEN_ID);
 
-    // The state is written on adoption, before the window exists: `session` is
-    // the relaunched one only once its launch has resolved.
-    let relaunch: ReturnType<typeof launchBuiltWith> | undefined;
-    await untilState(dataDir, (state) => harnessIdOf(state, ids.withId) === UNSEEN_ID, async () => {
-      relaunch = launchBuiltWith(env, dataDir, home);
-    });
-    session = await relaunch!;
-
+    session = await launchBuiltWith(env, dataDir, home);
     expect(storedIdOf(ids.withId)).toBe(UNSEEN_ID);
     await session.page.getByText(versionLabel).waitFor();
   });

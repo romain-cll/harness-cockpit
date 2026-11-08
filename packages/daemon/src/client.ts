@@ -10,21 +10,27 @@ import {
   RESIZE_EVENTS_HEADER,
   UPGRADE,
   type Attached,
+  type CallMethod,
+  type Calls,
   type Hello,
   type Message,
   type Request,
   type SessionReport,
+  type SettledSetup,
   type SpawnOptions,
+  type StateSnapshot,
   type TerminalExit,
   type TerminalInfo,
 } from './protocol';
 
 /** A request that is answered, without its id. */
-type Call = Request extends infer Each ? (Each extends { id: number } ? Omit<Each, 'id'> : never) : never;
+type Ask = Request extends infer Each ? (Each extends { id: number } ? Omit<Each, 'id'> : never) : never;
 
 export interface DaemonClient {
   /** Says which build the client belongs to; answers the daemon's own protocol, build and pid. */
   hello(build: string): Promise<Hello>;
+  /** Runs `method` in the daemon (see `Calls`); rejects with the daemon's reason when it refuses. */
+  call<Method extends CallMethod>(method: Method, params: Calls[Method]['params']): Promise<Calls[Method]['result']>;
   /** Resolves to the terminal's id; rejects with the daemon's reason when it refuses. */
   spawn(options: SpawnOptions): Promise<number>;
   list(): Promise<TerminalInfo[]>;
@@ -39,11 +45,18 @@ export interface DaemonClient {
   onData(listener: (event: { id: number; seq: number; data: string }) => void): void;
   /** A terminal's size changed; `seq` numbers it with the chunks of output. Absent from a daemon that sends no such event: the listeners then get the size at the `resize` call. */
   onResize(listener: (event: { id: number; seq?: number; cols: number; rows: number }) => void): void;
+  /** Every terminal's end, whoever spawned or attached it. */
   onExit(listener: (event: { id: number } & TerminalExit) => void): void;
   /** Everything a session reported (a hook, `cockpit setup`), for any session of the daemon. */
   onStatus(listener: (report: SessionReport) => void): void;
   /** The title a session's program set (OSC 0 or 2), once per change, for any session of the daemon. */
   onTitle(listener: (event: { sessionId: string; title: string }) => void): void;
+  /** The state after a change of `state.json`, the workspaces being set up or the failed sends. */
+  onState(listener: (snapshot: StateSnapshot) => void): void;
+  /** A terminal another connection, or the daemon, spawned. */
+  onSpawned(listener: (terminal: TerminalInfo) => void): void;
+  /** A workspace the daemon was setting up is done. */
+  onSettled(listener: (settled: SettledSetup) => void): void;
   /** The connection ended: the daemon went away, or `close` was called. */
   onClose(listener: () => void): void;
   close(): void;
@@ -161,12 +174,15 @@ function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutM
   const exitListeners: Array<Parameters<DaemonClient['onExit']>[0]> = [];
   const statusListeners: Array<Parameters<DaemonClient['onStatus']>[0]> = [];
   const titleListeners: Array<Parameters<DaemonClient['onTitle']>[0]> = [];
+  const stateListeners: Array<Parameters<DaemonClient['onState']>[0]> = [];
+  const spawnedListeners: Array<Parameters<DaemonClient['onSpawned']>[0]> = [];
+  const settledListeners: Array<Parameters<DaemonClient['onSettled']>[0]> = [];
   const closeListeners: Array<() => void> = [];
 
   const send = (message: Request) => {
     if (!socket.destroyed) socket.write(encode(message));
   };
-  const call = <T>(message: Call): Promise<T> =>
+  const ask = <T>(message: Ask): Promise<T> =>
     new Promise((resolve, reject) => {
       if (socket.destroyed) return reject(new Error('the background service connection is closed'));
       const id = ++lastId;
@@ -211,6 +227,15 @@ function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutM
       case 'title':
         titleListeners.forEach((listener) => listener({ sessionId: message.sessionId, title: message.title }));
         break;
+      case 'state':
+        stateListeners.forEach((listener) => listener({ state: message.state, setups: message.setups, failedSetups: message.failedSetups }));
+        break;
+      case 'spawned':
+        spawnedListeners.forEach((listener) => listener(message.terminal));
+        break;
+      case 'settled':
+        settledListeners.forEach((listener) => listener({ path: message.path, ...(message.message !== undefined && { message: message.message }) }));
+        break;
     }
   };
   const drain = async () => {
@@ -239,14 +264,15 @@ function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutM
     hello: (build) =>
       new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new DaemonNotAnsweringError(socketPath, timeoutMs)), timeoutMs);
-        call<Hello>({ type: 'hello', build }).then(
+        ask<Hello>({ type: 'hello', build }).then(
           (value) => (clearTimeout(timer), resolve(value)),
           (error: unknown) => (clearTimeout(timer), reject(error)),
         );
       }),
-    spawn: (options) => call({ type: 'spawn', options }),
-    list: () => call({ type: 'list' }),
-    attach: (terminal) => call({ type: 'attach', terminal }),
+    call: (method, params) => ask({ type: 'call', method, params }),
+    spawn: (options) => ask({ type: 'spawn', options }),
+    list: () => ask({ type: 'list' }),
+    attach: (terminal) => ask({ type: 'attach', terminal }),
     write: (terminal, data) => send({ type: 'write', terminal, data }),
     resize: (terminal, cols, rows) => {
       send({ type: 'resize', terminal, cols, rows });
@@ -258,6 +284,9 @@ function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutM
     onExit: (listener) => void exitListeners.push(listener),
     onStatus: (listener) => void statusListeners.push(listener),
     onTitle: (listener) => void titleListeners.push(listener),
+    onState: (listener) => void stateListeners.push(listener),
+    onSpawned: (listener) => void spawnedListeners.push(listener),
+    onSettled: (listener) => void settledListeners.push(listener),
     onClose: (listener) => void closeListeners.push(listener),
     close: () => void socket.destroy(),
   };

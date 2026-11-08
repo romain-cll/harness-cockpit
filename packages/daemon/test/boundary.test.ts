@@ -31,3 +31,16 @@ test('COCKPIT-30 AC5 — the hook field names session_id and sessionID are in no
   }
   expect(readFileSync(join(root, 'packages/harnesses/src/catalogue.ts'), 'utf8')).toContain('session_id');
 });
+
+// COCKPIT-37: the daemon is the only writer of `state.json`; the app keeps a replica it reads.
+test('COCKPIT-37 AC7 — the source of apps/desktop/src/main calls neither saveState nor loadState', () => {
+  const root = join(import.meta.dirname, '..', '..', '..');
+  const files = sources(join(root, 'apps/desktop/src/main'));
+  expect(files.length).toBeGreaterThan(0);
+  for (const file of files) {
+    const code = readFileSync(file, 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    expect(code, file).not.toMatch(/\b(?:saveState|loadState)\b/);
+  }
+});

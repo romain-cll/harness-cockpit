@@ -1,9 +1,11 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
-import { clearStaleSocket, daemonFiles } from './paths';
-import { encode, lineReader, PROTOCOL_VERSION, RESIZE_EVENTS_HEADER, UPGRADE, type Hello, type Message, type Request, type SessionEventName, type SessionReport, type SetupEventName, type TerminalInfo } from './protocol';
+import { createActions } from './actions';
+import { connectDaemon } from './client';
+import { clearStaleSocket, daemonFiles, listDaemonFiles } from './paths';
+import { encode, lineReader, PROTOCOL_VERSION, RESIZE_EVENTS_HEADER, UPGRADE, WRITES, WRONG_BUILD, type Hello, type Message, type Request, type SessionEventName, type SessionReport, type SetupEventName, type TerminalInfo } from './protocol';
 import { SESSION_EVENTS, SETUP_EVENTS } from './status';
 import { createTerminals, type Subscriber } from './terminals';
 
@@ -12,6 +14,10 @@ export interface DaemonOptions {
   home: string;
   /** The build of the app that started the daemon. */
   build: string;
+  /** The folder holding `state.json` (the app's `userData`), which the daemon loads and writes. Without it the daemon holds no state: a `call` is refused. */
+  stateDir?: string;
+  /** The `cockpit` binary the sessions' hooks and `cockpit setup` run. */
+  cli?: string;
 }
 
 export interface Daemon {
@@ -23,7 +29,6 @@ export interface Daemon {
 }
 
 const MAX_BODY_BYTES = 64 * 1024;
-const WRONG_BUILD = 'this background service belongs to another build of Cockpit';
 
 interface Connection extends Subscriber {
   socket: Socket;
@@ -35,16 +40,12 @@ interface Connection extends Subscriber {
  * Listens on `daemon-<protocol>-<build>.sock` (HTTP over a Unix socket) with a fresh token in
  * the `.token` next to it, written once it listens: of two daemons started together the one that
  * does not get the socket gives up without touching a file. `POST /session-events` takes the harness hooks' reports; `GET /terminals` and `POST /shutdown` list and end the daemon; `GET /attach`
- * upgrades to a stream of JSON lines that a client drives the terminals with. Rejects, touching
- * nothing, when another daemon holds the socket or the path is not a socket.
+ * upgrades to a stream of JSON lines that a client drives the terminals and the state with (`call`). Rejects, touching
+ * nothing, when another daemon holds the socket, the path is not a socket or `state.json` is from a newer version.
  */
-export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon> {
+export async function runDaemon({ home, build, stateDir, cli = '' }: DaemonOptions): Promise<Daemon> {
   const files = daemonFiles(home, PROTOCOL_VERSION, build);
   mkdirSync(home, { recursive: true });
-  await clearStaleSocket(files.socket);
-
-  const token = randomBytes(32).toString('hex');
-
   const connections = new Set<Connection>();
   // A daemon of another build asked for: it keeps its terminals and exits when the last one ends.
   let superseded = false;
@@ -52,18 +53,46 @@ export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon>
   let resolveClosed!: () => void;
   const closed = new Promise<void>((resolve) => (resolveClosed = resolve));
 
-  function onTerminalEnd(): void {
-    if (superseded && terminals.size === 0) void close();
-  }
-  const terminals = createTerminals(onTerminalEnd, (report) => broadcast({ type: 'status', ...report }));
-
-  const broadcast = (message: Message) => {
-    for (const { socket } of connections) if (!socket.destroyed) socket.write(encode(message));
+  const broadcast = (message: Message, except?: Connection) => {
+    for (const connection of connections) if (connection !== except && !connection.socket.destroyed) connection.socket.write(encode(message));
   };
+
+  const terminals = createTerminals({
+    onExit: (info, exit, killed) => {
+      broadcast({ type: 'exit', terminal: info.id, ...exit });
+      actions?.terminalEnded(info, killed);
+      if (superseded && terminals.size === 0) void close();
+    },
+    onTitle: (sessionId, title) => void actions?.title(sessionId, title),
+    onTitleStatus: (report) => broadcast({ type: 'status', ...report }),
+  });
+
+  // Loads `state.json` before any file of the daemon is written: a newer version fails the start.
+  const actions =
+    stateDir === undefined
+      ? undefined
+      : createActions({
+          home,
+          stateDir,
+          cli,
+          socket: files.socket,
+          terminals,
+          superseded: () => superseded,
+          announceState: (snapshot) => broadcast({ type: 'state', ...snapshot }),
+          announceSettled: (settled) => broadcast({ type: 'settled', ...settled }),
+          announceSpawned: (terminal, requester) => broadcast({ type: 'spawned', terminal }, requester as Connection | undefined),
+        });
+  await clearStaleSocket(files.socket);
+  // The daemons of other builds already listening (their `.sock`: a `.log` exists before a daemon runs), listed
+  // first, so that two daemons starting together never both supersede the other.
+  const older = listDaemonFiles(home).filter((daemon) => daemon.protocol === PROTOCOL_VERSION && daemon.build !== build && existsSync(daemon.socket));
+
+  const token = randomBytes(32).toString('hex');
 
   const server = createServer((req, res) => handle(req, res, token, {
     onSessionEvent: (report) => {
       if (!terminals.report(report)) return false;
+      actions?.report(report);
       broadcast({ type: 'status', ...report });
       return true;
     },
@@ -87,7 +116,6 @@ export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon>
       socket,
       data: (terminal, seq, data) => send({ type: 'data', terminal, seq, data }),
       resize: (terminal, seq, cols, rows) => send({ type: 'resize', terminal, seq, cols, rows }),
-      exit: (terminal, exit) => send({ type: 'exit', terminal, ...exit }),
       title: (sessionId, title) => send({ type: 'title', sessionId, title }),
     };
     connections.add(connection);
@@ -130,10 +158,19 @@ export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon>
               return { protocol: PROTOCOL_VERSION, build, pid: process.pid } satisfies Hello;
             });
             break;
+          case 'call':
+            answer(request.id, () => {
+              if (!actions) throw new Error('this background service holds no state');
+              if (WRITES.has(request.method) && (superseded || connection.build !== build)) throw new Error(WRONG_BUILD);
+              return actions.call(request.method, request.params as never, connection);
+            });
+            break;
           case 'spawn':
             answer(request.id, () => {
               if (connection.build !== build) throw new Error(WRONG_BUILD);
-              return terminals.spawn(request.options, connection);
+              const id = terminals.spawn(request.options, connection);
+              broadcast({ type: 'spawned', terminal: terminals.info(id) }, connection);
+              return id;
             });
             break;
           case 'list':
@@ -173,6 +210,19 @@ export async function runDaemon({ home, build }: DaemonOptions): Promise<Daemon>
   writeFileSync(temporaryPath, token, { mode: 0o600 });
   renameSync(temporaryPath, files.token);
   writeFileSync(files.pid, String(process.pid));
+
+  // They hear which build is the newest now, app or no app: each keeps its terminals, writes nothing to `state.json`
+  // from here and exits once empty. One that is gone or does not answer changes nothing.
+  await Promise.all(
+    older.map(async ({ socket }) => {
+      try {
+        const client = await connectDaemon(socket);
+        await client.hello(build).finally(() => client.close());
+      } catch {
+        // Gone, or not ours to reach.
+      }
+    }),
+  );
 
   // `waitForTerminals`: the files go and the daemon exits once every terminal has exited, SIGKILL after the
   // hang-up's grace included; otherwise as soon as the hang-ups are sent.

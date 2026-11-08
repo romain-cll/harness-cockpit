@@ -9,6 +9,7 @@ import {
   loadState,
   NewerStateError,
   ProjectExistsError,
+  readState,
   rememberApp,
   removeProject,
   saveState,
@@ -1130,5 +1131,37 @@ describe('COCKPIT-30 AC15 — the harness session id', () => {
     const state = { version: 1, projects: [], sessions: [workspaceSession({ id: 'a', harnessSessionId: 'first' })] };
 
     expect(setHarnessSessionId(state, 'nobody', 'x').sessions).toEqual(state.sessions);
+  });
+});
+
+// COCKPIT-37: the app reads the state the daemon owns, and only reads it.
+describe('COCKPIT-37 AC8 — readState reads and writes nothing', () => {
+  test('COCKPIT-37 AC8 — returns the content of a valid file, and an empty state for a missing folder, a missing file and a corrupted one, none of them created, backed up or written', () => {
+    expect(readState(dir)).toEqual({ version: 1, projects: [], sessions: [] });
+    expect(existsSync(dir)).toBe(false);
+
+    mkdirSync(dir, { recursive: true });
+    expect(readState(dir)).toEqual({ version: 1, projects: [], sessions: [] });
+    expect(readdirSync(dir)).toEqual([]);
+
+    seed('{ not json');
+    const corrupted = snapshot();
+    expect(readState(dir)).toEqual({ version: 1, projects: [], sessions: [] });
+    expect(snapshot()).toEqual(corrupted);
+    expect(readdirSync(dir)).toEqual(['state.json']);
+
+    seed(JSON.stringify({ version: 1, projects: [{ path: '/repo' }], editor: 'zed' }));
+    const valid = snapshot();
+    expect(readState(dir)).toEqual({ version: 1, projects: [{ path: '/repo' }], sessions: [], editor: 'zed' });
+    expect(snapshot()).toEqual(valid);
+  });
+
+  test('COCKPIT-37 AC8 — a file from a newer version throws NewerStateError and is left untouched', () => {
+    seed('{ "version": 99 }\n');
+    const before = snapshot();
+
+    expect(() => readState(dir)).toThrow(NewerStateError);
+    expect(snapshot()).toEqual(before);
+    expect(readdirSync(dir)).toEqual(['state.json']);
   });
 });

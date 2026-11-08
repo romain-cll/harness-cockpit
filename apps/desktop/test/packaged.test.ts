@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'vitest';
 import { daemonSocketIn, isAlive, launchEnv, launchPackaged, launchSpawned, MAIN_PROCESS_ERROR, packagedAppDir, type Session, stopGroup, versionLabel } from './launch';
 import { makeTestDir } from './run-root';
+import { describeCliPackagedSmoke } from './support/cli';
 import { describeDaemonPackagedSmoke } from './support/daemon';
 import { describeMode } from './support/mode-checks';
 import { describePanesPackagedSmoke } from './support/panes';
@@ -188,7 +189,10 @@ describe('packaged app state file', () => {
       expect(backups).toHaveLength(1);
       expect(readFileSync(join(dataDir, backups[0]!), 'utf8')).toBe(corrupt);
       expect(JSON.parse(readFileSync(stateFileIn(dataDir), 'utf8'))).toEqual({ version: 1 });
-      expect(session.output()).toContain(backups[0]!);
+      // The daemon sets the file aside and writes the warning to its log, not to the app's stderr.
+      const logs = readdirSync(session.cockpitHome).filter((name) => /^daemon-1-.+\.log$/.test(name));
+      expect(logs).toHaveLength(1);
+      expect(readFileSync(join(session.cockpitHome, logs[0]!), 'utf8')).toContain(backups[0]!);
     } finally {
       await session.close();
     }
@@ -450,5 +454,6 @@ describe.runIf(process.env.CI)('packaged app without the background switch', () 
 
 describePanesPackagedSmoke();
 describeDaemonPackagedSmoke();
+describeCliPackagedSmoke();
 
 describeResumeSmoke('packaged app', (fx) => launchPackagedWith(fx.env()), PACKAGED_CLI);

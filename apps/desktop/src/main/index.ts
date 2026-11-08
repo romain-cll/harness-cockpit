@@ -1,71 +1,63 @@
-import { spawn, type ChildProcess } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
-import { mkdir, rm, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { mkdir, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { homedir, uptime } from 'node:os';
-import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   connectDaemon,
   DaemonNotAnsweringError,
   daemonFiles,
+  describeFailure,
   ensureDaemon,
+  findWorkspace as findWorkspaceIn,
+  hasMainWorkspace as hasMainWorkspaceIn,
+  isMainWorkspace as isMainWorkspaceIn,
   listDaemonFiles,
   PROTOCOL_VERSION,
   readTerminals,
   shutdownDaemon,
+  startDaemonProcess,
+  terminalEnv,
+  toProject,
+  withSpawnDefaults,
+  workspaceName,
+  writeLaunch,
+  type CallMethod,
+  type Calls,
   type DaemonClient,
+  type FailedSetup as DaemonFailedSetup,
+  type Launch,
   type SessionReport,
+  type AvailableHarness,
+  type Setup,
   type SetupState,
-  type SpawnOptions,
+  type StateSnapshot,
   type TerminalExit,
   type TerminalInfo,
   type TerminalKind,
 } from '@cockpit/daemon';
 import { createPullRequest, findPullRequest, GitHubError, mergePullRequest, pullRequestStates } from '@cockpit/github';
-import { detectHarnesses, harnesses, statusLaunch, type DetectedHarness, type Harness } from '@cockpit/harnesses';
+import { detectHarnesses, harnesses } from '@cockpit/harnesses';
 import { apps, defaultApplicationDirs, detectApps, LaunchError, openIn, reveal, type App } from '@cockpit/launchers';
+import { NewerStateError, readState, type State } from '@cockpit/state';
 import {
-  addProject,
-  addSession,
-  closeSession,
-  loadState,
-  NewerStateError,
-  ProjectExistsError,
-  rememberApp,
-  removeProject,
-  saveState,
-  sessionName,
-  setHarnessSessionId,
-  setMainWorkspace,
-  type Session,
-  updateProjectPath,
-  type State,
-} from '@cockpit/state';
-import {
-  availableBranch,
   branchStatus,
   checkGit,
   cloneRepository,
   commitAll,
   commitsAfter,
-  createWorktree,
   fileDiff,
-  findRepositoryRoot,
   hasRemote,
   headSubject,
   initRepository,
   listBranches,
   listChanges,
   listWorktrees,
-  nameWorkspace,
   pushBranch,
   readWorkspaceConfig,
   removalState,
-  reservedPath,
-  removeWorktree,
-  repairWorktrees,
   watchWorktree,
   WorkspaceError,
   type Worktree,
@@ -93,7 +85,6 @@ import type {
   CloneRequest,
   CommitResult,
   CommitsAfterResult,
-  ComposeResult,
   CreatePullRequestResult,
   CreateRequest,
   CreateWorkspaceResult,
@@ -104,10 +95,8 @@ import type {
   ListedTerminal,
   MergeMethod,
   MergePullRequestResult,
-  Project,
   OpenWorkspaceResult,
   OutdatedTerminal,
-  PtySpawnOptions,
   PtySpawnRequest,
   PullRequestResult,
   PullRequestStatesResult,
@@ -116,12 +105,10 @@ import type {
   RemovalResult,
   RemoveWorkspaceResult,
   SessionStatus,
-  SettledSetup,
   TeardownResult,
   StartSessionOptions,
   StartSessionResult,
   UpdatePathResult,
-  Workspace,
 } from '../shared/api';
 import daemonPath from './daemon?modulePath';
 import { devFolderName } from './dev-folder';
@@ -163,7 +150,6 @@ const cockpitHome = resolve(process.env.COCKPIT_HOME || devHome || join(homedir(
 // The `cockpit` CLI the harness hooks run: copied into the bundle when packaged, built in
 // `apps/cli` otherwise (`app.getAppPath()` is `apps/desktop`).
 const cliPath = app.isPackaged ? join(process.resourcesPath, 'bin', 'cockpit') : resolve(app.getAppPath(), '../cli/dist/cockpit');
-const worktreesRoot = join(cockpitHome, 'worktrees');
 const applicationDirs = process.env.COCKPIT_TEST_APPLICATIONS_DIR
   ? [process.env.COCKPIT_TEST_APPLICATIONS_DIR]
   : defaultApplicationDirs(homedir());
@@ -249,81 +235,33 @@ function isFromApp({ senderFrame }: Pick<IpcMainEvent, 'senderFrame'>): boolean 
   return senderFrame !== null && originOf(senderFrame.url) === appOrigin;
 }
 
-// The loaded state, replaced by a new one (and saved) on every change.
+// What the daemon of this build last said of the app's state: `state.json` (read from the file at launch), the
+// workspaces it is setting up and the sends that failed, replaced by each `state` event. The main process only reads
+// it: every change goes to the daemon, the only writer of `state.json`.
 let state: State;
+let setups: Setup[] = [];
+let failedSetups: DaemonFailedSetup[] = [];
 
 // The last status each session reported, as the sidebar shows it.
 const sessionStatuses = new Map<string, SessionStatus>();
-
-// The sessions the composer started in a new workspace, waiting for the title their agent derives from
-// the prompt (session id to worktree and harness). In memory only: a title that arrives while the app
-// is not running names nothing. The first accepted title, the agent's exit or the end of the terminal
-// clears the entry.
-const pendingNames = new Map<string, { worktree: string; harness: Harness }>();
-
-// The workspaces the composer sent and the main process is still making (by worktree path): the branch and
-// the path are reserved, the worktree is created, then the agent or the setup shell starts. `projects:list`
-// shows them as rows being set up. In memory only: an app quit during the setup forgets them.
-interface Setup {
-  project: string;
-  path: string;
-  branch: string;
-  /** `null`: no worktree, the workspace opens the project's folder (the main workspace). */
-  base: string | null;
-  /** A harness id, or `terminal` for the setup shell. */
-  harness: string;
-  task: string;
-}
-const setups = new Map<string, Setup>();
-
-// The sends whose worktree could not be created, kept until the user dismisses them ("Back to composer").
-let failedSetups: FailedSetup[] = [];
-
-// A session's program set a terminal title. The daemon forwards only those between the markers
-// `cockpit setup` writes around the agent, so the setup's and the login shell's never get here. The
-// first one its harness derives from the prompt names the workspace: the branch follows it (`nameWorkspace`) and the windows list again.
-async function nameFromTitle({ sessionId, title }: { sessionId: string; title: string }): Promise<void> {
-  const pending = pendingNames.get(sessionId);
-  if (!pending) return;
-  const name = pending.harness.promptTitle(title);
-  if (name === null) return;
-  pendingNames.delete(sessionId);
-  try {
-    await nameWorkspace({ worktree: pending.worktree, name, env: await shellEnv });
-  } catch {
-    // The workspace keeps the name it has.
-    return;
-  }
-  for (const window of BrowserWindow.getAllWindows()) window.webContents.send('projects:changed');
-}
-
-// Keeps the harness's id for a session's conversation, an opaque string: the last one reported wins, and
-// nothing is written when it is the one stored.
-function storeHarnessSessionId(sessionId: string, harnessSessionId: string): void {
-  const session = state.sessions.find(({ id }) => id === sessionId);
-  if (!session || session.harnessSessionId === harnessSessionId) return;
-  const next = setHarnessSessionId(state, sessionId, harnessSessionId);
-  saveState(app.getPath('userData'), next);
-  state = next;
-}
 
 // A session reported to a daemon: a harness hook (a status or the conversation's id), or `cockpit setup` (a setup state, the
 // agent's exit). The window that holds the session's terminal is told of a change; a macOS
 // notification is raised for `waiting` and `finished` when no Cockpit window is focused, and
 // clicking it shows a window (a new one when none is open) on the session's page.
-function reportSessionStatus(report: SessionReport): void {
+function reportSessionStatus(report: SessionReport, daemon: Daemon): void {
   const { sessionId, event } = report;
+  // A daemon of an earlier build stores nothing: the daemon of this build does.
+  if (report.event === 'harness-session') {
+    if (!daemon.own) forwardToOwn('harness-session', { sessionId, harnessSessionId: report.harnessSessionId });
+    return;
+  }
   const session = state.sessions.find(({ id }) => id === sessionId);
   if (!session) return;
   const terminal = [...terminals.values()].find((each) => each.sessionId === sessionId);
   const owner = terminal?.owner && !terminal.owner.isDestroyed() ? terminal.owner : undefined;
 
-  if (report.event === 'harness-session') {
-    storeHarnessSessionId(sessionId, report.harnessSessionId);
-    return;
-  }
   if (report.event === 'exited') {
-    pendingNames.delete(sessionId);
     if (terminal) terminal.exitCode = report.exitCode;
     owner?.send('sessions:status', sessionId, event, report.exitCode);
     return;
@@ -354,32 +292,8 @@ function reportSessionStatus(report: SessionReport): void {
   notification.show();
 }
 
-// The environment of a terminal or a session: the login shell's, without the session variables
-// the app itself may have inherited (launched from a Cockpit session) and the daemon's
-// `ELECTRON_RUN_AS_NODE`, with `COCKPIT_SOCKET` (the daemon's socket), the `cockpit` CLI's folder
-// first on `PATH` and `extra` on top (a session's own variables).
-async function terminalEnv(extra: Record<string, string> = {}): Promise<Record<string, string>> {
-  const env = { ...(await shellEnv) };
-  for (const name of ['COCKPIT_SESSION_ID', 'COCKPIT_WORKSPACE_PATH', 'COCKPIT_SOCKET', 'ELECTRON_RUN_AS_NODE']) delete env[name];
-  env.COCKPIT_SOCKET = ownFiles.socket;
-  env.PATH = [dirname(cliPath), env.PATH].filter(Boolean).join(':');
-  return { ...env, TERM: 'xterm-256color', COLORTERM: 'truecolor', ...extra };
-}
-
-// Fills in what a spawn request leaves out: the user's login-shell environment
-// and the shell it names, run as a login shell as Terminal.app does, in the home
-// directory. Options the renderer passes win. `-l` belongs to the default shell
-// only: a request with its own `command` and no `args` runs it with no argument.
-async function withSpawnDefaults(request: PtySpawnRequest): Promise<PtySpawnOptions> {
-  const env = await terminalEnv();
-  return {
-    command: env.SHELL ?? '/bin/zsh',
-    args: request.command === undefined ? ['-l'] : [],
-    cwd: homedir(),
-    env,
-    ...request,
-  };
-}
+// What a terminal's environment is made of besides the login shell's.
+const terminalContext = async () => ({ env: await shellEnv, socket: ownFiles.socket, cli: cliPath, home: cockpitHome });
 
 // A shell was spawned for a page that navigated or was destroyed meanwhile.
 class PageGoneError extends Error {
@@ -405,6 +319,8 @@ const ownFiles = daemonFiles(cockpitHome, PROTOCOL_VERSION, daemonBuild);
 interface Daemon {
   client: DaemonClient;
   alive: boolean;
+  /** The daemon of this app's build, the only one that writes `state.json`. */
+  own: boolean;
   /** The terminals of this daemon the app knows, by the daemon's id for them. */
   terminals: Map<number, Terminal>;
 }
@@ -459,33 +375,26 @@ function end(daemon: Daemon, remote: number, exit: TerminalExit): void {
   if (!terminal) return;
   daemon.terminals.delete(remote);
   terminals.delete(terminal.appId);
-  if (terminal.sessionId !== undefined) {
-    pendingNames.delete(terminal.sessionId);
-    // A terminal that ended on its own is not lost: only a daemon that died (`exitCode: null`) leaves the mark.
-    // One the page asked to kill (a deleted workspace) is left as it is.
-    if (exit.exitCode !== null && !terminal.closing) markClosed(({ id }) => id === terminal.sessionId);
+  // A terminal that ended on its own is not lost: only a daemon that died (`exitCode: null`) leaves the mark. One the
+  // page asked to kill (a deleted workspace) is left as it is. The daemon of this build closes the mark of its own
+  // sessions; one of an earlier build writes nothing, so the daemon of this build is told.
+  if (!daemon.own && terminal.sessionId !== undefined && exit.exitCode !== null && !terminal.closing) {
+    forwardToOwn('session-dismiss', { sessionId: terminal.sessionId });
   }
   // One nobody attached to yet (a workspace's, started by the main process) tells every window.
   const hearers = terminal.owner ? [terminal.owner] : BrowserWindow.getAllWindows().map(({ webContents }) => webContents);
   for (const contents of hearers) if (!contents.isDestroyed()) contents.send('pty:exit', terminal.appId, exit);
 }
 
-// A workspace session is marked open in `state.json` from its start until its tab closes (`sessions:dismiss`),
-// its terminal exits by itself, or its workspace or project goes (the session stays stored): one still marked that
-// no daemon holds lost its terminal with a daemon.
-function markClosed(match: (session: Session) => boolean): void {
-  const open = state.sessions.filter((session) => session.open && match(session));
-  if (open.length === 0) return;
-  const next = open.reduce((current, { id }) => closeSession(current, id), state);
-  saveState(app.getPath('userData'), next);
-  state = next;
-}
+// The reports of the sessions of daemons of earlier builds, until the daemon of this build is connected.
+let heldBack: Array<() => void> = [];
 
 // Takes a connected client into use: its output goes to the window that owns each terminal, its
 // status reports to the sidebar, and its loss ends every terminal it held, as a crash does. The
 // terminals it already runs are listed (the `commands` ones belong to another app's connection).
-async function adopt(client: DaemonClient): Promise<Daemon> {
-  const daemon: Daemon = { client, alive: true, terminals: new Map() };
+// The daemon of this build is also where the state comes from.
+async function adopt(client: DaemonClient, own: boolean): Promise<Daemon> {
+  const daemon: Daemon = { client, alive: true, own, terminals: new Map() };
   client.onData(({ id, seq, data }) => {
     const terminal = daemon.terminals.get(id);
     if (terminal?.owner && !terminal.owner.isDestroyed()) terminal.owner.send('pty:data', terminal.appId, data, seq);
@@ -498,46 +407,120 @@ async function adopt(client: DaemonClient): Promise<Daemon> {
     if (terminal.owner && !terminal.owner.isDestroyed()) terminal.owner.send('pty:resized', terminal.appId, cols, rows, seq);
   });
   client.onExit(({ id, exitCode, signal }) => end(daemon, id, { exitCode, signal }));
-  client.onStatus(reportSessionStatus);
-  client.onTitle((event) => void nameFromTitle(event));
+  client.onStatus((report) => reportSessionStatus(report, daemon));
+  // A terminal another client (the CLI), or the daemon itself, started: listed, and shown by the page of its workspace
+  // unless the workspace is still being set up (the daemon says when it is done).
+  client.onSpawned((info) => {
+    if (daemon.terminals.has(info.id)) return;
+    register(daemon, info);
+    if (own && info.workspace !== undefined && !setups.some(({ path }) => path === info.workspace)) settle({ path: info.workspace });
+  });
+  if (own) {
+    client.onState(applySnapshot);
+    client.onSettled(settle);
+  }
   client.onClose(() => {
     daemon.alive = false;
     lostTerminals += [...daemon.terminals.values()].filter(({ kind, closing }) => kind !== 'commands' && !closing).length;
     for (const remote of daemon.terminals.keys()) end(daemon, remote, { exitCode: null, signal: null });
     if (ownDaemon === daemon) ownDaemon = undefined;
+    // The file is the truth: a daemon killed after it saved, before its `state` event was sent, left the replica behind.
+    if (own) {
+      try {
+        applySnapshot({ state: readState(app.getPath('userData')), setups, failedSetups });
+      } catch {
+        // Unreadable: the replica stays as it was.
+      }
+    }
     announceDaemonChange();
   });
+  if (own) {
+    applySnapshot(await client.call('state', {}).catch(() => ({ state, setups, failedSetups })));
+    if (detectedList) await client.call('harnesses', { known: detectedList }).catch(() => {});
+  }
   for (const info of await client.list().catch(() => [])) {
-    if (info.kind === 'commands') continue;
+    if (info.kind === 'commands' || daemon.terminals.has(info.id)) continue;
     register(daemon, info);
     if (info.sessionId !== undefined && info.status !== undefined) sessionStatuses.set(info.sessionId, info.status);
-    // An id reported while no app was connected.
-    if (info.sessionId !== undefined && info.harnessSessionId !== undefined) storeHarnessSessionId(info.sessionId, info.harnessSessionId);
+    // An id reported to a daemon of an earlier build while no app was connected.
+    if (!own && info.sessionId !== undefined && info.harnessSessionId !== undefined) {
+      const { sessionId, harnessSessionId } = info;
+      heldBack.push(() => forwardToOwn('harness-session', { sessionId, harnessSessionId }));
+    }
   }
   return daemon;
 }
 
-// Starts the daemon of this build: the app's own Electron binary as Node, detached into its own
-// session so it outlives the app, with its output in the log.
-function spawnDaemon(): ChildProcess {
-  mkdirSync(cockpitHome, { recursive: true });
-  const log = openSync(ownFiles.log, 'a');
-  try {
-    const child = spawn(process.execPath, [daemonPath, '--cockpit-daemon', daemonBuild], {
-      detached: true,
-      stdio: ['ignore', log, log, 'pipe'],
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', COCKPIT_HOME: cockpitHome },
-    });
-    child.on('error', (error) => {
-      appendFileSync(ownFiles.log, `${error.message}\n`);
-      child.emit('exit', 1, null);
-    });
-    child.unref();
-    return child;
-  } finally {
-    closeSync(log);
+// Makes the daemon's snapshot the replica; the windows list again, except one whose flow awaits its own write.
+function applySnapshot(snapshot: StateSnapshot): void {
+  ({ state, setups, failedSetups } = snapshot);
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!awaitingOwnWrite.has(window.webContents.id)) window.webContents.send('projects:changed');
   }
 }
+
+// The windows whose flow awaits a write it follows with its own `router.invalidate()`, then navigates if its
+// `claimNavigation` check holds (COCKPIT-86). The `state` that write causes must not invalidate them too: a second
+// invalidate aborts the in-flight load, so the flow's would resolve before or after the user's action by timing alone.
+const awaitingOwnWrite = new Map<number, number>();
+async function asOwnWrite<T>(sender: WebContents, write: () => Promise<T>): Promise<T> {
+  const { id } = sender;
+  awaitingOwnWrite.set(id, (awaitingOwnWrite.get(id) ?? 0) + 1);
+  try {
+    return await write();
+  } finally {
+    const left = awaitingOwnWrite.get(id)! - 1;
+    if (left === 0) awaitingOwnWrite.delete(id);
+    else awaitingOwnWrite.set(id, left);
+  }
+}
+
+// Tells every window that a workspace stopped setting up.
+function settle(settled: { path: string; message?: string }): void {
+  for (const window of BrowserWindow.getAllWindows()) window.webContents.send('workspaces:settled', settled);
+}
+
+// Writes go to the daemon of this build, which cannot be reached when it cannot start: the app then only reads.
+class DaemonUnavailableError extends Error {
+  constructor(reason: string) {
+    super(`Cockpit could not save its data: ${reason}`);
+  }
+}
+
+// The daemon of this build, started when it is not running; throws `DaemonUnavailableError` with why it cannot.
+async function writable(): Promise<Daemon> {
+  try {
+    return await ensureOwnDaemon();
+  } catch (error) {
+    throw new DaemonUnavailableError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// The harnesses, detected here once per launch (the composer and the "+" menu list them with no daemon): given to the
+// daemon, which starts the sessions, when they are detected and when one is adopted. Never at startup: detecting runs each
+// CLI's `--version`. `again` replaces the result every later caller shares.
+let detection: Promise<AvailableHarness[]> | undefined;
+let detectedList: AvailableHarness[] | undefined;
+function detected(again = false): Promise<AvailableHarness[]> {
+  if (again) detectedList = detection = undefined;
+  const current = (detection ??= shellEnv
+    .then((env) => detectHarnesses(env))
+    .then((list) => list.map(({ id, version, path }) => ({ id, name: harnesses.find((harness) => harness.id === id)!.name, version, path }))));
+  void current.then((list) => {
+    if (detection !== current) return;
+    detectedList = list;
+    if (ownDaemon?.alive) void ownDaemon.client.call('harnesses', { known: list }).catch(() => {});
+  });
+  return current;
+}
+
+// What the daemons of earlier builds learn and cannot store, told to the daemon of this build; lost if it is down.
+function forwardToOwn<Method extends CallMethod>(method: Method, params: Calls[Method]['params']): void {
+  void writable().then((daemon) => daemon.client.call(method, params)).catch(() => {});
+}
+
+// How to start the daemon of this build: what the app leaves in the launch file for the `cockpit` command.
+const launchOf = (): Launch => ({ executable: process.execPath, bundle: daemonPath, build: daemonBuild, stateDir: app.getPath('userData'), cli: cliPath });
 
 // This app's daemon, started when it is not running. Rejects with the reason it cannot start.
 function ensureOwnDaemon(): Promise<Daemon> {
@@ -552,7 +535,7 @@ function ensureOwnDaemon(): Promise<Daemon> {
   startingOwn ??= (async () => {
     const before = JSON.stringify(daemonStatus());
     try {
-      ownDaemon = await adopt(await ensureDaemon({ home: cockpitHome, build: daemonBuild, spawn: spawnDaemon }));
+      ownDaemon = await adopt(await ensureDaemon({ home: cockpitHome, build: daemonBuild, spawn: () => startDaemonProcess(cockpitHome, launchOf()) }), true);
       daemonFailure = undefined;
       lostTerminals = 0;
       return ownDaemon;
@@ -580,7 +563,7 @@ async function connectDaemons(): Promise<void> {
     try {
       const client = await connectDaemon(found.socket);
       await client.hello(daemonBuild);
-      await adopt(client);
+      await adopt(client, false);
     } catch (error) {
       // Stale files of a daemon that is gone say nothing; one that is there and silent is noted.
       if (error instanceof DaemonNotAnsweringError) console.error(`Cockpit skipped a background service of another build: ${error.message}`);
@@ -598,6 +581,7 @@ async function connectDaemons(): Promise<void> {
   }
   try {
     await ensureOwnDaemon();
+    for (const forward of heldBack.splice(0)) forward();
   } catch {
     console.error(`Cockpit's background service could not start: ${daemonFailure}`);
   }
@@ -625,17 +609,16 @@ function startTerminals() {
   const spawnFor = async (
     contents: WebContents | undefined,
     request: PtySpawnRequest,
-    { kind, sessionId, workspace, agentTitles, before = contents && endingsOf(contents) }: { kind: TerminalKind; sessionId?: string; workspace?: string; agentTitles?: SpawnOptions['agentTitles']; before?: number },
+    { kind, sessionId, workspace, before = contents && endingsOf(contents) }: { kind: TerminalKind; sessionId?: string; workspace?: string; before?: number },
   ) => {
     const daemon = await ensureOwnDaemon();
-    const options = await withSpawnDefaults(request);
+    const options = withSpawnDefaults(request, await terminalContext());
     const { command, cwd, cols, rows } = options;
     const remote = await daemon.client.spawn({
       kind,
       ...options,
       ...(sessionId !== undefined && { sessionId }),
       ...(workspace !== undefined && { workspace }),
-      ...(agentTitles && { agentTitles }),
     });
     const terminal = register(
       daemon,
@@ -763,15 +746,10 @@ function startTerminals() {
   return { spawnFor, endingsOf, kill };
 }
 
-// Why git could not do what was asked of `path`, in words for the user.
-function describeFailure(error: WorkspaceError, path: string): string {
-  return error.code === 'NOT_A_REPOSITORY' ? `${path} is not a git repository.` : error.message;
-}
-
 // Whether the project has its main workspace, the one with no worktree.
-const hasMainWorkspace = (project: string) => state.projects.some((entry) => entry.path === project && entry.mainWorkspace === true);
+const hasMainWorkspace = (project: string) => hasMainWorkspaceIn(state, project);
 // The main workspace's path is its project's.
-const isMainWorkspace = (project: string, path: string) => path === project && hasMainWorkspace(project);
+const isMainWorkspace = (project: string, path: string) => isMainWorkspaceIn(state, project, path);
 
 // Whether the main workspace's `branch` is the base the changes are compared with: it has no pull request of its own,
 // and `gh pr list --head` would match a fork's of that name.
@@ -781,68 +759,15 @@ async function onBaseBranch(project: string, branch: string | null): Promise<boo
   return defaultBase?.replace(/^origin\//, '') === branch;
 }
 
-// A project with its workspaces, which git tells: the linked worktrees, and the main working tree when the project has its main workspace.
-async function toProject({ path, mainWorkspace }: { path: string; mainWorkspace?: boolean }): Promise<Project> {
-  const project = { path, name: basename(path) };
-  // An absent folder, or a path that is not a folder (a file took its place), is "not found"; any other failure
-  // (EACCES, EIO…) goes on to git, as before.
-  const gone = await stat(path).then(
-    (found) => !found.isDirectory(),
-    (error: NodeJS.ErrnoException) => error.code === 'ENOENT' || error.code === 'ENOTDIR',
-  );
-  if (gone) return { ...project, workspaces: [], missing: true };
-  try {
-    const worktrees = await listWorktrees(path, { env: await shellEnv });
-    const workspaces: Workspace[] = worktrees
-      .filter((worktree) => mainWorkspace || !worktree.main)
-      .map(({ path, branch, name, main }): Workspace =>
-        main ? { path, name: branch ?? basename(path), branch, main: true } : { path, name: name ?? branch ?? basename(path), branch },
-      );
-    // A workspace being set up is a row from the reservation on, whether git lists its worktree yet or not.
-    for (const setup of setups.values()) {
-      if (setup.project !== path) continue;
-      const listed = workspaces.find((workspace) => workspace.path === setup.path);
-      if (listed) listed.settingUp = true;
-      else workspaces.push({ path: setup.path, name: setup.branch, branch: setup.branch, settingUp: true });
-    }
-    return { ...project, workspaces };
-  } catch (error) {
-    if (!(error instanceof WorkspaceError)) throw error;
-    return { ...project, workspaces: [], error: describeFailure(error, path) };
-  }
-}
-
-// What a refused worktree creation says, for the errors that name the branch or the worktrees folder.
-function creationRefusal(error: WorkspaceError, name: string): string | undefined {
-  if (error.code === 'BRANCH_EXISTS') return `A branch named ${name} already exists.`;
-  if (error.code === 'INVALID_BRANCH_NAME') return `${name} is not a valid branch name.`;
-  if (error.code === 'FS_FAILED') {
-    const errno = (error.cause as NodeJS.ErrnoException | undefined)?.code ?? error.message;
-    return `Cockpit could not create its worktrees folder ${worktreesRoot}: ${errno}.`;
-  }
-  return undefined;
-}
-
-// The terminal size a workspace's first terminal starts at; the page that shows it resizes it.
-const SETUP_SIZE = { cols: 80, rows: 24 };
-
-// Tells every window that a workspace stopped setting up.
-function settle(settled: SettledSetup): void {
-  for (const window of BrowserWindow.getAllWindows()) window.webContents.send('workspaces:settled', settled);
-}
-
 // git is checked on the first `projects:git` call and the answer kept for the launch.
 let gitCheck: Promise<'ok' | 'missing'> | undefined;
 
-// The projects the user added, kept in `state.json`.
-function startProjects(
-  userData: string,
-  { spawnFor, endingsOf }: ReturnType<typeof startTerminals>,
-  startSession: ReturnType<typeof startSessions>,
-): void {
-  ipcMain.handle('projects:list', (event) => {
+// The projects the user added, kept in `state.json`: read from the replica, changed through the daemon.
+function startProjects({ spawnFor, endingsOf }: ReturnType<typeof startTerminals>): void {
+  ipcMain.handle('projects:list', async (event) => {
     if (!isFromApp(event)) throw new Error('projects:list refused: unexpected origin');
-    return Promise.all(state.projects.map(toProject));
+    const env = await shellEnv;
+    return Promise.all(state.projects.map((project) => toProject(project, setups, env)));
   });
 
   ipcMain.handle('projects:git', (event) => {
@@ -864,63 +789,43 @@ function startProjects(
     return picked.canceled ? undefined : picked.filePaths[0];
   }
 
-  // Saves `next` and makes it the state; a refusal when the save fails leaves the state as it was.
-  function commit(next: State): Refused | undefined {
-    try {
-      saveState(userData, next);
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      return { status: 'refused', message: `Cockpit could not save its data: ${reason}` };
-    }
-    state = next;
-    return undefined;
-  }
+  // What a refusal is made of, for the failures the user is told: git's, and the daemon's that cannot start.
+  const refusal = (error: unknown): Refused | undefined =>
+    error instanceof WorkspaceError || error instanceof DaemonUnavailableError ? { status: 'refused', message: error.message } : undefined;
 
-  // The one way a repository becomes a project: add its root to the state, save, list it. A refusal
-  // changes nothing.
-  async function addRoot(root: string): Promise<AddProjectResult> {
-    try {
-      const refused = commit(addProject(state, root));
-      if (refused) return refused;
-      return { status: 'added', project: await toProject({ path: root }) };
-    } catch (error) {
-      if (error instanceof ProjectExistsError) {
-        return { status: 'refused', message: `${basename(error.path)} is already in Cockpit.` };
-      }
-      throw error;
-    }
-  }
-
-  // Runs `action`, turning a git failure into a refusal that carries git's message.
-  async function refusing(action: () => Promise<AddProjectResult>): Promise<AddProjectResult> {
+  // Runs `action`, turning those failures into a refusal.
+  async function refusing<Result>(action: () => Promise<Result>): Promise<Result | Refused> {
     try {
       return await action();
     } catch (error) {
-      if (error instanceof WorkspaceError) return { status: 'refused', message: error.message };
+      const refused = refusal(error);
+      if (refused) return refused;
       throw error;
     }
   }
 
-  const addAt = async (folder: string) => addRoot(await findRepositoryRoot(folder, { env: await shellEnv }));
+  // The one way a repository becomes a project: the daemon finds its root and adds it.
+  const addAt = async (folder: string) => (await writable()).client.call('project-add', { folder });
+
+  // After a clone, an init or a create: the folder is a repository, whatever the daemon says.
+  async function addMade(folder: string): Promise<AddProjectResult> {
+    const added = await addAt(folder);
+    return added.status === 'not-a-repository' ? { status: 'refused', message: `${folder} is not a git repository.` } : added;
+  }
 
   ipcMain.handle('projects:add', async (event): Promise<AddProjectResult> => {
     if (!isFromApp(event)) throw new Error('projects:add refused: unexpected origin');
     const folder = await pickFolder(event);
     if (folder === undefined) return { status: 'cancelled' };
-    try {
-      return await addAt(folder);
-    } catch (error) {
-      if (error instanceof WorkspaceError && error.code === 'NOT_A_REPOSITORY') return { status: 'not-a-repository', folder };
-      if (error instanceof WorkspaceError) return { status: 'refused', message: error.message };
-      throw error;
-    }
+    return refusing(() => addAt(folder));
   });
 
   ipcMain.handle('projects:init', (event, folder: string): Promise<AddProjectResult> => {
     if (!isFromApp(event)) throw new Error('projects:init refused: unexpected origin');
     return refusing(async () => {
+      await writable();
       await initRepository({ path: folder, env: await shellEnv });
-      return addAt(folder);
+      return addMade(folder);
     });
   });
 
@@ -953,12 +858,15 @@ function startProjects(
     event.sender.once('did-navigate', abort);
     event.sender.once('destroyed', abort);
     try {
+      // Refused before any git work when the daemon that will add the project is down.
+      await writable();
       const env = await shellEnv;
       await cloneRepository({ url: request.url, path, env, signal: controller.signal });
-      return await addAt(path);
+      return await addMade(path);
     } catch (error) {
       if (controller.signal.aborted) return { status: 'cancelled' };
-      if (error instanceof WorkspaceError) return { status: 'refused', message: error.message };
+      const refused = refusal(error);
+      if (refused) return refused;
       throw error;
     } finally {
       if (cloning === controller) cloning = undefined;
@@ -979,6 +887,7 @@ function startProjects(
     const path = join(request.location, request.name);
     if (existsSync(path)) return { status: 'refused', message: `${path} already exists.` };
     return refusing(async () => {
+      await writable();
       try {
         await mkdir(request.location, { recursive: true });
         await mkdir(path);
@@ -987,7 +896,7 @@ function startProjects(
       }
       try {
         await initRepository({ path, env: await shellEnv });
-        return await addAt(path);
+        return await addMade(path);
       } catch (error) {
         await rm(path, { recursive: true, force: true }).catch(() => {});
         throw error;
@@ -995,39 +904,22 @@ function startProjects(
     });
   });
 
-  ipcMain.handle('projects:remove', (event, path: string) => {
+  ipcMain.handle('projects:remove', async (event, path: string): Promise<Refused | undefined> => {
     if (!isFromApp(event)) throw new Error('projects:remove refused: unexpected origin');
-    const next = removeProject(state, path);
-    if (next.projects.length === state.projects.length) return;
-    saveState(userData, next);
-    state = next;
-    markClosed(({ project }) => project === path);
+    return refusing(async () => {
+      await (await writable()).client.call('project-remove', { path });
+      return undefined;
+    });
   });
 
-  // The project at `from` moved: the user picks its repository again. Its worktrees are reconnected after the
-  // state is saved, and a repair that fails (the workspaces then show git's error) does not undo the update.
+  // The project at `from` moved: the user picks its repository again.
   ipcMain.handle('projects:update-path', async (event, from: string): Promise<UpdatePathResult> => {
     if (!isFromApp(event)) throw new Error('projects:update-path refused: unexpected origin');
     // The sidebar's list can be stale (the project was removed from another window).
-    if (!state.projects.some((project) => project.path === from)) {
-      return { status: 'refused', message: `${from} is not a project in Cockpit.` };
-    }
+    if (!state.projects.some((project) => project.path === from)) return { status: 'refused', message: `${from} is not a project in Cockpit.` };
     const folder = await pickFolder(event);
     if (folder === undefined) return { status: 'cancelled' };
-    try {
-      const env = await shellEnv;
-      const root = await findRepositoryRoot(folder, { env });
-      const refused = commit(updateProjectPath(state, from, root));
-      if (refused) return refused;
-      await repairWorktrees(root, { env }).catch(() => {});
-      return { status: 'updated' };
-    } catch (error) {
-      if (error instanceof ProjectExistsError) return { status: 'refused', message: `${basename(error.path)} is already in Cockpit.` };
-      if (error instanceof WorkspaceError) {
-        return { status: 'refused', message: error.code === 'NOT_A_REPOSITORY' ? `${folder} is not in a git repository.` : error.message };
-      }
-      throw error;
-    }
+    return refusing(async () => (await writable()).client.call('project-update-path', { from, folder }));
   });
 
   // Runs `action` for a project of the state, turning a git failure into a refusal (or into what
@@ -1058,110 +950,34 @@ function startProjects(
     }),
   );
 
-  // The branch is named after the task, with a free name: not a local branch, not an existing worktree folder.
-  ipcMain.handle('workspaces:create', (event, project: string, task: string, base: string): Promise<CreateWorkspaceResult> => {
-    let name = task;
-    return forProject<CreateWorkspaceResult>(
-      event,
-      'workspaces:create',
-      project,
-      async () => {
-        const env = await shellEnv;
-        name = await availableBranch(project, task, { env, root: worktreesRoot });
-        const { path, branch } = await createWorktree({ repo: project, root: worktreesRoot, branch: name, base, env });
-        return { status: 'created', workspace: { path, name: branch ?? basename(path), branch } };
-      },
-      (error) => {
-        const message = creationRefusal(error, name);
-        return message === undefined ? undefined : { status: 'refused', message };
-      },
-    );
-  });
-
-  // Makes the worktree (none for the main workspace, which opens the project's folder), then starts the agent (or
-  // the setup shell) in it, with no page: the workspace page may be gone, reloaded or elsewhere meanwhile. The row
-  // is a "setting up" one until this ends.
-  async function runSetup({ project, path, branch, base, harness, task }: Setup): Promise<void> {
-    if (base !== null) {
-      try {
-        await createWorktree({ repo: project, root: worktreesRoot, branch, base, env: await shellEnv });
-      } catch (error) {
-        const message =
-          error instanceof WorkspaceError ? (creationRefusal(error, branch) ?? describeFailure(error, project)) : error instanceof Error ? error.message : String(error);
-        failedSetups.push({ id: randomUUID(), project, path, name: branch, message, prompt: task, agent: harness, base });
-        setups.delete(path);
-        settle({ path });
-        return;
-      }
-    }
-    let message: string | undefined;
-    try {
-      if (harness === 'terminal') {
-        // As the agent's start does: no shell for a project that is gone.
-        const found = await findWorkspace({ project, path });
-        if ('status' in found) message = found.message;
-        // The repository's setup, then the login shell (the main workspace runs no setup).
-        else {
-          const command = base === null ? {} : { command: cliPath, args: ['setup', '--shell'] };
-          await spawnFor(undefined, { ...SETUP_SIZE, cwd: path, ...command }, { kind: 'shell', workspace: path });
-        }
-      } else {
-        const started = await startSession(undefined, harness, SETUP_SIZE, {
-          workspace: { project, path },
-          setup: base !== null,
-          prompt: task,
-          nameFromTitle: base !== null,
-        });
-        if (started.status === 'refused') message = started.message;
-      }
-    } catch (error) {
-      message = `Could not start Terminal: ${error instanceof Error ? error.message : String(error)}`;
-    }
-    setups.delete(path);
-    settle({ path, ...(message !== undefined && { message }) });
+  // A write that is the daemon's: the workspaces it creates, makes and removes.
+  async function forward<Method extends CallMethod>(
+    event: IpcMainInvokeEvent,
+    channel: string,
+    method: Method,
+    params: Calls[Method]['params'],
+  ): Promise<Calls[Method]['result'] | Refused> {
+    if (!isFromApp(event)) throw new Error(`${channel} refused: unexpected origin`);
+    return refusing(async () => (await writable()).client.call(method, params));
   }
 
-  // Reserves the branch and the worktree's path, answers, and sets the workspace up in the background. A `null`
-  // base is the main workspace: the project is marked and its path is the workspace's, named after its branch.
-  ipcMain.handle('workspaces:compose', (event, project: string, task: string, base: string | null, harness: string): Promise<ComposeResult> => {
-    let name = task;
-    return forProject<ComposeResult>(
-      event,
-      'workspaces:compose',
-      project,
-      async () => {
-        const env = await shellEnv;
-        let path = project;
-        if (base === null) {
-          name = workspaceName((await listWorktrees(project, { env })).find((worktree) => worktree.main)!);
-          if (!hasMainWorkspace(project)) {
-            const refused = commit(setMainWorkspace(state, project, true));
-            if (refused) return refused;
-          }
-        } else {
-          const taken = [...setups.values()].filter((setup) => setup.project === project).map((setup) => setup.branch);
-          name = await availableBranch(project, task, { env, root: worktreesRoot, reserved: taken });
-          path = await reservedPath({ repo: project, root: worktreesRoot, branch: name, env });
-        }
-        const setup: Setup = { project, path, branch: name, base, harness, task };
-        setups.set(path, setup);
-        void runSetup(setup);
-        return { status: 'reserved', path, name };
-      },
-      (error) => {
-        const message = creationRefusal(error, name);
-        return message === undefined ? undefined : { status: 'refused', message };
-      },
-    );
-  });
+  ipcMain.handle('workspaces:create', (event, project: string, task: string, base: string): Promise<CreateWorkspaceResult | Refused> =>
+    forward(event, 'workspaces:create', 'workspace-create', { project, task, base }),
+  );
+
+  // Reserves the branch and the worktree's path, answers, and the daemon sets the workspace up in the background
+  // (`workspaces:settled` tells the end). A `null` base is the main workspace.
+  ipcMain.handle('workspaces:compose', (event, project: string, task: string, base: string | null, harness: string) =>
+    asOwnWrite(event.sender, () => forward(event, 'workspaces:compose', 'workspace-compose', { project, task, base, harness })),
+  );
 
   ipcMain.handle('workspaces:failed-setups', (event): FailedSetup[] => {
     if (!isFromApp(event)) throw new Error('workspaces:failed-setups refused: unexpected origin');
     return failedSetups;
   });
-  ipcMain.handle('workspaces:dismiss-setup', (event, id: string): void => {
+  ipcMain.handle('workspaces:dismiss-setup', async (event, id: string): Promise<void> => {
     if (!isFromApp(event)) throw new Error('workspaces:dismiss-setup refused: unexpected origin');
-    failedSetups = failedSetups.filter((failed) => failed.id !== id);
+    await asOwnWrite(event.sender, async () => (await writable()).client.call('dismiss-setup', { id }));
   });
 
   ipcMain.handle('workspaces:removal', (event, project: string, path: string): Promise<RemovalResult> =>
@@ -1175,44 +991,8 @@ function startProjects(
 
   ipcMain.handle(
     'workspaces:remove',
-    (
-      event,
-      project: string,
-      path: string,
-      options: { force?: boolean; deleteBranch?: boolean; forceBranch?: string },
-    ): Promise<RemoveWorkspaceResult> =>
-      forProject<RemoveWorkspaceResult>(
-        event,
-        'workspaces:remove',
-        project,
-        async () => {
-          // The folder is the user's: only the mark goes, and the sessions close.
-          if (isMainWorkspace(project, path)) {
-            const refused = commit(setMainWorkspace(state, project, false));
-            if (refused) return refused;
-            markClosed(({ directory }) => directory === path);
-            return { status: 'removed', branchKept: false };
-          }
-          await removeWorktree({
-            repo: project,
-            path,
-            force: options.force,
-            deleteBranch: options.deleteBranch,
-            forceBranch: options.forceBranch,
-            env: await shellEnv,
-          });
-          markClosed(({ directory }) => directory === path);
-          return { status: 'removed', branchKept: false };
-        },
-        (error) => {
-          if (error.code === 'BRANCH_NOT_MERGED') {
-            markClosed(({ directory }) => directory === path);
-            return { status: 'removed', branchKept: true };
-          }
-          if (error.code === 'DIRTY_WORKTREE') return { status: 'dirty' };
-          return undefined;
-        },
-      ),
+    (event, project: string, path: string, options: { force?: boolean; deleteBranch?: boolean; forceBranch?: string }): Promise<RemoveWorkspaceResult> =>
+      forward(event, 'workspaces:remove', 'workspace-remove', { project, path, options }),
   );
 
   // The editors and terminals of the catalogue found on this machine, looked up at each call.
@@ -1244,21 +1024,21 @@ function startProjects(
     const entry = apps.find(({ id }) => id === appId);
     const bundle = entry && (await detectApps(applicationDirs)).find(({ id }) => id === entry.id);
     if (!entry || !bundle) return { status: 'refused', message: `${entry?.name ?? appId} is not installed.` };
+    // Remembering the app is a write: with the daemon down it is refused before the app is opened.
+    const daemon = state[entry.kind] === entry.id ? undefined : await refusing(writable);
+    if (daemon && 'status' in daemon) return daemon;
     try {
       await openIn(bundle.path, path, { env: await shellEnv });
     } catch (error) {
       if (!(error instanceof LaunchError)) throw error;
       return { status: 'refused', message: `Could not open ${path} in ${entry.name}: ${error.message}` };
     }
-    if (state[entry.kind] === entry.id) return { status: 'opened' };
-    const next = rememberApp(state, entry.kind, entry.id);
+    if (!daemon) return { status: 'opened' };
     try {
-      saveState(userData, next);
+      await daemon.client.call('remember-app', { kind: entry.kind, id: entry.id });
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      return { status: 'refused', message: `Cockpit could not save its data: ${reason}` };
+      return { status: 'refused', message: error instanceof Error ? error.message : String(error) };
     }
-    state = next;
     return { status: 'opened' };
   }
 
@@ -1503,7 +1283,7 @@ function startProjects(
         try {
           const ptyId = await spawnFor(
             event.sender,
-            { ...size, command: cliPath, args: ['teardown'], cwd: path, env: await terminalEnv() },
+            { ...size, command: cliPath, args: ['teardown'], cwd: path, env: terminalEnv(await terminalContext()) },
             { kind: 'commands', before: endings },
           );
           return { status: 'started', ptyId };
@@ -1515,24 +1295,13 @@ function startProjects(
   );
 }
 
-// Sessions outside any project: an agent CLI run in a folder of its own under
-// the Cockpit home, in a pty of the daemon. The sessions are kept in `state.json`; the pty runs on
-// when the page or the app goes (and ends with the daemon: a start after it died starts a new one),
-// the folder stays. Returns the start, which the main process also runs itself, for no page.
-function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnType<typeof startTerminals>) {
-  // Detected on the first call that needs it, never at startup: detecting runs
-  // each CLI's `--version`, and an app that never starts a session should not.
-  let detection: Promise<DetectedHarness[]> | undefined;
-  const detected = () => (detection ??= shellEnv.then((env) => detectHarnesses(env)));
-
-  // `again` runs the detection again and replaces the result every later caller shares.
+// Sessions: an agent CLI run in a pty of the daemon, in a folder of its own outside any project or in a workspace.
+// The daemon starts them and keeps them in `state.json`; the pty runs on when the page or the app goes (and ends with
+// the daemon: a start after it died starts a new one), the folder stays.
+function startSessions({ endingsOf, kill }: ReturnType<typeof startTerminals>) {
   ipcMain.handle('sessions:harnesses', async (event, options?: { again?: boolean }) => {
     if (!isFromApp(event)) throw new Error('sessions:harnesses refused: unexpected origin');
-    if (options?.again) detection = undefined;
-    return (await detected()).map(({ id, version }) => {
-      const { name } = harnesses.find((harness) => harness.id === id)!;
-      return { id, name, version };
-    });
+    return (await detected(options?.again)).map(({ id, name, version }) => ({ id, name, version }));
   });
 
   // Newest first.
@@ -1556,9 +1325,9 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
         return { sessionId: id, reboot: Date.parse(createdAt) < bootedAt, ...(resumeCommand !== undefined && { resumeCommand }) };
       });
   });
-  ipcMain.handle('sessions:dismiss', (event, sessionId: string) => {
+  ipcMain.handle('sessions:dismiss', async (event, sessionId: string) => {
     if (!isFromApp(event)) throw new Error('sessions:dismiss refused: unexpected origin');
-    markClosed(({ id }) => id === sessionId);
+    await (await writable()).client.call('session-dismiss', { sessionId });
   });
 
   // The sessions whose resume is under way: a daemon holds none of them yet.
@@ -1568,131 +1337,66 @@ function startSessions(userData: string, { spawnFor, endingsOf, kill }: ReturnTy
   const heldSessionIds = () =>
     new Set([...terminals.values(), ...otherDaemons.flatMap((daemon) => daemon.terminals)].flatMap(({ sessionId }) => (sessionId === undefined ? [] : [sessionId])));
 
-  // Starts the harness for `contents`, the window that owns the terminal, or for none. With `resume`, a stored
-  // session that lost its terminal: the same record and id, the harness resuming its conversation.
+  // The daemon starts the harness; `contents`, the window that owns the terminal, receives its output. A page that
+  // ends while the harnesses are detected starts nothing; one that ends later gets no session: its terminal is
+  // killed and its session closed.
   async function startSession(
-    contents: WebContents | undefined,
-    harnessId: string,
-    size: { cols: number; rows: number },
-    options?: StartSessionOptions,
-    resume?: Session & { harnessSessionId: string },
+    contents: WebContents,
+    harnessId: string | undefined,
+    start: (daemon: Daemon) => Promise<Calls['session-start']['result']>,
   ): Promise<StartSessionResult> {
-    // A page that ends while detection or the worktree check runs starts nothing.
-    const endings = contents && endingsOf(contents);
-    // `terminal` is no agent CLI: the login shell, always available, never detected.
-    const login = harnessId === 'terminal';
-    const catalogued = harnesses.find(({ id }) => id === harnessId);
-    const found = login ? undefined : (await detected()).find(({ id }) => id === harnessId);
-    const harness = login ? { id: 'terminal', name: 'Terminal' } : catalogued;
-    if (!harness || (!login && !found)) return { status: 'refused', message: `${harness?.name ?? harnessId} is not installed.` };
-    // Detected at launch, removed since: nothing is created or spawned.
-    if (found && !isFile(found.path)) return { status: 'refused', message: `Could not start ${harness.name}: ${found.path} not found.` };
-    // The agent runs in the daemon: without it nothing is created, spawned or stored.
+    const endings = endingsOf(contents);
+    const gone = () => contents.isDestroyed() || endingsOf(contents) !== endings;
+    const pageGone = (name: string): Refused => ({ status: 'refused', message: `Could not start ${name}: the page that asked for it is gone` });
+    const name = harnessId === 'terminal' ? 'Terminal' : (harnesses.find(({ id }) => id === harnessId)?.name ?? harnessId ?? 'the agent');
+    let daemon: Daemon;
+    let started;
     try {
-      await ensureOwnDaemon();
+      daemon = await writable();
+      // `terminal` is no agent CLI: the login shell, never detected.
+      const found = harnessId === undefined || harnessId === 'terminal' ? undefined : (await detected()).find(({ id }) => id === harnessId);
+      if (harnessId !== undefined && harnessId !== 'terminal' && !found) return { status: 'refused', message: `${name} is not installed.` };
+      if (gone()) return pageGone(name);
+      started = await start(daemon);
     } catch (error) {
-      return { status: 'refused', message: `Could not start ${harness.name}: ${error instanceof Error ? error.message : String(error)}` };
+      if (error instanceof DaemonUnavailableError) return { status: 'refused', message: error.message };
+      throw error;
     }
-
-    // In a workspace the session runs in the worktree, which is the user's: nothing is created
-    // or removed there. Otherwise it gets a folder of its own, removed if the start fails.
-    const workspace = options?.workspace;
-    if (workspace) {
-      const found = await findWorkspace(workspace);
-      if ('status' in found) return found;
+    if (started.status === 'refused') {
+      // A terminal killed after its spawn: its exit follows, and the page that owned it hears of it.
+      const { terminal, ...refused } = started;
+      if (terminal) register(daemon, terminal, contents).closing = true;
+      return refused;
     }
-    if (contents && endingsOf(contents) !== endings) {
-      return { status: 'refused', message: `Could not start ${harness.name}: the page that asked for it is gone` };
+    const terminal = register(daemon, started.terminal, contents);
+    if (gone()) {
+      kill(terminal.appId);
+      void daemon.client.call('session-dismiss', { sessionId: started.session.id }).catch(() => {});
+      return pageGone(name);
     }
-    const id = resume?.id ?? randomUUID();
-    // A resumed session's last status is not the new agent's.
-    if (resume) sessionStatuses.delete(id);
-    const directory = workspace?.path ?? join(cockpitHome, 'sessions', id);
-    const prompt = options?.prompt?.trim() || undefined;
-    let ptyId: number | undefined;
-    try {
-      if (!workspace) mkdirSync(directory, { recursive: true });
-      let env = await terminalEnv({
-        COCKPIT_SESSION_ID: id,
-        ...(workspace && { COCKPIT_WORKSPACE_PATH: workspace.path }),
-      });
-      const viaSetup = workspace && options?.setup;
-      let command: { command?: string; args?: string[] };
-      if (catalogued && found) {
-        // The harness is told, through its arguments and environment, to report its status to the daemon.
-        const status = await statusLaunch(catalogued.id, { cli: cliPath, pluginsDir: join(cockpitHome, 'plugins'), env });
-        env = status.env as Record<string, string>;
-        // From the composer the terminal runs `cockpit setup`, which runs the repository's setup, then
-        // the agent, then the login shell. The agent follows `--then` by the path detection found, so
-        // that binary is the one that runs.
-        const agentArgs = [...status.args, ...(resume ? catalogued.resume(resume.harnessSessionId) : catalogued.start(prompt))];
-        command = viaSetup
-          ? { command: cliPath, args: ['setup', '--shell', '--then', found.path, ...agentArgs] }
-          : { command: found.path, args: agentArgs };
-      } else {
-        // The login shell: the spawn defaults run `$SHELL -l`.
-        command = {};
-      }
-      // The composer names the workspace after the first title the agent derives from the prompt. The
-      // entry exists before the spawn, so no title can arrive ahead of it.
-      if (workspace && options?.nameFromTitle && catalogued) {
-        pendingNames.set(id, { worktree: workspace.path, harness: catalogued });
-      }
-      ptyId = await spawnFor(
-        contents,
-        { ...size, ...command, cwd: directory, env },
-        {
-          kind: 'session',
-          sessionId: id,
-          workspace: workspace?.path,
-          // A harness with no hook on an interrupt: the daemon reads the end of a turn from the title.
-          ...(catalogued?.turnTitles && { agentTitles: { ...catalogued.turnTitles, marked: Boolean(viaSetup) } }),
-          before: endings,
-        },
-      );
-      if (resume) return { status: 'started', session: resume, ptyId };
-      const session = {
-        id,
-        name: sessionName(state, harness, workspace?.path),
-        harness: harness.id,
-        directory,
-        createdAt: new Date().toISOString(),
-        ...(workspace && { project: workspace.project, open: true }),
-      };
-      const next = addSession(state, session);
-      saveState(userData, next);
-      state = next;
-      return { status: 'started', session, ptyId };
-    } catch (error) {
-      pendingNames.delete(id);
-      if (ptyId !== undefined) kill(ptyId);
-      if (!workspace) rmSync(directory, { recursive: true, force: true });
-      return {
-        status: 'refused',
-        message: `Could not start ${harness.name}: ${error instanceof Error ? error.message : String(error)}`,
-      };
-    }
+    return { status: 'started', session: started.session, ptyId: terminal.appId };
   }
 
   ipcMain.handle('sessions:resume', async (event, sessionId: string, size: { cols: number; rows: number }): Promise<StartSessionResult> => {
     if (!isFromApp(event)) throw new Error('sessions:resume refused: unexpected origin');
     const session = state.sessions.find(({ id }) => id === sessionId);
-    const { project, harnessSessionId } = session ?? {};
-    if (!session || project === undefined || harnessSessionId === undefined) return { status: 'refused', message: 'This session has no conversation to resume.' };
     // A session a daemon holds runs, and one whose start is under way is about to: either would run two agents.
-    if (heldSessionIds().has(sessionId) || resuming.has(sessionId)) return { status: 'refused', message: `${session.name} is already running.` };
+    if (session && (heldSessionIds().has(sessionId) || resuming.has(sessionId))) return { status: 'refused', message: `${session.name} is already running.` };
     resuming.add(sessionId);
+    // A resumed session's last status is not the new agent's.
+    sessionStatuses.delete(sessionId);
     try {
-      return await startSession(event.sender, session.harness, size, { workspace: { project, path: session.directory } }, { ...session, harnessSessionId });
+      return await startSession(event.sender, session?.harness, (daemon) => daemon.client.call('session-resume', { sessionId, size, subscribe: true }));
     } finally {
       resuming.delete(sessionId);
     }
   });
-  ipcMain.handle('sessions:start', (event, harnessId: string, size: { cols: number; rows: number }, options?: StartSessionOptions) => {
+  ipcMain.handle('sessions:start', (event, harness: string, size: { cols: number; rows: number }, options?: StartSessionOptions) => {
     if (!isFromApp(event)) throw new Error('sessions:start refused: unexpected origin');
-    return startSession(event.sender, harnessId, size, options);
+    return asOwnWrite(event.sender, () =>
+      startSession(event.sender, harness, (daemon) => daemon.client.call('session-start', { harness, size, options, subscribe: true })),
+    );
   });
-  return startSession;
 }
 
 // Why `gh` could not read a pull request, as shown in the Changes sidebar.
@@ -1702,23 +1406,9 @@ function describeReadFailure(error: GitHubError): string {
   return `Could not read the pull request: ${error.message}`;
 }
 
-// What the user calls a workspace: its branch, or its folder name when detached.
-const workspaceName = ({ branch, path }: Worktree) => branch ?? basename(path);
-
 // A workspace is a project of the state and one of its linked worktrees (git tells), or its main working tree when it has its main workspace.
-async function findWorkspace({ project, path }: { project: string; path: string }): Promise<Worktree | Refused> {
-  if (!state.projects.some((entry) => entry.path === project)) {
-    return { status: 'refused', message: `${project} is not a project in Cockpit.` };
-  }
-  try {
-    const worktrees = await listWorktrees(project, { env: await shellEnv });
-    const found = worktrees.find((worktree) => (!worktree.main || hasMainWorkspace(project)) && worktree.path === path);
-    if (found) return found;
-    return { status: 'refused', message: `${path} is not a workspace of ${basename(project)}.` };
-  } catch (error) {
-    if (!(error instanceof WorkspaceError)) throw error;
-    return { status: 'refused', message: describeFailure(error, project) };
-  }
+async function findWorkspace(workspace: { project: string; path: string }): Promise<Worktree | Refused> {
+  return findWorkspaceIn(state, workspace, await shellEnv);
 }
 
 // The app never navigates away from its own page.
@@ -1738,7 +1428,8 @@ void app.whenReady().then(async () => {
   if (!hasLock) return;
   const userData = app.getPath('userData');
   try {
-    state = loadState(userData);
+    // Read only: the daemon is the only writer of `state.json`.
+    state = readState(userData);
   } catch (error) {
     // The file is left as it is: quit without opening a window. A file that
     // cannot be read (a folder, no permission) quits the same way.
@@ -1759,9 +1450,17 @@ void app.whenReady().then(async () => {
     if (!isFromApp(event)) throw new Error('get-shell-path refused: unexpected origin');
     return (await shellEnv).PATH ?? '';
   });
+  // How the `cockpit` command finds or starts the daemon when the app is closed. A home the daemon cannot use is the
+  // daemon's failure to report, not this one's.
+  try {
+    writeLaunch(cockpitHome, launchOf());
+  } catch {
+    // Nothing to write it in.
+  }
   await connectDaemons();
   const pty = startTerminals();
-  startProjects(userData, pty, startSessions(userData, pty));
+  startProjects(pty);
+  startSessions(pty);
 
   createWindow();
 

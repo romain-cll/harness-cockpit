@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -19,8 +19,10 @@ afterEach(() => {
   for (const cleanup of cleanups.splice(0).reverse()) cleanup();
 });
 
-beforeAll(() => {
+beforeAll(async () => {
   if (!existsSync(BINARY)) throw new Error(`${BINARY} is missing: run bun run build in apps/cli first`);
+  // macOS assesses a newly built executable on its first launch (about 0.5 s): absorb it here, with a usage error that touches no daemon, so the timed tests measure the binary only.
+  await run([], {});
 });
 
 /** A short folder: macOS limits a socket path to 103 bytes. */
@@ -174,5 +176,40 @@ describe('cockpit session-id, the compiled binary', () => {
     expect(result.err.startsWith('usage:')).toBe(true);
     for (const line of USAGE_LINES) expect(result.err).toContain(line);
     expect(server.connections()).toBe(0);
+  });
+});
+
+// COCKPIT-37 AC2: a command that needs the daemon starts it from the launch file the app wrote. The binary is what
+// runs `child_process.spawn` with a fourth `stdio` pipe (the daemon's ready line) under Bun. The daemon is the real
+// entry, run by the Bun that compiled the binary (it stands for the Electron binary that runs it in the app).
+describe('cockpit project list, the compiled binary', () => {
+  const BUN = resolve(import.meta.dirname, '../node_modules/.bin/bun');
+  const DAEMON_SOURCE = resolve(import.meta.dirname, '../../../packages/daemon/src/index.ts');
+  const BUILD = 'aaaa1111';
+
+  test('AC2 — with the launch file the app wrote and no daemon running, the binary starts the daemon of its build (its .pid appears, it outlives the binary) and the command succeeds', async () => {
+    const home = makeHome();
+    const root = makeHome();
+    const entry = join(root, 'daemon-entry.mjs');
+    writeFileSync(entry, `import { reportReady, runDaemonEntry } from '${DAEMON_SOURCE}';\nvoid runDaemonEntry(process.argv, process.env, { stderr: process.stderr, exit: (code) => process.exit(code), ready: () => reportReady() });\n`);
+    writeFileSync(join(home, 'daemon-launch.json'), JSON.stringify({ executable: BUN, bundle: entry, build: BUILD, stateDir: join(root, 'user-data'), cli: BINARY }));
+    const pidFile = join(home, `daemon-1-${BUILD}.pid`);
+    cleanups.push(() => {
+      if (!existsSync(pidFile)) return;
+      try {
+        process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL');
+      } catch {
+        // Already gone.
+      }
+    });
+    expect(readdirSync(home).filter((name) => name.endsWith('.pid'))).toEqual([]);
+
+    const result = await run(['project', 'list'], { COCKPIT_HOME: home, SHELL: '/bin/sh' });
+
+    expect(result).toMatchObject({ code: 0, err: '' });
+    expect(JSON.parse(result.out)).toEqual([]);
+    const pid = Number(readFileSync(pidFile, 'utf8'));
+    // `run` settles once the binary has ended: the daemon, started detached, is still there.
+    expect(() => process.kill(pid, 0)).not.toThrow();
   });
 });
