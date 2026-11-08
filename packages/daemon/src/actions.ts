@@ -28,6 +28,7 @@ import {
   listWorktrees,
   nameWorkspace,
   readWorkspaceConfig,
+  removalState,
   removeWorktree,
   repairWorktrees,
   reservedPath,
@@ -477,6 +478,10 @@ export function createActions({ home, stateDir, cli, socket, terminals, supersed
             if (refused) throw new Error(refused.message);
             await endWorkspace(path);
             return { status: 'removed', branchKept: false };
+          }
+          // A dirty worktree is refused before anything runs in it: the teardown would leave it torn down and still there.
+          if (options.teardown && !options.force && (await removalState({ repo: project, path, env: await loginEnv() })).uncommitted) {
+            return { status: 'dirty' };
           }
           const failed = options.teardown ? await runTeardown(project, path) : undefined;
           if (failed && !options.force) return refuse(failed);

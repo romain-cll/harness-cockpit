@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import { createActions } from './actions';
@@ -83,9 +83,9 @@ export async function runDaemon({ home, build, stateDir, cli = '' }: DaemonOptio
           announceSpawned: (terminal, requester) => broadcast({ type: 'spawned', terminal }, requester as Connection | undefined),
         });
   await clearStaleSocket(files.socket);
-  // The daemons of other builds up before this one listens: listed first, so that two daemons starting together
-  // never both supersede the other.
-  const older = listDaemonFiles(home).filter((daemon) => daemon.protocol === PROTOCOL_VERSION && daemon.build !== build);
+  // The daemons of other builds already listening (their `.sock`: a `.log` exists before a daemon runs), listed
+  // first, so that two daemons starting together never both supersede the other.
+  const older = listDaemonFiles(home).filter((daemon) => daemon.protocol === PROTOCOL_VERSION && daemon.build !== build && existsSync(daemon.socket));
 
   const token = randomBytes(32).toString('hex');
 
