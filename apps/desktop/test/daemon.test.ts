@@ -6,7 +6,11 @@ import { join } from 'node:path';
 import { connectDaemon } from '@cockpit/daemon';
 import { type Page } from 'playwright-core';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
+import { agentSelect, baseSelect, createButton, openComposer, promptBox, waitForMessage } from './composer';
 import { heldProcess, isAlive, killDaemonsIn, MAIN_PROCESS_ERROR, quitApp, type Session, startClock, untilRead, versionLabel, watchTerminalEnd } from './launch';
+import { readSidebarLines, startProjectRemoval } from './support/projects';
+import { openWorkspaceStartMenu } from './support/sessions';
+import { allPageErrorsOf } from './support/terminal';
 import { addWorktree, aliveOf, type ApiWindow, beginSetup, commandOf, daemonEnded, daemonFile, daemonPid, daemonProcessesOf, daemonSettled, destroyWindows, dotOf, environmentOf, escapeRegExp, expectDot, expectScreen, expectTabCount, factsOf, type Fixture, goToWorkspacePage, hasEnded, killApp, launchBuiltOn, makeDataDir, makeFixture, makeRepoWithSetup, makeWorkspace, must, newShellTab, notificationShown, pagesOf, postEvent, selectTab, SETUP_PID, shellPid, startSession, startSetup, stubPicker, tabNames, tokenFor, typeLine, uniqueBuild, untilWindows, watchTerminal } from './support/daemon';
 
 describe('daemon: built app', () => {
@@ -450,7 +454,7 @@ describe('daemon: built app, the daemon cannot start', () => {
   const failureView = (page: Page) => page.getByText("Cockpit's background service could not start", { exact: true });
   const SUBTITLE = 'Terminals and agents run in this service. Your projects and workspaces are untouched.';
 
-  test('AC10, COCKPIT-37 AC8 — COCKPIT_HOME a regular file: the window opens; stderr names the path; the sidebar lists the project, its workspace and the session of state.json; a workspace page and a session page show the failure view; the Sessions section says so; adding a project, removing it, creating a workspace and starting a session are each refused with the reason; state.json is unchanged', async () => {
+  test('AC10, COCKPIT-37 AC8 — COCKPIT_HOME a regular file: the window opens; stderr names the path; the sidebar lists the project, its workspace and the session of state.json; a workspace page and a session page show the failure view; the Sessions section says so; adding a project, removing it, creating a workspace and starting a session are each refused with the reason; the remove dialog, the composer and the workspace "+" menu show it (detection settles, no uncaught rejection); state.json is unchanged', async () => {
     const fx = makeFixture();
     const home = join(dataDir, 'h');
     writeFileSync(home, 'a file, not a folder');
@@ -518,6 +522,32 @@ describe('daemon: built app, the daemon cannot start', () => {
         };
       }, repo.root);
       for (const [what, message] of Object.entries(outcomes)) expect(message, `${what} is refused with the daemon's reason`).toContain(reason);
+
+      // The refusals as the UI shows them. The remove dialog says why, with no uncaught rejection in the page.
+      const dialog = await startProjectRemoval(page, repo.root);
+      await dialog.getByRole('button', { name: 'Remove', exact: true }).click();
+      await dialog.filter({ hasText: reason }).waitFor();
+      await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await dialog.waitFor({ state: 'hidden' });
+      expect(await allPageErrorsOf(page), 'no uncaught rejection').toEqual([]);
+
+      // Harness detection settles with no daemon: the composer leaves "Detecting…" and its send is refused with the reason.
+      await openComposer(page, repo.root);
+      await agentSelect(page).filter({ hasNotText: 'Detecting…' }).waitFor();
+      await baseSelect(page).filter({ hasText: /\S/ }).filter({ hasNotText: /^\s*Select a base\s*$/ }).waitFor();
+      await promptBox(page).fill('refused task');
+      await createButton(page).click();
+      expect(await waitForMessage(page)).toContain(reason);
+
+      // So does the "+" menu of a workspace: it lists the agent found, and starting it is refused with the reason.
+      await openWorkspaceStartMenu(page, worktree, 'view');
+      await page.getByRole('menuitem', { name: 'Claude Code', exact: true }).click();
+      await untilRead(
+        page,
+        readSidebarLines,
+        (lines, why: string) => lines.some((line) => line.includes(why) && !line.startsWith("Cockpit's background service could not start")),
+        reason,
+      );
       expect(readFileSync(stateFile, 'utf8'), 'state.json is unchanged').toBe(stateBefore);
       expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
     } finally {

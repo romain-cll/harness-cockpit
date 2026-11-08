@@ -1,10 +1,10 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, readFileSync, realpathSync, watch, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, realpathSync, symlinkSync, watch, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { expect } from 'vitest';
 import { runCli } from '../src/cli';
-import { runDaemon } from '../src/index';
+import { daemonFiles, runDaemon } from '../src/index';
 import { BUILD, connectTo, makeHome, onCleanup, waitForOutput } from './helpers';
 
 // What the tests of the state moved into the daemon (COCKPIT-37) assume of the API; the spec names the
@@ -83,6 +83,10 @@ export interface AgentFixture {
   runs: string;
   /** What the last stub run printed: its working directory, then its arguments, one per line. */
   ran: () => string[];
+  /** The file holding the pid of the last stub run (`kill -0` tells whether it still runs). */
+  pidFile: string;
+  /** The environment the last stub run had. */
+  environment: () => Record<string, string>;
 }
 
 /**
@@ -103,6 +107,8 @@ export function makeAgentFixture(): AgentFixture {
     `#!/bin/sh
 if [ "$1" = "--version" ]; then echo 9.9.9; exit 0; fi
 echo agent >> '${runs}'
+echo $$ > "$0.pid"
+env > "$0.env"
 { pwd -P; printf '%s\\n' "$@"; } > "$0.ran"
 echo agent-ready
 while IFS= read -r line; do
@@ -112,7 +118,7 @@ done
   );
   chmodSync(stub, 0o755);
   const shell = join(root, 'login-shell');
-  writeFileSync(shell, `#!/bin/sh\n[ "$1" = --warmup ] && exit 0\nif [ "$1" = -l ] && [ $# -eq 1 ]; then exec /bin/sh; fi\nPATH='${bin}:/usr/bin:/bin' /bin/sh -c "$2"\n`);
+  writeFileSync(shell, `#!/bin/sh\n[ "$1" = --warmup ] && exit 0\nif [ "$1" = -l ] && [ $# -eq 1 ]; then exec /bin/sh; fi\nLOGIN_SHELL_MARK=from-login-shell PATH='${bin}:/usr/bin:/bin' /bin/sh -c "$2"\n`);
   chmodSync(shell, 0o755);
   mkdirSync(join(root, 'cli'));
   const cli = join(root, 'cli', 'cockpit');
@@ -127,7 +133,14 @@ done
   expect(execFileSync(stub, ['--version'], { encoding: 'utf8' }).trim()).toBe('9.9.9');
   execFileSync(shell, ['--warmup']);
   execFileSync(cli, ['status', 'working'], { env: { PATH: '/usr/bin:/bin' } });
-  return { root, shell, cli, entry, runs, ran: () => readFileSync(`${stub}.ran`, 'utf8').split('\n').filter(Boolean) };
+  const environment = () =>
+    Object.fromEntries(
+      readFileSync(`${stub}.env`, 'utf8')
+        .split('\n')
+        .filter((line) => line.includes('='))
+        .map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]),
+    );
+  return { root, shell, cli, entry, runs, ran: () => readFileSync(`${stub}.ran`, 'utf8').split('\n').filter(Boolean), pidFile: `${stub}.pid`, environment };
 }
 
 export const runsOf = (fixture: AgentFixture) => readFileSync(fixture.runs, 'utf8').split('\n').filter(Boolean);
@@ -147,6 +160,18 @@ export function writeLaunchFile(home: string, launch: Launch): void {
 }
 
 export const launchOf = (fixture: AgentFixture, stateDir: string, build = BUILD): Launch => ({ executable: BUN, bundle: fixture.entry, build, stateDir, cli: fixture.cli });
+
+/**
+ * A launch whose daemon can run terminals: node-pty does not run under Bun, so the entry is bundled for Node
+ * (node-pty stays external, found through a `node_modules` link next to the bundle) and run by this process's Node,
+ * as the app runs its bundle with Electron as Node.
+ */
+export function nodeLaunchOf(fixture: AgentFixture, stateDir: string, build = BUILD): Launch {
+  const bundle = join(fixture.root, 'daemon-bundle.mjs');
+  execFileSync(BUN, ['build', fixture.entry, '--target', 'node', '--external', 'node-pty', '--outfile', bundle], { stdio: 'pipe' });
+  symlinkSync(join(REPO_ROOT, 'packages/daemon/node_modules'), join(fixture.root, 'node_modules'));
+  return { executable: process.execPath, bundle, build, stateDir, cli: fixture.cli };
+}
 
 export const newStateDir = () => join(realpathSync(makeHome()), 'user-data');
 
@@ -197,9 +222,8 @@ export function untilState(stateDir: string, holds: (state: ReturnType<typeof st
  * A daemon of this process, running the stub's login shell, with its state in a folder of its own and its launch
  * file in the home, as the app leaves them. `state` seeds `state.json` before the daemon loads it.
  */
-export async function startStateDaemon({ fixture, state, build = BUILD }: { fixture: AgentFixture; state?: object; build?: string }) {
-  // A real path: git reports worktrees by theirs (macOS `/var` is `/private/var`).
-  const home = realpathSync(makeHome());
+export async function startStateDaemon({ fixture, state, build = BUILD, home = realpathSync(makeHome()) }: { fixture: AgentFixture; state?: object; build?: string; home?: string }) {
+  // A real path by default: git reports worktrees by theirs (macOS `/var` is `/private/var`).
   const stateDir = newStateDir();
   if (state) {
     mkdirSync(stateDir, { recursive: true });
@@ -226,18 +250,51 @@ export function jsonLine(out: string): any {
   return JSON.parse(lines[0]!);
 }
 
-/** Runs the CLI in this process, from a plain shell: `COCKPIT_HOME` set, no `COCKPIT_SOCKET`. */
-export async function cockpit(argv: string[], { home, env = {}, stdin = '' }: { home: string; env?: Record<string, string | undefined>; stdin?: string }) {
+/**
+ * Runs the CLI in this process, from a plain shell: `COCKPIT_HOME` set (`home: undefined` leaves it unset), no
+ * `COCKPIT_SOCKET`, in `cwd` when given (a relative path is resolved against it).
+ */
+export async function cockpit(argv: string[], { home, env = {}, stdin = '', cwd }: { home: string | undefined; env?: Record<string, string | undefined>; stdin?: string; cwd?: string }) {
   const out: string[] = [];
   const err: string[] = [];
   const exits: number[] = [];
-  await runCli(argv, { PATH: process.env.PATH, HOME: process.env.HOME, SHELL: process.env.SHELL, COCKPIT_HOME: home, ...env } as NodeJS.ProcessEnv, {
-    stdin: Readable.from(stdin === '' ? [] : [Buffer.from(stdin)], { objectMode: false }),
-    stdout: { write: (text: string) => out.push(text) },
-    stderr: { write: (text: string) => err.push(text) },
-    exit: (code: number) => void exits.push(code),
-  });
+  const before = process.cwd();
+  if (cwd !== undefined) process.chdir(cwd);
+  try {
+    await runCli(argv, { PATH: process.env.PATH, HOME: process.env.HOME, SHELL: process.env.SHELL, COCKPIT_HOME: home, ...env } as NodeJS.ProcessEnv, {
+      stdin: Readable.from(stdin === '' ? [] : [Buffer.from(stdin)], { objectMode: false }),
+      stdout: { write: (text: string) => out.push(text) },
+      stderr: { write: (text: string) => err.push(text) },
+      exit: (code: number) => void exits.push(code),
+    });
+  } finally {
+    process.chdir(before);
+  }
   return { out: out.join(''), err: err.join(''), exits };
+}
+
+/** Sets variables of this process (`undefined` removes one) until the end of the test: a daemon the CLI starts, or `homedir()`, reads them. */
+export function setProcessEnv(variables: Record<string, string | undefined>): void {
+  for (const [name, value] of Object.entries(variables)) {
+    const before = process.env[name];
+    onCleanup(() => {
+      if (before === undefined) delete process.env[name];
+      else process.env[name] = before;
+    });
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+}
+
+/** Ends the daemon the CLI started in `home` (detached: nobody else would). */
+export function endDaemonIn(home: string, build = BUILD): void {
+  onCleanup(() => {
+    try {
+      process.kill(Number(readFileSync(daemonFiles(home, 1, build).pid, 'utf8')), 'SIGTERM');
+    } catch {
+      // It never started, or is gone.
+    }
+  });
 }
 
 /** Waits until the session's terminal has printed `text`, whether before or after the call. */

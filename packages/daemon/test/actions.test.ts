@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, test } from 'vitest';
-import { connectTo, OTHER_BUILD, registerCleanup, shellOptions } from './helpers';
+import { runDaemon } from '../src/index';
+import { connectTo, OTHER_BUILD, onCleanup, registerCleanup, shellOptions } from './helpers';
 import { cockpit, makeAgentFixture, makeRepo, startProjectDaemon, startStateDaemon, stateFileIn, stateIn, untilState } from './state-helpers';
 
 // COCKPIT-37: the daemon owns `state.json`: what it refuses, what it stores with no app connected. Real
@@ -68,5 +69,31 @@ describe('a session of the daemon with no app connected', () => {
     );
 
     expect(stateIn(stateDir).sessions).toEqual([expect.objectContaining({ id, harnessSessionId: 'conversation-1' })]);
+  });
+});
+
+describe('a superseded daemon', () => {
+  test('AC14 — a session that exits on its own writes nothing: what the newer build\'s daemon wrote in state.json since stays, and the mark is left for the app\'s relay', async () => {
+    const { fixture, repo, home, stateDir, socket, daemon, create, startAgent } = await startProjectDaemon();
+    const id = await startAgent(await create('superseded'));
+    // A client of another build supersedes the daemon; it keeps the session.
+    await connectTo(socket, OTHER_BUILD);
+    // The newer build's daemon on the same state.json writes: a second project.
+    const second = makeRepo('second');
+    const newer = await runDaemon({ home, build: OTHER_BUILD, stateDir, cli: fixture.cli });
+    onCleanup(() => newer.close());
+    const client = await connectTo(newer.socketPath, OTHER_BUILD);
+    await client.client.call('project-add', { folder: second.root });
+    expect(stateIn(stateDir).projects?.map(({ path }) => path).sort()).toEqual([repo.root, second.root].sort());
+
+    // The session's agent ends by itself; the superseded daemon closes once its last terminal is gone.
+    const connection = await connectTo(socket);
+    const terminal = (await connection.client.list()).find((entry) => entry.sessionId === id)!;
+    connection.client.write(terminal.id, 'quit\n');
+    await daemon.closed;
+
+    const state = stateIn(stateDir);
+    expect(state.projects?.map(({ path }) => path).sort()).toEqual([repo.root, second.root].sort());
+    expect(state.sessions).toEqual([expect.objectContaining({ id, open: true })]);
   });
 });

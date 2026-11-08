@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { connectDaemon } from '@cockpit/daemon';
 import { afterAll, beforeAll, describe, expect, test } from 'vitest';
 import { killDaemonsIn, MAIN_PROCESS_ERROR, quitApp, type Session, versionLabel } from './launch';
 import { cliEnv, createFromShell, launchFileIn, runCockpit } from './support/cli';
@@ -117,7 +118,7 @@ describe('cockpit command: a session on the daemon of an older build', () => {
     rmSync(dataDir, { recursive: true, force: true });
   });
 
-  test('AC10 — after the app relaunched as a new build, a conversation id the session of the old build\'s daemon reports (`cockpit session-id`) is stored on the session in state.json', async () => {
+  test('AC10, AC14 — after the app relaunched as a new build, a conversation id the session of the old build\'s daemon reports (`cockpit session-id`) is stored on the session in state.json, and when its agent then exits on its own the app relays it and state.json shows open false, the id kept', async () => {
     const oldBuild = uniqueBuild();
     const newBuild = uniqueBuild();
     session = await launchBuiltOn({ ...fx.env(), COCKPIT_TEST_DAEMON_BUILD: oldBuild }, dataDir, home);
@@ -139,7 +140,17 @@ describe('cockpit command: a session on the daemon of an older build', () => {
       runCockpit(REPOSITORY_CLI, ['session-id', 'claude-code'], { HOME: fx.root, COCKPIT_SOCKET: oldSocket, COCKPIT_SESSION_ID: id }, JSON.stringify({ session_id: 'conversation-after-update', hook_event_name: 'UserPromptSubmit' })),
     );
 
-    expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).sessions).toEqual([expect.objectContaining({ id, harnessSessionId: 'conversation-after-update' })]);
+    expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).sessions).toEqual([expect.objectContaining({ id, harnessSessionId: 'conversation-after-update', open: true })]);
+
+    // The agent ends by itself on the old daemon, which writes nothing (superseded): the app hears its exit and
+    // forwards `session-dismiss` to the daemon of its own build, which closes the mark.
+    const oldDaemon = await connectDaemon(oldSocket);
+    const terminal = (await oldDaemon.list()).find((entry) => entry.sessionId === id);
+    expect(terminal, 'the session still runs on the old build\'s daemon').toBeDefined();
+    await untilState(dataDir, (state) => state.sessions?.find((stored) => stored.id === id)?.open === false, async () => oldDaemon.write(terminal!.id, 'quit\n'));
+    oldDaemon.close();
+
+    expect(JSON.parse(readFileSync(join(dataDir, 'state.json'), 'utf8')).sessions).toEqual([expect.objectContaining({ id, harnessSessionId: 'conversation-after-update', open: false })]);
     expect(session.output()).not.toMatch(MAIN_PROCESS_ERROR);
   });
 });

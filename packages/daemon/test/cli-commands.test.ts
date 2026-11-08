@@ -1,11 +1,12 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, test } from 'vitest';
-import { daemonFiles } from '../src/index';
-import { BUILD, makeHome, registerCleanup } from './helpers';
+import { daemonFiles, readTerminals } from '../src/index';
+import { BUILD, connectTo, makeHome, registerCleanup, shellOptions } from './helpers';
 import {
   branchesOf,
   cockpit,
+  endDaemonIn,
   git,
   jsonLine,
   launchOf,
@@ -13,7 +14,9 @@ import {
   makePlainFolder,
   makeRepo,
   newStateDir,
+  nodeLaunchOf,
   runsOf,
+  setProcessEnv,
   startProjectDaemon,
   startStateDaemon,
   stateFileIn,
@@ -32,13 +35,13 @@ registerCleanup();
 const OPEN_COCKPIT = 'Open Cockpit once so the cockpit command can start its background service.';
 
 describe('cockpit project add and list', () => {
-  test('AC5 — add <folder> inside a repository prints the root as added (exit 0) and state.json lists it; list prints the projects with their workspaces; a second add of the root is refused (exit 1)', async () => {
+  test('AC5 — add <folder> inside a repository prints the root as added (exit 0), a relative folder being resolved against the current directory, and state.json lists it; list prints the projects with their workspaces; a second add of the root is refused (exit 1)', async () => {
     const fixture = makeAgentFixture();
     const repo = makeRepo('added');
     mkdirSync(join(repo.root, 'src'));
     const { home, stateDir } = await startStateDaemon({ fixture });
 
-    const added = await cockpit(['project', 'add', join(repo.root, 'src')], { home });
+    const added = await cockpit(['project', 'add', 'src'], { home, cwd: repo.root });
     expect(added.exits).toEqual([0]);
     expect(jsonLine(added.out)).toMatchObject({ status: 'added', project: { path: repo.root } });
     expect(stateIn(stateDir).projects).toEqual([{ path: repo.root }]);
@@ -85,11 +88,22 @@ describe('cockpit ws', () => {
     expect(projects.map((project) => [project.path, project.workspaces.map(({ path }) => path).sort()])).toEqual([[repo.root, [one.path, two.path].sort()]]);
   });
 
-  test('AC6 — delete --project --workspace removes a clean worktree (exit 0) and closes the open mark of its sessions in state.json', async () => {
-    const { repo, stateDir, run, create } = await startProjectDaemon();
+  test('AC6 — delete --project --workspace runs the repository\'s teardown while the agent still runs, then ends every session and terminal of the workspace (GET /terminals lists none of it), removes a clean worktree (exit 0) and closes the open mark of its sessions in state.json', async () => {
+    const { fixture, repo, stateDir, socket, run, create, startAgent } = await startProjectDaemon();
+    // The teardown says whether the agent was still running when it ran.
+    const config = join(repo.root, '.cockpit');
+    mkdirSync(config);
+    const teardown = `if kill -0 "$(cat '${fixture.pidFile}')" 2>/dev/null; then echo teardown >> '${fixture.runs}'; else echo teardown-after-the-agent >> '${fixture.runs}'; fi`;
+    writeFileSync(join(config, 'config.json'), JSON.stringify({ setup: [], teardown: [teardown] }));
     const workspace = await create('clean');
-    const started = jsonLine((await run(['session', 'start', '--project', repo.root, '--workspace', workspace.path, '--harness', 'claude-code', '--prompt', 'hello'])).out);
-    expect(stateIn(stateDir).sessions).toEqual([expect.objectContaining({ id: started.session.id, open: true })]);
+    const other = await create('other');
+    const id = await startAgent(workspace);
+    expect(stateIn(stateDir).sessions).toEqual([expect.objectContaining({ id, open: true })]);
+    // A shell in each workspace: the deleted one's goes, the other stays.
+    const shells = await connectTo(socket);
+    await shells.client.spawn({ ...shellOptions, cwd: workspace.path, workspace: workspace.path });
+    await shells.client.spawn({ ...shellOptions, cwd: other.path, workspace: other.path });
+    expect((await readTerminals(socket)).filter(({ workspace: each }) => each === workspace.path)).toHaveLength(2);
 
     let removed!: Awaited<ReturnType<typeof run>>;
     await untilState(stateDir, (state) => state.sessions?.[0]?.open === false, async () => {
@@ -98,9 +112,13 @@ describe('cockpit ws', () => {
 
     expect(removed.exits).toEqual([0]);
     expect(jsonLine(removed.out)).toEqual({ status: 'removed', branchKept: false });
+    expect(runsOf(fixture)).toEqual(['agent', 'teardown']);
     expect(existsSync(workspace.path)).toBe(false);
-    expect(worktreesOf(repo)).toEqual([]);
-    expect(stateIn(stateDir).sessions).toEqual([expect.objectContaining({ id: started.session.id, open: false })]);
+    expect(worktreesOf(repo)).toEqual([other.path]);
+    expect(stateIn(stateDir).sessions).toEqual([expect.objectContaining({ id, open: false })]);
+    const left = await readTerminals(socket);
+    expect(left.filter(({ workspace: each, sessionId }) => each === workspace.path || sessionId === id)).toEqual([]);
+    expect(left.filter(({ workspace: each }) => each === other.path)).toHaveLength(1);
   });
 
   test('AC6 — a dirty worktree without --force prints dirty (exit 1) and stays; with --force it is removed', async () => {
@@ -238,5 +256,62 @@ describe('cockpit usage and the daemon the CLI needs', () => {
     expect(result.out).toBe('');
     expect(readdirSync(home).filter((name) => /\.(sock|token|pid)$/.test(name))).toEqual([]);
     expect(readFileSync(stateFileIn(stateDir)).equals(before)).toBe(true);
+  });
+});
+
+describe('cockpit home and the environment of the daemon it starts', () => {
+  test('AC16 — with COCKPIT_HOME unset the CLI uses the folder of COCKPIT_SOCKET as its home', async () => {
+    const fixture = makeAgentFixture();
+    const repo = makeRepo('socket-home');
+    const { socket } = await startStateDaemon({ fixture, state: { version: 1, projects: [{ path: repo.root }] } });
+    // A home of no Cockpit: the fallback on `~/.cockpit` would find nothing.
+    const nowhere = realpathSync(makeHome());
+    setProcessEnv({ HOME: nowhere });
+
+    const result = await cockpit(['project', 'list'], { home: undefined, env: { COCKPIT_SOCKET: socket, HOME: nowhere } });
+
+    expect(result.exits).toEqual([0]);
+    expect(jsonLine(result.out)).toEqual([{ path: repo.root, name: 'socket-home', workspaces: [] }]);
+  });
+
+  test('AC16 — with neither COCKPIT_HOME nor COCKPIT_SOCKET the CLI uses ~/.cockpit', async () => {
+    const fixture = makeAgentFixture();
+    const repo = makeRepo('default-home');
+    const userHome = realpathSync(makeHome());
+    // A short build name: the socket path of a home one folder deeper stays under macOS's limit.
+    await startStateDaemon({ fixture, state: { version: 1, projects: [{ path: repo.root }] }, home: join(userHome, '.cockpit'), build: 'c1' });
+    setProcessEnv({ HOME: userHome });
+
+    const result = await cockpit(['project', 'list'], { home: undefined, env: { HOME: userHome } });
+
+    expect(result.exits).toEqual([0]);
+    expect(jsonLine(result.out)).toEqual([{ path: repo.root, name: 'default-home', workspaces: [] }]);
+  });
+
+  test('AC15 — a daemon the CLI starts from a shell holding TMUX, VIRTUAL_ENV and Claude Code session variables hands none of them to its sessions, and gives them the login shell\'s variables', async () => {
+    const fixture = makeAgentFixture();
+    const repo = makeRepo('polluted');
+    const home = realpathSync(makeHome());
+    const stateDir = newStateDir();
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(stateFileIn(stateDir), JSON.stringify({ version: 1, projects: [{ path: repo.root }] }));
+    // The CLI starts the daemon from the launch file the app wrote, and the daemon runs the sessions' terminals.
+    writeLaunchFile(home, nodeLaunchOf(fixture, stateDir));
+    endDaemonIn(home);
+    const polluted = { TMUX: '/tmp/tmux-501/default,1234,0', VIRTUAL_ENV: '/somewhere/venv', CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli' };
+    const shell = { SHELL: fixture.shell };
+    // The daemon is a child of this process as much as of the CLI: both environments hold the variables.
+    setProcessEnv({ ...polluted, ...shell });
+    const run = (argv: string[]) => cockpit(argv, { home, env: { ...polluted, ...shell } });
+
+    const created = await run(['ws', 'create', '--project', repo.root, '--task', 'polluted']);
+    expect(created.exits).toEqual([0]);
+    const started = await run(['session', 'start', '--project', repo.root, '--workspace', jsonLine(created.out).workspace.path, '--harness', 'claude-code', '--prompt', 'hello']);
+    expect(started.exits).toEqual([0]);
+    await untilSessionPrints(daemonFiles(home, 1, BUILD).socket, jsonLine(started.out).session.id, 'agent-ready');
+
+    const environment = fixture.environment();
+    for (const name of Object.keys(polluted)) expect(environment, name).not.toHaveProperty(name);
+    expect(environment.LOGIN_SHELL_MARK).toBe('from-login-shell');
   });
 });
