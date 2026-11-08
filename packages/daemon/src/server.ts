@@ -3,7 +3,8 @@ import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import { createActions } from './actions';
-import { clearStaleSocket, daemonFiles } from './paths';
+import { connectDaemon } from './client';
+import { clearStaleSocket, daemonFiles, listDaemonFiles } from './paths';
 import { encode, lineReader, PROTOCOL_VERSION, RESIZE_EVENTS_HEADER, UPGRADE, WRITES, WRONG_BUILD, type Hello, type Message, type Request, type SessionEventName, type SessionReport, type SetupEventName, type TerminalInfo } from './protocol';
 import { SESSION_EVENTS, SETUP_EVENTS } from './status';
 import { createTerminals, type Subscriber } from './terminals';
@@ -82,6 +83,9 @@ export async function runDaemon({ home, build, stateDir, cli = '' }: DaemonOptio
           announceSpawned: (terminal, requester) => broadcast({ type: 'spawned', terminal }, requester as Connection | undefined),
         });
   await clearStaleSocket(files.socket);
+  // The daemons of other builds up before this one listens: listed first, so that two daemons starting together
+  // never both supersede the other.
+  const older = listDaemonFiles(home).filter((daemon) => daemon.protocol === PROTOCOL_VERSION && daemon.build !== build);
 
   const token = randomBytes(32).toString('hex');
 
@@ -206,6 +210,19 @@ export async function runDaemon({ home, build, stateDir, cli = '' }: DaemonOptio
   writeFileSync(temporaryPath, token, { mode: 0o600 });
   renameSync(temporaryPath, files.token);
   writeFileSync(files.pid, String(process.pid));
+
+  // They hear which build is the newest now, app or no app: each keeps its terminals, writes nothing to `state.json`
+  // from here and exits once empty. One that is gone or does not answer changes nothing.
+  await Promise.all(
+    older.map(async ({ socket }) => {
+      try {
+        const client = await connectDaemon(socket);
+        await client.hello(build).finally(() => client.close());
+      } catch {
+        // Gone, or not ours to reach.
+      }
+    }),
+  );
 
   // `waitForTerminals`: the files go and the daemon exits once every terminal has exited, SIGKILL after the
   // hang-up's grace included; otherwise as soon as the hang-ups are sent.
