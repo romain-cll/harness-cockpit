@@ -95,16 +95,29 @@ export interface AgentFixture {
  * CLI as a script over Bun and the daemon's entry as a script over Bun. Every executable is run once, as
  * macOS scans a new one the first time.
  */
-export function makeAgentFixture(): AgentFixture {
+export function makeAgentFixture({ conversation = false }: { conversation?: boolean } = {}): AgentFixture {
   const root = realpathSync(makeHome());
   const bin = join(root, 'bin');
   mkdirSync(bin);
   const runs = join(root, 'runs.log');
   writeFileSync(runs, '');
   const stub = join(bin, 'claude');
+  // `conversation` (COCKPIT-96): a stub that answers turns. Its prompt (the last argument) and each line it reads is a
+  // turn: it reports `working` through the CLI (the environment of a session names the daemon and the session),
+  // prints `reply:<the turn>`, then reports `finished`.
+  const cliPath = join(root, 'cli', 'cockpit');
   writeFileSync(
     stub,
-    `#!/bin/sh
+    conversation
+      ? `#!/bin/sh
+if [ "$1" = "--version" ]; then echo 9.9.9; exit 0; fi
+echo agent >> '${runs}'
+for prompt; do :; done
+turn() { '${cliPath}' status working; echo "reply:$1"; '${cliPath}' status finished; }
+turn "$prompt"
+while IFS= read -r line; do turn "$line"; done
+`
+      : `#!/bin/sh
 if [ "$1" = "--version" ]; then echo 9.9.9; exit 0; fi
 echo agent >> '${runs}'
 echo $$ > "$0.pid"
@@ -121,7 +134,7 @@ done
   writeFileSync(shell, `#!/bin/sh\n[ "$1" = --warmup ] && exit 0\nif [ "$1" = -l ] && [ $# -eq 1 ]; then exec /bin/sh; fi\nLOGIN_SHELL_MARK=from-login-shell PATH='${bin}:/usr/bin:/bin' /bin/sh -c "$2"\n`);
   chmodSync(shell, 0o755);
   mkdirSync(join(root, 'cli'));
-  const cli = join(root, 'cli', 'cockpit');
+  const cli = cliPath;
   writeFileSync(cli, `#!/bin/sh\nexec '${BUN}' '${join(REPO_ROOT, 'apps/cli/src/main.ts')}' "$@"\n`);
   chmodSync(cli, 0o755);
   const entry = join(root, 'daemon-entry.mjs');
@@ -308,8 +321,8 @@ export async function untilSessionPrints(socket: string, sessionId: string, text
 }
 
 /** A daemon whose state holds a repository as a project, with `run` for CLI commands and `create` for a workspace. */
-export async function startProjectDaemon(build = BUILD) {
-  const fixture = makeAgentFixture();
+export async function startProjectDaemon(build = BUILD, fixtureOptions: Parameters<typeof makeAgentFixture>[0] = {}) {
+  const fixture = makeAgentFixture(fixtureOptions);
   const repo = makeRepo();
   const daemon = await startStateDaemon({ fixture, state: { version: 1, projects: [{ path: repo.root }] }, build });
   const run = (argv: string[]) => cockpit(argv, { home: daemon.home });
