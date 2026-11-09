@@ -174,6 +174,18 @@ describe('cockpit terminal send', () => {
     expect(bytesOf(connection.output(id))).toBe(hex('\u001b[200~hello\u001b[201~\r'));
   });
 
+  test('AC13 — the paste-end sequence inside the text is stripped, so the paste never ends early', async () => {
+    const { run, spawn, connection } = await start();
+    const id = await spawn({}, rawReader(15, true));
+    await waitForOutput(connection, id, 'ready');
+
+    const result = await run(['terminal', 'send', String(id), '--text', 'a\u001b[201~b', '--keys', 'enter']);
+
+    expect(result.exits).toEqual([0]);
+    await waitForOutput(connection, id, ':end');
+    expect(bytesOf(connection.output(id))).toBe(hex('\u001b[200~ab\u001b[201~\r'));
+  });
+
   test('AC6 — the keys reach the program as their bytes, in order', async () => {
     const { run, spawn, connection } = await start();
     const id = await spawn({}, rawReader(18, false));
@@ -266,6 +278,32 @@ describe('cockpit agent wait', () => {
 
     expect(result.exits).toEqual([1]);
     expect(jsonLine(result.out)).toEqual({ status: 'timeout' });
+  });
+
+  test.each([
+    ['just above the limit', '2147483.648'],
+    ['far above the limit', '99999999'],
+  ])('AC14 — --timeout %s (%s s): the usage on stderr, exit 2, nothing started', async (_label, seconds) => {
+    const home = makeHome();
+
+    const result = await cockpit(['agent', 'wait', 's1', '--until', 'finished', '--timeout', seconds], { home });
+
+    expect(result.exits).toEqual([2]);
+    expect(result.err.startsWith('usage:')).toBe(true);
+    expect(result.err).toContain(USAGE_LINES.wait);
+    expect(result.out).toBe('');
+    expect(readdirSync(home)).toEqual([]);
+  });
+
+  test('AC14 — --timeout 2147483 on a session already finished: prints finished and exits 0', async () => {
+    const { run, spawn, report } = await start();
+    await spawn({ kind: 'session', sessionId: 's1' });
+    await report('s1', 'finished');
+
+    const result = await run(['agent', 'wait', 's1', '--until', 'finished', '--timeout', '2147483']);
+
+    expect(result.exits).toEqual([0]);
+    expect(jsonLine(result.out)).toEqual({ status: 'finished', statusCount: 1 });
   });
 
   test('AC10 — the exited report during a wait: prints exited with the code and exits 1; a wait after the exit does the same at once', async () => {
