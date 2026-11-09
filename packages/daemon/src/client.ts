@@ -37,6 +37,10 @@ export interface DaemonClient {
   /** The ids below are the ones `spawn` answered, opaque to callers. */
   /** Subscribes to the terminal's output and answers its screen; later data events have a higher `seq`. */
   attach(id: unknown): Promise<Attached>;
+  /** The terminal's active buffer as plain text (last `maxLines` lines when given); rejects `no terminal <id>`. */
+  read(id: unknown, maxLines?: number): Promise<string>;
+  /** Pastes `text` (bracketed when the program asked for it), then writes the bytes of `keys` (names of `KEYS`); answers the terminal's info. */
+  send(id: unknown, input: { text?: string; keys?: string[] }): Promise<TerminalInfo>;
   write(id: unknown, data: string): void;
   /** Asks for a size; the terminal takes it, and a client hears of it, through `onResize`. */
   resize(id: unknown, cols: number, rows: number): void;
@@ -273,6 +277,8 @@ function createClient(socket: Socket, head: Buffer, socketPath: string, timeoutM
     spawn: (options) => ask({ type: 'spawn', options }),
     list: () => ask({ type: 'list' }),
     attach: (terminal) => ask({ type: 'attach', terminal }),
+    read: (terminal, maxLines) => ask({ type: 'read', terminal, maxLines }),
+    send: (terminal, { text, keys }) => ask({ type: 'send', terminal, text, keys }),
     write: (terminal, data) => send({ type: 'write', terminal, data }),
     resize: (terminal, cols, rows) => {
       send({ type: 'resize', terminal, cols, rows });
