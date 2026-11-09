@@ -5,6 +5,7 @@ import { toggleSidebar } from '@/components/collapsed';
 import { Projects } from '@/components/projects';
 import { linkRowClass, Sessions } from '@/components/sessions';
 import { Button } from '@/components/ui/button';
+import { versionLabel } from '@/components/version-label';
 
 export function AppSidebar({
   version,
@@ -46,7 +47,7 @@ export function AppSidebar({
       )}
       <Projects projects={projects} sessions={sessions} failedSetups={failedSetups} />
       <Sessions sessions={sessions} daemon={daemon} />
-      <footer className="shrink-0 px-2 text-[11px] text-subtle">Cockpit {version}</footer>
+      <footer className="shrink-0 px-2 text-[11px] text-subtle">{versionLabel(version)}</footer>
     </aside>
   );
 }
