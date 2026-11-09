@@ -179,6 +179,12 @@ export async function runDaemon({ home, build, stateDir, cli = '' }: DaemonOptio
           case 'attach':
             answer(request.id, () => terminals.attach(request.terminal, connection));
             break;
+          case 'read':
+            answer(request.id, () => terminals.read(request.terminal, request.maxLines));
+            break;
+          case 'send':
+            answer(request.id, () => terminals.send(request.terminal, request.text, request.keys));
+            break;
           case 'write':
             terminals.write(request.terminal, request.data);
             break;
