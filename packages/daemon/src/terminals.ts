@@ -42,6 +42,16 @@ export interface TerminalEvents {
   onTitleStatus(report: SessionReport): void;
 }
 
+/** The sequence that ends a bracketed paste: removed from a pasted text, which could otherwise end the paste early. */
+const PASTE_END = '\u001b[201~';
+
+/** `text` without the paste end, also the one that removing another would join (`ESC[20ESC[201~1~`). */
+const withoutPasteEnd = (text: string): string => {
+  let stripped = text;
+  while (stripped.includes(PASTE_END)) stripped = stripped.replaceAll(PASTE_END, '');
+  return stripped;
+};
+
 /** How long a hung-up process has to end before it is killed. */
 const HANGUP_GRACE_MS = 1000;
 
@@ -231,7 +241,7 @@ export function createTerminals({ onExit, onTitle, onTitleStatus }: TerminalEven
       if (unknown !== undefined) throw new Error(`unknown key ${unknown}`);
       await flushed(terminal);
       const paste = terminal.headless.modes.bracketedPasteMode;
-      const data = (text === undefined || text === '' ? '' : paste ? `\u001b[200~${text}\u001b[201~` : text) + keys.map((key) => KEYS[key as keyof typeof KEYS]).join('');
+      const data = (text === undefined || text === '' ? '' : paste ? `\u001b[200~${withoutPasteEnd(text)}${PASTE_END}` : text) + keys.map((key) => KEYS[key as keyof typeof KEYS]).join('');
       withTerminal(id, ({ pty }) => pty.write(data));
       return { ...terminal.info };
     },

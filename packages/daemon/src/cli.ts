@@ -220,6 +220,9 @@ function terminalCommand(subcommand: string | undefined, args: readonly string[]
   return undefined;
 }
 
+/** What `setTimeout` takes, 2^31 - 1 ms: a longer delay fires at once. */
+const MAX_TIMEOUT_SECONDS = 2_147_483.647;
+
 type Until = SessionEventName | 'settled';
 
 /** The request an `agent wait` command makes, or `undefined` when its usage is wrong. */
@@ -232,7 +235,7 @@ function waitCommand(args: readonly string[]): ((client: DaemonClient) => Promis
   const after = wholeNumber(stringOption(options, 'after'), 0);
   const timeoutText = stringOption(options, 'timeout');
   const timeout = timeoutText === undefined ? undefined : Number(timeoutText);
-  if ((options.has('after') && after === undefined) || (timeout !== undefined && !(timeout > 0 && Number.isFinite(timeout)))) return undefined;
+  if ((options.has('after') && after === undefined) || (timeout !== undefined && !(timeout > 0 && timeout <= MAX_TIMEOUT_SECONDS))) return undefined;
   return (client) => waitForAgent(client, session, until as Until, after, timeout);
 }
 
