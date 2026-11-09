@@ -49,6 +49,22 @@ export interface SpawnOptions {
 
 export type SessionEventName = 'working' | 'waiting' | 'finished';
 
+/** The keys `send` knows by name, and the bytes a terminal receives for each (arrows are always the normal-mode sequences). */
+export const KEYS = {
+  enter: '\r',
+  esc: '\u001b',
+  tab: '\t',
+  backspace: '\u007f',
+  up: '\u001b[A',
+  down: '\u001b[B',
+  right: '\u001b[C',
+  left: '\u001b[D',
+  'ctrl-c': '\u0003',
+  'ctrl-d': '\u0004',
+} as const;
+
+export const isKeyName = (name: unknown): name is keyof typeof KEYS => typeof name === 'string' && Object.hasOwn(KEYS, name);
+
 /** What `cockpit setup` reports of a setup run. */
 export type SetupEventName = 'setup-running' | 'setup-done' | 'setup-failed';
 
@@ -76,6 +92,8 @@ export interface TerminalInfo {
   workspace?: string;
   /** The last status the session reported. */
   status?: SessionEventName;
+  /** How many statuses the session reported (hooks and titles) since its terminal started; only on a `session` terminal. */
+  statusCount?: number;
   /** The last setup event the session reported. */
   setup?: SetupState;
   /** The exit code of the agent, once the session reported `exited` (`null` for a signal). */
@@ -275,6 +293,10 @@ export type Request =
   | { id: number; type: 'spawn'; options: SpawnOptions }
   | { id: number; type: 'list' }
   | { id: number; type: 'attach'; terminal: unknown }
+  /** The terminal's active buffer as plain text, the last `maxLines` lines of it when given. */
+  | { id: number; type: 'read'; terminal: unknown; maxLines?: number }
+  /** Pastes `text` (bracketed when the program asked for it), then writes the bytes of `keys`; answers the terminal's info. */
+  | { id: number; type: 'send'; terminal: unknown; text?: string; keys?: string[] }
   | { type: 'write'; terminal: unknown; data: string }
   | { type: 'resize'; terminal: unknown; cols: number; rows: number }
   | { type: 'kill'; terminal: unknown };

@@ -1,7 +1,7 @@
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { Terminal as Headless } from '@xterm/headless';
 import { spawn, type IPty } from 'node-pty';
-import { AGENT_MARKER_OSC, SCROLLBACK, type Attached, type SessionEventName, type SessionReport, type SetupState, type SpawnOptions, type TerminalExit, type TerminalInfo } from './protocol';
+import { AGENT_MARKER_OSC, isKeyName, KEYS, SCROLLBACK, type Attached, type SessionEventName, type SessionReport, type SetupState, type SpawnOptions, type TerminalExit, type TerminalInfo } from './protocol';
 
 /** Who receives what a terminal produces: one connection. */
 export interface Subscriber {
@@ -41,6 +41,16 @@ export interface TerminalEvents {
   /** A session's status was read from its title (an interrupted turn), not reported by a hook. */
   onTitleStatus(report: SessionReport): void;
 }
+
+/** The sequence that ends a bracketed paste: removed from a pasted text, which could otherwise end the paste early. */
+const PASTE_END = '\u001b[201~';
+
+/** `text` without the paste end, also the one that removing another would join (`ESC[20ESC[201~1~`). */
+const withoutPasteEnd = (text: string): string => {
+  let stripped = text;
+  while (stripped.includes(PASTE_END)) stripped = stripped.replaceAll(PASTE_END, '');
+  return stripped;
+};
 
 /** How long a hung-up process has to end before it is killed. */
 const HANGUP_GRACE_MS = 1000;
@@ -86,6 +96,9 @@ export function createTerminals({ onExit, onTitle, onTitleStatus }: TerminalEven
     terminal.pty.kill();
   };
 
+  // The headless terminal parses writes in order: a write with no data is called back once everything before it is on the screen.
+  const flushed = ({ headless }: Terminal) => new Promise<void>((resolve) => headless.write('', resolve));
+
   return {
     get size() {
       return terminals.size;
@@ -100,7 +113,7 @@ export function createTerminals({ onExit, onTitle, onTitleStatus }: TerminalEven
       headless.loadAddon(serializer);
 
       const id = ++lastId;
-      const info: TerminalInfo = { id, kind, command, cwd, cols, rows, ...(sessionId !== undefined && { sessionId }), ...(workspace !== undefined && { workspace }) };
+      const info: TerminalInfo = { id, kind, command, cwd, cols, rows, ...(sessionId !== undefined && { sessionId }), ...(workspace !== undefined && { workspace }), ...(kind === 'session' && { statusCount: 0 }) };
       let exited!: () => void;
       const gone = new Promise<void>((resolve) => (exited = resolve));
       const terminal: Terminal = {
@@ -137,6 +150,7 @@ export function createTerminals({ onExit, onTitle, onTitleStatus }: TerminalEven
         });
         const setStatusFromTitle = (event: SessionEventName, fromTitle: boolean) => {
           info.status = event;
+          info.statusCount = (info.statusCount ?? 0) + 1;
           terminal.fromTitle = fromTitle;
           onTitleStatus({ sessionId, event, ...(fromTitle && { fromTitle: true as const }) });
         };
@@ -197,6 +211,41 @@ export function createTerminals({ onExit, onTitle, onTitleStatus }: TerminalEven
       });
     },
 
+    /** The active buffer (scrollback and screen) as plain text: a wrapped line is one line, trailing spaces and empty lines are dropped. */
+    async read(id: unknown, maxLines?: number): Promise<string> {
+      const terminal = terminals.get(id);
+      if (!terminal) throw new Error(`no terminal ${id}`);
+      if (maxLines !== undefined && !isSize(maxLines)) throw new Error('maxLines must be a positive integer');
+      await flushed(terminal);
+      const buffer = terminal.headless.buffer.active;
+      const lines: string[] = [];
+      for (let row = 0; row < buffer.length; row++) {
+        const line = buffer.getLine(row)!;
+        const text = line.translateToString(true);
+        if (line.isWrapped && lines.length > 0) lines[lines.length - 1] += text;
+        else lines.push(text);
+      }
+      // Spaces the program wrote count as content to xterm, so they are trimmed once a line is whole.
+      const text = lines.map((line) => line.trimEnd());
+      while (text.length > 0 && text[text.length - 1] === '') text.pop();
+      return (maxLines === undefined ? text : text.slice(-maxLines)).join('\n');
+    },
+
+    /** Pastes `text`, bracketed when the program enabled mode 2004, then writes the `keys`; answers the info as of after the write. */
+    async send(id: unknown, text?: string, keys: string[] = []): Promise<TerminalInfo> {
+      const terminal = terminals.get(id);
+      if (!terminal) throw new Error(`no terminal ${id}`);
+      if (text !== undefined && typeof text !== 'string') throw new Error('text must be a string');
+      if (!Array.isArray(keys)) throw new Error('keys must be a list');
+      const unknown = keys.find((key) => !isKeyName(key));
+      if (unknown !== undefined) throw new Error(`unknown key ${unknown}`);
+      await flushed(terminal);
+      const paste = terminal.headless.modes.bracketedPasteMode;
+      const data = (text === undefined || text === '' ? '' : paste ? `\u001b[200~${withoutPasteEnd(text)}${PASTE_END}` : text) + keys.map((key) => KEYS[key as keyof typeof KEYS]).join('');
+      withTerminal(id, ({ pty }) => pty.write(data));
+      return { ...terminal.info };
+    },
+
     write: (id: unknown, data: string) => withTerminal(id, ({ pty }) => pty.write(data)),
 
     resize: (id: unknown, cols: number, rows: number) => {
@@ -241,7 +290,10 @@ export function createTerminals({ onExit, onTitle, onTitleStatus }: TerminalEven
         if (report.event === 'exited') info.exitCode = report.exitCode;
         else if (report.event === 'harness-session') info.harnessSessionId = report.harnessSessionId;
         else if (report.event.startsWith('setup-')) info.setup = report.event.slice('setup-'.length) as SetupState;
-        else info.status = report.event as SessionEventName;
+        else {
+          info.status = report.event as SessionEventName;
+          info.statusCount = (info.statusCount ?? 0) + 1;
+        }
         return true;
       }
       return false;
