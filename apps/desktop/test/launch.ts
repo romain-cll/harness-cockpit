@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import type { DaemonClient } from '@cockpit/daemon';
 import { chromium, type Browser, type ElementHandle, type Frame, type Page } from 'playwright-core';
 import { afterEach, expect } from 'vitest';
+import { versionLabel as versionLabelOf } from '../src/renderer/components/version-label';
 import { makeTestDir, runRoot } from './run-root';
 
 // Launching the app the ways it runs (the dev server, the built app, the packaged app) and
@@ -20,7 +21,7 @@ export const appDir = join(import.meta.dirname, '..');
 export const { version } = JSON.parse(readFileSync(join(appDir, 'package.json'), 'utf8')) as { version: string };
 // Shown in the sidebar from `window.api.getVersion()`, so it proves the
 // renderer reaches the main process.
-export const versionLabel = `Cockpit ${version}`;
+export const versionLabel = versionLabelOf(version);
 
 // Signs of an uncaught error in the main process.
 export const MAIN_PROCESS_ERROR = /\bUncaught\b|\bUnhandled\b|App threw an error/;

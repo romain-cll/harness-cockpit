@@ -1,6 +1,6 @@
 {
   "name": "@cockpit/desktop",
-  "version": "0.0.0",
+  "version": "0.0.0-alpha.0",
   "private": true,
   "description": "Cockpit desktop app",
   "type": "module",
@@ -10,7 +10,7 @@
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "package": "bun run --filter @cockpit/cli build && electron-vite build && electron-builder --dir",
-    "package:signed": "electron-builder --dir -c.mac.identity='CAILLE ROMAIN (64PK7M265S)' -c.mac.hardenedRuntime=true",
+    "package:signed": "electron-builder --publish never -c.mac.identity='CAILLE ROMAIN (64PK7M265S)' -c.mac.hardenedRuntime=true",
     "test": "bun run package && vitest run",
     "typecheck": "tsc -p tsconfig.json && tsc -p src/renderer/tsconfig.json && tsc -p test/tsconfig.json",
     "lint": "oxlint"

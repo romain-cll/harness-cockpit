@@ -1,12 +1,20 @@
 # Developer ID signed and notarized Cockpit.app (COCKPIT-17). The job runs in the GitHub environment
 # `release`, the only place the five secrets are stored: CSC_LINK, CSC_KEY_PASSWORD, APPLE_API_KEY_P8,
 # APPLE_API_KEY_ID and APPLE_API_ISSUER. No pull_request trigger: a PR run never reads them.
+# COCKPIT-23: every run builds the DMG, the zip and latest-mac.yml. A dispatch with `version` also checks it
+# first and, once everything passed, lets the secret-less `publish` job make the pre-release (and the tag).
 name: Signed app
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release (apps/desktop/package.json's); empty only builds and checks
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -19,10 +27,32 @@ jobs:
     runs-on: macos-latest
     environment: release
     timeout-minutes: 30
+    outputs:
+      short: ${{ steps.release.outputs.short }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      # Before anything is signed: the input is the app's version and its tag is free. `VERSION` comes from `env:`.
+      - name: Check release version
+        if: inputs.version != ''
+        run: |
+          actual=$(node -p "require('./apps/desktop/package.json').version")
+          if [ "$VERSION" != "$actual" ]; then
+            echo "The version input ($VERSION) differs from apps/desktop/package.json ($actual)"
+            exit 1
+          fi
+          status=0
+          git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" || status=$?
+          if [ "$status" = 0 ]; then
+            echo "The tag v$VERSION already exists on origin"
+            exit 1
+          fi
+          # 2: no such ref, the tag is free. Anything else is a failed call.
+          [ "$status" = 2 ] || exit "$status"
+          echo "Releasing v$VERSION: package.json says $actual and the tag is free"
+        env:
+          VERSION: ${{ inputs.version }}
       - uses: ./.github/actions/setup
       # No secret reaches the build.
       - run: bun run --filter @cockpit/cli build && bun run --cwd apps/desktop build
@@ -58,13 +88,65 @@ jobs:
           done
           codesign -d --entitlements - "$app/Contents/Resources/bin/cockpit" 2>&1 | grep -q 'com.apple.security.cs.allow-jit'
       - run: bun run --cwd apps/desktop vitest run test/packaged.test.ts test/launchd.test.ts
-      - name: Zip
-        id: zip
+      # The files the release is made of, checked on every run: the DMG's app and the zip's app are both signed
+      # and notarized, and latest-mac.yml (COCKPIT-27's feed) names this version and this zip.
+      - name: Verify release files
+        id: release
         run: |
-          ditto -c -k --keepParent apps/desktop/release/mac-arm64/Cockpit.app "$RUNNER_TEMP/Cockpit.zip"
           echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          release=apps/desktop/release
+          version=$(node -p "require('./apps/desktop/package.json').version")
+          dmg="$release/Cockpit-$version-arm64.dmg"
+          zip="$release/Cockpit-$version-arm64-mac.zip"
+          mkdir -p "$RUNNER_TEMP/dmg" "$RUNNER_TEMP/zip"
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/dmg" "$dmg"
+          trap 'hdiutil detach -force "$RUNNER_TEMP/dmg" || true' EXIT
+          app="$RUNNER_TEMP/dmg/Cockpit.app"
+          codesign --verify --deep --strict "$app"
+          spctl --assess --type execute -vv "$app" 2>&1 | tee "$RUNNER_TEMP/spctl-dmg.txt"
+          grep -q 'source=Notarized Developer ID' "$RUNNER_TEMP/spctl-dmg.txt"
+          xcrun stapler validate "$app"
+          ditto -x -k "$zip" "$RUNNER_TEMP/zip"
+          app="$RUNNER_TEMP/zip/Cockpit.app"
+          codesign --verify --deep --strict "$app"
+          spctl --assess --type execute -vv "$app" 2>&1 | tee "$RUNNER_TEMP/spctl-zip.txt"
+          grep -q 'source=Notarized Developer ID' "$RUNNER_TEMP/spctl-zip.txt"
+          grep -qx "version: $version" "$release/latest-mac.yml"
+          grep -qF "$(basename "$zip")" "$release/latest-mac.yml"
       - uses: actions/upload-artifact@v7
         with:
-          name: Cockpit-${{ steps.zip.outputs.short }}
-          path: ${{ runner.temp }}/Cockpit.zip
+          name: Cockpit-${{ steps.release.outputs.short }}
+          path: |
+            apps/desktop/release/*.dmg
+            apps/desktop/release/*.zip
+            apps/desktop/release/*.blockmap
+            apps/desktop/release/latest-mac.yml
+          if-no-files-found: error
           retention-days: 14
+
+  # Reads no secret and has no environment: it only turns the artifact the signing job proved into a release.
+  # The draft is published last, which creates the tag at the run's commit; a failed create leaves no tag.
+  publish:
+    needs: signed-app
+    if: inputs.version != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: Cockpit-${{ needs.signed-app.outputs.short }}
+          path: release
+      - name: Publish the release
+        run: |
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --prerelease --generate-notes \
+            "release/Cockpit-$VERSION-arm64.dmg" \
+            "release/Cockpit-$VERSION-arm64.dmg.blockmap" \
+            "release/Cockpit-$VERSION-arm64-mac.zip" \
+            "release/Cockpit-$VERSION-arm64-mac.zip.blockmap" \
+            release/latest-mac.yml
+          gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}

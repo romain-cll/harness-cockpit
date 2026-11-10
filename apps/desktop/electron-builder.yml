@@ -15,6 +15,12 @@ npmRebuild: false
 asarUnpack:
   - node_modules/node-pty/**
 mac:
+  # `--dir` builds (`package`) ignore `target`: they only write mac-arm64/Cockpit.app.
+  target:
+    - target: dmg
+      arch: [arm64]
+    - target: zip
+      arch: [arm64]
   # Test-build defaults: ad-hoc signed, no hardened runtime. `package:signed` overrides both
   # (Developer ID, hardened runtime, notarization) in signed-app.yml.
   identity: '-'
@@ -23,3 +29,9 @@ mac:
   entitlementsInherit: build/entitlements.mac.inherit.plist
   extendInfo:
     NSAppleEventsUsageDescription: A program run in a Cockpit terminal wants to control another app.
+# Without a publish config electron-builder writes no latest-mac.yml, even with `--publish never`
+# (the release workflow publishes with `gh`, not the builder).
+publish:
+  provider: github
+  owner: romain-cll
+  repo: harness-cockpit
